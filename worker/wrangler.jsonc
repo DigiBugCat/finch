@@ -1,0 +1,20 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "finch",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-06-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+  "durable_objects": {
+    "bindings": [{ "name": "APPLIANCE", "class_name": "ApplianceDO" }]
+  },
+  "migrations": [
+    {
+      // SQLite-backed DOs — required for the free tier and the modern DO API.
+      "tag": "v1",
+      "new_sqlite_classes": ["ApplianceDO"]
+    }
+  ]
+  // routes: bind finchmcp.com once the zone is on Cloudflare, e.g.
+  // "routes": [{ "pattern": "finchmcp.com/*", "zone_name": "finchmcp.com" }]
+}
