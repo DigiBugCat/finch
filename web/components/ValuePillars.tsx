@@ -4,24 +4,24 @@ export default function ValuePillars() {
       <div className="wrap">
         <div className="sec-head">
           <span className="sec-tag">WHY FINCH</span>
-          <h2>Your AI can think. Now it can reach.</h2>
-          <p>Smart assistants are stuck behind a screen. Finch gives them safe hands in the real world — using the devices you already own.</p>
+          <h2>Your agent can reason. Give it somewhere to land.</h2>
+          <p>A model in a chat window can't touch your hardware, your files, or your home network. Finch hands it a safe perch on a box you already own — no rented server, no public port.</p>
         </div>
         <div className="pillars">
           <div className="pillar">
             <div className="pillar-ic">🐦</div>
-            <h3>Bring a device to life</h3>
-            <p>Plug in any always-on computer. Finch wakes it, keeps it healthy, and restarts it after reboots — so it's ready whenever your AI calls.</p>
+            <h3>Wake a box, keep it perched</h3>
+            <p>Point Finch at any always-on machine. It installs as a service, survives reboots, and re-homes itself on its own — so the perch is there whenever an agent calls.</p>
           </div>
           <div className="pillar">
             <div className="pillar-ic">🔗</div>
-            <h3>One link for your AI</h3>
-            <p>Every ability gets a single web address. Paste it into Claude or Cursor and your assistant can use it instantly — from anywhere.</p>
+            <h3>A real URL, not localhost</h3>
+            <p>Every server gets a stable, public MCP endpoint with TLS. Drop it into Claude, Cursor, or your own client and it just answers — from anywhere, no tunnel to babysit.</p>
           </div>
           <div className="pillar">
             <div className="pillar-ic">🔒</div>
-            <h3>Safe by default</h3>
-            <p>Every request is checked at the door. You hold the keys, and your devices never open a port to the internet. Ever.</p>
+            <h3>Authed at the door</h3>
+            <p>Finch verifies every caller before a request ever touches your code. You hold the keys. Your box never opens a port to the internet. Ever.</p>
           </div>
         </div>
       </div>

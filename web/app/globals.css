@@ -179,23 +179,6 @@ section{position:relative; z-index:1}
 .safety h4{font-size:16.5px; font-weight:800; margin-bottom:8px}
 .safety p{color:var(--dim); font-size:14px}
 
-/* ---------- pricing ---------- */
-.price-grid{display:grid; grid-template-columns:repeat(3,1fr); gap:20px; align-items:stretch}
-.price{background:var(--card); border:1px solid var(--line); border-radius:22px; padding:32px 28px; display:flex; flex-direction:column}
-.price.feat{border-color:rgba(242,180,67,.45); background:linear-gradient(180deg, rgba(242,180,67,.07), var(--card)); position:relative}
-.price-badge{position:absolute; top:-13px; left:50%; transform:translateX(-50%); background:var(--amber); color:#2a200c;
-  font-weight:900; font-size:12px; padding:5px 14px; border-radius:999px; letter-spacing:.02em; white-space:nowrap}
-.price-name{font-weight:900; font-size:20px}
-.price-tag{font-size:13.5px; color:var(--dim); margin-top:4px}
-.price-amt{display:flex; align-items:baseline; gap:6px; margin:20px 0 4px}
-.price-amt .n{font-size:46px; font-weight:900; letter-spacing:-0.03em}
-.price-amt{flex-wrap:nowrap}
-.price-amt .per{color:var(--dim); font-weight:700; font-size:15px; white-space:nowrap}
-.price-feats{list-style:none; padding:0; margin:24px 0 26px; display:flex; flex-direction:column; gap:13px}
-.price-feats li{display:flex; gap:11px; align-items:flex-start; font-size:15px; color:var(--ink)}
-.price-feats .ck{color:var(--green); font-weight:900; flex-shrink:0}
-.price .btn{width:100%; justify-content:center; margin-top:auto}
-
 /* ---------- faq ---------- */
 .faq{max-width:780px; margin:0 auto; display:flex; flex-direction:column; gap:12px}
 .faq details{background:var(--card); border:1px solid var(--line); border-radius:14px; overflow:hidden; transition:.2s}
@@ -233,7 +216,7 @@ footer{border-top:1px solid var(--line); background:var(--bg3); padding:56px 0 4
 @media (max-width:920px){
   .hero-grid{grid-template-columns:1fr; gap:44px}
   .preview{transform:none}
-  .pillars,.steps,.ability-grid,.price-grid{grid-template-columns:1fr}
+  .pillars,.steps,.ability-grid{grid-template-columns:1fr}
   .safety-grid{grid-template-columns:repeat(2,1fr)}
   .split{grid-template-columns:1fr; gap:34px}
   .foot-grid{grid-template-columns:1fr 1fr; gap:28px}

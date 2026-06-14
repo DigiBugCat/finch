@@ -6,7 +6,7 @@ import HowItWorks from '@/components/HowItWorks';
 import Abilities from '@/components/Abilities';
 import FlockSplit from '@/components/FlockSplit';
 import Safety from '@/components/Safety';
-import Pricing from '@/components/Pricing';
+import Beta from '@/components/Beta';
 import Faq from '@/components/Faq';
 import FinalCta from '@/components/FinalCta';
 import Footer from '@/components/Footer';
@@ -23,7 +23,7 @@ export default function Home() {
       <Abilities />
       <FlockSplit />
       <Safety />
-      <Pricing />
+      <Beta />
       <Faq />
       <FinalCta />
       <Footer />

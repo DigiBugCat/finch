@@ -5,10 +5,10 @@ export default function FinalCta() {
     <section className="final">
       <div className="wrap">
         <div className="final-card">
-          <h2>Bring your devices home.</h2>
-          <p>Wake your first device, hand the link to your AI, and watch it start chirping. Free to begin — no card, no servers, no fuss.</p>
+          <h2>Bring your boxes home.</h2>
+          <p>Run one line, hand off the URL, and watch it start chirping. Free while we're in beta — no card, no rented servers, no open ports.</p>
           <div className="final-cta">
-            <Link className="btn btn-lg btn-amber" href="/sign-up">Start free →</Link>
+            <Link className="btn btn-lg btn-amber" href="/sign-up">Join the beta →</Link>
             <a className="btn btn-lg btn-ghost" href="#how">See how it works</a>
           </div>
         </div>

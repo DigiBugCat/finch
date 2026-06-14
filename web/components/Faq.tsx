@@ -7,24 +7,32 @@ export default function Faq() {
 
   const items = [
     {
-      q: "Do I need to know how to code?",
-      a: "Nope. You'll paste one command to wake a device, then copy a link into your AI app. If you can copy and paste, you're set. Writing your own abilities is optional — and yes, it's developer-friendly when you want it.",
+      q: "Do I have to write the MCP server myself?",
+      a: "Only if you want to — Finch hosts the server logic, it doesn't write it. Bring a FastMCP (or any MCP) server and Finch wraps it in auth and a public URL. If you've shipped a FastMCP server, you already know the shape. Not in the mood? Grab a ready-made ability and flash it onto a box in a minute.",
     },
     {
-      q: "Is it safe to connect my computer?",
-      a: "Very. Your computer never opens a port or accepts incoming connections — it dials out to Finch and only ever responds to requests you've authorized. Finch verifies every caller at the door before anything reaches your device.",
+      q: "Is it actually safe to put my box on the internet?",
+      a: "You're not exposing anything. Your box never opens a port or accepts an inbound connection — it dials out to Finch over an outbound tunnel and only answers calls you've authorized. Finch verifies every caller at the door before anything reaches your code. No reverse proxy, no exposed IP, no CGNAT gymnastics.",
     },
     {
-      q: "Which AI apps work with Finch?",
-      a: "Anything that speaks MCP — including Claude and Cursor — plus a growing list of clients. If your app supports MCP servers, it works with Finch out of the box.",
+      q: "Which clients can call it?",
+      a: "Anything that speaks MCP — Claude, Cursor, Windsurf, and a growing list of clients, plus your own code over the protocol. If it can add an MCP server by URL, it works with Finch out of the box.",
     },
     {
-      q: "What happens when my device is turned off?",
-      a: "It rests. Finch shows it as \"resting\" so you always know, and wakes it the moment it comes back online — no reconnecting, no fiddling.",
+      q: "What happens when my box goes offline?",
+      a: "It rests. Finch marks the endpoint \"resting\" so you always know, and re-homes it the moment the box is back — no re-running the installer, no re-pasting URLs.",
     },
     {
-      q: "What can my AI actually do with it?",
-      a: "Anything you can package as a small tool: printing, transcription, searching your notes, reading the web, running your home, and more. Start with a ready-made ability or bring your own.",
+      q: "What can I actually expose through it?",
+      a: "Anything you can wrap as an MCP tool: printing, transcription, a notes index, web fetch, home automation, your own scripts. Start from a ready-made ability or bring your own server.",
+    },
+    {
+      q: "What can I actually expose through it?",
+      a: "Anything you can wrap as an MCP tool: printing, transcription, a notes index, web fetch, home automation, your own scripts. Start from a ready-made ability or bring your own server.",
+    },
+    {
+      q: "It's free now — what's the catch, and what happens later?",
+      a: "No catch. Finch is in beta and free while we're here — every box, every tool, no card, no tiers. Paid plans arrive once Finch is out of beta, and the beta flock keeps early-supporter pricing, grandfathered. We'd rather earn the upgrade than gate the beta — and we'll give you plenty of warning before anything has a price on it.",
     },
   ];
 

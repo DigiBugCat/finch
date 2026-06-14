@@ -6,12 +6,12 @@ export default function FlockSplit() {
       <div className="wrap split">
         <div>
           <span className="sec-tag">THE FLOCK</span>
-          <h2>One cozy place to watch them all.</h2>
-          <p className="lede">A calm dashboard, not a control room. See who's awake at a glance, grab any link in a tap, and add a device in under a minute.</p>
+          <h2>Watch the whole flock from one perch.</h2>
+          <p className="lede">A calm dashboard, not a control room. See who's awake at a glance, copy any endpoint in a tap, and add a box in under a minute.</p>
           <div className="split-list">
-            <div className="split-item"><span className="ck">✓</span><div><b>Ambient health</b><span>The perch meter glows green for every device that's online. Read your whole flock in half a second.</span></div></div>
-            <div className="split-item"><span className="ck">✓</span><div><b>One-tap links</b><span>Copy any MCP address straight into your AI app — masked when it's a secret, full when you copy.</span></div></div>
-            <div className="split-item"><span className="ck">✓</span><div><b>Honest states</b><span>Chirping, resting, or just invited — Finch always tells you the truth about what's online.</span></div></div>
+            <div className="split-item"><span className="ck">✓</span><div><b>Ambient health</b><span>The perch meter glows green for every box that's chirping. Read the whole roost in half a second.</span></div></div>
+            <div className="split-item"><span className="ck">✓</span><div><b>One-tap endpoints</b><span>Copy any MCP endpoint straight into your client — masked by default, full when you copy.</span></div></div>
+            <div className="split-item"><span className="ck">✓</span><div><b>Honest states</b><span>Chirping, resting, or just invited — Finch tells you the truth about what's actually reachable.</span></div></div>
           </div>
           <div style={{ marginTop: '30px' }}><Link className="btn btn-lg btn-ghost" href="/dashboard">Open the dashboard →</Link></div>
         </div>

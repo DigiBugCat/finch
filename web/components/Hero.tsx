@@ -5,17 +5,17 @@ export default function Hero() {
     <section className="hero">
       <div className="wrap hero-grid">
         <div className="hero-copy">
-          <span className="eyebrow">🌙 <b>New</b> · the cozy home for your AI&apos;s tools</span>
-          <h1>Your AI, meet<br />the <span className="soft">real world.</span></h1>
-          <p className="hero-sub">Finch turns any spare computer — a Mac mini, a Raspberry Pi, that laptop in the closet — into a safe, always-on helper your AI can actually use. No servers. No wiring. No open ports.</p>
+          <span className="eyebrow">🌙 Now in <b>beta</b> · free while it lasts</span>
+          <h1>Give your agent<br />a place to <span className="soft">land.</span></h1>
+          <p className="hero-sub">Finch turns any always-on box — Mac mini, Pi, the server humming under your desk — into a public, authenticated MCP server. You write the tool logic. Finch handles auth, routing, and hosting. Outbound-only: nothing listens, no ports to open.</p>
           <div className="hero-cta">
-            <Link className="btn btn-lg btn-amber" href="/sign-up">Start free →</Link>
+            <Link className="btn btn-lg btn-amber" href="/sign-up">Join the beta →</Link>
             <a className="btn btn-lg btn-ghost" href="#how">See how it works</a>
           </div>
           <div className="hero-trust">
-            <span><i>✓</i> Works with Claude, Cursor &amp; any MCP app</span>
-            <span><i>✓</i> Free for your first device</span>
-            <span><i>✓</i> Your keys, your data</span>
+            <span><i>✓</i> Speaks MCP — Claude, Cursor, any client</span>
+            <span><i>✓</i> Free for the whole beta</span>
+            <span><i>✓</i> Your keys, your box, your data</span>
           </div>
         </div>
 

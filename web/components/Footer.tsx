@@ -7,14 +7,14 @@ export default function Footer() {
         <div className="foot-grid">
           <div className="foot-brand">
             <a className="logo" href="#top"><span className="logo-mark">🐦</span> Finch</a>
-            <p>The cozy home for your AI's tools. Wake a device, hand over a link, and let your assistant reach the real world.</p>
+            <p>The open roost for MCP appliances. Send a box home, hand over the endpoint, and let your agent reach the real world.</p>
           </div>
           <div className="foot-col">
             <h5>Product</h5>
             <a href="#how">How it works</a>
             <a href="#abilities">Abilities</a>
             <a href="#safety">Safety</a>
-            <a href="#pricing">Pricing</a>
+            <a href="#beta">Beta</a>
             <Link href="/dashboard">Dashboard</Link>
           </div>
           <div className="foot-col">

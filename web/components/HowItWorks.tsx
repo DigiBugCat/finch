@@ -19,19 +19,19 @@ export default function HowItWorks() {
       <div className="wrap">
         <div className="sec-head">
           <span className="sec-tag">HOW IT WORKS</span>
-          <h2>Live in under a minute</h2>
-          <p>If you can copy and paste, you can use Finch. Here's the whole thing.</p>
+          <h2>From cold box to live endpoint in a minute</h2>
+          <p>One command up. One URL out. That's the whole loop.</p>
         </div>
         <div className="steps">
           <div className="step">
             <div className="step-n"></div>
-            <h3>Pick a device</h3>
-            <p>Any computer that stays on works beautifully — a Mac mini, a Raspberry Pi, an old laptop on a shelf.</p>
+            <h3>Pick a box</h3>
+            <p>Anything that stays on and runs a shell — a Mac mini, a Pi, a spare Linux box. If it can hold a process, it can hold a roost.</p>
           </div>
           <div className="step">
             <div className="step-n"></div>
-            <h3>Wake it with one line</h3>
-            <p>Paste a single command. Your device flies home, joins your flock, and starts chirping.</p>
+            <h3>Bring it home</h3>
+            <p>Run one line. The box dials out to Finch, joins your flock, and starts chirping — no port-forwarding, no firewall holes.</p>
             <div className="step-code">
               <code id="install-cmd">curl -fsSL finchmcp.com/start | sh</code>
               <button className="copybtn" data-copy="curl -fsSL finchmcp.com/start | sh" onClick={handleCopy}>Copy</button>
@@ -39,8 +39,8 @@ export default function HowItWorks() {
           </div>
           <div className="step">
             <div className="step-n"></div>
-            <h3>Hand the link to your AI</h3>
-            <p>Copy your new web address into any AI app. That's it — your assistant can now use your device.</p>
+            <h3>Hand off the URL</h3>
+            <p>Each ability publishes its own MCP endpoint. Drop the URL into any client and your agent is holding the tool — auth already handled.</p>
             <div className="step-code">
               <code>maray.finchmcp.com/printer/mcp</code>
               <button className="copybtn" data-copy="https://maray.finchmcp.com/printer/mcp" onClick={handleCopy}>Copy</button>

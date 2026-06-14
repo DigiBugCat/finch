@@ -21,12 +21,12 @@ export default function Nav() {
           <a href="#how">How it works</a>
           <a href="#abilities">Abilities</a>
           <a href="#safety">Safety</a>
-          <a href="#pricing">Pricing</a>
+          <a href="#beta">Beta</a>
           <a href="#faq">FAQ</a>
         </div>
         <div className="nav-cta">
           <Link className="nav-signin" href="/sign-in">Sign in</Link>
-          <Link className="btn btn-md btn-amber" href="/sign-up">Start free</Link>
+          <Link className="btn btn-md btn-amber" href="/sign-up">Join the beta</Link>
         </div>
       </div>
     </nav>
