@@ -34,6 +34,58 @@ export interface Env {
   TICKET_SECRET: string; // HMAC key for join tickets + per-machine connect-tokens
   DEFAULT_TENANT?: string; // DEV-ONLY tenant fallback when no slug resolves
   DEV?: string; // "1" in the dev env; gates the DEFAULT_TENANT fallback
+
+  // Cloudflare Rate Limiting bindings (unsafe.bindings ratelimit). Optional so
+  // tests / `wrangler dev` without the binding still run (limiter() no-ops when
+  // absent). RELAY_LIMIT gates per-(tenant,IP) on the MCP relay BEFORE the
+  // checkKey DO round-trip; JOIN_LIMIT gates per-IP on /join.
+  RELAY_LIMIT?: RateLimiter;
+  JOIN_LIMIT?: RateLimiter;
+}
+
+/** Cloudflare Rate Limiting binding surface (not in workers-types yet). */
+export interface RateLimiter {
+  limit(opts: { key: string }): Promise<{ success: boolean }>;
+}
+
+/** Apply a rate limiter if bound; fail OPEN if the binding is absent (dev/test)
+ *  so the limiter is purely additive. Returns true if the request is allowed. */
+export async function rateLimitOk(
+  limiter: RateLimiter | undefined,
+  key: string,
+): Promise<boolean> {
+  if (!limiter) return true;
+  try {
+    const { success } = await limiter.limit({ key });
+    return success;
+  } catch {
+    return true; // never fail a request because the limiter errored
+  }
+}
+
+/** Best-effort client IP for rate-limit keying (Cloudflare-set header). */
+export function clientIp(req: Request): string {
+  return (
+    req.headers.get("cf-connecting-ip") ||
+    req.headers.get("x-forwarded-for") ||
+    "unknown"
+  );
+}
+
+// Max relay request body we'll buffer into a DO (#16 / security L9). The DO
+// buffers the whole body via req.text(); a few-MB cap keeps concurrent POSTs
+// from summing past DO heap. Enforced here pre-stub AND in ApplianceDO.fetch.
+const MAX_RELAY_BODY_BYTES = 4 * 1024 * 1024; // 4 MiB
+
+/** Percent-decode a path segment, tolerating a malformed encoding (a raw "%"
+ *  in a name would make decodeURIComponent throw). Falls back to the raw value
+ *  so a bad encoding degrades to "wrong machine" rather than a 500. */
+function safeDecode(seg: string): string {
+  try {
+    return decodeURIComponent(seg);
+  } catch {
+    return seg;
+  }
 }
 
 /** Extract the vanity host slug for an MCP/relay request.
@@ -59,11 +111,9 @@ async function resolveTenant(host: string, env: Env): Promise<string | null> {
   if (slug) {
     const tenant = await routerLookup(env, slug);
     if (tenant) return tenant;
-    // Known-shaped slug that isn't registered: fail closed in prod.
-    if (env.DEV === "1" && env.DEFAULT_TENANT) return env.DEFAULT_TENANT;
-    return null;
   }
-  // No usable slug (apex / www / workers.dev / localhost). Dev-only fallback.
+  // No usable/registered slug (unregistered slug, apex, www, workers.dev,
+  // localhost): fail closed in prod; dev-only DEFAULT_TENANT fallback otherwise.
   if (env.DEV === "1" && env.DEFAULT_TENANT) return env.DEFAULT_TENANT;
   return null;
 }
@@ -86,7 +136,7 @@ function machineStub(
 }
 
 /** Small JSON helper. */
-function json(status: number, body: unknown): Response {
+export function json(status: number, body: unknown): Response {
   return new Response(JSON.stringify(body), {
     status,
     headers: { "content-type": "application/json" },
@@ -94,7 +144,7 @@ function json(status: number, body: unknown): Response {
 }
 
 /** Call a TenantDO op via its internal fetch RPC. */
-async function tenantOp<T = any>(
+export async function tenantOp<T = any>(
   env: Env,
   tenant: string,
   op: string,
@@ -163,13 +213,21 @@ export default {
     const appliance = parts[0];
     const second = parts[1];
 
+    // The path segment is percent-ENCODED, but the control plane (api.ts /
+    // tenant-do.ts) stores the machine name DECODED. Decode at the edge so the
+    // connect-token assertion (payload.machine === machine) and the ApplianceDO
+    // idFromName key both compare against the same value the box joined under —
+    // otherwise a non-ASCII or spaced name (e.g. "My Mac" → "My%20Mac") 401s on
+    // _connect and routes to the wrong (empty) DO → 503 on mcp. We re-encode
+    // only when building outward URL strings. (code-review #11)
+    const machine = second ? safeDecode(second) : "";
+
     // /<appliance>/<machine>/_connect  — agent dials in (WS upgrade).
     // /<appliance>/<machine>/mcp        — public MCP call to a specific machine.
     // /<appliance>/mcp                  — load-balanced across the appliance.
 
     // Agent registration: /<appliance>/<machine>/_connect
     if (second && parts[2] === "_connect") {
-      const machine = second;
       if (req.headers.get("Upgrade") !== "websocket") {
         return new Response("expected websocket upgrade", { status: 426 });
       }
@@ -202,7 +260,8 @@ export default {
 
     // Public MCP call to a specific machine: /<appliance>/<machine>/mcp
     if (second && parts[2] === "mcp" && parts.length >= 3) {
-      const machine = second;
+      // `machine` is the DECODED name (see safeDecode at the edge above); it
+      // keys the ApplianceDO and matches the stored registry entry.
       // Upstream path the agent should see: everything after <appliance>/<machine>.
       const upstream = parts.slice(2).join("/");
       return relayMcp(req, env, ctx, tenant, appliance, machine, path, upstream);
@@ -210,15 +269,19 @@ export default {
 
     // Load-balanced appliance URL: /<appliance>/mcp
     if (second === "mcp" && parts.length === 2) {
-      const machine = await pickHealthyMachine(env, tenant, appliance);
-      if (!machine) {
-        // No healthy machine. Record this 503 too, so a load-balanced offline
-        // call is just as visible in the dashboard (logs / recentCalls / err)
-        // as a specific-machine offline 503 (which goes through relayMcp). The
-        // canonical appliance URL minted at enroll is exactly this LB route, so
-        // without this its offline failures would silently vanish. We attribute
-        // the caller's key when present (best-effort — we don't fail the 503 on
-        // a bad/absent key), and fire-and-forget the write via waitUntil.
+      // Upstream path: everything after <appliance> (the resolved <machine> is
+      // injected by relayMcp so the DO's two-segment strip yields this path).
+      const upstream = parts.slice(1).join("/");
+      // Pick the WHOLE healthy pool (shuffled) and FAIL OVER inside relayMcp: it
+      // relays to the first candidate and, if that DO reports "appliance offline"
+      // (a stale-pick blackhole — the picker reads persisted liveness, which can
+      // lag a just-dropped socket), retries the next sibling. Only when every
+      // candidate is dead do we 503. (code-review #12)
+      const pool = await pickHealthyPool(env, tenant, appliance);
+      if (!pool.length) {
+        // No healthy machine at all. Record this 503 too, so a load-balanced
+        // offline call is just as visible in the dashboard (logs / recentCalls /
+        // err) as a specific-machine offline 503. Best-effort caller attribution.
         const caller = await callerLabel(req, env, tenant, appliance);
         ctx.waitUntil(
           tenantOp(env, tenant, "recordCall", {
@@ -232,32 +295,35 @@ export default {
         );
         return json(503, { error: "appliance offline", appliance });
       }
-      // Upstream path: everything after <appliance> (the resolved <machine> is
-      // injected by relayMcp so the DO's two-segment strip yields this path).
-      const upstream = parts.slice(1).join("/");
-      return relayMcp(req, env, ctx, tenant, appliance, machine, path, upstream);
+      return relayMcp(req, env, ctx, tenant, appliance, pool, path, upstream);
     }
 
     return json(404, { error: "not found", path });
   },
 };
 
-/** Pick an online machine for an appliance (load-balance). Returns the machine
- *  name, or null if none are healthy. Reads TenantDO getState. */
-async function pickHealthyMachine(
+/** The shuffled pool of online machine names for an appliance (load-balance +
+ *  failover). Uses the UNIFIED liveness rule (connected AND not pending) so the
+ *  picker and the dashboard agree. Reads TenantDO getState. Empty if none. */
+async function pickHealthyPool(
   env: Env,
   tenant: string,
   appliance: string,
-): Promise<string | null> {
+): Promise<string[]> {
   const state = await tenantOp(env, tenant, "getState");
   const ap = (state?.appliances ?? []).find((a: any) => a.id === appliance);
-  if (!ap) return null;
+  if (!ap) return [];
   const machines: any[] = ap.machines ?? [];
-  const healthy = machines.filter((m) => m.connected || m.state === "chirping");
-  const pool = healthy.length ? healthy : [];
-  if (!pool.length) return null;
-  // Spread load: random pick among healthy machines.
-  return pool[Math.floor(Math.random() * pool.length)].name;
+  // online = holds a live socket AND approved (matches tenant-do machineOnline).
+  const healthy = machines.filter(
+    (m) => m.connected && m.state !== "pending",
+  );
+  // Fisher-Yates shuffle so load spreads and failover tries a fresh order.
+  for (let i = healthy.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [healthy[i], healthy[j]] = [healthy[j], healthy[i]];
+  }
+  return healthy.map((m) => m.name as string);
 }
 
 /** Best-effort caller attribution for a request: resolve the presented finch_
@@ -289,17 +355,35 @@ async function callerLabel(
 
 /** Extract a Bearer finch_ key, check it against the tenant's TenantDO, relay to
  *  the per-machine ApplianceDO, and record the call. 401 if the key is absent or
- *  not allowed for this appliance. */
+ *  not allowed for this appliance. `machineOrPool` is a single machine name (the
+ *  specific-machine route) or a shuffled candidate pool (the LB route) that we
+ *  fail over on a DO "appliance offline" 503. */
 async function relayMcp(
   req: Request,
   env: Env,
   ctx: ExecutionContext,
   tenant: string,
   appliance: string,
-  machine: string,
+  machineOrPool: string | string[],
   route: string,
   upstream: string,
 ): Promise<Response> {
+  // THROTTLE FIRST — before the checkKey DO round-trip. A well-formed-but-wrong
+  // Bearer finch_ otherwise forces a checkKey + state load per request; gating
+  // per-(tenant,IP) here makes a cheap DO-invocation DoS expensive. (security M5)
+  const ip = clientIp(req);
+  if (!(await rateLimitOk(env.RELAY_LIMIT, `${tenant}:${ip}`))) {
+    return json(429, { error: "rate limited" });
+  }
+
+  // REQUEST-SIZE CAP — reject oversized bodies before buffering them into a DO.
+  // content-length is client-controlled/absent for chunked, so this is a cheap
+  // first gate; ApplianceDO enforces the real limit on the buffered string. (#16)
+  const cl = req.headers.get("content-length");
+  if (cl && Number(cl) > MAX_RELAY_BODY_BYTES) {
+    return json(413, { error: "request body too large" });
+  }
+
   const auth = req.headers.get("authorization") || "";
   const m = auth.match(/^Bearer\s+(finch_[A-Za-z0-9_-]+)$/);
   if (!m) {
@@ -310,7 +394,7 @@ async function relayMcp(
   const check = await tenantOp<{
     allowed: boolean;
     keyLabel: string;
-    reason?: "no-key" | "scope" | "acl";
+    reason?: "no-key" | "scope" | "acl" | "expired";
   }>(env, tenant, "checkKey", { hash, appliance });
   if (!check.allowed) {
     // Distinguish the denial cause so a caller can tell "unknown key" from
@@ -321,24 +405,15 @@ async function relayMcp(
         ? "no ACL rule grants this key access to this appliance"
         : check.reason === "scope"
           ? "key scope does not include this appliance"
-          : "key not allowed for this appliance";
+          : check.reason === "expired"
+            ? "key has expired"
+            : "key not allowed for this appliance";
     return json(403, { error });
   }
 
   const caller = check.keyLabel || "finch_key";
-  const start = Date.now();
-  const stub = machineStub(env, tenant, appliance, machine);
-
-  // Normalize the forwarded URL to /<appliance>/<machine>/<rest>. ApplianceDO
-  // strips exactly TWO leading segments to derive the upstream path it sends to
-  // the agent. `upstream` is the path the agent should see (e.g. "mcp"); for the
-  // load-balanced entry (/<appliance>/mcp) the resolved <machine> isn't in the
-  // URL, so without this rewrite the DO would strip "<appliance>/<mcp>" and the
-  // agent would receive "/" instead of "/mcp".
-  const inUrl = new URL(req.url);
-  inUrl.pathname =
-    `/${appliance}/${encodeURIComponent(machine)}` +
-    (upstream ? `/${upstream}` : "");
+  const pool =
+    typeof machineOrPool === "string" ? [machineOrPool] : machineOrPool;
 
   // KEY-STRIP: the caller's finch_ key must NEVER cross the trust boundary into
   // the box's local upstream. Clone the headers and delete the Authorization
@@ -351,30 +426,72 @@ async function relayMcp(
   for (const [name, value] of [...relayHeaders.entries()]) {
     if (value.includes("finch_")) relayHeaders.delete(name);
   }
-  const relayReq = new Request(inUrl.toString(), {
-    method: req.method,
-    headers: relayHeaders,
-    body: req.body,
-    // duplex is required when streaming a request body in workerd.
-    ...(req.body ? { duplex: "half" } : {}),
-  } as RequestInit);
 
-  let res: Response;
-  try {
-    res = await stub.fetch(relayReq);
-  } catch (e) {
-    res = json(502, { error: `relay failed: ${e}` });
+  // Buffer the body ONCE so we can replay it across failover candidates (a
+  // streaming body can't be re-sent). Enforce the real size cap here too, since
+  // content-length may be absent for a chunked request.
+  let bodyBytes: ArrayBuffer | null = null;
+  if (req.body) {
+    bodyBytes = await req.arrayBuffer();
+    if (bodyBytes.byteLength > MAX_RELAY_BODY_BYTES) {
+      return json(413, { error: "request body too large" });
+    }
+  }
+
+  const start = Date.now();
+  let res = json(503, { error: "appliance offline", appliance });
+  let usedMachine = pool[0];
+  for (const machine of pool) {
+    usedMachine = machine;
+    // Normalize the forwarded URL to /<appliance>/<machine>/<rest>. ApplianceDO
+    // strips exactly TWO leading segments to derive the upstream path. For the LB
+    // entry (/<appliance>/mcp) the resolved <machine> isn't in the URL, so this
+    // rewrite is what lets the DO yield "/mcp" instead of "/".
+    const inUrl = new URL(req.url);
+    inUrl.pathname =
+      `/${appliance}/${encodeURIComponent(machine)}` +
+      (upstream ? `/${upstream}` : "");
+    const relayReq = new Request(inUrl.toString(), {
+      method: req.method,
+      headers: relayHeaders,
+      body: bodyBytes,
+    } as RequestInit);
+
+    const stub = machineStub(env, tenant, appliance, machine);
+    try {
+      res = await stub.fetch(relayReq);
+    } catch (e) {
+      res = json(502, { error: `relay failed: ${e}` });
+    }
+    // FAIL OVER only on the DO's own "appliance offline" signal (no agent socket
+    // for this machine) — a stale pick. Any other status (including an upstream
+    // 503) is the box's real answer and is returned as-is. The DO tags its
+    // offline 503 with X-Finch-Offline so we don't have to read the body.
+    if (res.status === 503 && res.headers.get("X-Finch-Offline") === "1") {
+      // Reconcile: the picked machine had no agent socket, so its persisted
+      // liveness is stale. Mark it offline (here, where the tenant is known —
+      // the public relay path doesn't carry tenant down to the DO) so the next
+      // pick excludes it. Fire-and-forget. (code-review #12)
+      ctx.waitUntil(
+        tenantOp(env, tenant, "markMachine", {
+          appliance,
+          machine,
+          connected: false,
+        }).catch(() => {}),
+      );
+      continue; // try the next sibling
+    }
+    break;
   }
   const ms = Date.now() - start;
 
   // Fire-and-forget metrics; never block the response on the counter write.
   // Must use ctx.waitUntil — a bare unawaited promise is cancelled once the
-  // response is returned, so the recordCall subrequest to TenantDO never
-  // commits (the success path returns fast and consistently lost its counter).
+  // response is returned, so the recordCall subrequest to TenantDO never commits.
   ctx.waitUntil(
     tenantOp(env, tenant, "recordCall", {
       appliance,
-      machine,
+      machine: usedMachine,
       status: res.status,
       ms,
       caller,

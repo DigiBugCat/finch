@@ -122,3 +122,12 @@ critical wires aren't connected end-to-end — this is a codebase that needs its
 **first CI/test harness (#31)** before launch, not a redesign. The total absence of tests is what
 let a dozen "the real value is computed but thrown away" bugs accumulate; that's the highest-leverage
 process fix.
+
+## 5. Dependencies considered: partysocket
+
+**Evaluated and DEFERRED.** No surface fits. The box-side relay client is Go (can't use the JS
+lib). The hub relay is a hibernatable-WebSocket DO where a reconnecting client lib would defeat
+hibernation. The only plausible spot — replacing the dashboard's mount/mutation-only fetch (#27) —
+is a read-only liveness poll, where a focus-aware `setInterval` (5–10s) on the existing `refetch`
+is far simpler than standing up a WS push tier. Revisit only if a browser→hub live-update socket
+becomes a real requirement.

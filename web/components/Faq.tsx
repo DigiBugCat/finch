@@ -41,11 +41,7 @@ export default function Faq() {
         </div>
         <div className="faq">
           {items.map((item, i) => (
-            <details
-              key={i}
-              open={openIndex === i}
-              onToggle={() => {}}
-            >
+            <details key={i} open={openIndex === i}>
               <summary
                 onClick={(e) => {
                   e.preventDefault();

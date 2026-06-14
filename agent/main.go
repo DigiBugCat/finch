@@ -43,7 +43,11 @@ import (
 	"github.com/coder/websocket"
 )
 
-const agentVersion = "1.4.0"
+// agentVersion is the canonical default. Release builds may stamp it via
+// `-ldflags "-X main.agentVersion=<v>"`; the literal here is the source of
+// truth that CI (scripts/check-versions.mjs) asserts matches the worker's
+// LATEST_AGENT and the web dashboard constant. Keep all three in sync.
+var agentVersion = "1.4.0"
 
 // connectSkew is how long before a connect-token's exp we treat it as already
 // expired and force a fresh /join, so we never dial with a token that lapses
@@ -61,11 +65,10 @@ type frame struct {
 }
 
 type joinResp struct {
-	OK         bool   `json:"ok"`
-	Tenant     string `json:"tenant"`
-	Appliance  string `json:"appliance"`
-	Machine    string `json:"machine"`
-	ConnectURL string `json:"connectUrl"`
+	OK        bool   `json:"ok"`
+	Tenant    string `json:"tenant"`
+	Appliance string `json:"appliance"`
+	Machine   string `json:"machine"`
 	// Short-lived (~120s) per-machine HMAC grant. We present it on the _connect
 	// dial as ?ct=<connectToken>; the hub verifies it BEFORE accepting the relay
 	// socket. (FLEET_SECRET is gone — this token is the whole proof.)
@@ -79,6 +82,14 @@ func main() {
 	ticket := flag.String("ticket", "", "one-shot enrollment ticket from the dashboard (required)")
 	machine := flag.String("machine", hostName, "this box's name")
 	upstream := flag.String("upstream", "http://127.0.0.1:8000", "local MCP server base URL")
+
+	// The dashboard/install one-liner is `finch join --hub … --ticket …`, but
+	// flag.Parse stops at the first non-flag arg (`join`), so --ticket would
+	// never be read. Strip a leading `join` subcommand so both `finch join …`
+	// and bare `finch …` work.
+	if len(os.Args) > 1 && os.Args[1] == "join" {
+		os.Args = append(os.Args[:1], os.Args[2:]...)
+	}
 	flag.Parse()
 
 	if *ticket == "" {
@@ -107,7 +118,15 @@ func main() {
 	connectToken := jr.ConnectToken
 	connectExp := tokenExp(connectToken)
 
+	// Exponential backoff (capped at 30s) shared by the re-join and reconnect
+	// paths below. Sleeps the current delay, then doubles it for next time.
 	backoff := time.Second
+	backoffSleep := func() {
+		time.Sleep(backoff)
+		if backoff < 30*time.Second {
+			backoff *= 2
+		}
+	}
 	for {
 		// Refresh the connect-token if it has (nearly) expired. The dashboard
 		// ticket is one-shot, but re-/join with the SAME ticket succeeds while
@@ -117,10 +136,7 @@ func main() {
 			fresh, err := join(*hub, *ticket, *machine)
 			if err != nil {
 				log.Printf("finch: re-join failed: %v (retrying in %s)", err, backoff)
-				time.Sleep(backoff)
-				if backoff < 30*time.Second {
-					backoff *= 2
-				}
+				backoffSleep()
 				continue
 			}
 			connectToken = fresh.ConnectToken
@@ -135,10 +151,7 @@ func main() {
 		err := serve(wsURL, upstreamURL)
 		if err != nil {
 			log.Printf("finch: link down: %v (reconnecting in %s)", err, backoff)
-			time.Sleep(backoff)
-			if backoff < 30*time.Second {
-				backoff *= 2
-			}
+			backoffSleep()
 			continue
 		}
 		// A clean session: only reset backoff if the link actually held for a
@@ -268,18 +281,34 @@ func serve(wsURL string, upstream *url.URL) error {
 		}
 	}
 
-	// NAT keepalive — hub auto-pongs without waking the Durable Object.
+	// NAT keepalive — hub auto-pongs without waking the Durable Object. Track
+	// consecutive ping failures and cancel the connection ctx on the 2nd (we
+	// tolerate one missed pong) so a dead peer is detected in ~60s instead of
+	// falling back to OS TCP keepalive (~165s). cancel() unblocks c.Read below,
+	// which returns and lets the reconnect loop take over. (code-review #26)
 	go func() {
 		t := time.NewTicker(30 * time.Second)
 		defer t.Stop()
+		fails := 0
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-t.C:
 				pctx, pcancel := context.WithTimeout(ctx, 10*time.Second)
-				_ = c.Ping(pctx)
+				err := c.Ping(pctx)
 				pcancel()
+				if err != nil {
+					fails++
+					log.Printf("finch: keepalive ping failed (%d): %v", fails, err)
+					if fails >= 2 {
+						log.Printf("finch: peer unresponsive — dropping link")
+						cancel()
+						return
+					}
+				} else {
+					fails = 0
+				}
 			}
 		}
 	}()
@@ -316,7 +345,7 @@ func forward(ctx context.Context, upstream *url.URL, f frame) frame {
 	reqCtx, cancel := context.WithTimeout(ctx, 28*time.Second)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(reqCtx, f.Method, target, bytes.NewReader([]byte(f.Body)))
+	req, err := http.NewRequestWithContext(reqCtx, f.Method, target, strings.NewReader(f.Body))
 	if err != nil {
 		out.Status, out.Body = 502, err.Error()
 		return out
@@ -340,7 +369,21 @@ func forward(ctx context.Context, upstream *url.URL, f frame) frame {
 	b, _ := io.ReadAll(resp.Body)
 	out.Status = resp.StatusCode
 	out.Body = string(b)
-	out.Headers = map[string]string{"content-type": resp.Header.Get("content-type")}
+	// Forward the FULL upstream header set (minus hop-by-hop / recomputed) so
+	// stateful MCP works end-to-end — collapsing to content-type stripped the
+	// Mcp-Session-Id returned on `initialize`, which 4xx'd every follow-up call.
+	// The hub re-emits these (also minus hop-by-hop) onto the client response.
+	out.Headers = map[string]string{}
+	for k, vs := range resp.Header {
+		switch strings.ToLower(k) {
+		case "connection", "keep-alive", "transfer-encoding", "upgrade", "content-length", "content-encoding":
+			// hop-by-hop / recomputed — never forward.
+		default:
+			if len(vs) > 0 {
+				out.Headers[k] = vs[0]
+			}
+		}
+	}
 	return out
 }
 

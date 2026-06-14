@@ -1,11 +1,9 @@
 // POST /api/finch/keys {label,scope,owner} -> hub POST /api/keys
-import { errorResponse, hubProxy, requireAdmin } from "@/lib/hub";
+import { adminProxy, errorResponse } from "@/lib/hub";
 
 export async function POST(req: Request) {
   try {
-    await requireAdmin();
-    const body = await req.text();
-    return await hubProxy("/api/keys", { method: "POST", body });
+    return await adminProxy(req, "/api/keys", "POST");
   } catch (err) {
     return errorResponse(err);
   }

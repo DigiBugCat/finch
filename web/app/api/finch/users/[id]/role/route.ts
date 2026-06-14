@@ -6,15 +6,13 @@
 // blocks members from self-promoting. It also refuses to demote the last
 // remaining admin/owner so a tenant can never be left with no admin.
 import { clerkClient } from "@clerk/nextjs/server";
-import { errorResponse, HttpError, requireAdmin } from "@/lib/hub";
-
-function clerkRole(role: string | undefined): "org:admin" | "org:member" {
-  return role === "Admin" || role === "org:admin" ? "org:admin" : "org:member";
-}
-
-function isAdminRole(role: string | null | undefined): boolean {
-  return role === "org:admin" || role === "admin";
-}
+import {
+  errorResponse,
+  HttpError,
+  isClerkOrgAdmin,
+  requireAdmin,
+  toClerkOrgRole,
+} from "@/lib/hub";
 
 export async function POST(
   req: Request,
@@ -27,7 +25,7 @@ export async function POST(
     }
     const { id } = await params;
     const body = (await req.json().catch(() => ({}))) as { role?: string };
-    const nextRole = clerkRole(body?.role);
+    const nextRole = toClerkOrgRole(body?.role);
 
     const clerk = await clerkClient();
 
@@ -37,7 +35,7 @@ export async function POST(
         organizationId: orgId,
         limit: 100,
       });
-      const admins = list.data.filter((m) => isAdminRole(m.role));
+      const admins = list.data.filter((m) => isClerkOrgAdmin(m.role));
       const targetIsAdmin = admins.some((m) => m.publicUserData?.userId === id);
       if (targetIsAdmin && admins.length <= 1) {
         throw new HttpError(400, "can't demote the last admin");

@@ -27,6 +27,7 @@ import {
   type Appliance,
   type Machine,
   type Key,
+  type KeyScope,
   type PublicKey,
   type AclRule,
   type AclEntity,
@@ -56,11 +57,98 @@ interface StoredState {
   acl: AclRule[];
   logs: LogEvent[];
   settings: Settings;
+  // Spent join-ticket ids (M1): jti -> the ticket's exp (epoch SECONDS). A jti
+  // is recorded on first successful /join and rejected thereafter; entries are
+  // evicted once expired (a replay past exp is already rejected by verifyToken).
+  usedTickets?: Record<string, number>;
 }
 
 const MAX_LOGS = 500;
 const MAX_RECENT_CALLS = 20;
 const ROLL_WINDOW = 50; // calls kept for the rolling p50/p95/err estimate
+
+// Growth caps (M5 / M1): bound state so a flood of joins can't grow a DO
+// unbounded.
+const MAX_APPLIANCES_PER_TENANT = 200;
+const MAX_MACHINES_PER_APPLIANCE = 100;
+
+// Machine-name validation (M1): the box picks its own name, so clamp it to a
+// sane length + charset before it pollutes the registry / squats a slot.
+const MAX_MACHINE_NAME = 64;
+const MACHINE_NAME_RE = /^[A-Za-z0-9 ._\-]+$/;
+
+/** Validate + normalize an agent-supplied machine name. Returns the trimmed
+ *  name, or null if it's empty, too long, or carries disallowed characters. */
+function cleanMachineName(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const name = raw.trim();
+  if (!name || name.length > MAX_MACHINE_NAME) return null;
+  if (!MACHINE_NAME_RE.test(name)) return null;
+  return name;
+}
+
+const MS_PER_HOUR = 3_600_000;
+
+/** Absolute epoch-hour for a ms timestamp (used to anchor the 24h buckets). */
+function epochHour(ms: number): number {
+  return Math.floor(ms / MS_PER_HOUR);
+}
+
+/** Format an epoch-ms timestamp as a short relative string. 0/undefined →
+ *  "never". This is the single place "lastSeen"/"handshake"/"ago" strings are
+ *  produced — a DO can't run a clock between requests, so we always derive these
+ *  on READ from a stored timestamp rather than freezing a literal "now". */
+function timeAgo(ts?: number, now = Date.now()): string {
+  if (!ts || ts <= 0) return "never";
+  const diff = Math.max(0, now - ts);
+  const sec = Math.floor(diff / 1000);
+  if (sec < 10) return "now";
+  if (sec < 60) return `${sec}s ago`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const hr = Math.floor(min / 60);
+  if (hr < 24) return `${hr}h ago`;
+  const day = Math.floor(hr / 24);
+  return `${day}d ago`;
+}
+
+/** UNIFIED liveness for a machine: online iff it holds a live relay socket AND
+ *  has been approved (state !== "pending"). The two former read paths
+ *  (getState's isOnline(state) and pickHealthyMachine's connected||chirping)
+ *  now share this one rule, so the dashboard and the LB picker can't disagree
+ *  about which machines are reachable. */
+function machineOnline(m: { connected?: boolean; state: ApplianceState }): boolean {
+  return !!m.connected && m.state !== "pending";
+}
+
+/** Rotate a 24-slot bucket array (anchored at absolute epoch-hour
+ *  `lastBucketHour`) into a TRAILING-24h window where index 23 = the current
+ *  hour. Buckets older than 24h drop off; gaps between the last write and now are
+ *  zeroed. With no anchor (legacy state) we treat the array as already current.
+ *  Pure — used on READ; recordCall ages buckets in place on WRITE. */
+function rollBuckets(
+  raw: number[] | undefined,
+  lastBucketHour: number | undefined,
+  now: number,
+): number[] {
+  const out = Array<number>(24).fill(0);
+  if (!Array.isArray(raw) || raw.length !== 24) return out;
+  if (typeof lastBucketHour !== "number") {
+    // Legacy/un-anchored: best-effort passthrough (caller's old hour-of-day
+    // layout). Copy as-is so we don't lose the only history we have.
+    for (let i = 0; i < 24; i++) out[i] = raw[i] || 0;
+    return out;
+  }
+  const nowHour = epochHour(now);
+  for (let i = 0; i < 24; i++) {
+    // raw[i] holds the count for absolute hour (lastBucketHour - 23 + i).
+    const absHour = lastBucketHour - 23 + i;
+    const age = nowHour - absHour; // 0 = current hour, 23 = oldest still in window
+    if (age < 0 || age > 23) continue; // future (clock skew) or aged out
+    out[23 - age] += raw[i] || 0;
+  }
+  return out;
+}
 
 const ok = (body: unknown): Response =>
   new Response(JSON.stringify(body), {
@@ -105,8 +193,11 @@ export class TenantDO extends DurableObject<Env> {
           return ok(await this.decline(a.id));
         case "setTags":
           return ok(await this.setTags(a.id, a.tags));
-        case "mintKey":
-          return ok(await this.mintKey(a.label, a.scope, a.owner));
+        case "mintKey": {
+          const r = await this.mintKey(a.label, a.scope, a.owner);
+          if ("error" in r) return bad(400, r.error);
+          return ok(r);
+        }
         case "revokeMachineKey":
           return ok(
             await this.revokeMachineKey(a.appliance, a.machine, a.key),
@@ -117,14 +208,22 @@ export class TenantDO extends DurableObject<Env> {
           return ok(await this.removeAcl(a.id));
         case "updateSetting":
           return ok(await this.updateSetting(a.key, a.val));
-        case "registerMachine":
-          return ok(
-            await this.registerMachine(a.appliance, a.machine, a.os, a.version),
+        case "registerMachine": {
+          const r = await this.registerMachine(
+            a.appliance,
+            a.machine,
+            a.os,
+            a.version,
           );
+          if (r.error) return bad(409, r.error);
+          return ok(r);
+        }
         case "markMachine":
           return ok(
             await this.markMachine(a.appliance, a.machine, a.connected),
           );
+        case "claimTicket":
+          return ok(await this.claimTicket(a.jti, a.exp));
         case "recordCall":
           return ok(
             await this.recordCall(
@@ -176,6 +275,7 @@ export class TenantDO extends DurableObject<Env> {
         },
       ],
       logs: [],
+      usedTickets: {},
       settings: {
         org: id,
         subdomain: "",
@@ -195,7 +295,9 @@ export class TenantDO extends DurableObject<Env> {
 
   private log(s: StoredState, ev: Omit<LogEvent, "ago" | "ts">): void {
     const ts = Date.now();
-    s.logs.unshift({ ...ev, ts, ago: "now" });
+    // `ago` is derived from `ts` on read (getState); store an empty placeholder
+    // so a stale literal is never persisted.
+    s.logs.unshift({ ...ev, ts, ago: "" });
     if (s.logs.length > MAX_LOGS) s.logs.length = MAX_LOGS;
   }
 
@@ -206,6 +308,7 @@ export class TenantDO extends DurableObject<Env> {
    *  hashes. Never persisted — always recomputed from the stored record. */
   private async getState(): Promise<TenantState> {
     const s = await this.load();
+    const now = Date.now();
 
     const appliances: Appliance[] = s.appliances.map((a) => {
       const machines = (a.machines ?? []).map((m) => ({
@@ -213,13 +316,18 @@ export class TenantDO extends DurableObject<Env> {
         appliance: a.id,
         applianceLabel: a.label,
         outdated: m.version !== LATEST_AGENT,
+        // Derive the relative-time display strings on read from stored epoch-ms.
+        lastSeen: timeAgo(m.lastSeenAt, now),
+        handshake: timeAgo(m.handshakeAt, now),
       }));
       // appliance.state derives from its machines: online if any machine is
-      // online. With no machines we keep the appliance's own lifecycle state
-      // (invited/pending/resting) untouched.
+      // online. Liveness is UNIFIED across read paths: a machine is online iff
+      // it holds a live relay socket AND has been approved (state !== pending) —
+      // the same rule pickHealthyMachine uses. With no machines we keep the
+      // appliance's own lifecycle state (invited/pending/resting) untouched.
       let state: ApplianceState = a.state;
       if (machines.length) {
-        const anyOnline = machines.some((m) => isOnline(m.state));
+        const anyOnline = machines.some((m) => machineOnline(m));
         const anyPending = machines.some((m) => m.state === "pending");
         state = anyOnline ? "chirping" : anyPending ? "pending" : "resting";
       }
@@ -229,6 +337,9 @@ export class TenantDO extends DurableObject<Env> {
         (machines.length
           ? machines.some((m) => m.outdated)
           : version !== LATEST_AGENT);
+      // Roll the 24h buckets to a trailing window with index 23 = current hour.
+      const traffic24h = rollBuckets(a.traffic24h, a.lastBucketHour, now);
+      const latency24h = rollBuckets(a.lat24h, a.lastBucketHour, now);
       return {
         ...a,
         state,
@@ -236,6 +347,13 @@ export class TenantDO extends DurableObject<Env> {
         machineCount: machines.length,
         version,
         outdated,
+        lastSeen: timeAgo(a.lastSeenAt, now),
+        traffic24h,
+        lat24h: latency24h,
+        recentCalls: (a.recentCalls ?? []).map((c) => ({
+          ...c,
+          ago: timeAgo(c.ts, now),
+        })),
       };
     });
 
@@ -255,6 +373,11 @@ export class TenantDO extends DurableObject<Env> {
 
     const publicKeys: PublicKey[] = s.keys.map(({ hash, ...rest }) => rest);
 
+    const logs: LogEvent[] = (s.logs ?? []).map((ev) => ({
+      ...ev,
+      ago: timeAgo(ev.ts, now),
+    }));
+
     return {
       host: s.host,
       appliances,
@@ -262,20 +385,33 @@ export class TenantDO extends DurableObject<Env> {
       keys: publicKeys,
       groups: s.groups,
       acl: s.acl,
-      logs: s.logs,
+      logs,
       settings: s.settings,
-      overview: this.overview(appliances, s.keys),
+      overview: this.overview(
+        appliances,
+        s.keys,
+        now,
+        !!s.settings.enforceExpiry,
+      ),
       latestAgent: LATEST_AGENT,
     };
   }
 
-  private overview(appliances: Appliance[], keys: Key[]): Overview {
-    const on = appliances.filter((a) => isOnline(a.state));
+  private overview(
+    appliances: Appliance[],
+    keys: Key[],
+    now: number,
+    enforceExpiry: boolean,
+  ): Overview {
+    // The fleet's 24h HISTORY is built over ALL appliances (the buckets here are
+    // already rolled to a trailing window, index 23 = now). Building it only over
+    // currently-online appliances made a resting box's stored history vanish the
+    // moment it idled — the chart must still show the traffic it served.
     const traffic24h = Array.from({ length: 24 }, (_, h) =>
-      on.reduce((sum, a) => sum + (a.traffic24h[h] || 0), 0),
+      appliances.reduce((sum, a) => sum + (a.traffic24h[h] || 0), 0),
     );
     const latency24h = Array.from({ length: 24 }, (_, h) => {
-      const vals = on
+      const vals = appliances
         .map((a) => a.lat24h[h])
         .filter((v): v is number => typeof v === "number" && v > 0);
       return vals.length
@@ -283,6 +419,18 @@ export class TenantDO extends DurableObject<Env> {
         : 0;
     });
     const callsToday = traffic24h.reduce((s, v) => s + v, 0);
+
+    // activeNow / total reflect the LIVE fleet; p50/p95/err are quality-of-
+    // service numbers for the boxes currently serving (an idle box's stale
+    // rolling window shouldn't drag the live SLO).
+    const on = appliances.filter((a) => isOnline(a.state));
+
+    // Active keys = not-yet-expired keys (expiry only enforced if the tenant
+    // turned it on; here we just don't count an over-expiry key as active).
+    const keysActive = enforceExpiry
+      ? keys.filter((k) => !(k.expiresAt && now > k.expiresAt)).length
+      : keys.length;
+
     return {
       callsToday,
       callsDelta: 0,
@@ -295,7 +443,7 @@ export class TenantDO extends DurableObject<Env> {
       errRate: on.length
         ? +(on.reduce((s, a) => s + a.err, 0) / on.length).toFixed(2)
         : 0,
-      keysActive: keys.length,
+      keysActive,
       traffic24h,
       latency24h,
       latest: LATEST_AGENT,
@@ -311,28 +459,20 @@ export class TenantDO extends DurableObject<Env> {
     return s.appliances.find((a) => a.id === id);
   }
 
-  private slug(name: string): string {
-    const base = name
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-+|-+$/g, "");
-    return base || "appliance";
+  /** Lowercase a string into a host-safe slug; `fallback` if it reduces empty.
+   *  Used for both appliance ids (from name) and the default subdomain (from id). */
+  private slugify(raw: string, fallback: string): string {
+    return (
+      raw
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-+|-+$/g, "") || fallback
+    );
   }
 
   /** This DO is keyed by the REAL tenant id (Clerk org/user id). */
   private tenantId(): string {
     return this.ctx.id.name ?? "";
-  }
-
-  /** A host-safe default subdomain slug for this tenant, derived from its id.
-   *  Used at first enroll when the tenant hasn't picked a custom subdomain. */
-  private defaultSubdomain(): string {
-    const id = this.tenantId();
-    const base = id
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-+|-+$/g, "");
-    return base || "tenant";
   }
 
   /** Register slug→tenantId in the singleton RouterDO so the relay plane can
@@ -357,7 +497,7 @@ export class TenantDO extends DurableObject<Env> {
       relay: "—",
       version: "",
       address: "",
-      handshake: "never",
+      handshake: "never", // display-only; machine.handshake is timestamp-derived
       protocol: "offline",
     };
   }
@@ -376,7 +516,8 @@ export class TenantDO extends DurableObject<Env> {
       owner: "you",
       box: "—",
       created: now,
-      lastSeen: "never",
+      lastSeen: "never", // derived from lastSeenAt on read
+      lastSeenAt: 0,
       uptime: "—",
       blurb: "Ticket minted — waiting for the box to phone home.",
       group,
@@ -394,6 +535,7 @@ export class TenantDO extends DurableObject<Env> {
       err: 0,
       traffic24h: Array(24).fill(0),
       lat24h: Array(24).fill(0),
+      lastBucketHour: epochHour(Date.now()),
       recentCalls: [],
       conn: this.emptyConn(),
     };
@@ -406,7 +548,7 @@ export class TenantDO extends DurableObject<Env> {
     group?: string,
   ): Promise<{ id: string }> {
     const s = await this.load();
-    let id = this.slug(name);
+    let id = this.slugify(name, "appliance");
     // de-dupe id within the tenant
     if (this.findAppliance(s, id)) {
       let n = 2;
@@ -423,7 +565,7 @@ export class TenantDO extends DurableObject<Env> {
     // public relay URL resolves. Best-effort; if the default slug collides with
     // another tenant we leave the subdomain blank (the tenant can pick one).
     if (!s.settings.subdomain) {
-      const slug = this.defaultSubdomain();
+      const slug = this.slugify(this.tenantId(), "tenant");
       const claimed = await this.registerSlug(slug);
       if (claimed) {
         s.settings.subdomain = slug;
@@ -461,11 +603,16 @@ export class TenantDO extends DurableObject<Env> {
     const s = await this.load();
     const ap = this.findAppliance(s, id);
     if (!ap) return { ok: false };
-    // Promote any pending machines to chirping; appliance.state re-derives.
+    // Approve = clear the pending gate. Liveness is then owned by markMachine: an
+    // approved-but-disconnected machine must read "resting", not "chirping". So
+    // derive from m.connected rather than flipping straight to chirping.
     for (const m of ap.machines) {
-      if (m.state === "pending") m.state = "chirping";
+      if (m.state === "pending") m.state = m.connected ? "chirping" : "resting";
     }
-    if (ap.state === "pending") ap.state = "chirping";
+    if (ap.state === "pending") {
+      const anyConnected = ap.machines.some((mm) => mm.connected);
+      ap.state = anyConnected ? "chirping" : "resting";
+    }
     this.log(s, {
       cat: "device",
       actor: "you",
@@ -517,22 +664,58 @@ export class TenantDO extends DurableObject<Env> {
 
   private async mintKey(
     label: string,
-    scope?: string,
+    scope?: KeyScope,
     owner?: string,
-  ): Promise<{ plaintext: string; key: PublicKey }> {
+  ): Promise<
+    { plaintext: string; key: PublicKey } | { error: string }
+  > {
     const s = await this.load();
+
+    // Validate + normalize the structured scope. Default is LEAST-PRIVILEGE:
+    // no scope (or an empty appliance list) mints a key that reaches nothing
+    // until the operator scopes it — never a fleet-wide key by accident. Every
+    // listed appliance id MUST exist (400 on an unknown id) so a key can't carry
+    // dangling free-text that silently grants or denies.
+    const normScope = this.normalizeScope(s, scope);
+    if ("error" in normScope) return { error: normScope.error };
+
     const plaintext = genFinchKey();
     const hash = await hashKey(plaintext);
+    const now = Date.now();
     const key: Key = {
       id: "k_" + crypto.randomUUID().slice(0, 8),
       label,
       owner: owner || "you",
-      created: new Date().toISOString().slice(0, 10),
-      scope: scope || "all appliances",
+      created: new Date(now).toISOString().slice(0, 10),
+      scope: normScope.scope,
       hash,
       last4: last4(plaintext),
+      // Stamp the absolute expiry from the tenant's keyExpiry policy. Enforcement
+      // is gated by settings.enforceExpiry at checkKey time; we always stamp so
+      // flipping the toggle on takes effect immediately for new keys.
+      expiresAt: this.expiryFromSettings(s, now),
     };
     s.keys.push(key);
+
+    // Populate the display lists (#10): attach the key's ID to every appliance
+    // it can reach (and that appliance's machines), so the per-machine /
+    // per-appliance key chips actually render — and revokeMachineKey (which now
+    // works by id) has lists to prune. {all:true} reaches every appliance.
+    const reach: StoredAppliance[] =
+      "all" in normScope.scope && normScope.scope.all === true
+        ? s.appliances
+        : s.appliances.filter((a) =>
+            (normScope.scope as { appliances: string[] }).appliances.includes(
+              a.id,
+            ),
+          );
+    for (const a of reach) {
+      if (!a.keys.includes(key.id)) a.keys.push(key.id);
+      for (const m of a.machines) {
+        if (!m.keys.includes(key.id)) m.keys.push(key.id);
+      }
+    }
+
     this.log(s, {
       cat: "key",
       actor: key.owner,
@@ -545,37 +728,75 @@ export class TenantDO extends DurableObject<Env> {
     return { plaintext, key: pub };
   }
 
+  /** Validate + normalize an incoming KeyScope. {all:true} passes through; an
+   *  appliance list is filtered to existing ids (unknown id → 400). A missing or
+   *  empty scope defaults to an explicit empty allow-list (least privilege). */
+  private normalizeScope(
+    s: StoredState,
+    scope?: KeyScope,
+  ): { scope: KeyScope } | { error: string } {
+    if (scope && "all" in scope && scope.all === true) {
+      return { scope: { all: true } };
+    }
+    const ids = Array.isArray((scope as any)?.appliances)
+      ? ((scope as any).appliances as unknown[]).map(String)
+      : [];
+    const unknown = ids.filter((id) => !this.findAppliance(s, id));
+    if (unknown.length) {
+      return { error: `unknown appliance id(s): ${unknown.join(", ")}` };
+    }
+    // De-dupe; least-privilege default is the explicit empty list.
+    return { scope: { appliances: Array.from(new Set(ids)) } };
+  }
+
+  /** Absolute expiry (epoch ms) for a key, from settings.keyExpiry. "never" (or
+   *  an unparseable value) → undefined (no expiry stamped). */
+  private expiryFromSettings(s: StoredState, now: number): number | undefined {
+    const raw = (s.settings.keyExpiry || "").trim().toLowerCase();
+    if (!raw || raw === "never") return undefined;
+    const m = raw.match(/^(\d+)\s*day/);
+    if (!m) return undefined;
+    const days = parseInt(m[1], 10);
+    if (!Number.isFinite(days) || days <= 0) return undefined;
+    return now + days * 24 * MS_PER_HOUR;
+  }
+
   private async revokeMachineKey(
     appliance: string,
     machine: string,
     key: string,
   ): Promise<{ ok: boolean }> {
     const s = await this.load();
-    // Remove the key label from the machine (and the appliance's display list).
-    let touched = false;
-    const ap = this.findAppliance(s, appliance);
-    if (ap) {
-      const m = ap.machines.find((mm) => mm.name === machine);
-      if (m && m.keys.includes(key)) {
-        m.keys = m.keys.filter((k) => k !== key);
+    // `key` is the Key.id (the dashboard sends the id). REVOKE BY ID so the
+    // change actually takes effect: checkKey authorizes by sha-256(plaintext)
+    // hash, so dropping the Key whose id matches removes the only record the
+    // hash lookup can hit. (The old label-match could over-revoke on duplicate
+    // labels and, worse, leave the authorizing Key in place if labels drifted.)
+    const before = s.keys.length;
+    const target = s.keys.find((k) => k.id === key);
+    s.keys = s.keys.filter((k) => k.id !== key);
+    let touched = s.keys.length !== before;
+
+    // Drop the id from the display lists everywhere it appears so the per-machine
+    // / per-appliance key chips stop rendering a now-dead key.
+    for (const a of s.appliances) {
+      if (a.keys.includes(key)) {
+        a.keys = a.keys.filter((k) => k !== key);
         touched = true;
       }
-      if (ap.keys.includes(key)) ap.keys = ap.keys.filter((k) => k !== key);
+      for (const m of a.machines) {
+        if (m.keys.includes(key)) {
+          m.keys = m.keys.filter((k) => k !== key);
+          touched = true;
+        }
+      }
     }
-    // If no machine anywhere still references the label, drop the Key entirely.
-    const stillUsed = s.appliances.some((a) =>
-      a.machines.some((m) => m.keys.includes(key)),
-    );
-    if (!stillUsed) {
-      const before = s.keys.length;
-      s.keys = s.keys.filter((k) => k.label !== key);
-      if (s.keys.length !== before) touched = true;
-    }
+
     this.log(s, {
       cat: "key",
       actor: "you",
       action: "revoked key",
-      target: `${key} @ ${appliance}/${machine}`,
+      target: `${target?.label ?? key} @ ${appliance}/${machine}`,
       ip: "",
     });
     await this.save(s);
@@ -681,6 +902,34 @@ export class TenantDO extends DurableObject<Env> {
 
   // ---- agent / relay callbacks -------------------------------------------
 
+  /** Atomically claim a one-time join-ticket id (M1 replay protection). A DO
+   *  runs one request at a time, so the read-check-write here is atomic: the
+   *  first /join with a given jti records it and returns {ok:true}; any replay
+   *  (until the ticket's own exp, after which verifyToken already rejects it)
+   *  returns {ok:false}. Expired jtis are evicted on each claim so the used-set
+   *  can't grow without bound. A ticket WITHOUT a jti (legacy) is allowed through
+   *  — its exp still bounds replayability. */
+  private async claimTicket(
+    jti: unknown,
+    exp: unknown,
+  ): Promise<{ ok: boolean }> {
+    if (typeof jti !== "string" || !jti) return { ok: true }; // legacy ticket
+    const s = await this.load();
+    const used = s.usedTickets ?? (s.usedTickets = {});
+    const nowSec = Math.floor(Date.now() / 1000);
+    // Evict expired entries so the map stays bounded.
+    for (const [k, e] of Object.entries(used)) {
+      if (typeof e !== "number" || e <= nowSec) delete used[k];
+    }
+    if (used[jti]) {
+      await this.save(s); // persist the eviction even on a rejected replay
+      return { ok: false };
+    }
+    used[jti] = typeof exp === "number" && exp > nowSec ? exp : nowSec + 3600;
+    await this.save(s);
+    return { ok: true };
+  }
+
   /** Agent join: register (or refresh) a machine under an appliance. Sets the
    *  appliance pending|chirping per settings.requireApproval. */
   private async registerMachine(
@@ -688,26 +937,49 @@ export class TenantDO extends DurableObject<Env> {
     machine: string,
     os: string,
     version: string,
-  ): Promise<{ ok: boolean; state: ApplianceState }> {
+  ): Promise<{ ok: boolean; state?: ApplianceState; error?: string }> {
+    // Validate/clamp the machine name at the DATA layer too (defense-in-depth;
+    // api.ts also clamps at the /join door). (security M1)
+    const cleaned = cleanMachineName(machine);
+    if (!cleaned) return { ok: false, error: "invalid machine name" };
+    machine = cleaned;
+
     const s = await this.load();
     let ap = this.findAppliance(s, appliance);
     if (!ap) {
       // Join for an appliance we don't know (e.g. enrolled then evicted) —
-      // create it on the fly so the machine has a home.
+      // create it on the fly so the machine has a home. Cap appliances-per-tenant
+      // so a flood of joins to unknown ids can't grow the DO unbounded (M5).
+      if (s.appliances.length >= MAX_APPLIANCES_PER_TENANT) {
+        return { ok: false, error: "appliance limit reached for tenant" };
+      }
       ap = this.newAppliance(appliance, appliance, s.settings.defaultGroup);
       s.appliances.push(ap);
     }
     const requireApproval = s.settings.requireApproval;
+    // The state a GENUINELY NEW machine starts in.
     const newState: ApplianceState = requireApproval ? "pending" : "chirping";
+    const now = Date.now();
 
     let m = ap.machines.find((mm) => mm.name === machine);
     if (m) {
+      // RE-JOIN of a known machine (agent restart): refresh os/version/lastSeen
+      // but DO NOT clobber its lifecycle state. Re-stamping pending|chirping here
+      // would demote an already-approved, live box back to pending on every agent
+      // restart. The only legitimate demotion is leaving "invited"; markMachine
+      // owns connected↔chirping/resting transitions from here on. A still-pending
+      // machine stays pending (re-approval not retriggered).
       m.os = os;
       m.version = version;
-      m.state = newState;
-      m.lastSeen = "now";
+      m.lastSeenAt = now;
       m.outdated = version !== LATEST_AGENT;
+      if (m.state === "invited") m.state = newState;
     } else {
+      // Genuinely new machine. Cap machines-per-appliance (M1/M5): bound name
+      // squatting + unbounded DO creation behind a single ticket.
+      if (ap.machines.length >= MAX_MACHINES_PER_APPLIANCE) {
+        return { ok: false, error: "machine limit reached for appliance" };
+      }
       m = {
         name: machine,
         os,
@@ -719,15 +991,19 @@ export class TenantDO extends DurableObject<Env> {
         address: "",
         outdated: version !== LATEST_AGENT,
         lastSeen: "now",
+        lastSeenAt: now,
         relay: "—",
-        handshake: "now",
+        handshake: "never",
+        handshakeAt: 0,
         connected: false,
       };
       ap.machines.push(m);
     }
     ap.machineCount = ap.machines.length;
     ap.box = ap.box === "—" ? machine : ap.box;
-    ap.lastSeen = "now";
+    ap.lastSeenAt = now;
+    // Promote the appliance out of "invited" on first real join; never demote an
+    // approved appliance back to pending on a re-join.
     if (ap.state === "invited") ap.state = newState;
 
     this.log(s, {
@@ -738,7 +1014,7 @@ export class TenantDO extends DurableObject<Env> {
       ip: "",
     });
     await this.save(s);
-    return { ok: true, state: newState };
+    return { ok: true, state: m.state };
   }
 
   /** Relay callback on WS open/close: mark a machine connected/disconnected and
@@ -753,19 +1029,23 @@ export class TenantDO extends DurableObject<Env> {
     if (!ap) return { ok: false };
     const m = ap.machines.find((mm) => mm.name === machine);
     if (!m) return { ok: false };
+    const now = Date.now();
     m.connected = connected;
-    // Don't override a pending (unapproved) machine's lifecycle state.
+    // markMachine is the SOLE authority for connected↔chirping/resting. Don't
+    // override a pending (unapproved) machine's lifecycle state.
     if (m.state !== "pending") {
       m.state = connected ? "chirping" : "resting";
     }
-    m.lastSeen = connected ? "now" : m.lastSeen;
-    m.handshake = connected ? "now" : m.handshake;
+    if (connected) {
+      m.lastSeenAt = now;
+      m.handshakeAt = now;
+    }
 
     const anyConnected = ap.machines.some((mm) => mm.connected);
     if (ap.state !== "pending" && ap.state !== "invited") {
       ap.state = anyConnected ? "chirping" : "resting";
     }
-    ap.lastSeen = anyConnected ? "now" : ap.lastSeen;
+    if (anyConnected) ap.lastSeenAt = now;
 
     this.log(s, {
       cat: "device",
@@ -814,12 +1094,15 @@ export class TenantDO extends DurableObject<Env> {
         100
       ).toFixed(2);
 
+    const now = Date.now();
+
     // Per-route metric also reflected on the machine, if present.
     const m = ap.machines.find((mm) => mm.name === machine);
-    if (m) m.lastSeen = "now";
+    if (m) m.lastSeenAt = now;
 
     const call: RecentCall = {
-      ago: "now",
+      ts: now,
+      ago: "", // derived from ts on read
       route,
       caller,
       status,
@@ -829,19 +1112,27 @@ export class TenantDO extends DurableObject<Env> {
     if (ap.recentCalls.length > MAX_RECENT_CALLS)
       ap.recentCalls.length = MAX_RECENT_CALLS;
 
-    // Current hour bucket of the rolling 24h window.
-    const hour = new Date().getUTCHours();
+    // 24h buckets keyed by ABSOLUTE epoch-hour, not hour-of-day. Age the stored
+    // window forward to `now` first (zeroing every hour elapsed since the last
+    // write) so a slot can't accumulate every day's hour-h traffic forever; then
+    // write into the current (now) slot. Stamp lastBucketHour so the next write
+    // (and getState's read-side rotation) knows the anchor.
+    const nowHour = epochHour(now);
     if (!Array.isArray(ap.traffic24h) || ap.traffic24h.length !== 24)
       ap.traffic24h = Array(24).fill(0);
-    ap.traffic24h[hour] = (ap.traffic24h[hour] || 0) + 1;
     if (!Array.isArray(ap.lat24h) || ap.lat24h.length !== 24)
       ap.lat24h = Array(24).fill(0);
+    ap.traffic24h = rollBuckets(ap.traffic24h, ap.lastBucketHour, now);
+    ap.lat24h = rollBuckets(ap.lat24h, ap.lastBucketHour, now);
+    ap.lastBucketHour = nowHour;
+    // Index 23 is always the current hour after rolling.
+    ap.traffic24h[23] = (ap.traffic24h[23] || 0) + 1;
     // Exponential-ish blend so the latency sparkline tracks recent calls.
-    ap.lat24h[hour] = ap.lat24h[hour]
-      ? Math.round(ap.lat24h[hour] * 0.7 + ms * 0.3)
+    ap.lat24h[23] = ap.lat24h[23]
+      ? Math.round(ap.lat24h[23] * 0.7 + ms * 0.3)
       : ms;
 
-    ap.lastSeen = "now";
+    ap.lastSeenAt = now;
 
     this.log(s, {
       cat: "request",
@@ -877,22 +1168,31 @@ export class TenantDO extends DurableObject<Env> {
   ): Promise<{
     allowed: boolean;
     keyLabel: string;
-    reason?: "no-key" | "scope" | "acl";
+    reason?: "no-key" | "scope" | "acl" | "expired";
   }> {
     const s = await this.load();
     const key = s.keys.find((k) => k.hash === hash);
     if (!key) return { allowed: false, keyLabel: "", reason: "no-key" };
 
-    // Gate 1: key scope (coarse floor).
-    const scope = (key.scope || "").trim().toLowerCase();
+    // Gate 0: expiry. Only enforced when the tenant flips settings.enforceExpiry
+    // on — the toggle is no longer cosmetic. A key with no stamped expiry never
+    // expires (e.g. minted under keyExpiry="never").
+    if (
+      s.settings.enforceExpiry &&
+      key.expiresAt &&
+      Date.now() > key.expiresAt
+    ) {
+      return { allowed: false, keyLabel: key.label, reason: "expired" };
+    }
+
+    // Gate 1: key scope (structured — {all:true} or an explicit appliance list).
+    const scope = key.scope;
     const scopeOk =
-      scope === "all appliances" ||
-      scope === "all" ||
-      scope === "*" ||
-      scope
-        .split(",")
-        .map((x) => x.trim())
-        .includes(appliance.toLowerCase());
+      !!scope &&
+      ("all" in scope && scope.all === true
+        ? true
+        : Array.isArray((scope as any).appliances) &&
+          (scope as any).appliances.includes(appliance));
     if (!scopeOk) {
       return { allowed: false, keyLabel: key.label, reason: "scope" };
     }

@@ -149,13 +149,15 @@ describe("TenantDO.registerMachine — machine state", () => {
   });
 });
 
-describe("TenantDO.checkKey — scope gate", () => {
+describe("TenantDO.checkKey — scope gate (structured)", () => {
   // The owner rule (user:you -> all) is seeded fresh, and mintKey owner defaults
   // to "you", so a default key passes the ACL gate — letting us isolate scope.
+  // Scope is now STRUCTURED: {all:true} | {appliances:[...]}; magic strings/CSV
+  // are gone (security M2). mintKey validates every listed appliance id exists.
   async function mint(
     t: string,
     label: string,
-    scope?: string,
+    scope?: unknown,
   ): Promise<string> {
     const r = await op<{ plaintext: string }>(t, "mintKey", { label, scope });
     return r.plaintext;
@@ -172,10 +174,10 @@ describe("TenantDO.checkKey — scope gate", () => {
     expect(r.reason).toBe("no-key");
   });
 
-  it("allows an 'all appliances' scoped key (owner ACL passes)", async () => {
+  it("allows an {all:true} scoped key (owner ACL passes)", async () => {
     const t = freshTenant();
     await op(t, "enroll", { name: "Scraper" });
-    const key = await mint(t, "wide", "all appliances");
+    const key = await mint(t, "wide", { all: true });
     const r = await op<{ allowed: boolean }>(t, "checkKey", {
       hash: await hashKey(key),
       appliance: "scraper",
@@ -183,11 +185,10 @@ describe("TenantDO.checkKey — scope gate", () => {
     expect(r.allowed).toBe(true);
   });
 
-  it("denies with reason 'scope' when the appliance is not in a csv scope", async () => {
+  it("defaults to LEAST-PRIVILEGE (empty scope) — denies with reason 'scope'", async () => {
     const t = freshTenant();
     await op(t, "enroll", { name: "Scraper" });
-    await op(t, "enroll", { name: "Printer" });
-    const key = await mint(t, "narrow", "printer"); // scoped to printer only
+    const key = await mint(t, "bare"); // no scope → reaches nothing
     const r = await op<{ allowed: boolean; reason: string }>(t, "checkKey", {
       hash: await hashKey(key),
       appliance: "scraper",
@@ -196,16 +197,40 @@ describe("TenantDO.checkKey — scope gate", () => {
     expect(r.reason).toBe("scope");
   });
 
-  it("allows a csv scope that includes the appliance", async () => {
+  it("denies with reason 'scope' when the appliance is not in the list", async () => {
     const t = freshTenant();
     await op(t, "enroll", { name: "Scraper" });
     await op(t, "enroll", { name: "Printer" });
-    const key = await mint(t, "csv", "printer, scraper");
+    const key = await mint(t, "narrow", { appliances: ["printer"] });
+    const r = await op<{ allowed: boolean; reason: string }>(t, "checkKey", {
+      hash: await hashKey(key),
+      appliance: "scraper",
+    });
+    expect(r.allowed).toBe(false);
+    expect(r.reason).toBe("scope");
+  });
+
+  it("allows an appliance list that includes the target", async () => {
+    const t = freshTenant();
+    await op(t, "enroll", { name: "Scraper" });
+    await op(t, "enroll", { name: "Printer" });
+    const key = await mint(t, "list", { appliances: ["printer", "scraper"] });
     const r = await op<{ allowed: boolean }>(t, "checkKey", {
       hash: await hashKey(key),
       appliance: "scraper",
     });
     expect(r.allowed).toBe(true);
+  });
+
+  it("rejects minting a key scoped to an UNKNOWN appliance id (400)", async () => {
+    const t = freshTenant();
+    await op(t, "enroll", { name: "Scraper" });
+    const r = await op<{ error?: string; plaintext?: string }>(t, "mintKey", {
+      label: "bad-scope",
+      scope: { appliances: ["ghost"] },
+    });
+    expect(r.plaintext).toBeUndefined();
+    expect(r.error).toMatch(/unknown appliance/i);
   });
 });
 
@@ -223,7 +248,7 @@ describe("TenantDO.evalAccess — ACL matrix (default-deny)", () => {
   async function mintNonOwner(t: string, label: string): Promise<string> {
     const r = await op<{ plaintext: string }>(t, "mintKey", {
       label,
-      scope: "all appliances",
+      scope: { all: true }, // structured: scope passes, isolate the ACL gate
       owner: ALICE,
     });
     return r.plaintext;
@@ -336,7 +361,7 @@ describe("TenantDO.evalAccess — ACL matrix (default-deny)", () => {
     // The default 'you' owner: mint with default owner so it matches user:you.
     const r = await op<{ plaintext: string }>(t, "mintKey", {
       label: "owner-key",
-      scope: "all appliances",
+      scope: { all: true },
     });
     expect(await allowed(t, r.plaintext)).toBe(true);
   });
@@ -375,5 +400,174 @@ describe("TenantDO.evalAccess — ACL matrix (default-deny)", () => {
     });
     // appliance "nope" doesn't exist -> evalAccess findAppliance fails -> deny.
     expect(await allowed(t, key, "nope")).toBe(false);
+  });
+});
+
+describe("TenantDO.claimTicket — single-use jti (M1 replay protection)", () => {
+  it("burns a jti once: first claim ok, replay rejected", async () => {
+    const t = freshTenant();
+    const exp = Math.floor(Date.now() / 1000) + 900;
+    const first = await op<{ ok: boolean }>(t, "claimTicket", {
+      jti: "jti-abc",
+      exp,
+    });
+    const second = await op<{ ok: boolean }>(t, "claimTicket", {
+      jti: "jti-abc",
+      exp,
+    });
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(false);
+  });
+
+  it("allows distinct jtis independently", async () => {
+    const t = freshTenant();
+    const exp = Math.floor(Date.now() / 1000) + 900;
+    expect((await op<{ ok: boolean }>(t, "claimTicket", { jti: "a", exp })).ok).toBe(true);
+    expect((await op<{ ok: boolean }>(t, "claimTicket", { jti: "b", exp })).ok).toBe(true);
+  });
+
+  it("legacy ticket (no jti) is allowed through (exp still bounds it)", async () => {
+    const t = freshTenant();
+    expect((await op<{ ok: boolean }>(t, "claimTicket", {})).ok).toBe(true);
+  });
+});
+
+describe("TenantDO.checkKey — expiry gate (#11)", () => {
+  it("ignores expiry when enforceExpiry is OFF (default)", async () => {
+    const t = freshTenant();
+    await op(t, "enroll", { name: "Scraper" });
+    // keyExpiry default "90 days" stamps an expiresAt; enforce is off by default.
+    const r = await op<{ plaintext: string }>(t, "mintKey", {
+      label: "k",
+      scope: { all: true },
+    });
+    const chk = await op<{ allowed: boolean }>(t, "checkKey", {
+      hash: await hashKey(r.plaintext),
+      appliance: "scraper",
+    });
+    expect(chk.allowed).toBe(true);
+  });
+
+  it("a 'never'-expiry key stays valid even with enforceExpiry ON", async () => {
+    const t = freshTenant();
+    await op(t, "enroll", { name: "Scraper" });
+    // keyExpiry "never" → no expiresAt stamped; enforce on must not reject it
+    // (no expiry to enforce). The time-based rejection path can't be exercised
+    // without fast-forwarding the clock, but this proves the gate only fires when
+    // an expiresAt exists.
+    await op(t, "updateSetting", { key: "keyExpiry", val: "never" });
+    await op(t, "updateSetting", { key: "enforceExpiry", val: true });
+    const r = await op<{ plaintext: string }>(t, "mintKey", {
+      label: "no-exp",
+      scope: { all: true },
+    });
+    const chk = await op<{ allowed: boolean }>(t, "checkKey", {
+      hash: await hashKey(r.plaintext),
+      appliance: "scraper",
+    });
+    expect(chk.allowed).toBe(true);
+  });
+
+  it("stamps a future expiresAt from keyExpiry days at mint", async () => {
+    const t = freshTenant();
+    await op(t, "enroll", { name: "Scraper" });
+    await op(t, "updateSetting", { key: "keyExpiry", val: "30 days" });
+    await op(t, "mintKey", { label: "exp30", scope: { all: true } });
+    const state = await op<any>(t, "getState");
+    const k = state.keys.find((kk: any) => kk.label === "exp30");
+    expect(typeof k.expiresAt).toBe("number");
+    expect(k.expiresAt).toBeGreaterThan(Date.now());
+  });
+});
+
+describe("TenantDO.revokeMachineKey — revoke by id (#10)", () => {
+  it("revoking by Key.id makes the hash lookup stop matching", async () => {
+    const t = freshTenant();
+    await op(t, "enroll", { name: "Scraper" });
+    const minted = await op<{ plaintext: string; key: { id: string } }>(
+      t,
+      "mintKey",
+      { label: "live", scope: { all: true } },
+    );
+    // Sanity: the key authorizes before revoke.
+    const before = await op<{ allowed: boolean }>(t, "checkKey", {
+      hash: await hashKey(minted.plaintext),
+      appliance: "scraper",
+    });
+    expect(before.allowed).toBe(true);
+    // Revoke by id.
+    const rev = await op<{ ok: boolean }>(t, "revokeMachineKey", {
+      appliance: "scraper",
+      machine: "—",
+      key: minted.key.id,
+    });
+    expect(rev.ok).toBe(true);
+    const after = await op<{ allowed: boolean; reason?: string }>(t, "checkKey", {
+      hash: await hashKey(minted.plaintext),
+      appliance: "scraper",
+    });
+    expect(after.allowed).toBe(false);
+    expect(after.reason).toBe("no-key");
+  });
+
+  it("populates the appliance key display list at mint (scoped)", async () => {
+    const t = freshTenant();
+    await op(t, "enroll", { name: "Scraper" });
+    const minted = await op<{ key: { id: string } }>(t, "mintKey", {
+      label: "scoped",
+      scope: { appliances: ["scraper"] },
+    });
+    const state = await op<any>(t, "getState");
+    const ap = state.appliances.find((a: any) => a.id === "scraper");
+    expect(ap.keys).toContain(minted.key.id);
+  });
+});
+
+describe("TenantDO.registerMachine — re-join preserves approved state (#5)", () => {
+  it("does NOT demote an approved+connected machine to pending on re-join", async () => {
+    const t = freshTenant();
+    await op(t, "enroll", { name: "Scraper" });
+    // requireApproval default true → first join is pending.
+    await op(t, "registerMachine", {
+      appliance: "scraper",
+      machine: "box-1",
+      os: "linux",
+      version: "1.4.0",
+    });
+    await op(t, "approve", { id: "scraper" });
+    await op(t, "markMachine", {
+      appliance: "scraper",
+      machine: "box-1",
+      connected: true,
+    });
+    // Agent restart re-joins the SAME machine.
+    const rj = await op<{ ok: boolean; state: string }>(t, "registerMachine", {
+      appliance: "scraper",
+      machine: "box-1",
+      os: "linux",
+      version: "1.4.0",
+    });
+    expect(rj.state).not.toBe("pending"); // not demoted
+    const state = await op<any>(t, "getState");
+    const m = state.machines.find((mm: any) => mm.name === "box-1");
+    expect(m.state).not.toBe("pending");
+  });
+});
+
+describe("TenantDO.approve — derives liveness from connected (#12)", () => {
+  it("an approved-but-disconnected machine reads resting, not chirping", async () => {
+    const t = freshTenant();
+    await op(t, "enroll", { name: "Scraper" });
+    await op(t, "registerMachine", {
+      appliance: "scraper",
+      machine: "box-1",
+      os: "linux",
+      version: "1.4.0",
+    });
+    // Approve WITHOUT ever connecting.
+    await op(t, "approve", { id: "scraper" });
+    const state = await op<any>(t, "getState");
+    const m = state.machines.find((mm: any) => mm.name === "box-1");
+    expect(m.state).toBe("resting"); // not "chirping"
   });
 });

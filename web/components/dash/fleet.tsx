@@ -3,17 +3,17 @@
 import { useState } from 'react';
 import { Avatar, Button, Card, CopyChip, InlineConfirm, MonoUrl, SectionLabel, StatePill, TagList, isOnline } from '@/components/dash/primitives';
 import { AreaChart } from '@/components/dash/charts';
-import { ROOST_DATA } from '@/components/dash/data';
+import { LATEST_AGENT } from '@/components/dash/data';
 
-export function mcpUrl(host: any, id: any) { return `https://${host}/${id}/mcp`; }
-export function machineUrl(host: any, id: any, machine: any) { return `https://${host}/${id}/${machine}/mcp`; }
+function mcpUrl(host: any, id: any) { return `https://${host}/${id}/mcp`; }
+function machineUrl(host: any, id: any, machine: any) { return `https://${host}/${id}/${machine}/mcp`; }
 const mdot = (st: any) => isOnline(st) ? "on" : st === "pending" ? "inv" : "off";
 
 // out-of-date / version badge
 function VersionTag({ a }: any) {
   if (a.state === "invited") return null;
   return a.outdated
-    ? <span className="ver-badge out" title={`update available — latest v${ROOST_DATA.LATEST_AGENT}`}>⬆ v{a.version} · update</span>
+    ? <span className="ver-badge out" title={`update available — latest v${LATEST_AGENT}`}>⬆ v{a.version} · update</span>
     : <span className="ver-badge mono">v{a.version}</span>;
 }
 function MachineCount({ a }: any) {
@@ -107,7 +107,7 @@ export function FleetCompact({ apps, host, onOpen, onRelease }: any) {
           <span className="app-id mono crow-id">{a.id}</span>
           <StatePill state={a.state} />
           {a.machineCount ? <span className="m-count">{a.machineCount}×</span> : null}
-          {a.outdated && <span className="ver-badge out crow-ver" title={`update to v${ROOST_DATA.LATEST_AGENT}`}>⬆</span>}
+          {a.outdated && <span className="ver-badge out crow-ver" title={`update to v${LATEST_AGENT}`}>⬆</span>}
           <span className="crow-spacer" />
           {a.state !== "invited" && <CopyChip value={mcpUrl(host, a.id)} label="copy url" />}
         </div>

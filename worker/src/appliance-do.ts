@@ -45,6 +45,22 @@ interface Frame {
 
 const REQUEST_TIMEOUT_MS = 30_000;
 
+// Max relay body we'll buffer (#16 / L9). Mirrors index.ts's pre-stub cap; we
+// enforce by STRING LENGTH after req.text() because content-length is
+// client-controlled and absent for chunked requests.
+const MAX_RELAY_BODY_BYTES = 4 * 1024 * 1024; // 4 MiB
+
+// Hop-by-hop / recomputed headers we never re-emit from the upstream response.
+// Everything else (notably Mcp-Session-Id) IS forwarded so stateful MCP works.
+const HOP_BY_HOP = new Set([
+  "connection",
+  "keep-alive",
+  "transfer-encoding",
+  "upgrade",
+  "content-length",
+  "content-encoding",
+]);
+
 export class ApplianceDO extends DurableObject<Env> {
   // Public requests awaiting an agent response, keyed by frame id.
   // In-memory only — but a request in flight is "pending work" that keeps us
@@ -99,10 +115,32 @@ export class ApplianceDO extends DurableObject<Env> {
       return new Response(null, { status: 101, webSocket: client });
     }
 
+    // SSE is not yet supported end-to-end (the relay frames a single buffered
+    // response; it can't stream a session-sticky event stream). Fail FAST with
+    // 501 rather than hanging or silently dropping events. (code-review #10)
+    if ((req.headers.get("accept") || "").includes("text/event-stream")) {
+      return json(501, {
+        error: "text/event-stream not supported by the relay yet",
+      });
+    }
+
     // ---- Public request: relay it to the connected agent. ----
     const agent = this.ctx.getWebSockets("agent")[0];
     if (!agent) {
-      return json(503, { error: "appliance offline", id: parts[0] });
+      // No live agent socket for this machine — a stale pick. Tag the 503 with
+      // X-Finch-Offline so the relay (which knows the tenant; the public relay
+      // path doesn't carry it down to this DO) can fail over to a sibling AND
+      // mark this machine offline so the next pick excludes it. (code-review #12)
+      return json(
+        503,
+        { error: "appliance offline", id: parts[0] },
+        { "X-Finch-Offline": "1" },
+      );
+    }
+
+    const body = await req.text();
+    if (body.length > MAX_RELAY_BODY_BYTES) {
+      return json(413, { error: "request body too large" });
     }
 
     const id = crypto.randomUUID();
@@ -112,7 +150,7 @@ export class ApplianceDO extends DurableObject<Env> {
       method: req.method,
       path: relPath,
       headers: Object.fromEntries(req.headers),
-      body: await req.text(),
+      body,
     };
 
     const res = await new Promise<Frame>((resolve) => {
@@ -134,11 +172,19 @@ export class ApplianceDO extends DurableObject<Env> {
       }
     });
 
+    // Re-emit the FULL upstream header set (minus hop-by-hop / recomputed) so
+    // stateful MCP works — the Mcp-Session-Id returned on `initialize` must reach
+    // the caller or every follow-up call 4xx's. (code-review #10)
+    const headers = new Headers();
+    for (const [k, v] of Object.entries(res.headers ?? {})) {
+      if (!HOP_BY_HOP.has(k.toLowerCase())) headers.set(k, v);
+    }
+    if (!headers.has("content-type")) {
+      headers.set("content-type", "application/json");
+    }
     return new Response(res.body ?? "", {
       status: res.status ?? 502,
-      headers: {
-        "content-type": res.headers?.["content-type"] ?? "application/json",
-      },
+      headers,
     });
   }
 
@@ -165,6 +211,9 @@ export class ApplianceDO extends DurableObject<Env> {
   }
 
   async webSocketClose(ws: WebSocket, code: number, reason: string) {
+    // A dead link must NOT leave in-flight callers hanging on the 30s timeout —
+    // drain pending now with a fast 502 so they unblock immediately. (#9)
+    this.failPending("appliance link closed");
     // Code 1012 means we superseded this socket with a fresh agent connection
     // (single-agent eviction above). The newer socket is the live one, so do NOT
     // mark the machine offline — that would flap a connected machine to offline.
@@ -178,10 +227,21 @@ export class ApplianceDO extends DurableObject<Env> {
   }
 
   async webSocketError(ws: WebSocket, _error: unknown) {
-    // Agent link errored; pending requests will time out and 504. Also flag the
-    // machine offline so the appliance state stops claiming it's chirping.
+    // Agent link errored — fail in-flight requests fast instead of waiting out
+    // the 30s timer, and flag the machine offline. (#9)
+    this.failPending("appliance link errored");
     const meta = ws.deserializeAttachment() as SockMeta | null;
     if (meta) await this.markMachine(meta, false);
+  }
+
+  /** Resolve every in-flight pending request with a fast 502 and clear the map.
+   *  Called on socket close/error so a dead link surfaces immediately rather
+   *  than each caller waiting out REQUEST_TIMEOUT_MS. */
+  private failPending(reason: string): void {
+    for (const resolve of this.pending.values()) {
+      resolve({ id: "", type: "res", status: 502, body: reason });
+    }
+    this.pending.clear();
   }
 
   /** Report this machine's connected state to its tenant's TenantDO. Skipped if
@@ -209,9 +269,13 @@ export class ApplianceDO extends DurableObject<Env> {
   }
 }
 
-function json(status: number, body: unknown): Response {
+function json(
+  status: number,
+  body: unknown,
+  extraHeaders?: Record<string, string>,
+): Response {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...(extraHeaders ?? {}) },
   });
 }

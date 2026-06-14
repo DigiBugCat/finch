@@ -189,11 +189,6 @@ export interface MintKeyResp {
   scope: string;
 }
 
-// The agent version the dashboard treats as "latest" for the out-of-date badge.
-// Kept in sync with the hub's LATEST_AGENT.
+// The agent version the dashboard treats as "latest" for the out-of-date badge
+// (fleet.tsx). Kept in sync with the hub's LATEST_AGENT.
 export const LATEST_AGENT = "1.4.0";
-
-// Compatibility shim: fleet.tsx + panels.tsx still import ROOST_DATA for the
-// two static fields they reference (LATEST_AGENT, HOST). Real host comes from
-// live state now, so HOST is just a harmless placeholder for the unused panels.
-export const ROOST_DATA = { LATEST_AGENT, HOST: "" } as const;

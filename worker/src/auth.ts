@@ -76,11 +76,23 @@ export interface TicketPayload {
   appliance: string;
   exp: number; // epoch SECONDS; verifyToken rejects once Date.now()/1000 > exp
   // `kind` distinguishes the two HMAC grants that share this signer:
-  //   - "join"    (or absent) — the long-ish enroll ticket presented at POST /join.
+  //   - "join"    (or absent) — the short enroll ticket presented at POST /join.
   //   - "connect" — the short-lived (~120s) per-machine grant the agent presents
   //                 on the /_connect WS dial (?ct=…). Bound to a single machine.
   kind?: "join" | "connect";
   machine?: string; // present (and verified) only for kind:"connect" tokens
+  // Random one-time id. On a join ticket the hub records it (TenantDO used-set)
+  // at first /join and rejects any replay until exp, so a captured ticket can't
+  // be reused for its whole TTL. Connect tokens don't carry one (they're already
+  // bound to a single machine + a ~120s window and are dialed repeatedly).
+  jti?: string;
+}
+
+/** A fresh random 128-bit ticket id (hex), for jti replay-protection. */
+export function genJti(): string {
+  const raw = new Uint8Array(16);
+  crypto.getRandomValues(raw);
+  return bytesToHex(raw);
 }
 
 async function hmacKey(secret: string): Promise<CryptoKey> {
@@ -93,40 +105,35 @@ async function hmacKey(secret: string): Promise<CryptoKey> {
   );
 }
 
-/**
- * Sign a stateless join ticket:
- *   base64url(JSON payload) + "." + base64url(HMAC-SHA256(payload, secret))
- * The secret is TICKET_SECRET (passed by the caller from env).
- */
-export async function signToken(
-  payload: TicketPayload,
-  secret: string,
-): Promise<string> {
+// ---- HMAC envelope: base64url(JSON) "." base64url(HMAC-SHA256(body)) -----
+// Shared by both signed grants (join/connect tickets and tenant assertions);
+// they differ only in the payload shape, so each verify passes its own
+// shape-validator. Constant-time signature compare; stateless.
+
+/** Sign `payload` into the `body.sig` envelope with `secret`. */
+async function signEnvelope(payload: unknown, secret: string): Promise<string> {
   const body = bytesToB64url(enc.encode(JSON.stringify(payload)));
   const key = await hmacKey(secret);
   const sig = await crypto.subtle.sign("HMAC", key, enc.encode(body));
   return body + "." + bytesToB64url(new Uint8Array(sig));
 }
 
-/**
- * Verify and decode a ticket. Returns the payload, or null if:
- *   - it's malformed
- *   - the HMAC signature doesn't match (wrong/tampered)
- *   - it has expired (exp passed)
- * Constant-time signature comparison; no storage touched (stateless).
- */
-export async function verifyToken(
-  ticket: string,
+/** Verify an envelope's HMAC + decode its JSON body, then hand it to `validate`.
+ *  Returns the validated payload (with the post-validate exp check applied), or
+ *  null on any malformed/forged/expired/shape-rejected input. */
+async function verifyEnvelope<T extends { exp: number }>(
+  token: string,
   secret: string,
-): Promise<TicketPayload | null> {
-  const dot = ticket.indexOf(".");
-  if (dot <= 0 || dot === ticket.length - 1) return null;
-  const body = ticket.slice(0, dot);
-  const sigPart = ticket.slice(dot + 1);
+  validate: (p: any) => T | null,
+): Promise<T | null> {
+  if (!token || !secret) return null;
+  const dot = token.indexOf(".");
+  if (dot <= 0 || dot === token.length - 1) return null;
+  const body = token.slice(0, dot);
 
   let sigBytes: Uint8Array;
   try {
-    sigBytes = b64urlToBytes(sigPart);
+    sigBytes = b64urlToBytes(token.slice(dot + 1));
   } catch {
     return null;
   }
@@ -137,27 +144,49 @@ export async function verifyToken(
   );
   if (!timingSafeEqual(sigBytes, expected)) return null;
 
-  let payload: TicketPayload;
+  let parsed: unknown;
   try {
-    payload = JSON.parse(new TextDecoder().decode(b64urlToBytes(body)));
+    parsed = JSON.parse(new TextDecoder().decode(b64urlToBytes(body)));
   } catch {
     return null;
   }
-  if (
-    typeof payload !== "object" ||
-    payload === null ||
-    typeof payload.tenant !== "string" ||
-    typeof payload.appliance !== "string" ||
-    typeof payload.exp !== "number" ||
-    (payload.kind !== undefined &&
-      payload.kind !== "join" &&
-      payload.kind !== "connect") ||
-    (payload.machine !== undefined && typeof payload.machine !== "string")
-  ) {
-    return null;
-  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const payload = validate(parsed);
+  if (!payload) return null;
   if (Date.now() / 1000 > payload.exp) return null; // expired
   return payload;
+}
+
+/**
+ * Sign a stateless join/connect ticket:
+ *   base64url(JSON payload) + "." + base64url(HMAC-SHA256(payload, secret))
+ * The secret is TICKET_SECRET (passed by the caller from env).
+ */
+export function signToken(
+  payload: TicketPayload,
+  secret: string,
+): Promise<string> {
+  return signEnvelope(payload, secret);
+}
+
+/**
+ * Verify and decode a ticket. Returns the payload, or null if it's malformed,
+ * the HMAC doesn't match, the shape is wrong, or it has expired.
+ */
+export function verifyToken(
+  ticket: string,
+  secret: string,
+): Promise<TicketPayload | null> {
+  return verifyEnvelope<TicketPayload>(ticket, secret, (p) =>
+    typeof p.tenant === "string" &&
+    typeof p.appliance === "string" &&
+    typeof p.exp === "number" &&
+    (p.kind === undefined || p.kind === "join" || p.kind === "connect") &&
+    (p.machine === undefined || typeof p.machine === "string") &&
+    (p.jti === undefined || typeof p.jti === "string")
+      ? (p as TicketPayload)
+      : null,
+  );
 }
 
 // ---- service-to-service auth --------------------------------------------
@@ -196,59 +225,25 @@ export interface TenantAssertion {
 }
 
 /** Sign a tenant assertion with the service secret. */
-export async function signAssertion(
+export function signAssertion(
   payload: TenantAssertion,
   secret: string,
 ): Promise<string> {
-  const body = bytesToB64url(enc.encode(JSON.stringify(payload)));
-  const key = await hmacKey(secret);
-  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(body));
-  return body + "." + bytesToB64url(new Uint8Array(sig));
+  return signEnvelope(payload, secret);
 }
 
 /**
  * Verify a tenant assertion. Returns the tenant id, or null if the assertion is
- * missing/malformed, the HMAC doesn't match, or it has expired. Constant-time
- * signature compare; stateless.
+ * missing/malformed, the HMAC doesn't match, or it has expired.
  */
 export async function verifyAssertion(
   token: string,
   secret: string,
 ): Promise<string | null> {
-  if (!token || !secret) return null;
-  const dot = token.indexOf(".");
-  if (dot <= 0 || dot === token.length - 1) return null;
-  const body = token.slice(0, dot);
-  const sigPart = token.slice(dot + 1);
-
-  let sigBytes: Uint8Array;
-  try {
-    sigBytes = b64urlToBytes(sigPart);
-  } catch {
-    return null;
-  }
-
-  const key = await hmacKey(secret);
-  const expected = new Uint8Array(
-    await crypto.subtle.sign("HMAC", key, enc.encode(body)),
+  const payload = await verifyEnvelope<TenantAssertion>(token, secret, (p) =>
+    typeof p.tenant === "string" && p.tenant && typeof p.exp === "number"
+      ? (p as TenantAssertion)
+      : null,
   );
-  if (!timingSafeEqual(sigBytes, expected)) return null;
-
-  let payload: TenantAssertion;
-  try {
-    payload = JSON.parse(new TextDecoder().decode(b64urlToBytes(body)));
-  } catch {
-    return null;
-  }
-  if (
-    typeof payload !== "object" ||
-    payload === null ||
-    typeof payload.tenant !== "string" ||
-    !payload.tenant ||
-    typeof payload.exp !== "number"
-  ) {
-    return null;
-  }
-  if (Date.now() / 1000 > payload.exp) return null; // expired
-  return payload.tenant;
+  return payload?.tenant ?? null;
 }

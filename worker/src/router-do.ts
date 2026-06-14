@@ -39,22 +39,15 @@ const bad = (status: number, error: string): Response =>
 export const ROUTER_SINGLETON = "global";
 
 export class RouterDO extends DurableObject<Env> {
-  private inited = false;
-
-  constructor(ctx: DurableObjectState, env: Env) {
-    super(ctx, env);
-  }
-
-  /** Lazily create the slug→tenant table. */
+  /** Create the slug→tenant table if absent (idempotent; cheap no-op once it
+   *  exists). Called at the top of fetch so the table is always present. */
   private init(): void {
-    if (this.inited) return;
     this.ctx.storage.sql.exec(
       `CREATE TABLE IF NOT EXISTS slugs (
          slug   TEXT PRIMARY KEY,
          tenant TEXT NOT NULL
        )`,
     );
-    this.inited = true;
   }
 
   async fetch(req: Request): Promise<Response> {

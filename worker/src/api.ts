@@ -11,8 +11,14 @@
 //   - /join is the ONE exception — it's TICKET-authed (the box presents the
 //     stateless join ticket it was handed at enroll). No service secret.
 
-import type { Env } from "./index";
-import { serviceOk, signToken, verifyToken, verifyAssertion } from "./auth";
+import { rateLimitOk, clientIp, json, tenantOp, type Env } from "./index";
+import {
+  serviceOk,
+  signToken,
+  verifyToken,
+  verifyAssertion,
+  genJti,
+} from "./auth";
 import type {
   EnrollResp,
   JoinResp,
@@ -21,35 +27,27 @@ import type {
   PublicKey,
 } from "./types";
 
-const TICKET_TTL_SECONDS = 60 * 60; // join tickets live 1h
+// Join tickets are short-lived AND single-use (jti replay-checked at /join), so
+// a 15-minute window is ample for the enroll → install → join flow while sharply
+// bounding the replay surface a captured ticket exposes. (security M1)
+const TICKET_TTL_SECONDS = 15 * 60; // join tickets live 15m
 const CONNECT_TOKEN_TTL_SECONDS = 120; // per-machine _connect grants live 120s
+
+// Machine-name clamp at the door (M1): bound length + charset before the name
+// ever reaches the registry. Mirrors tenant-do's cleanMachineName.
+const MAX_MACHINE_NAME = 64;
+const MACHINE_NAME_RE = /^[A-Za-z0-9 ._\-]+$/;
+function cleanMachine(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const name = raw.trim();
+  if (!name || name.length > MAX_MACHINE_NAME) return null;
+  if (!MACHINE_NAME_RE.test(name)) return null;
+  return name;
+}
 
 /** True if this path is handled by the control API (vs the MCP/relay plane). */
 export function isApiPath(path: string): boolean {
   return path === "/join" || path === "/api" || path.startsWith("/api/");
-}
-
-function json(status: number, body: unknown): Response {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { "content-type": "application/json" },
-  });
-}
-
-/** Call a TenantDO op via internal fetch RPC, return the parsed JSON. */
-async function tenantOp<T = any>(
-  env: Env,
-  tenant: string,
-  op: string,
-  args: Record<string, unknown> = {},
-): Promise<T> {
-  const stub = env.TENANT.get(env.TENANT.idFromName(tenant));
-  const res = await stub.fetch("https://tenant/op", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ op, ...args }),
-  });
-  return (await res.json()) as T;
 }
 
 async function readJson(req: Request): Promise<any> {
@@ -135,16 +133,21 @@ export async function handleApi(
     return json(out?.ok === false ? 404 : 200, out);
   }
 
-  // POST /api/keys {label,scope,owner}
+  // POST /api/keys {label,scope,owner}. scope is the STRUCTURED KeyScope
+  // ({all:true} | {appliances:[...]}); TenantDO.mintKey validates every listed
+  // appliance id exists and 400s on an unknown id. We pass it through and
+  // surface the DO's error verbatim (no validation duplicated here).
   if (method === "POST" && seg.length === 1 && seg[0] === "keys") {
     const body = await readJson(req);
     if (!body.label) return json(400, { error: "label required" });
-    const out = await tenantOp<{ plaintext: string; key: PublicKey }>(
-      env,
-      tenant,
-      "mintKey",
-      { label: body.label, scope: body.scope, owner: body.owner },
-    );
+    const out = await tenantOp<
+      { plaintext: string; key: PublicKey } | { error: string }
+    >(env, tenant, "mintKey", {
+      label: body.label,
+      scope: body.scope,
+      owner: body.owner,
+    });
+    if ("error" in out) return json(400, { error: out.error });
     const resp: MintKeyResp = {
       key: out.plaintext,
       label: out.key.label,
@@ -245,7 +248,12 @@ async function handleEnroll(
   });
 
   const exp = Math.floor(Date.now() / 1000) + TICKET_TTL_SECONDS;
-  const ticket = await signToken({ tenant, appliance: id, exp }, env.TICKET_SECRET);
+  // jti makes the ticket SINGLE-USE: the hub records it at first /join and
+  // rejects replays for the rest of its TTL. (security M1)
+  const ticket = await signToken(
+    { tenant, appliance: id, exp, kind: "join", jti: genJti() },
+    env.TICKET_SECRET,
+  );
 
   const base = await tenantHostBase(env, tenant, host);
   const url = `${base.http}/${id}/mcp`;
@@ -268,29 +276,57 @@ async function handleJoin(
   env: Env,
   host: string,
 ): Promise<Response> {
+  // Rate-limit /join per-IP before any work — a public, unauthenticated endpoint
+  // that mints DOs must not be a cheap flood vector. (security M5)
+  const ip = clientIp(req);
+  if (!(await rateLimitOk(env.JOIN_LIMIT, `join:${ip}`))) {
+    return json(429, { error: "rate limited" });
+  }
+
   const body = await readJson(req);
   if (!body.ticket || !body.machine) {
     return json(400, { error: "ticket and machine required" });
   }
+  // Validate + clamp the attacker-chosen machine name (length + charset) before
+  // it can pollute the registry / squat a name. (security M1)
+  const machine = cleanMachine(body.machine);
+  if (!machine) {
+    return json(400, {
+      error: "invalid machine name (1-64 chars, [A-Za-z0-9 ._-] only)",
+    });
+  }
   const payload = await verifyToken(body.ticket, env.TICKET_SECRET);
-  if (!payload) {
+  if (!payload || (payload.kind !== undefined && payload.kind !== "join")) {
     return json(401, { error: "invalid or expired ticket" });
   }
   const { tenant, appliance } = payload;
 
+  // SINGLE-USE: atomically burn the ticket's jti before doing any registration
+  // work, so a captured ticket can't be replayed for its TTL. (security M1)
+  const claim = await tenantOp<{ ok: boolean }>(env, tenant, "claimTicket", {
+    jti: payload.jti,
+    exp: payload.exp,
+  });
+  if (!claim.ok) {
+    return json(409, { error: "ticket already used" });
+  }
+
   const os = typeof body.os === "string" ? body.os : "unknown";
   const version = typeof body.version === "string" ? body.version : "0.0.0";
 
-  await tenantOp(env, tenant, "registerMachine", {
-    appliance,
-    machine: body.machine,
-    os,
-    version,
-  });
+  const reg = await tenantOp<{ ok: boolean; error?: string }>(
+    env,
+    tenant,
+    "registerMachine",
+    { appliance, machine, os, version },
+  );
+  if (reg.error) {
+    return json(409, { error: reg.error });
+  }
 
   const base = await tenantHostBase(env, tenant, host);
   const connectUrl = `${base.ws}/${appliance}/${encodeURIComponent(
-    body.machine,
+    machine,
   )}/_connect`;
 
   // Mint the short-lived per-machine connect-token. The agent presents it on the
@@ -303,7 +339,7 @@ async function handleJoin(
     {
       tenant,
       appliance,
-      machine: body.machine,
+      machine,
       kind: "connect",
       exp: connectExp,
     },
@@ -314,7 +350,7 @@ async function handleJoin(
     ok: true,
     tenant,
     appliance,
-    machine: body.machine,
+    machine,
     connectUrl,
     connectToken,
   };

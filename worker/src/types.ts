@@ -24,9 +24,11 @@ export interface Machine {
   keys: string[]; // finch_ key labels scoped to this machine
   address: string; // tailnet-style display address
   outdated: boolean;
-  lastSeen: string;
+  lastSeen: string; // formatted relative string, derived from lastSeenAt on read
+  lastSeenAt?: number; // epoch ms (0/undefined = never)
   relay: string;
-  handshake: string;
+  handshake: string; // formatted relative string, derived from handshakeAt on read
+  handshakeAt?: number; // epoch ms (0/undefined = never)
   // runtime (not persisted): the relay DO sets these from the live WS
   connected?: boolean;
 }
@@ -39,7 +41,8 @@ export interface Appliance {
   owner: string;
   box: string;
   created: string;
-  lastSeen: string;
+  lastSeen: string; // formatted relative string, derived from lastSeenAt on read
+  lastSeenAt?: number; // epoch ms (0/undefined = never)
   uptime: string;
   blurb: string;
   group: string;
@@ -56,13 +59,19 @@ export interface Appliance {
   p50: number;
   p95: number;
   err: number;
-  traffic24h: number[]; // 24 hourly buckets
+  traffic24h: number[]; // 24 trailing hourly buckets, index 23 = current hour
   lat24h: number[];
+  // Absolute epoch-hour (Date.now()/3_600_000, floored) the buckets were last
+  // written/rolled. recordCall ages stale buckets to zero from here; getState
+  // rotates the array so index 23 is the current hour on read. undefined → the
+  // buckets are treated as belonging to the current hour (legacy/first write).
+  lastBucketHour?: number;
   recentCalls: RecentCall[];
   conn: Connection;
 }
 
 export interface RecentCall {
+  ts: number; // epoch ms — formatted to a relative "ago" on read
   ago: string;
   route: string;
   caller: string;
@@ -78,14 +87,23 @@ export interface Connection {
   protocol: string;
 }
 
+/** A key's reach, in STRUCTURED form (no magic strings). Either every
+ *  appliance ({all:true}) or an explicit allow-list of appliance ids. The
+ *  allow-list is validated at mint (every id must exist) so a key can never
+ *  carry free-text that silently grants nothing or everything. */
+export type KeyScope = { all: true } | { all?: false; appliances: string[] };
+
 export interface Key {
   id: string;
   label: string;
   owner: string;
   created: string;
-  scope: string; // "all appliances" | csv of appliance ids
+  scope: KeyScope; // structured reach (validated at mint)
   hash: string; // sha-256 of the finch_ key; plaintext returned ONCE at mint
   last4: string; // for display
+  // Absolute expiry (epoch ms). Stamped at mint from settings.keyExpiry; only
+  // ENFORCED when settings.enforceExpiry is on. undefined = never expires.
+  expiresAt?: number;
 }
 
 export interface AclEntity {
@@ -162,10 +180,6 @@ export type PublicKey = Omit<Key, "hash"> & { hash?: undefined };
 
 // ---- API request/response shapes ----------------------------------
 
-export interface EnrollReq {
-  name: string;
-  group?: string;
-}
 export interface EnrollResp {
   id: string;
   ticket: string; // one-shot signed join ticket (shown once)
@@ -174,13 +188,6 @@ export interface EnrollResp {
   expiresAt: number;
 }
 
-/** Agent → hub: POST /join with a ticket to claim a machine slot. */
-export interface JoinReq {
-  ticket: string;
-  machine: string; // box name
-  os: string;
-  version: string;
-}
 export interface JoinResp {
   ok: boolean;
   tenant: string;
@@ -193,15 +200,10 @@ export interface JoinResp {
   connectToken: string;
 }
 
-export interface MintKeyReq {
-  label: string;
-  scope?: string;
-  owner?: string;
-}
 export interface MintKeyResp {
   key: string; // plaintext finch_… — returned ONCE
   label: string;
-  scope: string;
+  scope: KeyScope;
 }
 
 export const LATEST_AGENT = "1.4.0";

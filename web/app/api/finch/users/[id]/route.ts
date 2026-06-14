@@ -5,11 +5,7 @@
 // authorization itself (requireAdmin blocks members) and refuses to remove the
 // last remaining admin/owner so the tenant is never left without an admin.
 import { clerkClient } from "@clerk/nextjs/server";
-import { errorResponse, HttpError, requireAdmin } from "@/lib/hub";
-
-function isAdminRole(role: string | null | undefined): boolean {
-  return role === "org:admin" || role === "admin";
-}
+import { errorResponse, HttpError, isClerkOrgAdmin, requireAdmin } from "@/lib/hub";
 
 export async function DELETE(
   _req: Request,
@@ -29,7 +25,7 @@ export async function DELETE(
       organizationId: orgId,
       limit: 100,
     });
-    const admins = list.data.filter((m) => isAdminRole(m.role));
+    const admins = list.data.filter((m) => isClerkOrgAdmin(m.role));
     const targetIsAdmin = admins.some((m) => m.publicUserData?.userId === id);
     if (targetIsAdmin && admins.length <= 1) {
       throw new HttpError(400, "can't remove the last admin");

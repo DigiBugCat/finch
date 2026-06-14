@@ -6,17 +6,20 @@
   "description": "Finch hub — Cloudflare Worker + Durable Object relay for MCP appliances",
   "scripts": {
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
+    "preflight": "node scripts/deploy-preflight.mjs",
+    "deploy": "node scripts/deploy-preflight.mjs production && wrangler deploy --env production",
+    "deploy:dev": "node scripts/deploy-preflight.mjs dev && wrangler deploy --env dev",
     "typecheck": "tsc --noEmit",
     "build": "wrangler deploy --dry-run --outdir dist",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "ci": "npm run typecheck && wrangler deploy --dry-run --env production && vitest run"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.16.15",
-    "@cloudflare/workers-types": "latest",
-    "typescript": "^5",
+    "@cloudflare/workers-types": "^4.20260613.1",
+    "typescript": "^5.9.3",
     "vitest": "^4.1.8",
-    "wrangler": "latest"
+    "wrangler": "^4.100.0"
   }
 }

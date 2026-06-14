@@ -56,5 +56,43 @@ export function useFinchState(): UseFinchState {
     };
   }, [refetch]);
 
+  // Live polling so box-phones-home, online/offline flips, approvals and call
+  // counts surface without the user acting — backing the "appears the moment it
+  // connects" copy. The refetch is idempotent; we pause it while the tab is
+  // hidden (no point polling a backgrounded tab) and resume on focus, firing an
+  // immediate refetch so a tab that's been away catches up at once.
+  useEffect(() => {
+    const PERIOD_MS = 7000;
+    let timer: ReturnType<typeof setInterval> | undefined;
+
+    const stop = () => {
+      if (timer !== undefined) {
+        clearInterval(timer);
+        timer = undefined;
+      }
+    };
+    const start = () => {
+      if (timer === undefined) {
+        timer = setInterval(() => void refetch(), PERIOD_MS);
+      }
+    };
+
+    const onVisibility = () => {
+      if (document.hidden) {
+        stop();
+      } else {
+        void refetch(); // catch up immediately on return
+        start();
+      }
+    };
+
+    if (!document.hidden) start();
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility);
+      stop();
+    };
+  }, [refetch]);
+
   return { state, loading, error, refetch };
 }

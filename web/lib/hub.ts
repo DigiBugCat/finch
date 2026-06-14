@@ -104,6 +104,18 @@ function roleIsAdmin(role: string | null | undefined): boolean {
   );
 }
 
+/** True for a Clerk org admin membership role. Narrower than roleIsAdmin (no
+ *  "owner" forms) — Clerk org memberships are only ever org:admin/org:member.
+ *  Used by the user-management routes to guard the last-admin invariant. */
+export function isClerkOrgAdmin(role: string | null | undefined): boolean {
+  return role === "org:admin" || role === "admin";
+}
+
+/** Map the dashboard's role label (or a raw Clerk role) to a Clerk org role. */
+export function toClerkOrgRole(role: string | undefined): "org:admin" | "org:member" {
+  return role === "Admin" || role === "org:admin" ? "org:admin" : "org:member";
+}
+
 /**
  * Resolve the current tenant + caller authorization from the Clerk session.
  * The tenant = the Clerk org id, or the user id if there's no active org.
@@ -140,6 +152,26 @@ export async function requireAdmin(): Promise<ResolvedTenant> {
   return ctx;
 }
 
+/** Throw 500 unless `hubUrl` is https: or a localhost/127.0.0.1 dev URL. Guards
+ *  against a misconfigured cleartext HUB_URL leaking the service secret +
+ *  signed assertion. Fail-closed: an unparseable URL is rejected too. */
+function assertSecureHubUrl(hubUrl: string): void {
+  let u: URL;
+  try {
+    u = new URL(hubUrl);
+  } catch {
+    throw new HttpError(500, "HUB_URL is not a valid URL");
+  }
+  if (u.protocol === "https:") return;
+  const isLocalhost =
+    u.hostname === "localhost" ||
+    u.hostname === "127.0.0.1" ||
+    u.hostname === "[::1]" ||
+    u.hostname === "::1";
+  if (u.protocol === "http:" && isLocalhost) return;
+  throw new HttpError(500, "HUB_URL must be https (or http on localhost)");
+}
+
 /**
  * Call the hub control API for the current tenant. Resolves the tenant from
  * the Clerk session, attaches the service secret + tenant headers, and fetches
@@ -157,6 +189,12 @@ export async function hubFetch(
   if (!serviceSecret) {
     throw new HttpError(500, "FINCH_SERVICE_SECRET is not configured");
   }
+  // FAIL CLOSED on a non-https HUB_URL. We send the X-Finch-Service root secret
+  // and a signed tenant assertion on every call — a misconfigured cleartext
+  // override would leak them on the wire. Allow https: always, and plain http
+  // only for a localhost/127.0.0.1 dev hub. Reject everything else regardless
+  // of how HUB_URL was set.
+  assertSecureHubUrl(hubUrl);
 
   const headers = new Headers(init.headers);
   headers.set("X-Finch-Service", serviceSecret);
@@ -185,11 +223,27 @@ export async function hubProxy(
   });
 }
 
-/** Turn a thrown HttpError (or anything) into a JSON Response for a handler. */
+/** Admin-only passthrough: require admin, then forward the request body to a
+ *  hub path verbatim. Collapses the handful of routes that are pure proxies
+ *  (acl, enroll, keys, settings, tags) into one call + a try/catch. */
+export async function adminProxy(
+  req: Request,
+  hubPath: string,
+  method: string,
+): Promise<Response> {
+  await requireAdmin();
+  return hubProxy(hubPath, { method, body: await req.text() });
+}
+
+/** Turn a thrown HttpError (or anything) into a JSON Response for a handler.
+ *  Expected errors (HttpError, incl. our 4xx) keep their structured message so
+ *  the UI can surface it. Anything else is an unexpected 500 — log the real
+ *  message server-side, but return a generic body so we never leak raw
+ *  exception text (stack-adjacent details, secrets in messages) to clients. */
 export function errorResponse(err: unknown): Response {
   if (err instanceof HttpError) {
     return Response.json({ error: err.message }, { status: err.status });
   }
-  const message = err instanceof Error ? err.message : "internal error";
-  return Response.json({ error: message }, { status: 500 });
+  console.error("finch bridge: unhandled error", err);
+  return Response.json({ error: "internal error" }, { status: 500 });
 }

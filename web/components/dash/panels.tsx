@@ -1,29 +1,17 @@
 "use client";
-// Roost — Enroll, Keys, Activity panels.
+// Roost — Enroll + Keys panels.
 import { useState } from 'react';
 import { Button, Card, CopyChip, DuskInput, InlineConfirm, MaskedSecret, SectionLabel } from '@/components/dash/primitives';
 
+// Only the posix platforms the hub actually serves an installer for. The worker
+// serves a single GET /install (curl|sh) shell installer; there's no
+// /install.ps1 (Windows) or finch/agent Docker image yet, so we don't offer
+// tabs that 404. Add them back here once the worker serves them.
 const PLATS = [
   ["macos", "macOS", "🍎"],
   ["debian", "Debian / Ubuntu", "🐧"],
   ["pi", "Raspberry Pi", "🍓"],
-  ["docker", "Docker", "🐳"],
-  ["windows", "Windows", "🪟"],
 ];
-
-// Per-platform install command, built from the hub's REAL signed ticket. The
-// hub already returns the canonical curl|sh command (resp.install) for the
-// posix path; the other platforms reuse the same ticket — only the fetch/run
-// wrapper differs. We never fabricate a ticket client-side.
-function installFor(plat: any, host: any, install: string, ticket: string) {
-  const scheme = host && (host.startsWith("localhost") || host.startsWith("127.0.0.1")) ? "http" : "https";
-  if (plat === "windows")
-    return `iwr -useb ${scheme}://${host}/install.ps1 | iex; finch join --ticket ${ticket}`;
-  if (plat === "docker")
-    return `docker run -d --name finch-agent \\\n  -e FINCH_TICKET=${ticket} \\\n  finch/agent:latest`;
-  // macOS / Debian / Pi all use the canonical posix one-liner the hub minted.
-  return install;
-}
 
 // ============ ENROLL ==============================================
 // Renders the hub's REAL enroll response. `onEnrolled(id, group)` POSTs to the
@@ -63,9 +51,10 @@ export function EnrollView({ host, existingIds, groups, onEnrolled, onWatch }: a
   };
 
   const ticket: string = enrolled?.ticket ?? "";
-  const baseInstall: string = enrolled?.install ?? "";
   const enrolledId: string = enrolled?.id ?? clean;
-  const command = installFor(plat, host, baseInstall, ticket);
+  // Every supported (posix) platform uses the canonical curl|sh one-liner the
+  // hub minted verbatim — the platform tabs are just a hint, not a code switch.
+  const command: string = enrolled?.install ?? "";
 
   return (
     <div className="view view-narrow">
@@ -213,33 +202,6 @@ export function KeysView({ keys, users, onMint, onRevoke }: any) {
             <span className="k-val mono dim">{`finch_••••${k.last4}`}</span>
             <span className="k-created mono dim">{k.created}</span>
             <span className="k-act"><InlineConfirm prompt="revoke?" trigger="revoke" onConfirm={() => onRevoke(k)} /></span>
-          </div>
-        ))}
-      </Card>
-    </div>
-  );
-}
-
-// ============ ACTIVITY ============================================
-export function ActivityView({ activity }: any) {
-  const glyph: any = {
-    call: "→", online: "●", offline: "○", keymint: "🔑", revoke: "⊘", enroll: "🐣",
-  };
-  const cls: any = {
-    call: "act-call", online: "act-online", offline: "act-offline",
-    keymint: "act-key", revoke: "act-revoke", enroll: "act-enroll",
-  };
-  return (
-    <div className="view view-narrow">
-      <h1 className="page-title">Activity</h1>
-      <p className="page-lede">Enrollments, keys, and online/offline transitions — newest first.</p>
-      <Card className="table-card">
-        {activity.map((e: any, i: number) => (
-          <div key={i} className="arow">
-            <span className={`act-glyph ${cls[e.kind]}`}>{glyph[e.kind]}</span>
-            <span className="act-text">{e.text}</span>
-            <span className="act-who mono dim">{e.who}</span>
-            <span className="act-time mono dim">{e.ago}</span>
           </div>
         ))}
       </Card>

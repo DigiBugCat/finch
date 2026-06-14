@@ -33,8 +33,8 @@ export default function HowItWorks() {
             <h3>Bring it home</h3>
             <p>Run one line. The box dials out to Finch, joins your flock, and starts chirping — no port-forwarding, no firewall holes.</p>
             <div className="step-code">
-              <code id="install-cmd">curl -fsSL finchmcp.com/start | sh</code>
-              <button className="copybtn" data-copy="curl -fsSL finchmcp.com/start | sh" onClick={handleCopy}>Copy</button>
+              <code id="install-cmd">curl -fsSL finchmcp.com/install | sh</code>
+              <button className="copybtn" data-copy="curl -fsSL finchmcp.com/install | sh" onClick={handleCopy}>Copy</button>
             </div>
           </div>
           <div className="step">
