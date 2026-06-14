@@ -27,12 +27,8 @@ export default function Faq() {
       a: "Anything you can wrap as an MCP tool: printing, transcription, a notes index, web fetch, home automation, your own scripts. Start from a ready-made ability or bring your own server.",
     },
     {
-      q: "What can I actually expose through it?",
-      a: "Anything you can wrap as an MCP tool: printing, transcription, a notes index, web fetch, home automation, your own scripts. Start from a ready-made ability or bring your own server.",
-    },
-    {
-      q: "It's free now — what's the catch, and what happens later?",
-      a: "No catch. Finch is in beta and free while we're here — every box, every tool, no card, no tiers. Paid plans arrive once Finch is out of beta, and the beta flock keeps early-supporter pricing, grandfathered. We'd rather earn the upgrade than gate the beta — and we'll give you plenty of warning before anything has a price on it.",
+      q: "Is it free?",
+      a: "Yes — Finch is in beta, so it's free to use right now. Paid plans come later, once it's out of beta. We'll give you plenty of warning before anything changes.",
     },
   ];
 

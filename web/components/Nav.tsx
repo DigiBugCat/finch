@@ -26,7 +26,7 @@ export default function Nav() {
         </div>
         <div className="nav-cta">
           <Link className="nav-signin" href="/sign-in">Sign in</Link>
-          <Link className="btn btn-md btn-amber" href="/sign-up">Join the beta</Link>
+          <Link className="btn btn-md btn-amber" href="/sign-up">Get started</Link>
         </div>
       </div>
     </nav>

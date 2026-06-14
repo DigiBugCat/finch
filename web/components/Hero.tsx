@@ -5,11 +5,11 @@ export default function Hero() {
     <section className="hero">
       <div className="wrap hero-grid">
         <div className="hero-copy">
-          <span className="eyebrow">🌙 Now in <b>beta</b> · free while it lasts</span>
+          <span className="eyebrow">🌙 Now in <b>beta</b> · free during beta</span>
           <h1>Give your agent<br />a place to <span className="soft">land.</span></h1>
           <p className="hero-sub">Finch turns any always-on box — Mac mini, Pi, the server humming under your desk — into a public, authenticated MCP server. You write the tool logic. Finch handles auth, routing, and hosting. Outbound-only: nothing listens, no ports to open.</p>
           <div className="hero-cta">
-            <Link className="btn btn-lg btn-amber" href="/sign-up">Join the beta →</Link>
+            <Link className="btn btn-lg btn-amber" href="/sign-up">Get started →</Link>
             <a className="btn btn-lg btn-ghost" href="#how">See how it works</a>
           </div>
           <div className="hero-trust">
