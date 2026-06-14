@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import Link from 'next/link';
+import { Show, UserButton } from '@clerk/nextjs';
 
 export default function Nav() {
   const [scrolled, setScrolled] = useState(false);
@@ -25,8 +26,14 @@ export default function Nav() {
           <a href="#faq">FAQ</a>
         </div>
         <div className="nav-cta">
-          <Link className="nav-signin" href="/sign-in">Sign in</Link>
-          <Link className="btn btn-md btn-amber" href="/sign-up">Get started</Link>
+          <Show when="signed-out">
+            <Link className="nav-signin" href="/sign-in">Sign in</Link>
+            <Link className="btn btn-md btn-amber" href="/sign-up">Get started</Link>
+          </Show>
+          <Show when="signed-in">
+            <Link className="nav-signin" href="/dashboard">Dashboard</Link>
+            <UserButton />
+          </Show>
         </div>
       </div>
     </nav>
