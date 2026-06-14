@@ -1,6 +1,11 @@
 "use client";
-// Roost — app shell: header, nav, shared state, router.
-import { useState } from 'react';
+// Finch — dashboard app shell: header, nav, live state, router.
+//
+// Data source: the live hub TenantState via useFinchState() (GET
+// /api/finch/state). Every mutation calls the Next bridge under /api/finch/*
+// and then refetch()es so the UI reflects real hub state. The view components
+// are prop-driven and unchanged — only the data source + action handlers here.
+import { useCallback, useState } from 'react';
 import { UserButton, useUser } from '@clerk/nextjs';
 import { HomeView } from './home';
 import { FleetView } from './overview';
@@ -11,24 +16,11 @@ import { AccessView } from './access';
 import { LogsView } from './logs';
 import { SettingsView } from './settings';
 import { isOnline, Card } from './primitives';
-import { ROOST_DATA } from './data';
-
-const LOG_CAT: any = {
-  enroll: "device", online: "device", offline: "device", release: "device",
-  approve: "device", decline: "device", revoke: "key", keymint: "key",
-  invite: "admin", role: "admin", setting: "admin", access: "access",
-};
+import { useFinchState } from './useFinchState';
 
 export default function DashboardApp() {
   const { user } = useUser();
-  const D = ROOST_DATA;
-  const host = D.HOST;
-
-  const [appliances, setAppliances] = useState(D.appliances);
-  const [keys] = useState(D.keys);
-  const [logs, setLogs] = useState(D.logs);
-  const [users, setUsers] = useState(D.users);
-  const [settings, setSettings] = useState(D.settings);
+  const { state, loading, error, refetch } = useFinchState();
 
   const [view, setView] = useState("overview");
   const [openId, setOpenId] = useState<any>(null);
@@ -38,101 +30,120 @@ export default function DashboardApp() {
   const flash = (msg: any) => { setToast(msg); setTimeout(() => setToast(null), 2200); };
   const go = (v: any) => { setView(v); window.scrollTo({ top: 0 }); };
 
-  const log = (kind: any, actor: any, action: any, target: any) =>
-    setLogs((l: any) => [{ ago: "just now", cat: LOG_CAT[kind] || "admin", actor, action, target: target || "", ip: "100.64.12.3" }, ...l]);
+  // POST/PUT/DELETE a bridge endpoint, then refetch live state. Returns the
+  // parsed JSON body so callers can read minted secrets / install strings.
+  const mutate = useCallback(async (
+    path: string,
+    init: RequestInit,
+    okMsg?: string,
+    failMsg?: string,
+  ): Promise<any | null> => {
+    try {
+      const res = await fetch(path, {
+        ...init,
+        headers: { "content-type": "application/json", ...(init.headers || {}) },
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        flash(`⚠ ${body?.error || failMsg || "something went wrong"}`);
+        return null;
+      }
+      await refetch();
+      if (okMsg) flash(okMsg);
+      return body;
+    } catch (e) {
+      flash(`⚠ ${failMsg || (e instanceof Error ? e.message : "request failed")}`);
+      return null;
+    }
+  }, [refetch]);
 
-  // machines lens is derived from appliance state so it stays in sync
-  const machines = appliances.flatMap((a: any) => (a.machines || []).map((m: any) => ({ ...m, group: a.group, tags: a.tags, owner: a.owner })));
+  // ----- live state (with safe fallbacks while loading) -------------
+  const host = state?.host ?? "";
+  const appliances = state?.appliances ?? [];
+  const keys = state?.keys ?? [];
+  const logs = state?.logs ?? [];
+  const users = state?.users ?? [];
+  const settings = state?.settings ?? ({} as any);
+  const groups = state?.groups ?? [];
+  const acl = state?.acl ?? [];
+  const overview = state?.overview ?? ({} as any);
+
+  // machines lens is derived from appliance state so it stays in sync; the hub
+  // also flattens it into state.machines — prefer that, fall back to derive.
+  const machines = (state?.machines && state.machines.length)
+    ? state.machines
+    : appliances.flatMap((a: any) => (a.machines || []).map((m: any) => ({ ...m, group: a.group, tags: a.tags, owner: a.owner })));
 
   // --- device actions ----------------------------------------------
   const openDevice = (id: any) => { setOpenId(id); go("detail"); };
 
   const releaseDevice = (id: any) => {
-    setAppliances((list: any) => list.filter((a: any) => a.id !== id));
-    log("release", "you", "released", id);
-    flash(`🕊 ${id} set free`);
+    void mutate(`/api/finch/appliances/${encodeURIComponent(id)}/release`,
+      { method: "POST" }, `🕊 ${id} set free`, `couldn't release ${id}`);
     if (view === "detail") go("overview");
   };
-
-  const makeMachine = (id: any, state: any) => ({
-    name: `${id}-pi`, os: "Raspberry Pi OS", version: D.LATEST_AGENT, state,
-    appliance: id, applianceLabel: id, keys: [], address: "100.99.0.1",
-    outdated: false, lastSeen: "now", relay: "sfo · us-west", handshake: "now",
-  });
 
   const enrollDevice = (id: any, group: any) => {
-    const requireApproval = settings.requireApproval;
-    const appliance = {
-      id, label: id, state: "invited", owner: "you", box: "—",
-      created: "just now", lastSeen: "never", uptime: "—",
-      calls: 0, p50: 0, p95: 0, err: 0,
-      group: group || settings.defaultGroup || "Home lab", version: D.LATEST_AGENT, outdated: false, tags: [],
-      machines: [], machineCount: 0, routes: ["/call"], traffic24h: Array(24).fill(0), lat24h: [], recentCalls: [],
-      conn: { relay: "—", version: `finch-agent ${D.LATEST_AGENT}`, address: "—", handshake: "never", protocol: "pending" },
-      blurb: "Ticket minted — waiting for the box to phone home.", components: [], keys: [],
-    };
-    setAppliances((list: any) => [appliance, ...list.filter((a: any) => a.id !== id)]);
-    log("enroll", "you", "enrolled", id);
-    setTimeout(() => {
-      const st = requireApproval ? "pending" : "chirping";
-      setAppliances((list: any) => list.map((a: any) => a.id === id ? {
-        ...a, state: st, box: "Raspberry Pi 5", lastSeen: "now", uptime: requireApproval ? "—" : "0d 0h",
-        machines: [makeMachine(id, st)], machineCount: 1,
-        blurb: requireApproval ? "Connected — waiting for an admin to approve it." : "Just connected — serving its first calls.",
-      } : a));
-      if (requireApproval) { log("device", id, "requested approval", ""); flash(`⏳ ${id} connected — awaiting approval`); }
-      else { log("online", id, "started chirping", ""); flash(`🐦 ${id} flew home — now chirping`); }
-    }, 4200);
+    // POST creates the 'invited' appliance server-side; it stays 'invited'
+    // until the agent joins (no fake setTimeout). refetch surfaces it.
+    void mutate(
+      `/api/finch/enroll`,
+      { method: "POST", body: JSON.stringify({ name: id, group }) },
+      undefined,
+      `couldn't enroll ${id}`,
+    ).then((resp) => {
+      if (resp?.install) {
+        // EnrollView renders its own command block; surface the real install
+        // string via a toast so it's never lost.
+        flash(`🎟 ${id} enrolled — install ready`);
+      }
+    });
   };
 
-  const approveDevice = (id: any) => {
-    setAppliances((list: any) => list.map((a: any) => a.id === id ? {
-      ...a, state: "chirping", uptime: "0d 0h", blurb: "Just connected — serving its first calls.",
-      machines: (a.machines || []).map((m: any) => ({ ...m, state: "chirping" })),
-    } : a));
-    log("approve", "you", "approved", id);
-    flash(`🐦 ${id} approved — now chirping`);
-  };
+  const approveDevice = (id: any) =>
+    void mutate(`/api/finch/appliances/${encodeURIComponent(id)}/approve`,
+      { method: "POST" }, `🐦 ${id} approved — now chirping`, `couldn't approve ${id}`);
+
   const declineDevice = (id: any) => {
-    setAppliances((list: any) => list.filter((a: any) => a.id !== id));
-    log("decline", "you", "declined", id);
-    flash(`${id} declined`);
+    void mutate(`/api/finch/appliances/${encodeURIComponent(id)}/decline`,
+      { method: "POST" }, `${id} declined`, `couldn't decline ${id}`);
     if (view === "detail") go("overview");
   };
 
-  const setTags = (id: any, tags: any) => setAppliances((list: any) => list.map((a: any) => a.id === id ? { ...a, tags } : a));
+  const setTags = (id: any, tags: any) =>
+    void mutate(`/api/finch/appliances/${encodeURIComponent(id)}/tags`,
+      { method: "PUT", body: JSON.stringify({ tags }) }, undefined, `couldn't update tags`);
 
-  const revokeMachineKey = (appId: any, machineName: any, key: any) => {
-    setAppliances((list: any) => list.map((a: any) => a.id === appId
-      ? { ...a, machines: a.machines.map((m: any) => m.name === machineName ? { ...m, keys: m.keys.filter((k: any) => k !== key) } : m) }
-      : a));
-    log("revoke", "you", "revoked key", `${key} · ${machineName}`);
-    flash("🔑 key revoked");
-  };
+  const revokeMachineKey = (appId: any, machineName: any, key: any) =>
+    void mutate(`/api/finch/keys/revoke`,
+      { method: "POST", body: JSON.stringify({ machine: machineName, appliance: appId, key }) },
+      "🔑 key revoked", "couldn't revoke key");
 
-  // --- user actions ------------------------------------------------
-  const inviteUser = ({ email, role }: any) => {
-    const name = email.split("@")[0];
-    setUsers((us: any) => [...us, { id: "u" + Date.now(), name, email, role, devices: 0, lastActive: "—", status: "invited" }]);
-    log("invite", "you", "invited", email);
-    flash(`✉ invite sent to ${email}`);
-  };
-  const setUserRole = (id: any, role: any) => {
-    setUsers((us: any) => us.map((u: any) => u.id === id ? { ...u, role } : u));
-    const u = users.find((x: any) => x.id === id);
-    log("role", "you", "set role", `${u ? u.name : id} → ${role}`);
-  };
-  const removeUser = (id: any) => {
-    const u = users.find((x: any) => x.id === id);
-    setUsers((us: any) => us.filter((x: any) => x.id !== id));
-    if (u) log("role", "you", "removed", u.name);
-    flash("teammate removed");
-  };
+  // --- user actions (Clerk-backed via the bridge) ------------------
+  const inviteUser = ({ email, role }: any) =>
+    void mutate(`/api/finch/users/invite`,
+      { method: "POST", body: JSON.stringify({ email, role }) },
+      `✉ invite sent to ${email}`, `couldn't invite ${email}`);
 
-  const updateSetting = (key: any, val: any) => {
-    setSettings((s: any) => ({ ...s, [key]: val }));
-    log("setting", "you", "changed", key);
-  };
+  const setUserRole = (id: any, role: any) =>
+    void mutate(`/api/finch/users/${encodeURIComponent(id)}/role`,
+      { method: "POST", body: JSON.stringify({ role }) }, undefined, "couldn't set role");
+
+  const removeUser = (id: any) =>
+    void mutate(`/api/finch/users/${encodeURIComponent(id)}`,
+      { method: "DELETE" }, "teammate removed", "couldn't remove teammate");
+
+  // --- access (ACL) ------------------------------------------------
+  const addAcl = (src: any, dst: any) =>
+    void mutate(`/api/finch/acl`,
+      { method: "POST", body: JSON.stringify({ src, dst }) }, "✓ rule added", "couldn't add rule");
+  const removeAcl = (id: any) =>
+    void mutate(`/api/finch/acl/${encodeURIComponent(id)}`,
+      { method: "DELETE" }, "rule removed", "couldn't remove rule");
+
+  const updateSetting = (key: any, val: any) =>
+    void mutate(`/api/finch/settings`,
+      { method: "PUT", body: JSON.stringify({ key, val }) }, undefined, `couldn't update ${key}`);
 
   const onAddDevice = () => go("enroll");
 
@@ -144,6 +155,9 @@ export default function DashboardApp() {
     ["access", "Access"], ["logs", "Logs"], ["settings", "Settings"],
   ];
 
+  // ----- loading / error gate --------------------------------------
+  const showLoading = loading && !state;
+
   return (
     <div className="app">
       <header className="topbar">
@@ -151,7 +165,7 @@ export default function DashboardApp() {
           <a className="brand" href="/" title="finchmcp.com">
             <span className="brand-mark">🐦</span>
             <span className="brand-name">Finch</span>
-            <span className="host-chip mono">{host}</span>
+            {host && <span className="host-chip mono">{host}</span>}
           </a>
           <div className="user">
             <span className="admin-badge">admin</span>
@@ -174,38 +188,50 @@ export default function DashboardApp() {
       </header>
 
       <main className="main">
-        {view === "home" && (
-          <HomeView appliances={appliances} machines={machines} overview={D.overview} host={host}
-            onOpen={openDevice} onApprove={approveDevice} onAddDevice={onAddDevice} />
+        {showLoading && (
+          <div className="view"><Card><p className="dim" style={{ padding: 20 }}>Loading your flock…</p></Card></div>
         )}
-        {view === "overview" && (
-          <FleetView appliances={appliances} machines={machines} overview={D.overview} host={host}
-            groups={D.groups} onOpen={openDevice} onRelease={releaseDevice} onAddDevice={onAddDevice}
-            layout={layout} setLayout={setLayout} />
+        {!showLoading && error && !state && (
+          <div className="view"><Card><p className="dim" style={{ padding: 20 }}>Couldn’t load your flock — {error}</p></Card></div>
         )}
-        {view === "detail" && current && (
-          <DetailView app={current} host={host} onBack={() => go("overview")}
-            onRelease={releaseDevice} onTags={setTags} onApprove={approveDevice} onDecline={declineDevice}
-            onRevokeMachineKey={revokeMachineKey} />
-        )}
-        {view === "detail" && !current && (
-          <div className="view"><button className="backlink" onClick={() => go("overview")}>← Fleet</button>
-            <Card><p className="dim" style={{ padding: 20 }}>This appliance has left the roost.</p></Card></div>
-        )}
-        {view === "enroll" && (
-          <EnrollView host={host} existingIds={appliances.map((a: any) => a.id)} groups={D.groups.map((g: any) => g.name)} onEnrolled={enrollDevice} onWatch={() => go("overview")} />
-        )}
-        {view === "users" && (
-          <UsersView users={users} onInvite={inviteUser} onRole={setUserRole} onRemove={removeUser} />
-        )}
-        {view === "access" && (
-          <AccessView appliances={appliances} groups={D.groups} keys={keys} acl={D.acl} />
-        )}
-        {view === "logs" && (
-          <LogsView logs={logs} />
-        )}
-        {view === "settings" && (
-          <SettingsView settings={settings} onChange={updateSetting} />
+
+        {!showLoading && state && (
+          <>
+            {view === "home" && (
+              <HomeView appliances={appliances} machines={machines} overview={overview} host={host}
+                onOpen={openDevice} onApprove={approveDevice} onAddDevice={onAddDevice} />
+            )}
+            {view === "overview" && (
+              <FleetView appliances={appliances} machines={machines} overview={overview} host={host}
+                groups={groups} onOpen={openDevice} onRelease={releaseDevice} onAddDevice={onAddDevice}
+                layout={layout} setLayout={setLayout} />
+            )}
+            {view === "detail" && current && (
+              <DetailView app={current} host={host} onBack={() => go("overview")}
+                onRelease={releaseDevice} onTags={setTags} onApprove={approveDevice} onDecline={declineDevice}
+                onRevokeMachineKey={revokeMachineKey} />
+            )}
+            {view === "detail" && !current && (
+              <div className="view"><button className="backlink" onClick={() => go("overview")}>← Fleet</button>
+                <Card><p className="dim" style={{ padding: 20 }}>This appliance has left the roost.</p></Card></div>
+            )}
+            {view === "enroll" && (
+              <EnrollView host={host} existingIds={appliances.map((a: any) => a.id)} groups={groups.map((g: any) => g.name)} onEnrolled={enrollDevice} onWatch={() => go("overview")} />
+            )}
+            {view === "users" && (
+              <UsersView users={users} onInvite={inviteUser} onRole={setUserRole} onRemove={removeUser} />
+            )}
+            {view === "access" && (
+              <AccessView appliances={appliances} groups={groups} keys={keys} acl={acl}
+                onAdd={addAcl} onRemove={removeAcl} />
+            )}
+            {view === "logs" && (
+              <LogsView logs={logs} />
+            )}
+            {view === "settings" && (
+              <SettingsView settings={settings} onChange={updateSetting} />
+            )}
+          </>
         )}
       </main>
 

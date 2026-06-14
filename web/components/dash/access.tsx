@@ -1,6 +1,6 @@
 "use client";
 // Roost — Access: ACL rules (by tag / group / key) + generated raw policy.
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Button, Card, CopyChip, EntityChip, InlineConfirm, SectionLabel } from '@/components/dash/primitives';
 
 function tokenSrc(s: any) {
@@ -16,11 +16,14 @@ function tokenDst(d: any) {
   return d.name; // appliance
 }
 
-export function AccessView({ appliances, groups, keys, acl }: any) {
+export function AccessView({ appliances, groups, keys, acl, onAdd, onRemove }: any) {
   const [rules, setRules] = useState(acl);
   const [mode, setMode] = useState("rules"); // rules | policy
   const [srcVal, setSrcVal] = useState("user:priya");
   const [dst, setDst] = useState<any[]>([]);
+
+  // Re-seed from live state whenever the parent refetches the ACL.
+  useEffect(() => { setRules(acl); }, [acl]);
 
   const allTags = [...new Set(appliances.flatMap((a: any) => a.tags || []))];
   const users = ["you", "priya", "sam"];
@@ -38,10 +41,15 @@ export function AccessView({ appliances, groups, keys, acl }: any) {
     if (!dst.length) return;
     const idx = srcVal.indexOf(":");
     const src = { type: srcVal.slice(0, idx), name: srcVal.slice(idx + 1) };
+    // optimistic — the parent persists to the hub then refetches (re-seeds rules)
     setRules((r: any) => [{ id: "r" + Date.now(), src, dst: [...dst], action: "allow" }, ...r]);
+    onAdd?.(src, [...dst]);
     setDst([]);
   };
-  const removeRule = (id: any) => setRules((r: any) => r.filter((x: any) => x.id !== id));
+  const removeRule = (id: any) => {
+    setRules((r: any) => r.filter((x: any) => x.id !== id));
+    onRemove?.(id);
+  };
 
   const policy = JSON.stringify({
     tagOwners: Object.fromEntries(allTags.map((t: any) => [`tag:${t}`, ["you@finch"]])),
