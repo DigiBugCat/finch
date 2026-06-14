@@ -138,11 +138,10 @@ async function verifyEnvelope<T extends { exp: number }>(
     return null;
   }
 
+  // crypto.subtle.verify is constant-time — no need to re-sign + manual compare.
   const key = await hmacKey(secret);
-  const expected = new Uint8Array(
-    await crypto.subtle.sign("HMAC", key, enc.encode(body)),
-  );
-  if (!timingSafeEqual(sigBytes, expected)) return null;
+  const ok = await crypto.subtle.verify("HMAC", key, sigBytes, enc.encode(body));
+  if (!ok) return null;
 
   let parsed: unknown;
   try {
