@@ -1,6 +1,6 @@
 // POST /api/finch/appliances/:id/:action -> hub POST /api/appliances/:id/:action
 // action ∈ { release, approve, decline }
-import { errorResponse, hubProxy, HttpError } from "@/lib/hub";
+import { errorResponse, hubProxy, HttpError, requireAdmin } from "@/lib/hub";
 
 const ACTIONS = new Set(["release", "approve", "decline"]);
 
@@ -9,6 +9,7 @@ export async function POST(
   { params }: { params: Promise<{ id: string; action: string }> },
 ) {
   try {
+    await requireAdmin();
     const { id, action } = await params;
     if (!ACTIONS.has(action)) {
       throw new HttpError(404, `unknown appliance action: ${action}`);

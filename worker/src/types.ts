@@ -187,7 +187,10 @@ export interface JoinResp {
   appliance: string;
   machine: string;
   connectUrl: string; // wss URL to open the relay WebSocket
-  fleetSecret?: string;
+  // Short-lived (~120s) per-machine HMAC grant the agent MUST present on the
+  // _connect dial as ?ct=<connectToken>. The hub verifies it (kind+tenant+
+  // appliance+machine match, not expired) BEFORE forwarding the WS upgrade.
+  connectToken: string;
 }
 
 export interface MintKeyReq {

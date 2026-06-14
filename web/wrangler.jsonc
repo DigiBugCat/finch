@@ -8,16 +8,47 @@
     "directory": ".open-next/assets",
     "binding": "ASSETS"
   },
-  "services": [
-    { "binding": "WORKER_SELF_REFERENCE", "service": "finch-web" }
-  ],
-  "vars": {
-    // Non-secret default; override per-environment. The hub base the API
-    // bridge proxies to. FINCH_SERVICE_SECRET is a SECRET — set it via
-    // `wrangler secret put FINCH_SERVICE_SECRET` (and .dev.vars locally),
-    // never here.
-    "HUB_URL": "http://localhost:8787"
+  // Distinct worker names per env (finch-web-dev / finch-web-prod) so deploys
+  // are isolated. Each env's WORKER_SELF_REFERENCE must point at its OWN name,
+  // and FINCH_HUB binds to the matching hub worker (finch-dev / finch-prod) so
+  // the web→hub trust call rides a service binding, not the public wire.
+  // FINCH_SERVICE_SECRET + CLERK_SECRET_KEY are SECRETS — set via
+  // `wrangler secret put … --env <env>`, never here.
+  "env": {
+    // ---- dev: workers.dev, local/dev hub ----
+    "dev": {
+      "name": "finch-web-dev",
+      "workers_dev": true,
+      "services": [
+        { "binding": "WORKER_SELF_REFERENCE", "service": "finch-web-dev" },
+        { "binding": "FINCH_HUB", "service": "finch-dev" }
+      ],
+      "vars": {
+        "HUB_URL": "http://localhost:8787"
+      }
+    },
+
+    // ---- production: apex route, no workers.dev, prod hub ----
+    "production": {
+      "name": "finch-web-prod",
+      "workers_dev": false,
+      "services": [
+        { "binding": "WORKER_SELF_REFERENCE", "service": "finch-web-prod" },
+        { "binding": "FINCH_HUB", "service": "finch-prod" }
+      ],
+      // HUB_URL is the public-fetch fallback; unused once the FINCH_HUB service
+      // binding is the path web→hub takes.
+      "vars": {
+        "HUB_URL": "https://finchmcp.com"
+      },
+      "routes": [
+        { "pattern": "finchmcp.com/*", "zone_name": "finchmcp.com" }
+      ]
+    }
   }
-  // Clerk secret + any other runtime vars come from .dev.vars locally and
-  // `wrangler secret put` (or the dashboard) in production.
+  // Secrets per env:
+  //   wrangler secret put CLERK_SECRET_KEY      --env production   (sk_live_…)
+  //   wrangler secret put FINCH_SERVICE_SECRET  --env production   (== hub's)
+  // Build-time: NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=pk_live_… (CI build env)
+  // Deploy: opennextjs-cloudflare build && opennextjs-cloudflare deploy -- --env production
 }

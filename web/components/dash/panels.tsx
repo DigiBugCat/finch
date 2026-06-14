@@ -2,21 +2,6 @@
 // Roost — Enroll, Keys, Activity panels.
 import { useState } from 'react';
 import { Button, Card, CopyChip, DuskInput, InlineConfirm, MaskedSecret, SectionLabel } from '@/components/dash/primitives';
-import { ROOST_DATA } from '@/components/dash/data';
-
-// Deterministic, SSR-safe hex generator. Seeded from `seed` so output is stable
-// across renders/server+client while still looking random. Small LCG over the
-// hex alphabet — `n` hex chars out.
-function randHex(n: number, seed: number = 0) {
-  const c = "0123456789abcdef";
-  let s = "";
-  let state = (seed ^ 0x9e3779b9) >>> 0;
-  for (let i = 0; i < n; i++) {
-    state = (state * 1664525 + 1013904223) >>> 0;
-    s += c[(state >>> 24) & 15];
-  }
-  return s;
-}
 
 const PLATS = [
   ["macos", "macOS", "🍎"],
@@ -25,26 +10,30 @@ const PLATS = [
   ["docker", "Docker", "🐳"],
   ["windows", "Windows", "🪟"],
 ];
-function installFor(plat: any, host: any, id: any, ticket: any) {
-  if (plat === "windows")
-    return `iwr -useb https://${host}/install.ps1 | iex\nfinch join --id ${id} --ticket ${ticket}`;
-  if (plat === "docker")
-    return `docker run -d --name finch-${id} \\\n  -e FINCH_TICKET=${ticket} \\\n  finch/agent:latest join --id ${id}`;
-  return `curl -fsSL https://${host}/install | sh\nfinch join --id ${id} --ticket ${ticket}`;
-}
 
-// helper: derive a stable numeric seed from a string id
-function seedFromStr(str: string) {
-  let h = 5381;
-  for (let i = 0; i < str.length; i++) h = ((h << 5) + h + str.charCodeAt(i)) >>> 0;
-  return h;
+// Per-platform install command, built from the hub's REAL signed ticket. The
+// hub already returns the canonical curl|sh command (resp.install) for the
+// posix path; the other platforms reuse the same ticket — only the fetch/run
+// wrapper differs. We never fabricate a ticket client-side.
+function installFor(plat: any, host: any, install: string, ticket: string) {
+  const scheme = host && (host.startsWith("localhost") || host.startsWith("127.0.0.1")) ? "http" : "https";
+  if (plat === "windows")
+    return `iwr -useb ${scheme}://${host}/install.ps1 | iex; finch join --ticket ${ticket}`;
+  if (plat === "docker")
+    return `docker run -d --name finch-agent \\\n  -e FINCH_TICKET=${ticket} \\\n  finch/agent:latest`;
+  // macOS / Debian / Pi all use the canonical posix one-liner the hub minted.
+  return install;
 }
 
 // ============ ENROLL ==============================================
+// Renders the hub's REAL enroll response. `onEnrolled(id, group)` POSTs to the
+// hub and resolves to the EnrollResp ({ id, ticket, url, install, expiresAt }).
+// We render that verbatim — no client-side ticket fabrication.
 export function EnrollView({ host, existingIds, groups, onEnrolled, onWatch }: any) {
   const [id, setId] = useState("");
   const [phase, setPhase] = useState("idle"); // idle | minting | minted
-  const [ticket, setTicket] = useState("");
+  const [enrolled, setEnrolled] = useState<any>(null); // EnrollResp from the hub
+  const [mintErr, setMintErr] = useState("");
   const [plat, setPlat] = useState("macos");
   const [group, setGroup] = useState((groups && groups[0]) || "Home lab");
 
@@ -57,17 +46,26 @@ export function EnrollView({ host, existingIds, groups, onEnrolled, onWatch }: a
   }
   const canMint = clean && !error && phase !== "minting";
 
-  const mint = () => {
+  const mint = async () => {
     if (!canMint) return;
     setPhase("minting");
-    setTimeout(() => {
-      setTicket(`tk_${randHex(24, seedFromStr(clean))}`);
+    setMintErr("");
+    // onEnrolled creates the appliance server-side and returns the hub's real
+    // EnrollResp (or null on failure). Render the ticket/install it gives back.
+    const resp = await onEnrolled(clean, group);
+    if (resp && resp.ticket) {
+      setEnrolled(resp);
       setPhase("minted");
-      onEnrolled(clean, group); // adds an 'invited' appliance to the roost
-    }, 900);
+    } else {
+      setPhase("idle");
+      setMintErr("couldn't mint a ticket — try again");
+    }
   };
 
-  const command = installFor(plat, host, clean, ticket);
+  const ticket: string = enrolled?.ticket ?? "";
+  const baseInstall: string = enrolled?.install ?? "";
+  const enrolledId: string = enrolled?.id ?? clean;
+  const command = installFor(plat, host, baseInstall, ticket);
 
   return (
     <div className="view view-narrow">
@@ -77,15 +75,16 @@ export function EnrollView({ host, existingIds, groups, onEnrolled, onWatch }: a
       <Card className="enroll-card">
         <SectionLabel hint="lowercase · digits · dashes · ≤40">appliance id</SectionLabel>
         <div className="enroll-input-row">
-          <DuskInput value={id} onChange={(v: any) => { setId(v); if (phase === "minted") setPhase("idle"); }}
+          <DuskInput value={id} onChange={(v: any) => { setId(v); if (phase === "minted") { setPhase("idle"); setEnrolled(null); } }}
             placeholder="calendar-sync" prefix={`${host}/`} error={!!error} autoFocus />
           <Button kind="accent" onClick={mint} disabled={!canMint}>
             {phase === "minting" ? "minting…" : phase === "minted" ? "mint another" : "Mint ticket"}
           </Button>
         </div>
         {error && <div className="field-err">⚠ {error}</div>}
+        {mintErr && <div className="field-err">⚠ {mintErr}</div>}
         {clean && !error && (
-          <div className="enroll-preview mono dim">→ {`https://${host}/${clean}/mcp`}</div>
+          <div className="enroll-preview mono dim">→ {enrolled?.url ?? `https://${host}/${clean}/mcp`}</div>
         )}
         <div className="enroll-group">
           <span className="dim" style={{ fontSize: 13, fontWeight: 700 }}>group</span>
@@ -95,7 +94,7 @@ export function EnrollView({ host, existingIds, groups, onEnrolled, onWatch }: a
         </div>
       </Card>
 
-      {phase === "minted" && (
+      {phase === "minted" && enrolled && (
         <Card className="ticket-card">
           <SectionLabel hint="pick the box's platform — the same ticket works on any">one paste, and it's live</SectionLabel>
           <div className="plat-tabs">
@@ -110,13 +109,13 @@ export function EnrollView({ host, existingIds, groups, onEnrolled, onWatch }: a
             <CopyChip value={command} className="command-copy" />
           </div>
           <div className="ticket-foot">
-            <MaskedSecret value={ticket} prefix="tk_" note={null} />
-            <span className="ticket-msg">🎟 one-time ticket — <b className="mono">{clean}</b> has one hour to fly home.</span>
+            <MaskedSecret value={ticket} note={null} />
+            <span className="ticket-msg">🎟 one-time ticket — <b className="mono">{enrolledId}</b> has one hour to fly home.</span>
           </div>
           <div className="listening">
             <span className="listening-pulse" />
             <div style={{ flex: 1, minWidth: 0 }}>
-              <div style={{ fontWeight: 700 }}>Listening for <b className="mono own-you">{clean}</b> to phone home<span className="dots">…</span></div>
+              <div style={{ fontWeight: 700 }}>Listening for <b className="mono own-you">{enrolledId}</b> to phone home<span className="dots">…</span></div>
               <div className="dim" style={{ fontSize: 12.5 }}>Run the command on the box — it appears here the moment it connects.</div>
             </div>
             <Button kind="ghost" onClick={onWatch}>Watch it fly home →</Button>
@@ -128,20 +127,31 @@ export function EnrollView({ host, existingIds, groups, onEnrolled, onWatch }: a
 }
 
 // ============ KEYS ================================================
-export function KeysView({ keys, onMint, onRevoke }: any) {
+// The ONLY finch_ key-minting surface. `onMint({label, owner})` POSTs to the
+// hub and resolves to the MintKeyResp ({ key, label, scope }) — the plaintext
+// finch_ key is shown ONCE here and never again. `onRevoke(key)` revokes by the
+// key's stable id (not its mutable label). `users` are the real Clerk members.
+export function KeysView({ keys, users, onMint, onRevoke }: any) {
   const [label, setLabel] = useState("");
-  const [owner, setOwner] = useState("you");
-  const [revealed, setRevealed] = useState<any>(null); // {label, value}
+  // Default the owner to the signed-in user (first member is the owner row).
+  const ownerOptions: string[] = (users || []).map((u: any) => u.name).filter(Boolean);
+  const [owner, setOwner] = useState(ownerOptions[0] || "you");
+  const [revealed, setRevealed] = useState<any>(null); // { label, value }
+  const [busy, setBusy] = useState(false);
 
   const clean = label.trim().toLowerCase().replace(/\s+/g, "-");
-  const canMint = clean && /^[a-z0-9-]+$/.test(clean);
+  const canMint = !!clean && /^[a-z0-9-]+$/.test(clean) && !busy;
 
-  const mint = () => {
+  const mint = async () => {
     if (!canMint) return;
-    const value = `rk_live_${randHex(22, seedFromStr(clean))}`;
-    onMint({ label: clean, owner, value });
-    setRevealed({ label: clean, value, owner });
-    setLabel("");
+    setBusy(true);
+    // The hub mints the real finch_ key; reveal the returned plaintext once.
+    const resp = await onMint({ label: clean, owner });
+    setBusy(false);
+    if (resp && resp.key) {
+      setRevealed({ label: resp.label ?? clean, value: resp.key });
+      setLabel("");
+    }
   };
 
   return (
@@ -157,9 +167,9 @@ export function KeysView({ keys, onMint, onRevoke }: any) {
       {revealed && (
         <Card className="reveal-card">
           <SectionLabel hint="you won't see this again">key minted · <b className="mono">{revealed.label}</b></SectionLabel>
-          <MaskedSecret value={revealed.value} prefix="rk_live_" />
+          <MaskedSecret value={revealed.value} />
           <div className="reveal-hand mono">
-            on their machine: <span className="reveal-cmd">roost enroll {ROOST_DATA.HOST} {revealed.value.slice(0, 14)}…</span>
+            give this to the caller as <span className="reveal-cmd">Authorization: Bearer {revealed.value.slice(0, 12)}…</span>
           </div>
           <Button kind="ghost" onClick={() => setRevealed(null)}>done, I copied it</Button>
         </Card>
@@ -170,13 +180,15 @@ export function KeysView({ keys, onMint, onRevoke }: any) {
         <SectionLabel>mint a key</SectionLabel>
         <div className="mintkey-row">
           <DuskInput value={label} onChange={setLabel} placeholder="laptop-name" mono />
-          <div className="owner-pick">
-            <span className="dim">owner</span>
-            {["you", "priya", "sam"].map((o) => (
-              <button key={o} className={`owner-btn ${owner === o ? "owner-on" : ""}`} onClick={() => setOwner(o)}>{o}</button>
-            ))}
-          </div>
-          <Button kind="accent" onClick={mint} disabled={!canMint}>Mint key</Button>
+          {ownerOptions.length > 0 && (
+            <div className="owner-pick">
+              <span className="dim">owner</span>
+              {ownerOptions.map((o) => (
+                <button key={o} className={`owner-btn ${owner === o ? "owner-on" : ""}`} onClick={() => setOwner(o)}>{o}</button>
+              ))}
+            </div>
+          )}
+          <Button kind="accent" onClick={mint} disabled={!canMint}>{busy ? "minting…" : "Mint key"}</Button>
         </div>
       </Card>
 
@@ -190,14 +202,17 @@ export function KeysView({ keys, onMint, onRevoke }: any) {
           <span className="k-created">created</span>
           <span className="k-act"></span>
         </div>
+        {keys.length === 0 && (
+          <div className="krow"><span className="dim" style={{ padding: "8px 0" }}>No keys yet — mint one above.</span></div>
+        )}
         {keys.map((k: any) => (
           <div key={k.id} className="krow">
             <span className="k-label mono">🔑 {k.label}</span>
             <span className="k-owner mono"><span className={k.owner === "you" ? "own-you" : "own-other"}>{k.owner}</span></span>
             <span className="k-scope mono dim">{k.scope}</span>
-            <span className="k-val mono dim">{`rk_live_••••${k.value.slice(-4)}`}</span>
+            <span className="k-val mono dim">{`finch_••••${k.last4}`}</span>
             <span className="k-created mono dim">{k.created}</span>
-            <span className="k-act"><InlineConfirm prompt="revoke?" trigger="revoke" onConfirm={() => onRevoke(k.id)} /></span>
+            <span className="k-act"><InlineConfirm prompt="revoke?" trigger="revoke" onConfirm={() => onRevoke(k)} /></span>
           </div>
         ))}
       </Card>

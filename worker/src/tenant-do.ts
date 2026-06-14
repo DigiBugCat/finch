@@ -21,6 +21,7 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./index";
 import { genFinchKey, hashKey, last4 } from "./auth";
+import { routerRegister } from "./router-do";
 import {
   type TenantState,
   type Appliance,
@@ -153,7 +154,11 @@ export class TenantDO extends DurableObject<Env> {
     return this.fresh();
   }
 
-  /** A brand-new tenant: empty roost, default settings, no mock seed data. */
+  /** A brand-new tenant: empty roost, default settings, no mock seed data.
+   *  Seeds ONE locked owner rule (`user:you` may reach `all`) so the tenant
+   *  owner's keys pass the default-deny ACL gate out of the box; everyone else
+   *  is denied until an explicit allow rule is added. The rule is `locked` so it
+   *  can't be removed via removeAcl (the owner can never lock themselves out). */
   private fresh(): StoredState {
     const id = this.ctx.id.name ?? "";
     return {
@@ -161,7 +166,15 @@ export class TenantDO extends DurableObject<Env> {
       appliances: [],
       keys: [],
       groups: [],
-      acl: [],
+      acl: [
+        {
+          id: "r_owner",
+          src: { type: "user", name: "you" },
+          dst: [{ type: "all" }],
+          action: "allow",
+          locked: true,
+        },
+      ],
       logs: [],
       settings: {
         org: id,
@@ -306,6 +319,39 @@ export class TenantDO extends DurableObject<Env> {
     return base || "appliance";
   }
 
+  /** This DO is keyed by the REAL tenant id (Clerk org/user id). */
+  private tenantId(): string {
+    return this.ctx.id.name ?? "";
+  }
+
+  /** A host-safe default subdomain slug for this tenant, derived from its id.
+   *  Used at first enroll when the tenant hasn't picked a custom subdomain. */
+  private defaultSubdomain(): string {
+    const id = this.tenantId();
+    const base = id
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "");
+    return base || "tenant";
+  }
+
+  /** Register slug→tenantId in the singleton RouterDO so the relay plane can
+   *  resolve <slug>.finchmcp.com to this tenant. Idempotent for the same pair;
+   *  a slug already owned by another tenant is left untouched (collision). The
+   *  DO reaches the router via env.ROUTER. Best-effort: never throws into a
+   *  mutation. Returns whether the mapping is (now) owned by this tenant. */
+  private async registerSlug(slug: string): Promise<boolean> {
+    const s = (slug || "").trim().toLowerCase();
+    const tenant = this.tenantId();
+    if (!s || !tenant) return false;
+    try {
+      const res = await routerRegister(this.env, s, tenant);
+      return res.ok;
+    } catch {
+      return false;
+    }
+  }
+
   private emptyConn() {
     return {
       relay: "—",
@@ -371,6 +417,18 @@ export class TenantDO extends DurableObject<Env> {
     s.appliances.push(this.newAppliance(id, name, g));
     if (g && !s.groups.some((gr) => gr.name === g)) {
       s.groups.push({ name: g, members: ["you"] });
+    }
+    // First enroll for a tenant that hasn't chosen a subdomain: claim a default
+    // slug (derived from the tenant id) and register it in the RouterDO so the
+    // public relay URL resolves. Best-effort; if the default slug collides with
+    // another tenant we leave the subdomain blank (the tenant can pick one).
+    if (!s.settings.subdomain) {
+      const slug = this.defaultSubdomain();
+      const claimed = await this.registerSlug(slug);
+      if (claimed) {
+        s.settings.subdomain = slug;
+        s.host = `${slug}.finchmcp.com`;
+      }
     }
     this.log(s, {
       cat: "device",
@@ -571,14 +629,45 @@ export class TenantDO extends DurableObject<Env> {
   private async updateSetting(
     key: string,
     val: unknown,
-  ): Promise<{ ok: boolean }> {
+  ): Promise<{ ok: boolean; error?: string }> {
     const s = await this.load();
     if (!(key in s.settings)) return { ok: false };
-    (s.settings as any)[key] = val;
-    // Subdomain drives the public host.
-    if (key === "subdomain" && typeof val === "string" && val) {
-      s.host = `${val}.finchmcp.com`;
+
+    // Subdomain drives the public host AND the relay-plane slug→tenant mapping.
+    // Register the slug in the RouterDO first and REJECT collisions (a slug
+    // already owned by another tenant) before persisting — otherwise the host
+    // would advertise a subdomain that resolves to someone else's tenant.
+    if (key === "subdomain") {
+      const slug =
+        typeof val === "string" ? val.trim().toLowerCase() : "";
+      if (slug) {
+        let res: { ok: boolean; reason?: string; owner?: string };
+        try {
+          res = await routerRegister(this.env, slug, this.tenantId());
+        } catch {
+          res = { ok: false, reason: "router-unavailable" };
+        }
+        if (!res.ok) {
+          return {
+            ok: false,
+            error:
+              res.reason === "collision"
+                ? "subdomain already taken"
+                : "could not register subdomain",
+          };
+        }
+        s.settings.subdomain = slug;
+        s.host = `${slug}.finchmcp.com`;
+      } else {
+        // Clearing the subdomain: leave any prior RouterDO mapping in place
+        // (slugs are not recycled) but drop the public host.
+        s.settings.subdomain = "";
+        s.host = "";
+      }
+    } else {
+      (s.settings as any)[key] = val;
     }
+
     this.log(s, {
       cat: "admin",
       actor: "you",
@@ -766,22 +855,37 @@ export class TenantDO extends DurableObject<Env> {
     return { ok: true };
   }
 
-  // ---- key check (MCP router) --------------------------------------------
+  // ---- key check + ACL evaluation (MCP router) ---------------------------
 
   /** Given the sha-256 hash of a presented finch_ key and the target appliance,
-   *  decide if the call is allowed. A key is allowed when its scope is "all
-   *  appliances" or lists the appliance id. Returns the key's label for logging
-   *  / attribution. (ACL group/tag policy is layered on top by the router; this
-   *  is the key-existence + scope gate.) */
+   *  decide if the call is allowed. TWO gates, BOTH must pass (default-deny):
+   *
+   *   1. KEY SCOPE — the key's scope must be "all appliances"/"*" or list the
+   *      appliance id (the existing per-key coarse gate, kept as a floor).
+   *   2. ACL — the tenant's acl rules must contain at least one `allow` rule
+   *      whose src matches this key's identity (key label/id, the key owner as a
+   *      user, or a group the owner/key belongs to) AND whose dst matches the
+   *      target appliance (by appliance id, one of its tags, its group, or
+   *      `all`). An owner/admin "allow all" rule is honored. No matching allow
+   *      rule → denied. This is the "enforced at the door" promise made real.
+   *
+   *  Returns the key's label for logging / attribution and a `reason` for the
+   *  denial (so the relay can return a precise 403). */
   private async checkKey(
     hash: string,
     appliance: string,
-  ): Promise<{ allowed: boolean; keyLabel: string }> {
+  ): Promise<{
+    allowed: boolean;
+    keyLabel: string;
+    reason?: "no-key" | "scope" | "acl";
+  }> {
     const s = await this.load();
     const key = s.keys.find((k) => k.hash === hash);
-    if (!key) return { allowed: false, keyLabel: "" };
+    if (!key) return { allowed: false, keyLabel: "", reason: "no-key" };
+
+    // Gate 1: key scope (coarse floor).
     const scope = (key.scope || "").trim().toLowerCase();
-    const allowed =
+    const scopeOk =
       scope === "all appliances" ||
       scope === "all" ||
       scope === "*" ||
@@ -789,7 +893,94 @@ export class TenantDO extends DurableObject<Env> {
         .split(",")
         .map((x) => x.trim())
         .includes(appliance.toLowerCase());
-    return { allowed, keyLabel: key.label };
+    if (!scopeOk) {
+      return { allowed: false, keyLabel: key.label, reason: "scope" };
+    }
+
+    // Gate 2: ACL evaluation (default-deny).
+    const aclOk = this.evalAccess(s, key, appliance);
+    if (!aclOk) {
+      return { allowed: false, keyLabel: key.label, reason: "acl" };
+    }
+
+    return { allowed: true, keyLabel: key.label };
+  }
+
+  /** Evaluate the tenant's ACL rules for a key reaching an appliance.
+   *  Default-deny: returns true iff at least one `allow` rule's src matches the
+   *  key's identity AND its dst matches the target appliance. */
+  private evalAccess(s: StoredState, key: Key, appliance: string): boolean {
+    const ap = this.findAppliance(s, appliance);
+    if (!ap) return false;
+
+    // The identities this key presents as a rule SOURCE.
+    const ident = this.keyIdentities(s, key);
+
+    // The descriptors this appliance matches as a rule DESTINATION.
+    const apTags = new Set((ap.tags || []).map((t) => t.toLowerCase()));
+    const apGroup = (ap.group || "").toLowerCase();
+    const apId = (ap.id || "").toLowerCase();
+
+    for (const rule of s.acl) {
+      if (rule.action !== "allow") continue;
+      if (!this.srcMatches(rule.src, ident)) continue;
+      const dsts = Array.isArray(rule.dst) ? rule.dst : [rule.dst];
+      for (const d of dsts) {
+        if (d.type === "all") return true;
+        const dn = (d.name || "").toLowerCase();
+        if (d.type === "appliance" && dn === apId) return true;
+        if (d.type === "tag" && apTags.has(dn)) return true;
+        if (d.type === "group" && dn === apGroup) return true;
+      }
+    }
+    return false;
+  }
+
+  /** The set of ACL src identities a key presents: itself (as a key, by label
+   *  AND id), its owner (as a user), and any groups the owner/key-label belong
+   *  to. Lowercased for case-insensitive matching. */
+  private keyIdentities(
+    s: StoredState,
+    key: Key,
+  ): { keys: Set<string>; users: Set<string>; groups: Set<string> } {
+    const keys = new Set<string>();
+    if (key.label) keys.add(key.label.toLowerCase());
+    if (key.id) keys.add(key.id.toLowerCase());
+
+    const users = new Set<string>();
+    if (key.owner) users.add(key.owner.toLowerCase());
+
+    const groups = new Set<string>();
+    for (const g of s.groups || []) {
+      const members = (g.members || []).map((m) => m.toLowerCase());
+      if (
+        (key.owner && members.includes(key.owner.toLowerCase())) ||
+        (key.label && members.includes(key.label.toLowerCase()))
+      ) {
+        groups.add((g.name || "").toLowerCase());
+      }
+    }
+    return { keys, users, groups };
+  }
+
+  /** Does a rule's src entity match one of the key's identities? */
+  private srcMatches(
+    src: AclEntity,
+    ident: { keys: Set<string>; users: Set<string>; groups: Set<string> },
+  ): boolean {
+    const n = (src.name || "").toLowerCase();
+    switch (src.type) {
+      case "all":
+        return true;
+      case "key":
+        return ident.keys.has(n);
+      case "user":
+        return ident.users.has(n);
+      case "group":
+        return ident.groups.has(n);
+      default:
+        return false;
+    }
   }
 }
 

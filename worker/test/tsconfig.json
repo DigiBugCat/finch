@@ -1,0 +1,16 @@
+{
+  // Type-checking config for the vitest test suite. The root tsconfig only
+  // includes `src` (so `npm run typecheck` stays scoped to shipping code). This
+  // one adds the @cloudflare/vitest-pool-workers test types so the virtual
+  // `cloudflare:test` module (env, runInDurableObject, …) and the worker types
+  // resolve in the test files. Run with: tsc -p test --noEmit.
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": [
+      "@cloudflare/workers-types",
+      "@cloudflare/vitest-pool-workers"
+    ]
+  },
+  "include": ["**/*.ts", "../src"]
+}

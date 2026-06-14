@@ -71,6 +71,19 @@ export class ApplianceDO extends DurableObject<Env> {
         appliance: url.searchParams.get("appliance") ?? "",
         machine: url.searchParams.get("machine") ?? "",
       };
+      // SINGLE-AGENT: a machine has exactly one live agent socket. Evict any
+      // prior "agent" sockets before accepting the new one (last-writer-wins) so
+      // a reconnect — or a would-be second claimant — can't leave two sockets
+      // racing in getWebSockets("agent")[0]. Close code 1012 ("superseded") is
+      // recognized by webSocketClose, which then skips markMachine(false) so the
+      // freshly-accepted socket's liveness doesn't flap offline.
+      for (const old of this.ctx.getWebSockets("agent")) {
+        try {
+          old.close(1012, "superseded");
+        } catch {
+          /* already closing */
+        }
+      }
       const { 0: client, 1: server } = new WebSocketPair();
       // Hibernation-aware accept; tag it so getWebSockets("agent") finds it.
       this.ctx.acceptWebSocket(server, ["agent"]);
@@ -152,8 +165,11 @@ export class ApplianceDO extends DurableObject<Env> {
   }
 
   async webSocketClose(ws: WebSocket, code: number, reason: string) {
+    // Code 1012 means we superseded this socket with a fresh agent connection
+    // (single-agent eviction above). The newer socket is the live one, so do NOT
+    // mark the machine offline — that would flap a connected machine to offline.
     const meta = ws.deserializeAttachment() as SockMeta | null;
-    if (meta) await this.markMachine(meta, false);
+    if (meta && code !== 1012) await this.markMachine(meta, false);
     try {
       ws.close(code, reason);
     } catch {

@@ -1,0 +1,23 @@
+# Finch web (dashboard) — local dev vars TEMPLATE.
+#
+# Copy to `.dev.vars` (gitignored) and fill with THROWAWAY dev values.
+# `next dev` / `opennextjs-cloudflare preview` read `.dev.vars` locally.
+# Prod uses a SEPARATE Clerk instance (pk_live/sk_live) and per-env secrets
+# set via `wrangler secret put <NAME> --env production`.
+
+NEXTJS_ENV=development
+
+# Clerk routing (non-secret).
+NEXT_PUBLIC_CLERK_SIGN_IN_URL=/sign-in
+NEXT_PUBLIC_CLERK_SIGN_UP_URL=/sign-up
+NEXT_PUBLIC_CLERK_SIGN_IN_FALLBACK_REDIRECT_URL=/
+NEXT_PUBLIC_CLERK_SIGN_UP_FALLBACK_REDIRECT_URL=/
+
+# Clerk DEV instance keys. Publishable is public; secret key is sensitive even
+# in dev — use your own dev instance's values, never commit real ones.
+NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=pk_test_REPLACE_WITH_DEV_CLERK_PUBLISHABLE_KEY
+CLERK_SECRET_KEY=sk_test_REPLACE_WITH_DEV_CLERK_SECRET_KEY
+
+# Finch hub bridge — must match the hub worker (../worker/.dev.vars).
+HUB_URL=http://localhost:8787
+FINCH_SERVICE_SECRET="REPLACE_WITH_DEV_SERVICE_SECRET"

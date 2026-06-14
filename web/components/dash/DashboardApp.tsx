@@ -10,7 +10,7 @@ import { UserButton, useUser } from '@clerk/nextjs';
 import { HomeView } from './home';
 import { FleetView } from './overview';
 import { DetailView } from './fleet';
-import { EnrollView } from './panels';
+import { EnrollView, KeysView } from './panels';
 import { UsersView } from './users';
 import { AccessView } from './access';
 import { LogsView } from './logs';
@@ -83,21 +83,19 @@ export default function DashboardApp() {
     if (view === "detail") go("overview");
   };
 
-  const enrollDevice = (id: any, group: any) => {
+  // Returns the hub's real EnrollResp ({ id, ticket, url, install, expiresAt })
+  // so EnrollView renders the real ticket + install command (no fabrication).
+  const enrollDevice = async (id: any, group: any) => {
     // POST creates the 'invited' appliance server-side; it stays 'invited'
-    // until the agent joins (no fake setTimeout). refetch surfaces it.
-    void mutate(
+    // until the agent joins. refetch surfaces it.
+    const resp = await mutate(
       `/api/finch/enroll`,
       { method: "POST", body: JSON.stringify({ name: id, group }) },
       undefined,
       `couldn't enroll ${id}`,
-    ).then((resp) => {
-      if (resp?.install) {
-        // EnrollView renders its own command block; surface the real install
-        // string via a toast so it's never lost.
-        flash(`🎟 ${id} enrolled — install ready`);
-      }
-    });
+    );
+    if (resp?.ticket) flash(`🎟 ${id} enrolled — install ready`);
+    return resp;
   };
 
   const approveDevice = (id: any) =>
@@ -114,9 +112,23 @@ export default function DashboardApp() {
     void mutate(`/api/finch/appliances/${encodeURIComponent(id)}/tags`,
       { method: "PUT", body: JSON.stringify({ tags }) }, undefined, `couldn't update tags`);
 
+  // Per-machine key chip (appliance detail view): detach a key label from a box.
   const revokeMachineKey = (appId: any, machineName: any, key: any) =>
     void mutate(`/api/finch/keys/revoke`,
       { method: "POST", body: JSON.stringify({ machine: machineName, appliance: appId, key }) },
+      "🔑 key revoked", "couldn't revoke key");
+
+  // --- keys (the tenant-level Keys view) ---------------------------
+  // Mint a real finch_ key via the hub; returns the MintKeyResp so KeysView can
+  // reveal the plaintext once. Revoke by the key's stable id (not its label).
+  const mintKey = ({ label, owner }: any) =>
+    mutate(`/api/finch/keys`,
+      { method: "POST", body: JSON.stringify({ label, owner }) },
+      `🔑 key minted — ${label}`, `couldn't mint ${label}`);
+
+  const revokeKey = (k: any) =>
+    void mutate(`/api/finch/keys/revoke`,
+      { method: "POST", body: JSON.stringify({ id: k.id, label: k.label }) },
       "🔑 key revoked", "couldn't revoke key");
 
   // --- user actions (Clerk-backed via the bridge) ------------------
@@ -151,8 +163,8 @@ export default function DashboardApp() {
   const online = appliances.filter((a: any) => isOnline(a.state)).length;
 
   const nav = [
-    ["overview", "Fleet"], ["home", "Observability"], ["users", "Users"],
-    ["access", "Access"], ["logs", "Logs"], ["settings", "Settings"],
+    ["overview", "Fleet"], ["home", "Observability"], ["keys", "Keys"],
+    ["users", "Users"], ["access", "Access"], ["logs", "Logs"], ["settings", "Settings"],
   ];
 
   // ----- loading / error gate --------------------------------------
@@ -218,18 +230,21 @@ export default function DashboardApp() {
             {view === "enroll" && (
               <EnrollView host={host} existingIds={appliances.map((a: any) => a.id)} groups={groups.map((g: any) => g.name)} onEnrolled={enrollDevice} onWatch={() => go("overview")} />
             )}
+            {view === "keys" && (
+              <KeysView keys={keys} users={users} onMint={mintKey} onRevoke={revokeKey} />
+            )}
             {view === "users" && (
               <UsersView users={users} onInvite={inviteUser} onRole={setUserRole} onRemove={removeUser} />
             )}
             {view === "access" && (
-              <AccessView appliances={appliances} groups={groups} keys={keys} acl={acl}
+              <AccessView appliances={appliances} groups={groups} keys={keys} acl={acl} users={users}
                 onAdd={addAcl} onRemove={removeAcl} />
             )}
             {view === "logs" && (
               <LogsView logs={logs} />
             )}
             {view === "settings" && (
-              <SettingsView settings={settings} onChange={updateSetting} />
+              <SettingsView settings={settings} groups={groups} onChange={updateSetting} />
             )}
           </>
         )}

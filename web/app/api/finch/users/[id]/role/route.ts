@@ -1,9 +1,19 @@
 // POST /api/finch/users/:id/role {role} -> update a Clerk org membership's role.
-// Best-effort: 400 when there's no active org. `:id` is the Clerk user id.
-import { auth, clerkClient } from "@clerk/nextjs/server";
+// Admin-only. Requires an active org. `:id` is the Clerk user id.
+//
+// This route talks to the Clerk backend admin client directly (users live in
+// Clerk, not the hub), so it must enforce authorization itself — requireAdmin()
+// blocks members from self-promoting. It also refuses to demote the last
+// remaining admin/owner so a tenant can never be left with no admin.
+import { clerkClient } from "@clerk/nextjs/server";
+import { errorResponse, HttpError, requireAdmin } from "@/lib/hub";
 
 function clerkRole(role: string | undefined): "org:admin" | "org:member" {
   return role === "Admin" || role === "org:admin" ? "org:admin" : "org:member";
+}
+
+function isAdminRole(role: string | null | undefined): boolean {
+  return role === "org:admin" || role === "admin";
 }
 
 export async function POST(
@@ -11,28 +21,36 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> },
 ) {
   try {
-    const { userId, orgId } = await auth();
-    if (!userId) {
-      return Response.json({ error: "unauthenticated" }, { status: 401 });
-    }
+    const { orgId } = await requireAdmin();
     if (!orgId) {
-      return Response.json(
-        { error: "an active organization is required" },
-        { status: 400 },
-      );
+      throw new HttpError(400, "an active organization is required");
     }
     const { id } = await params;
-    const body = await req.json().catch(() => ({}));
+    const body = (await req.json().catch(() => ({}))) as { role?: string };
+    const nextRole = clerkRole(body?.role);
 
     const clerk = await clerkClient();
+
+    // Guard: don't let the last admin/owner be demoted to member.
+    if (nextRole === "org:member") {
+      const list = await clerk.organizations.getOrganizationMembershipList({
+        organizationId: orgId,
+        limit: 100,
+      });
+      const admins = list.data.filter((m) => isAdminRole(m.role));
+      const targetIsAdmin = admins.some((m) => m.publicUserData?.userId === id);
+      if (targetIsAdmin && admins.length <= 1) {
+        throw new HttpError(400, "can't demote the last admin");
+      }
+    }
+
     await clerk.organizations.updateOrganizationMembership({
       organizationId: orgId,
       userId: id,
-      role: clerkRole(body?.role),
+      role: nextRole,
     });
     return Response.json({ ok: true }, { status: 200 });
   } catch (err) {
-    const message = err instanceof Error ? err.message : "update failed";
-    return Response.json({ error: message }, { status: 400 });
+    return errorResponse(err);
   }
 }

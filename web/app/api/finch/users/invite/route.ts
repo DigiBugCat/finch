@@ -1,7 +1,9 @@
 // POST /api/finch/users/invite {email,role} -> Clerk org invitation.
-// Users live in Clerk, not the hub — so this talks to Clerk directly. Requires
-// an active org (you can't invite a teammate to a personal/no-org tenant).
-import { auth, clerkClient } from "@clerk/nextjs/server";
+// Admin-only. Users live in Clerk, not the hub — so this talks to Clerk
+// directly. Requires an active org (you can't invite a teammate to a
+// personal/no-org tenant). requireAdmin() blocks members from inviting outsiders.
+import { clerkClient } from "@clerk/nextjs/server";
+import { errorResponse, HttpError, requireAdmin } from "@/lib/hub";
 
 function clerkRole(role: string | undefined): "org:admin" | "org:member" {
   return role === "Admin" || role === "org:admin" ? "org:admin" : "org:member";
@@ -9,20 +11,20 @@ function clerkRole(role: string | undefined): "org:admin" | "org:member" {
 
 export async function POST(req: Request) {
   try {
-    const { userId, orgId } = await auth();
-    if (!userId) {
-      return Response.json({ error: "unauthenticated" }, { status: 401 });
-    }
+    const { orgId, userId } = await requireAdmin();
     if (!orgId) {
-      return Response.json(
-        { error: "an active organization is required to invite teammates" },
-        { status: 400 },
+      throw new HttpError(
+        400,
+        "an active organization is required to invite teammates",
       );
     }
-    const body = await req.json().catch(() => ({}));
+    const body = (await req.json().catch(() => ({}))) as {
+      email?: string;
+      role?: string;
+    };
     const email = (body?.email ?? "").trim();
     if (!email) {
-      return Response.json({ error: "email required" }, { status: 400 });
+      throw new HttpError(400, "email required");
     }
 
     const clerk = await clerkClient();
@@ -36,7 +38,6 @@ export async function POST(req: Request) {
 
     return Response.json({ ok: true, id: invitation.id }, { status: 200 });
   } catch (err) {
-    const message = err instanceof Error ? err.message : "invite failed";
-    return Response.json({ error: message }, { status: 400 });
+    return errorResponse(err);
   }
 }

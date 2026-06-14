@@ -75,6 +75,12 @@ export interface TicketPayload {
   tenant: string;
   appliance: string;
   exp: number; // epoch SECONDS; verifyToken rejects once Date.now()/1000 > exp
+  // `kind` distinguishes the two HMAC grants that share this signer:
+  //   - "join"    (or absent) — the long-ish enroll ticket presented at POST /join.
+  //   - "connect" — the short-lived (~120s) per-machine grant the agent presents
+  //                 on the /_connect WS dial (?ct=…). Bound to a single machine.
+  kind?: "join" | "connect";
+  machine?: string; // present (and verified) only for kind:"connect" tokens
 }
 
 async function hmacKey(secret: string): Promise<CryptoKey> {
@@ -142,7 +148,11 @@ export async function verifyToken(
     payload === null ||
     typeof payload.tenant !== "string" ||
     typeof payload.appliance !== "string" ||
-    typeof payload.exp !== "number"
+    typeof payload.exp !== "number" ||
+    (payload.kind !== undefined &&
+      payload.kind !== "join" &&
+      payload.kind !== "connect") ||
+    (payload.machine !== undefined && typeof payload.machine !== "string")
   ) {
     return null;
   }
@@ -166,4 +176,79 @@ export function serviceOk(
   const a = enc.encode(got);
   const b = enc.encode(env.FINCH_SERVICE_SECRET);
   return timingSafeEqual(a, b);
+}
+
+// ---- signed tenant assertion (web → hub) --------------------------------
+//
+// The web app no longer just NAMES the tenant in a raw, unsigned X-Finch-Tenant
+// header (which any holder of the shared service secret could forge for any
+// tenant). Instead it SIGNS a short-lived assertion {tenant,exp} with the shared
+// FINCH_SERVICE_SECRET; the hub verifies the HMAC + expiry and trusts THAT
+// tenant. A leaked-but-not-signing secret holder can't replay it for arbitrary
+// tenants, and the bound tenant is cryptographically tied to the request.
+//
+// Wire format mirrors the join ticket: base64url(JSON) "." base64url(HMAC). The
+// payload is intentionally minimal ({tenant,exp}) — distinct from TicketPayload.
+
+export interface TenantAssertion {
+  tenant: string;
+  exp: number; // epoch SECONDS
+}
+
+/** Sign a tenant assertion with the service secret. */
+export async function signAssertion(
+  payload: TenantAssertion,
+  secret: string,
+): Promise<string> {
+  const body = bytesToB64url(enc.encode(JSON.stringify(payload)));
+  const key = await hmacKey(secret);
+  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(body));
+  return body + "." + bytesToB64url(new Uint8Array(sig));
+}
+
+/**
+ * Verify a tenant assertion. Returns the tenant id, or null if the assertion is
+ * missing/malformed, the HMAC doesn't match, or it has expired. Constant-time
+ * signature compare; stateless.
+ */
+export async function verifyAssertion(
+  token: string,
+  secret: string,
+): Promise<string | null> {
+  if (!token || !secret) return null;
+  const dot = token.indexOf(".");
+  if (dot <= 0 || dot === token.length - 1) return null;
+  const body = token.slice(0, dot);
+  const sigPart = token.slice(dot + 1);
+
+  let sigBytes: Uint8Array;
+  try {
+    sigBytes = b64urlToBytes(sigPart);
+  } catch {
+    return null;
+  }
+
+  const key = await hmacKey(secret);
+  const expected = new Uint8Array(
+    await crypto.subtle.sign("HMAC", key, enc.encode(body)),
+  );
+  if (!timingSafeEqual(sigBytes, expected)) return null;
+
+  let payload: TenantAssertion;
+  try {
+    payload = JSON.parse(new TextDecoder().decode(b64urlToBytes(body)));
+  } catch {
+    return null;
+  }
+  if (
+    typeof payload !== "object" ||
+    payload === null ||
+    typeof payload.tenant !== "string" ||
+    !payload.tenant ||
+    typeof payload.exp !== "number"
+  ) {
+    return null;
+  }
+  if (Date.now() / 1000 > payload.exp) return null; // expired
+  return payload.tenant;
 }

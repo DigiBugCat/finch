@@ -12,7 +12,7 @@
 //     stateless join ticket it was handed at enroll). No service secret.
 
 import type { Env } from "./index";
-import { serviceOk, signToken, verifyToken } from "./auth";
+import { serviceOk, signToken, verifyToken, verifyAssertion } from "./auth";
 import type {
   EnrollResp,
   JoinResp,
@@ -22,6 +22,7 @@ import type {
 } from "./types";
 
 const TICKET_TTL_SECONDS = 60 * 60; // join tickets live 1h
+const CONNECT_TOKEN_TTL_SECONDS = 120; // per-machine _connect grants live 120s
 
 /** True if this path is handled by the control API (vs the MCP/relay plane). */
 export function isApiPath(path: string): boolean {
@@ -74,13 +75,23 @@ export async function handleApi(
     return handleJoin(req, env, host);
   }
 
-  // ---- Everything else under /api requires the service secret + tenant. ----
+  // ---- Everything else under /api requires the service secret + a SIGNED
+  //      tenant assertion. The shared service secret proves "a first-party web
+  //      worker is calling"; the assertion cryptographically binds WHICH tenant
+  //      this request acts as. We IGNORE any raw, unsigned X-Finch-Tenant — only
+  //      the HMAC-signed X-Finch-Auth {tenant,exp} is trusted (verified with the
+  //      same FINCH_SERVICE_SECRET). A leaked secret alone can't be replayed for
+  //      an arbitrary tenant without also forging the signature; an expired
+  //      assertion is rejected. ----
   if (!serviceOk(req, env)) {
     return json(401, { error: "bad or missing X-Finch-Service" });
   }
-  const tenant = req.headers.get("X-Finch-Tenant");
+  const assertion = req.headers.get("X-Finch-Auth") || "";
+  const tenant = await verifyAssertion(assertion, env.FINCH_SERVICE_SECRET);
   if (!tenant) {
-    return json(400, { error: "missing X-Finch-Tenant" });
+    return json(401, {
+      error: "missing, invalid, or expired tenant assertion (X-Finch-Auth)",
+    });
   }
 
   const parts = path.split("/").filter(Boolean); // ["api", ...]
@@ -197,6 +208,26 @@ export async function handleApi(
   return json(404, { error: "no such control route", path, method });
 }
 
+// Build operator-facing URLs from the tenant's RESOLVABLE host
+// (<slug>.finchmcp.com, registered in RouterDO) — NOT the inbound apex host,
+// which fails closed at the relay (slugFromHost("finchmcp.com") === ""). Local
+// dev keeps the reachable inbound host (localhost:8787) for convenience.
+async function tenantHostBase(
+  env: Env,
+  tenant: string,
+  inboundHost: string,
+): Promise<{ http: string; ws: string; host: string }> {
+  const local =
+    inboundHost.startsWith("localhost") || inboundHost.startsWith("127.");
+  let host = inboundHost;
+  if (!local) {
+    const state = await tenantOp<{ host?: string }>(env, tenant, "getState");
+    if (state?.host) host = state.host;
+  }
+  const s = local ? "" : "s";
+  return { http: `http${s}://${host}`, ws: `ws${s}://${host}`, host };
+}
+
 // ---- POST /api/enroll ------------------------------------------------------
 
 async function handleEnroll(
@@ -216,11 +247,9 @@ async function handleEnroll(
   const exp = Math.floor(Date.now() / 1000) + TICKET_TTL_SECONDS;
   const ticket = await signToken({ tenant, appliance: id, exp }, env.TICKET_SECRET);
 
-  const scheme = host.startsWith("localhost") || host.startsWith("127.0.0.1")
-    ? "http"
-    : "https";
-  const url = `${scheme}://${host}/${id}/mcp`;
-  const install = `curl -fsSL ${scheme}://${host}/install | sh && finch join --ticket ${ticket}`;
+  const base = await tenantHostBase(env, tenant, host);
+  const url = `${base.http}/${id}/mcp`;
+  const install = `curl -fsSL ${base.http}/install | sh && finch join --hub ${base.http} --ticket ${ticket}`;
 
   const resp: EnrollResp = {
     id,
@@ -259,12 +288,27 @@ async function handleJoin(
     version,
   });
 
-  const scheme = host.startsWith("localhost") || host.startsWith("127.0.0.1")
-    ? "ws"
-    : "wss";
-  const connectUrl = `${scheme}://${host}/${appliance}/${encodeURIComponent(
+  const base = await tenantHostBase(env, tenant, host);
+  const connectUrl = `${base.ws}/${appliance}/${encodeURIComponent(
     body.machine,
   )}/_connect`;
+
+  // Mint the short-lived per-machine connect-token. The agent presents it on the
+  // _connect dial as ?ct=<token>; index.ts verifies kind+tenant+appliance+machine
+  // and expiry BEFORE forwarding the WS upgrade to the relay DO. This is the sole
+  // proof that authenticates the box-side agent channel (FLEET_SECRET removed).
+  const connectExp =
+    Math.floor(Date.now() / 1000) + CONNECT_TOKEN_TTL_SECONDS;
+  const connectToken = await signToken(
+    {
+      tenant,
+      appliance,
+      machine: body.machine,
+      kind: "connect",
+      exp: connectExp,
+    },
+    env.TICKET_SECRET,
+  );
 
   const resp: JoinResp = {
     ok: true,
@@ -272,7 +316,7 @@ async function handleJoin(
     appliance,
     machine: body.machine,
     connectUrl,
-    fleetSecret: env.FLEET_SECRET,
+    connectToken,
   };
   return json(200, resp);
 }

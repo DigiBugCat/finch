@@ -1,6 +1,6 @@
 "use client";
 // Roost — Access: ACL rules (by tag / group / key) + generated raw policy.
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { Button, Card, CopyChip, EntityChip, InlineConfirm, SectionLabel } from '@/components/dash/primitives';
 
 function tokenSrc(s: any) {
@@ -16,19 +16,20 @@ function tokenDst(d: any) {
   return d.name; // appliance
 }
 
-export function AccessView({ appliances, groups, keys, acl, onAdd, onRemove }: any) {
-  const [rules, setRules] = useState(acl);
+export function AccessView({ appliances, groups, keys, acl, users, onAdd, onRemove }: any) {
   const [mode, setMode] = useState("rules"); // rules | policy
-  const [srcVal, setSrcVal] = useState("user:priya");
   const [dst, setDst] = useState<any[]>([]);
 
-  // Re-seed from live state whenever the parent refetches the ACL.
-  useEffect(() => { setRules(acl); }, [acl]);
-
   const allTags = [...new Set(appliances.flatMap((a: any) => a.tags || []))];
-  const users = ["you", "priya", "sam"];
+  // Real Clerk members (from /api/finch/state) — not a hardcoded phantom list.
+  const userNames: string[] = (users || []).map((u: any) => u.name).filter(Boolean);
   const keyNames = keys.map((k: any) => k.label);
   const groupNames = (groups || []).map((g: any) => g.name);
+
+  // Source dropdown seeded from real entities; default to the first real user.
+  const [srcVal, setSrcVal] = useState(
+    userNames.length ? `user:${userNames[0]}` : "",
+  );
 
   const targetOptions = [
     ...allTags.map((t: any) => ({ type: "tag", name: t })),
@@ -38,22 +39,18 @@ export function AccessView({ appliances, groups, keys, acl, onAdd, onRemove }: a
   const toggleDst = (o: any) => setDst((d) => inDst(o) ? d.filter((x) => !(x.type === o.type && x.name === o.name)) : [...d, o]);
 
   const addRule = () => {
-    if (!dst.length) return;
+    if (!dst.length || !srcVal) return;
     const idx = srcVal.indexOf(":");
     const src = { type: srcVal.slice(0, idx), name: srcVal.slice(idx + 1) };
-    // optimistic — the parent persists to the hub then refetches (re-seeds rules)
-    setRules((r: any) => [{ id: "r" + Date.now(), src, dst: [...dst], action: "allow" }, ...r]);
+    // Prop-driven: the parent persists to the hub then refetches (re-seeds acl).
     onAdd?.(src, [...dst]);
     setDst([]);
   };
-  const removeRule = (id: any) => {
-    setRules((r: any) => r.filter((x: any) => x.id !== id));
-    onRemove?.(id);
-  };
+  const removeRule = (id: any) => onRemove?.(id);
 
   const policy = JSON.stringify({
-    tagOwners: Object.fromEntries(allTags.map((t: any) => [`tag:${t}`, ["you@finch"]])),
-    acls: rules.map((r: any) => ({ action: "accept", src: [tokenSrc(r.src)], dst: r.dst.map(tokenDst) })),
+    tagOwners: Object.fromEntries(allTags.map((t: any) => [`tag:${t}`, [`${userNames[0] ?? "owner"}@finch`]])),
+    acls: acl.map((r: any) => ({ action: "accept", src: [tokenSrc(r.src)], dst: r.dst.map(tokenDst) })),
   }, null, 2);
 
   return (
@@ -71,7 +68,7 @@ export function AccessView({ appliances, groups, keys, acl, onAdd, onRemove }: a
         <>
           <Card className="rule-builder">
             <select className="acl-select" value={srcVal} onChange={(e) => setSrcVal(e.target.value)}>
-              <optgroup label="Users">{users.map((u) => <option key={u} value={`user:${u}`}>{u}</option>)}</optgroup>
+              <optgroup label="Users">{userNames.map((u: string) => <option key={u} value={`user:${u}`}>{u}</option>)}</optgroup>
               <optgroup label="Groups">{groupNames.map((g: any) => <option key={g} value={`group:${g}`}>{g}</option>)}</optgroup>
               <optgroup label="Keys">{keyNames.map((k: any) => <option key={k} value={`key:${k}`}>{k}</option>)}</optgroup>
             </select>
@@ -87,14 +84,14 @@ export function AccessView({ appliances, groups, keys, acl, onAdd, onRemove }: a
           </Card>
 
           <Card className="table-card">
-            {rules.map((r: any) => (
+            {acl.map((r: any) => (
               <div key={r.id} className="rule-card">
                 <EntityChip ent={r.src} />
                 <span className="rule-arrow">may reach</span>
                 <span className="rule-dsts">{r.dst.map((d: any, i: number) => <EntityChip key={i} ent={d} />)}</span>
                 <span className="rule-spacer" />
                 <span className="rule-allow">allow</span>
-                {r.src.type === "user" && r.src.name === "you"
+                {r.locked
                   ? <span className="dim mono rule-locked">admin · locked</span>
                   : <InlineConfirm prompt="remove?" trigger="remove" onConfirm={() => removeRule(r.id)} />}
               </div>

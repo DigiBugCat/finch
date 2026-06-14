@@ -1,32 +1,46 @@
 // DELETE /api/finch/users/:id -> remove a member from the Clerk org.
-// Best-effort: 400 when there's no active org. `:id` is the Clerk user id.
-import { auth, clerkClient } from "@clerk/nextjs/server";
+// Admin-only. Requires an active org. `:id` is the Clerk user id.
+//
+// Talks to the Clerk backend admin client directly, so it enforces
+// authorization itself (requireAdmin blocks members) and refuses to remove the
+// last remaining admin/owner so the tenant is never left without an admin.
+import { clerkClient } from "@clerk/nextjs/server";
+import { errorResponse, HttpError, requireAdmin } from "@/lib/hub";
+
+function isAdminRole(role: string | null | undefined): boolean {
+  return role === "org:admin" || role === "admin";
+}
 
 export async function DELETE(
   _req: Request,
   { params }: { params: Promise<{ id: string }> },
 ) {
   try {
-    const { userId, orgId } = await auth();
-    if (!userId) {
-      return Response.json({ error: "unauthenticated" }, { status: 401 });
-    }
+    const { orgId } = await requireAdmin();
     if (!orgId) {
-      return Response.json(
-        { error: "an active organization is required" },
-        { status: 400 },
-      );
+      throw new HttpError(400, "an active organization is required");
     }
     const { id } = await params;
 
     const clerk = await clerkClient();
+
+    // Guard: don't let the last admin/owner be removed from the org.
+    const list = await clerk.organizations.getOrganizationMembershipList({
+      organizationId: orgId,
+      limit: 100,
+    });
+    const admins = list.data.filter((m) => isAdminRole(m.role));
+    const targetIsAdmin = admins.some((m) => m.publicUserData?.userId === id);
+    if (targetIsAdmin && admins.length <= 1) {
+      throw new HttpError(400, "can't remove the last admin");
+    }
+
     await clerk.organizations.deleteOrganizationMembership({
       organizationId: orgId,
       userId: id,
     });
     return Response.json({ ok: true }, { status: 200 });
   } catch (err) {
-    const message = err instanceof Error ? err.message : "remove failed";
-    return Response.json({ error: message }, { status: 400 });
+    return errorResponse(err);
   }
 }

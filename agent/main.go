@@ -8,14 +8,24 @@
 //	finch join --hub http://localhost:8787 --ticket <tkt> --upstream http://127.0.0.1:8000
 //
 // The ticket is minted in the dashboard ("Add device"). On join the hub tells
-// us which appliance/machine we are; we then hold the relay WebSocket open and
-// reconnect with backoff, sending WS-protocol pings for NAT keepalive (the hub
-// auto-pongs them without waking the Durable Object, so they're free).
+// us which appliance/machine we are AND hands us a short-lived per-machine
+// connect-token; we present that token on the relay dial (?ct=<token>) — it is
+// the sole proof that authenticates this box-side channel. We then hold the
+// relay WebSocket open, reconnect with backoff, and send WS-protocol pings for
+// NAT keepalive (the hub auto-pongs them without waking the Durable Object, so
+// they're free).
+//
+// Reconnect model: the enrollment ticket is one-shot (the dashboard consumes it
+// on first /join), but the connect-token lives only ~120s. So we do NOT re-/join
+// on every blip — we keep reconnecting with the SAME still-valid connect-token,
+// and only re-/join (re-using the original ticket while it remains within its own
+// TTL) once the connect-token has expired.
 package main
 
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -24,6 +34,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"runtime"
 	"strings"
 	"sync"
@@ -33,6 +44,11 @@ import (
 )
 
 const agentVersion = "1.4.0"
+
+// connectSkew is how long before a connect-token's exp we treat it as already
+// expired and force a fresh /join, so we never dial with a token that lapses
+// mid-handshake.
+const connectSkew = 5 * time.Second
 
 type frame struct {
 	ID      string            `json:"id"`
@@ -45,13 +61,16 @@ type frame struct {
 }
 
 type joinResp struct {
-	OK          bool   `json:"ok"`
-	Tenant      string `json:"tenant"`
-	Appliance   string `json:"appliance"`
-	Machine     string `json:"machine"`
-	ConnectURL  string `json:"connectUrl"`
-	FleetSecret string `json:"fleetSecret"`
-	Error       string `json:"error"`
+	OK         bool   `json:"ok"`
+	Tenant     string `json:"tenant"`
+	Appliance  string `json:"appliance"`
+	Machine    string `json:"machine"`
+	ConnectURL string `json:"connectUrl"`
+	// Short-lived (~120s) per-machine HMAC grant. We present it on the _connect
+	// dial as ?ct=<connectToken>; the hub verifies it BEFORE accepting the relay
+	// socket. (FLEET_SECRET is gone — this token is the whole proof.)
+	ConnectToken string `json:"connectToken"`
+	Error        string `json:"error"`
 }
 
 func main() {
@@ -66,6 +85,14 @@ func main() {
 		log.Fatal("finch: --ticket is required (mint one in the dashboard → Add device)")
 	}
 
+	// Confine forwarded requests to the configured upstream: parse it once so
+	// forward() can reject any path that would escape the base (SSRF guard).
+	upstreamURL, err := url.Parse(strings.TrimRight(*upstream, "/"))
+	if err != nil || upstreamURL.Scheme == "" || upstreamURL.Host == "" {
+		log.Fatalf("finch: --upstream %q is not a valid absolute URL", *upstream)
+	}
+
+	// First join: claims the slot and yields the assignment + connect-token.
 	jr, err := join(*hub, *ticket, *machine)
 	if err != nil {
 		log.Fatalf("finch: join failed: %v", err)
@@ -75,11 +102,37 @@ func main() {
 	// Build the relay WS URL from the hub base + appliance/machine, so the
 	// scheme/host always match the hub we were given (the hub's connectUrl may
 	// assume prod wss://finchmcp.com which is wrong for local dev).
-	wsURL := relayURL(*hub, jr.Appliance, jr.Machine)
+	wsBase := relayURL(*hub, jr.Appliance, jr.Machine)
+
+	connectToken := jr.ConnectToken
+	connectExp := tokenExp(connectToken)
 
 	backoff := time.Second
 	for {
-		err := serve(wsURL, *upstream)
+		// Refresh the connect-token if it has (nearly) expired. The dashboard
+		// ticket is one-shot, but re-/join with the SAME ticket succeeds while
+		// the ticket itself is within its (longer) TTL — that's how steady-state
+		// reconnection survives past the 120s connect-token lifetime.
+		if time.Now().Add(connectSkew).After(connectExp) {
+			fresh, err := join(*hub, *ticket, *machine)
+			if err != nil {
+				log.Printf("finch: re-join failed: %v (retrying in %s)", err, backoff)
+				time.Sleep(backoff)
+				if backoff < 30*time.Second {
+					backoff *= 2
+				}
+				continue
+			}
+			connectToken = fresh.ConnectToken
+			connectExp = tokenExp(connectToken)
+			// The hub may have re-pinned the appliance/machine; rebuild the URL.
+			wsBase = relayURL(*hub, fresh.Appliance, fresh.Machine)
+			log.Printf("finch: refreshed connect-token (valid until %s)", connectExp.Format(time.RFC3339))
+		}
+
+		wsURL := wsBase + "?ct=" + url.QueryEscape(connectToken)
+		start := time.Now()
+		err := serve(wsURL, upstreamURL)
 		if err != nil {
 			log.Printf("finch: link down: %v (reconnecting in %s)", err, backoff)
 			time.Sleep(backoff)
@@ -88,11 +141,17 @@ func main() {
 			}
 			continue
 		}
-		backoff = time.Second
+		// A clean session: only reset backoff if the link actually held for a
+		// while (a session that drops instantly shouldn't reset the ramp).
+		if time.Since(start) > time.Minute {
+			backoff = time.Second
+		}
 	}
 }
 
-// join claims a machine slot with the ticket and returns the hub's assignment.
+// join claims a machine slot with the ticket and returns the hub's assignment
+// (including the per-machine connect-token). Safe to call again on reconnect
+// while the ticket remains within its own TTL.
 func join(hub, ticket, machine string) (*joinResp, error) {
 	body, _ := json.Marshal(map[string]string{
 		"ticket":  ticket,
@@ -121,10 +180,39 @@ func join(hub, ticket, machine string) (*joinResp, error) {
 	if !jr.OK || jr.Appliance == "" || jr.Machine == "" {
 		return nil, fmt.Errorf("join rejected: %s", jr.Error)
 	}
+	if jr.ConnectToken == "" {
+		return nil, fmt.Errorf("join response missing connectToken")
+	}
 	return &jr, nil
 }
 
-// relayURL builds ws(s)://<host>/<appliance>/<machine>/_connect from the hub base.
+// tokenExp decodes the (unsigned) expiry from a finch HMAC token of the form
+// base64url(JSON payload) "." base64url(sig). We only read the `exp` claim to
+// decide when to refresh — the hub still verifies the signature, so trusting
+// the unverified payload here is safe (a forged exp only makes us re-/join
+// sooner/later, never bypasses hub auth). On any parse failure we return a
+// zero time so the caller treats the token as already expired (fail-safe →
+// forces a fresh /join).
+func tokenExp(token string) time.Time {
+	dot := strings.IndexByte(token, '.')
+	if dot <= 0 {
+		return time.Time{}
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(token[:dot])
+	if err != nil {
+		return time.Time{}
+	}
+	var p struct {
+		Exp int64 `json:"exp"`
+	}
+	if err := json.Unmarshal(raw, &p); err != nil || p.Exp == 0 {
+		return time.Time{}
+	}
+	return time.Unix(p.Exp, 0)
+}
+
+// relayURL builds ws(s)://<host>/<appliance>/<machine>/_connect from the hub
+// base (without the query string — the caller appends ?ct=<token>).
 func relayURL(hub, appliance, machine string) string {
 	u, err := url.Parse(strings.TrimRight(hub, "/"))
 	if err != nil {
@@ -137,6 +225,7 @@ func relayURL(hub, appliance, machine string) string {
 		u.Scheme = "ws"
 	}
 	u.Path = "/" + appliance + "/" + machine + "/_connect"
+	u.RawQuery = ""
 	return u.String()
 }
 
@@ -154,7 +243,7 @@ func osLabel() string {
 }
 
 // serve holds one relay connection for its lifetime; returns on disconnect.
-func serve(wsURL, upstream string) error {
+func serve(wsURL string, upstream *url.URL) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -164,7 +253,7 @@ func serve(wsURL, upstream string) error {
 	}
 	defer c.Close(websocket.StatusNormalClosure, "bye")
 	c.SetReadLimit(32 << 20) // 32 MiB frames
-	log.Printf("finch: relay open %s -> %s", wsURL, upstream)
+	log.Printf("finch: relay open -> %s", upstream)
 
 	// One writer at a time: coder/websocket forbids concurrent writes.
 	var wmu sync.Mutex
@@ -208,18 +297,36 @@ func serve(wsURL, upstream string) error {
 	}
 }
 
-// forward replays one hub request against the local MCP server.
-func forward(ctx context.Context, upstream string, f frame) frame {
+// forward replays one hub request against the local MCP server. The hub-supplied
+// path is sanitized (path.Clean + scheme/host-injection reject + base
+// confinement) so a malicious or buggy path can never escape --upstream — the
+// relay is otherwise an SSRF foothold into the box's loopback.
+func forward(ctx context.Context, upstream *url.URL, f frame) frame {
 	out := frame{ID: f.ID, Type: "res"}
-	req, err := http.NewRequestWithContext(ctx, f.Method, strings.TrimRight(upstream, "/")+f.Path, bytes.NewReader([]byte(f.Body)))
+
+	target, err := resolveUpstream(upstream, f.Path)
+	if err != nil {
+		out.Status, out.Body = 403, err.Error()
+		return out
+	}
+
+	// Bound the upstream call below the hub's relay timeout so a hung local
+	// server can't pin a goroutine indefinitely; still cancels on link drop
+	// since it's a child of the relay ctx.
+	reqCtx, cancel := context.WithTimeout(ctx, 28*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(reqCtx, f.Method, target, bytes.NewReader([]byte(f.Body)))
 	if err != nil {
 		out.Status, out.Body = 502, err.Error()
 		return out
 	}
 	for k, v := range f.Headers {
 		switch strings.ToLower(k) {
-		case "host", "connection", "upgrade", "content-length", "transfer-encoding":
-			// hop-by-hop / recomputed — skip
+		case "host", "connection", "upgrade", "content-length", "transfer-encoding", "authorization":
+			// hop-by-hop / recomputed / credential — never forward to the box.
+			// (The hub already strips the caller's finch_ key; we drop it again
+			// here as defense-in-depth.)
 		default:
 			req.Header.Set(k, v)
 		}
@@ -235,4 +342,65 @@ func forward(ctx context.Context, upstream string, f frame) frame {
 	out.Body = string(b)
 	out.Headers = map[string]string{"content-type": resp.Header.Get("content-type")}
 	return out
+}
+
+// resolveUpstream turns the hub-supplied request path into an absolute upstream
+// URL, refusing anything that would escape the configured --upstream base.
+// Defenses, in order:
+//   - reject scheme/authority injection (a path that itself parses to an
+//     absolute URL, or starts with "//" → protocol-relative host).
+//   - path.Clean to collapse "." / ".." segments, then confine the cleaned
+//     path to the allowed route prefix so a "/mcp/../admin" can't climb out of
+//     the MCP route the hub gated and SSRF something else on loopback.
+//   - rebuild the URL from the trusted base host/scheme + the cleaned path +
+//     the (query-only) raw query, so host/scheme can never come from the frame.
+//
+// The confinement prefix is the upstream's own base path when one is configured
+// (e.g. --upstream http://127.0.0.1:8000/mcp), otherwise the canonical "/mcp"
+// route the hub forwards. Either way the result must equal the prefix or be a
+// child of it — collapsing "/mcp/../admin" to "/admin" is therefore rejected.
+func resolveUpstream(base *url.URL, rawPath string) (string, error) {
+	if rawPath == "" {
+		rawPath = "/"
+	}
+	// Split off any query string the hub appended (it lives in f.Path).
+	reqPath := rawPath
+	rawQuery := ""
+	if i := strings.IndexByte(rawPath, '?'); i >= 0 {
+		reqPath = rawPath[:i]
+		rawQuery = rawPath[i+1:]
+	}
+
+	// Reject absolute-URL or protocol-relative injection outright: a legitimate
+	// relay path is always origin-relative (starts with a single "/").
+	if strings.Contains(reqPath, "://") || strings.HasPrefix(reqPath, "//") {
+		return "", fmt.Errorf("rejected path (scheme/host injection): %q", reqPath)
+	}
+	if !strings.HasPrefix(reqPath, "/") {
+		return "", fmt.Errorf("rejected path (not origin-relative): %q", reqPath)
+	}
+
+	// Collapse . and .. ; path.Clean of an absolute path can never produce a
+	// result that climbs above "/", so the cleaned path is always rooted.
+	clean := path.Clean(reqPath)
+
+	// Confine to the allowed prefix: the upstream's configured base path if any,
+	// else the canonical "/mcp" route. The cleaned path must BE the prefix or a
+	// child of it — this is what makes the hub's "/mcp"-only gate un-bypassable
+	// by traversal (e.g. "/mcp/../admin" → "/admin" is rejected here).
+	prefix := strings.TrimRight(base.Path, "/")
+	if prefix == "" {
+		prefix = "/mcp"
+	}
+	if clean != prefix && !strings.HasPrefix(clean, prefix+"/") {
+		return "", fmt.Errorf("rejected path (escapes upstream prefix %q): %q", prefix, clean)
+	}
+
+	// Build the upstream URL from the trusted base host/scheme + the cleaned
+	// path. When the upstream carries a base path it's already a prefix of
+	// `clean`, so assigning `clean` is correct (no double-prefix).
+	out := *base
+	out.Path = clean
+	out.RawQuery = rawQuery
+	return out.String(), nil
 }

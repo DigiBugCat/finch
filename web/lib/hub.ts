@@ -3,13 +3,53 @@
 // The hub (../worker) is the source of truth. Its /api/* surface is
 // service-secret authed and tenant-scoped:
 //   X-Finch-Service: <FINCH_SERVICE_SECRET>   (must equal the hub's)
-//   X-Finch-Tenant:  <tenantId>                (the Clerk org id, or user id)
+//   X-Finch-Auth:    <signed {tenant,exp}>     (HMAC-SHA256 with the SAME secret)
+//
+// The service secret proves "a first-party web worker is calling"; the SIGNED
+// assertion cryptographically binds WHICH tenant the request acts as. We no
+// longer send a raw, unsigned X-Finch-Tenant — the hub ignores it and trusts
+// only the HMAC-signed assertion, so a leaked service secret alone can't be
+// replayed for an arbitrary tenant.
 //
 // This module centralizes (a) resolving the tenant from the Clerk session and
 // (b) calling the hub with the right headers. Route handlers stay thin.
 
 import "server-only";
 import { auth } from "@clerk/nextjs/server";
+
+/** TTL of a signed tenant assertion (seconds). Short — each hub call mints a
+ *  fresh one; this only bounds clock-skew tolerance / replay window. */
+const ASSERTION_TTL_SECONDS = 120;
+
+const te = new TextEncoder();
+
+function bytesToB64url(bytes: Uint8Array): string {
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/** Sign a {tenant,exp} assertion with the shared service secret (HMAC-SHA256).
+ *  Wire format mirrors the hub's verifyAssertion: b64url(JSON) "." b64url(sig). */
+async function signAssertion(
+  tenant: string,
+  secret: string,
+): Promise<string> {
+  const payload = {
+    tenant,
+    exp: Math.floor(Date.now() / 1000) + ASSERTION_TTL_SECONDS,
+  };
+  const body = bytesToB64url(te.encode(JSON.stringify(payload)));
+  const key = await crypto.subtle.importKey(
+    "raw",
+    te.encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, te.encode(body));
+  return body + "." + bytesToB64url(new Uint8Array(sig));
+}
 
 /** A thrown HttpError short-circuits a route handler with a JSON response. */
 export class HttpError extends Error {
@@ -37,14 +77,67 @@ async function runtimeEnv(name: string): Promise<string | undefined> {
   return typeof pv === "string" && pv.length ? pv : undefined;
 }
 
+/** What resolveTenant() returns: the tenant id plus the caller's identity and
+ *  org role so handlers can authorize without re-calling Clerk. */
+export interface ResolvedTenant {
+  /** The hub tenant id — the Clerk org id, or the user id with no active org. */
+  tenant: string;
+  /** The signed-in Clerk user id. */
+  userId: string;
+  /** The active Clerk org id, or null for a personal (no-org) tenant. */
+  orgId: string | null;
+  /** The caller's role in the active org (e.g. "org:admin"/"org:member"), or
+   *  null when there's no org. A personal tenant has no org role but the lone
+   *  user is implicitly the owner. */
+  role: string | null;
+  /** True when the caller may perform admin/mutating actions for this tenant:
+   *  a personal (no-org) tenant's sole user, or an org admin/owner. */
+  isAdmin: boolean;
+}
+
+function roleIsAdmin(role: string | null | undefined): boolean {
+  return (
+    role === "org:admin" ||
+    role === "admin" ||
+    role === "org:owner" ||
+    role === "owner"
+  );
+}
+
 /**
+ * Resolve the current tenant + caller authorization from the Clerk session.
  * The tenant = the Clerk org id, or the user id if there's no active org.
  * Throws 401 (HttpError) when the request is unauthenticated.
  */
-export async function resolveTenant(): Promise<string> {
-  const { userId, orgId } = await auth();
+export async function resolveTenant(): Promise<ResolvedTenant> {
+  const { userId, orgId, orgRole } = await auth();
   if (!userId) throw new HttpError(401, "unauthenticated");
-  return orgId ?? userId;
+  // No active org → personal tenant; the lone user owns it (implicit admin).
+  // With an org, admin rights require an admin/owner role.
+  const isAdmin = !orgId || roleIsAdmin(orgRole);
+  return {
+    tenant: orgId ?? userId,
+    userId,
+    orgId: orgId ?? null,
+    role: orgRole ?? null,
+    isAdmin,
+  };
+}
+
+/**
+ * Authorize a mutating request. Returns the resolved tenant when the caller may
+ * act as an admin for it; otherwise throws 401 (unauthenticated) or 403
+ * (member without admin rights). Call this at the top of every mutating route.
+ *
+ * Authorization model: a personal (no-org) tenant's sole user is always
+ * authorized; in an org, only admins/owners may mutate. Members are read-only.
+ */
+export async function requireAdmin(): Promise<ResolvedTenant> {
+  const ctx = await resolveTenant();
+  if (!ctx.isAdmin) {
+    throw new HttpError(403, "admin role required");
+  }
+  return ctx;
 }
 
 /**
@@ -56,7 +149,7 @@ export async function hubFetch(
   path: string,
   init: RequestInit = {},
 ): Promise<Response> {
-  const tenant = await resolveTenant();
+  const { tenant } = await resolveTenant();
 
   const hubUrl = await runtimeEnv("HUB_URL");
   const serviceSecret = await runtimeEnv("FINCH_SERVICE_SECRET");
@@ -67,7 +160,9 @@ export async function hubFetch(
 
   const headers = new Headers(init.headers);
   headers.set("X-Finch-Service", serviceSecret);
-  headers.set("X-Finch-Tenant", tenant);
+  // Bind the tenant cryptographically: sign {tenant,exp} with the service
+  // secret. The hub verifies this and ignores any raw X-Finch-Tenant.
+  headers.set("X-Finch-Auth", await signAssertion(tenant, serviceSecret));
   if (init.body && !headers.has("content-type")) {
     headers.set("content-type", "application/json");
   }

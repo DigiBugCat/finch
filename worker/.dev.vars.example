@@ -1,0 +1,21 @@
+# Finch hub (worker) — local dev vars TEMPLATE.
+#
+# Copy to `.dev.vars` (gitignored) and fill with THROWAWAY dev values.
+# `wrangler dev` reads `.dev.vars` in local Miniflare mode. These are NOT prod
+# secrets — generate fresh, high-entropy prod values and set them per-env with
+# `wrangler secret put <NAME> --env production` (never `secret bulk .dev.vars`).
+
+# web-app -> control API shared secret. Must MATCH web/.dev.vars FINCH_SERVICE_SECRET.
+FINCH_SERVICE_SECRET="REPLACE_WITH_DEV_SERVICE_SECRET"
+
+# HMAC key for join tickets + per-machine connect-tokens.
+TICKET_SECRET="REPLACE_WITH_DEV_TICKET_SECRET"
+
+# DEV-ONLY tenant fallback (consulted only when DEV=1). Never set in prod —
+# prod resolveTenant fails closed (404) on an unresolved host.
+DEFAULT_TENANT="dev-tenant"
+
+# Gates the DEFAULT_TENANT fallback for a plain top-level `wrangler dev`. Set to
+# "1" in local dev only. NEVER set in prod (prod runs `--env production`, which
+# omits DEV/DEFAULT_TENANT, so resolveTenant fails closed → 404 on unknown hosts).
+DEV="1"

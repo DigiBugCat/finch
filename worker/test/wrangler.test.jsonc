@@ -1,0 +1,30 @@
+{
+  // Dedicated wrangler config for the vitest pool-workers runtime. It mirrors the
+  // top-level durable_objects + SQLite migrations from ../wrangler.jsonc so the
+  // tests can instantiate the REAL ApplianceDO / TenantDO / RouterDO classes
+  // against an isolated in-memory Miniflare. Secrets (FINCH_SERVICE_SECRET,
+  // TICKET_SECRET) and DEV vars are injected per-test via `vars` here — they are
+  // test-only fixtures, never the prod values. No routes / no workers.dev.
+  "name": "finch-test",
+  "main": "../src/index.ts",
+  "compatibility_date": "2026-06-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "FINCH_SERVICE_SECRET": "test-service-secret",
+    "TICKET_SECRET": "test-ticket-secret",
+    "DEFAULT_TENANT": "dev-tenant",
+    "DEV": "1"
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "APPLIANCE", "class_name": "ApplianceDO" },
+      { "name": "TENANT", "class_name": "TenantDO" },
+      { "name": "ROUTER", "class_name": "RouterDO" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["ApplianceDO"] },
+    { "tag": "v2", "new_sqlite_classes": ["TenantDO"] },
+    { "tag": "v3", "new_sqlite_classes": ["RouterDO"] }
+  ]
+}

@@ -5,16 +5,22 @@
   "compatibility_date": "2026-06-01",
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
-  // Non-secret defaults. Secrets (FINCH_SERVICE_SECRET, FLEET_SECRET,
-  // TICKET_SECRET) come from `.dev.vars` in dev and `wrangler secret put` in
-  // prod — never checked in here.
-  "vars": {
-    "DEFAULT_TENANT": "dev-tenant"
-  },
+  // No top-level `vars`. DEFAULT_TENANT is DEV-ONLY (see [env.dev]) — it must
+  // never ship to prod, where tenantFromHost/resolveTenant fail closed (404).
+  // Secrets (FINCH_SERVICE_SECRET, TICKET_SECRET) come from `.dev.vars` in dev
+  // and `wrangler secret put … --env <env>` in prod — never checked in here.
+  //
+  // NOTE: wrangler does NOT inherit top-level durable_objects / migrations /
+  // vars into named environments, so each env below repeats durable_objects +
+  // migrations. The class definitions are identical, but DO ids are name-scoped
+  // per Worker — so finch-dev and finch-prod get fully separate
+  // ApplianceDO/TenantDO/RouterDO namespaces. A dev deploy can never read or
+  // mutate prod tenant registries, keys, or ACLs.
   "durable_objects": {
     "bindings": [
       { "name": "APPLIANCE", "class_name": "ApplianceDO" },
-      { "name": "TENANT", "class_name": "TenantDO" }
+      { "name": "TENANT", "class_name": "TenantDO" },
+      { "name": "ROUTER", "class_name": "RouterDO" }
     ]
   },
   "migrations": [
@@ -27,8 +33,68 @@
       // TenantDO — per-tenant control-plane state, also SQLite-backed.
       "tag": "v2",
       "new_sqlite_classes": ["TenantDO"]
+    },
+    {
+      // RouterDO — singleton slug→tenantId index for the relay plane.
+      "tag": "v3",
+      "new_sqlite_classes": ["RouterDO"]
     }
-  ]
-  // routes: bind finchmcp.com once the zone is on Cloudflare, e.g.
-  // "routes": [{ "pattern": "finchmcp.com/*", "zone_name": "finchmcp.com" }]
+  ],
+
+  "env": {
+    // ---- dev: workers.dev, DEFAULT_TENANT fallback enabled (DEV=1) ----
+    "dev": {
+      "name": "finch-dev",
+      "workers_dev": true,
+      "observability": { "enabled": true },
+      // DEFAULT_TENANT lives ONLY here (and in .dev.vars for `wrangler dev`).
+      // DEV=1 gates the dev-only tenant fallback in resolveTenant.
+      "vars": {
+        "DEFAULT_TENANT": "dev-tenant",
+        "DEV": "1"
+      },
+      "durable_objects": {
+        "bindings": [
+          { "name": "APPLIANCE", "class_name": "ApplianceDO" },
+          { "name": "TENANT", "class_name": "TenantDO" },
+          { "name": "ROUTER", "class_name": "RouterDO" }
+        ]
+      },
+      "migrations": [
+        { "tag": "v1", "new_sqlite_classes": ["ApplianceDO"] },
+        { "tag": "v2", "new_sqlite_classes": ["TenantDO"] },
+        { "tag": "v3", "new_sqlite_classes": ["RouterDO"] }
+      ]
+    },
+
+    // ---- production: real routes, no workers.dev, fail-closed tenant ----
+    "production": {
+      "name": "finch-prod",
+      "workers_dev": false,
+      "observability": { "enabled": true },
+      // NO DEFAULT_TENANT and NO DEV — resolveTenant fails closed (404) for any
+      // host without a registered <slug>.finchmcp.com subdomain.
+      "vars": {},
+      "routes": [
+        { "pattern": "finchmcp.com/*", "zone_name": "finchmcp.com" },
+        { "pattern": "*.finchmcp.com/*", "zone_name": "finchmcp.com" }
+      ],
+      "durable_objects": {
+        "bindings": [
+          { "name": "APPLIANCE", "class_name": "ApplianceDO" },
+          { "name": "TENANT", "class_name": "TenantDO" },
+          { "name": "ROUTER", "class_name": "RouterDO" }
+        ]
+      },
+      "migrations": [
+        { "tag": "v1", "new_sqlite_classes": ["ApplianceDO"] },
+        { "tag": "v2", "new_sqlite_classes": ["TenantDO"] },
+        { "tag": "v3", "new_sqlite_classes": ["RouterDO"] }
+      ]
+    }
+  }
+  // Secrets per env (never `secret bulk .dev.vars`):
+  //   wrangler secret put FINCH_SERVICE_SECRET --env production
+  //   wrangler secret put TICKET_SECRET        --env production
+  // Deploy: wrangler deploy --env production  (or --env dev)
 }
