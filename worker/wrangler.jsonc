@@ -5,14 +5,28 @@
   "compatibility_date": "2026-06-01",
   "compatibility_flags": ["nodejs_compat"],
   "observability": { "enabled": true },
+  // Non-secret defaults. Secrets (FINCH_SERVICE_SECRET, FLEET_SECRET,
+  // TICKET_SECRET) come from `.dev.vars` in dev and `wrangler secret put` in
+  // prod — never checked in here.
+  "vars": {
+    "DEFAULT_TENANT": "dev-tenant"
+  },
   "durable_objects": {
-    "bindings": [{ "name": "APPLIANCE", "class_name": "ApplianceDO" }]
+    "bindings": [
+      { "name": "APPLIANCE", "class_name": "ApplianceDO" },
+      { "name": "TENANT", "class_name": "TenantDO" }
+    ]
   },
   "migrations": [
     {
       // SQLite-backed DOs — required for the free tier and the modern DO API.
       "tag": "v1",
       "new_sqlite_classes": ["ApplianceDO"]
+    },
+    {
+      // TenantDO — per-tenant control-plane state, also SQLite-backed.
+      "tag": "v2",
+      "new_sqlite_classes": ["TenantDO"]
     }
   ]
   // routes: bind finchmcp.com once the zone is on Cloudflare, e.g.

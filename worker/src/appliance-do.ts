@@ -1,9 +1,17 @@
 /// <reference types="@cloudflare/workers-types" />
 //
-// ApplianceDO — one Durable Object per finch appliance. It is the rendezvous
-// point: the box-side agent dials OUT to /{id}/_connect and parks a WebSocket
-// here; public requests routed to this DO are relayed down that socket and the
-// response is relayed back.
+// ApplianceDO — one Durable Object per finch MACHINE (keyed
+// `${tenant}:${appliance}:${machine}`). It is the rendezvous point: the
+// box-side agent dials OUT to /<appliance>/<machine>/_connect and parks a
+// WebSocket here; public requests routed to this DO are relayed down that
+// socket and the response is relayed back.
+//
+// Beyond relaying, it reports liveness to the tenant's TenantDO: on WS open it
+// calls markMachine{connected:true}; on close/error markMachine{connected:false}
+// so the appliance's online/offline state stays accurate. It learns its
+// tenant/appliance/machine from query params on the _connect URL and stashes
+// them via serializeAttachment so they survive hibernation (the close/error
+// handlers fire on a possibly-evicted-and-revived object).
 //
 // Hibernation: we use the WebSocket Hibernation API (ctx.acceptWebSocket +
 // webSocketMessage handler method, NOT addEventListener). That lets the runtime
@@ -14,6 +22,14 @@
 
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./index";
+
+/** Identity stashed on the agent socket via serializeAttachment so the
+ *  close/error handlers can reach the right TenantDO after hibernation. */
+interface SockMeta {
+  tenant: string;
+  appliance: string;
+  machine: string;
+}
 
 interface Frame {
   id: string;
@@ -38,23 +54,35 @@ export class ApplianceDO extends DurableObject<Env> {
 
   async fetch(req: Request): Promise<Response> {
     const url = new URL(req.url);
-    // Path relative to the appliance: strip the leading /{id} segment so the
-    // upstream MCP server sees /mcp, not /{id}/mcp.
+    // This DO is per-MACHINE, so the incoming path is
+    // /<appliance>/<machine>/<rest>. Strip BOTH leading segments so the
+    // upstream agent sees /_connect or /mcp — not /<appliance>/<machine>/mcp.
     const parts = url.pathname.split("/").filter(Boolean);
-    const relPath = "/" + parts.slice(1).join("/") + (url.search || "");
+    const relPath = "/" + parts.slice(2).join("/") + (url.search || "");
 
     // ---- Agent registration: the box dials in here with a WS upgrade. ----
     if (relPath.startsWith("/_connect")) {
       if (req.headers.get("Upgrade") !== "websocket") {
         return new Response("expected websocket upgrade", { status: 426 });
       }
+      // index.ts stamps tenant/appliance/machine onto the _connect URL.
+      const meta: SockMeta = {
+        tenant: url.searchParams.get("tenant") ?? "",
+        appliance: url.searchParams.get("appliance") ?? "",
+        machine: url.searchParams.get("machine") ?? "",
+      };
       const { 0: client, 1: server } = new WebSocketPair();
       // Hibernation-aware accept; tag it so getWebSockets("agent") finds it.
       this.ctx.acceptWebSocket(server, ["agent"]);
+      // Persist identity so close/error handlers survive hibernation.
+      server.serializeAttachment(meta);
       // Auto-pong NAT keepalives without waking the DO.
       this.ctx.setWebSocketAutoResponse(
         new WebSocketRequestResponsePair("ping", "pong"),
       );
+      // Tell the tenant this machine is live (fire-and-forget — don't block the
+      // 101 on the control-plane write).
+      this.ctx.waitUntil(this.markMachine(meta, true));
       return new Response(null, { status: 101, webSocket: client });
     }
 
@@ -124,6 +152,8 @@ export class ApplianceDO extends DurableObject<Env> {
   }
 
   async webSocketClose(ws: WebSocket, code: number, reason: string) {
+    const meta = ws.deserializeAttachment() as SockMeta | null;
+    if (meta) await this.markMachine(meta, false);
     try {
       ws.close(code, reason);
     } catch {
@@ -131,8 +161,35 @@ export class ApplianceDO extends DurableObject<Env> {
     }
   }
 
-  async webSocketError(_ws: WebSocket, _error: unknown) {
-    // Agent link errored; pending requests will time out and 504.
+  async webSocketError(ws: WebSocket, _error: unknown) {
+    // Agent link errored; pending requests will time out and 504. Also flag the
+    // machine offline so the appliance state stops claiming it's chirping.
+    const meta = ws.deserializeAttachment() as SockMeta | null;
+    if (meta) await this.markMachine(meta, false);
+  }
+
+  /** Report this machine's connected state to its tenant's TenantDO. Skipped if
+   *  we don't have full identity (e.g. an old socket from before this field
+   *  existed). Best-effort: never throws into the WS lifecycle. */
+  private async markMachine(meta: SockMeta, connected: boolean): Promise<void> {
+    if (!meta.tenant || !meta.appliance || !meta.machine) return;
+    try {
+      const stub = this.env.TENANT.get(
+        this.env.TENANT.idFromName(meta.tenant),
+      );
+      await stub.fetch("https://tenant/op", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          op: "markMachine",
+          appliance: meta.appliance,
+          machine: meta.machine,
+          connected,
+        }),
+      });
+    } catch {
+      /* control-plane write failed; liveness will reconcile on next event */
+    }
   }
 }
 
