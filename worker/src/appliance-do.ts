@@ -22,6 +22,12 @@
 
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./index";
+import {
+  type AgentFrame,
+  type ReqFrame,
+  type ResetFrame,
+  decodeChunk,
+} from "./relay-frames";
 
 /** Identity stashed on the agent socket via serializeAttachment so the
  *  close/error handlers can reach the right TenantDO after hibernation. */
@@ -31,19 +37,42 @@ interface SockMeta {
   machine: string;
 }
 
-interface Frame {
-  id: string;
-  type: "req" | "res";
-  // req
-  method?: string;
-  path?: string;
-  headers?: Record<string, string>;
-  body?: string;
-  // res
-  status?: number;
+/** One in-flight relayed response, keyed by frame id. Created when the DO sends
+ *  a `req` down the socket; lives until `end`/`err`/`reset` or socket death.
+ *
+ *  Lifecycle: the public fetch() awaits `head` (resolveHead). On `head` we hand
+ *  back a streaming Response whose ReadableStream `start` captures `controller`;
+ *  subsequent `chunk` frames enqueue base64-decoded bytes, `end` closes it,
+ *  `err`/`reset` error it. The idle `timer` is armed on send and re-armed on
+ *  every head/chunk for this id; on fire it 504s a head-less stream or errors a
+ *  streaming one (and sends `reset` to the agent). */
+interface Stream {
+  /** ReadableStream controller, set once the head arrives and the body stream
+   *  has been started. Undefined while we're still awaiting head. */
+  controller?: ReadableStreamDefaultController<Uint8Array>;
+  /** Resolves the fetch()'s await-first-frame promise with the agent's first
+   *  frame (head or err). Cleared (set to undefined) once it has fired so a
+   *  late frame can't double-resolve. */
+  resolveHead?: (f: AgentFrame) => void;
+  /** Idle-timeout handle (see RELAY_IDLE_MS). */
+  timer: ReturnType<typeof setTimeout>;
+  /** True once `head` (or `err`) has resolved the head promise — past this
+   *  point we are committed to the stream body, not a fresh Response. */
+  headSettled: boolean;
+  /** Chunks that arrived after `head` but before start() captured the controller
+   *  (a race the WS input gate normally prevents). start() flushes them, so a
+   *  future regression can't silently truncate the body. */
+  pending?: Uint8Array[];
+  /** `end` won the same race — start() closes after flushing `pending`. */
+  ended?: boolean;
 }
 
-const REQUEST_TIMEOUT_MS = 30_000;
+// Per-stream idle timeout. Armed on `req` send, RESET on every head/chunk for
+// that id. On fire: no head yet -> resolve 504; head already sent -> error the
+// readable + send `reset` to the agent. This REPLACES the old 30s total cap —
+// a long-running ("thinking") tool that keeps streaming never trips it; only a
+// genuinely stalled link does.
+const RELAY_IDLE_MS = 300_000;
 
 // Max relay body we'll buffer (#16 / L9). Mirrors index.ts's pre-stub cap; we
 // enforce by STRING LENGTH after req.text() because content-length is
@@ -62,11 +91,12 @@ const HOP_BY_HOP = new Set([
 ]);
 
 export class ApplianceDO extends DurableObject<Env> {
-  // Public requests awaiting an agent response, keyed by frame id.
-  // In-memory only — but a request in flight is "pending work" that keeps us
-  // awake for the round-trip, so this survives the wait. It's only ever empty
-  // when we hibernate (no requests pending), so nothing is lost.
-  private pending = new Map<string, (f: Frame) => void>();
+  // In-flight relayed responses, keyed by frame id. In-memory only — but a
+  // request in flight is "pending work" (the streaming Response is the DO's
+  // return value and keeps us awake for the round-trip), so this survives the
+  // relay. It's only ever empty when we hibernate (no streams open), so nothing
+  // is lost. See the Stream interface for the per-id lifecycle.
+  private streams = new Map<string, Stream>();
 
   async fetch(req: Request): Promise<Response> {
     const url = new URL(req.url);
@@ -115,15 +145,6 @@ export class ApplianceDO extends DurableObject<Env> {
       return new Response(null, { status: 101, webSocket: client });
     }
 
-    // SSE is not yet supported end-to-end (the relay frames a single buffered
-    // response; it can't stream a session-sticky event stream). Fail FAST with
-    // 501 rather than hanging or silently dropping events. (code-review #10)
-    if ((req.headers.get("accept") || "").includes("text/event-stream")) {
-      return json(501, {
-        error: "text/event-stream not supported by the relay yet",
-      });
-    }
-
     // ---- Public request: relay it to the connected agent. ----
     const agent = this.ctx.getWebSockets("agent")[0];
     if (!agent) {
@@ -144,7 +165,7 @@ export class ApplianceDO extends DurableObject<Env> {
     }
 
     const id = crypto.randomUUID();
-    const frame: Frame = {
+    const frame: ReqFrame = {
       id,
       type: "req",
       method: req.method,
@@ -153,45 +174,98 @@ export class ApplianceDO extends DurableObject<Env> {
       body,
     };
 
-    const res = await new Promise<Frame>((resolve) => {
-      const timer = setTimeout(() => {
-        if (this.pending.delete(id)) {
-          resolve({ id, type: "res", status: 504, body: "upstream timeout" });
-        }
-      }, REQUEST_TIMEOUT_MS);
-      this.pending.set(id, (f) => {
-        clearTimeout(timer);
-        resolve(f);
-      });
+    // Register the stream and arm the idle timer BEFORE sending, so a head/chunk
+    // that lands synchronously (or a same-tick reset) finds its entry. Await the
+    // FIRST frame for this id: `head` -> a streaming Response; `err` -> a plain
+    // error Response; idle timeout with no head -> 504.
+    const first = await new Promise<AgentFrame>((resolve) => {
+      const timer = setTimeout(() => this.onIdle(id), RELAY_IDLE_MS);
+      this.streams.set(id, { resolveHead: resolve, timer, headSettled: false });
       try {
         agent.send(JSON.stringify(frame));
       } catch (e) {
-        clearTimeout(timer);
-        this.pending.delete(id);
-        resolve({ id, type: "res", status: 502, body: `relay failed: ${e}` });
+        // Couldn't even hand the request to the agent — fail this stream fast as
+        // a 502 (BEFORE head, so index.ts may still fail over). Synthesize an
+        // err frame and tear the entry down.
+        this.settleHead(id, {
+          id,
+          type: "err",
+          status: 502,
+          message: `relay failed: ${e}`,
+        });
       }
     });
 
-    // Re-emit the FULL upstream header set (minus hop-by-hop / recomputed) so
-    // stateful MCP works — the Mcp-Session-Id returned on `initialize` must reach
-    // the caller or every follow-up call 4xx's. (code-review #10)
+    if (first.type === "err") {
+      // Error before head. Return the message as a plain body with the agent's
+      // status (502 dial fail / 403 SSRF). index.ts only fails over on a 503
+      // X-Finch-Offline, so an err here is the box's real (terminal) answer.
+      return new Response(first.message, { status: first.status });
+    }
+    if (first.type !== "head") {
+      // Only head/err can settle the head promise; defensively 502 anything else.
+      return new Response("relay protocol error", { status: 502 });
+    }
+
+    // head -> stream the body. Build the Response headers from the agent's
+    // ORDERED [name,value] list (hop-by-hop already excluded agent-side; we keep
+    // HOP_BY_HOP as defense-in-depth). headers.append PRESERVES DUPLICATES so
+    // multiple Set-Cookie survive.
     const headers = new Headers();
-    for (const [k, v] of Object.entries(res.headers ?? {})) {
-      if (!HOP_BY_HOP.has(k.toLowerCase())) headers.set(k, v);
+    // `?? []` tolerates a head whose `headers` key is absent (the agent omits it
+    // when no headers survive the hop-by-hop filter) — iterating undefined throws.
+    for (const [k, v] of first.headers ?? []) {
+      if (!HOP_BY_HOP.has(k.toLowerCase())) headers.append(k, v);
     }
-    if (!headers.has("content-type")) {
-      headers.set("content-type", "application/json");
-    }
-    return new Response(res.body ?? "", {
-      status: res.status ?? 502,
-      headers,
+
+    // The ReadableStream is fed by chunk frames (base64-decoded) and closed on
+    // end. Its `start` captures the controller into the live stream entry so
+    // webSocketMessage can pump into it. If the stream entry is already gone
+    // (e.g. a same-tick reset between head and here), close immediately.
+    const self = this;
+    const readable = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const s = self.streams.get(id);
+        if (!s) {
+          controller.close();
+          return;
+        }
+        s.controller = controller;
+        // Flush any chunks that landed before we captured the controller, then
+        // close if `end` already arrived during that window.
+        if (s.pending) {
+          for (const bytes of s.pending) {
+            try {
+              controller.enqueue(bytes);
+            } catch {
+              /* errored mid-flush */
+            }
+          }
+          s.pending = undefined;
+        }
+        if (s.ended) {
+          self.streams.delete(id);
+          try {
+            controller.close();
+          } catch {
+            /* already closed */
+          }
+        }
+      },
+      cancel() {
+        // The consumer (the downstream client) went away. Tear the stream down
+        // and tell the agent to stop reading the upstream body into the void.
+        self.resetStream(id, "client cancelled", true);
+      },
     });
+
+    return new Response(readable, { status: first.status, headers });
   }
 
-  // Hibernatable handler — fires when the agent sends a frame (a response, or
-  // later: server-initiated MCP messages for the bidirectional channel).
+  // Hibernatable handler — fires when the agent sends a frame down the socket:
+  // head / chunk / end / err / reset, all keyed by the relayed request id.
   async webSocketMessage(_ws: WebSocket, message: string | ArrayBuffer) {
-    let frame: Frame;
+    let frame: AgentFrame;
     try {
       const text =
         typeof message === "string"
@@ -201,19 +275,149 @@ export class ApplianceDO extends DurableObject<Env> {
     } catch {
       return;
     }
-    if (frame.type === "res") {
-      const resolve = this.pending.get(frame.id);
-      if (resolve) {
-        this.pending.delete(frame.id);
-        resolve(frame);
+    const s = this.streams.get(frame.id);
+    if (!s) return; // unknown / already-torn-down id — ignore.
+
+    switch (frame.type) {
+      case "head":
+        // First frame: re-arm idle, settle the awaiting fetch() with the head.
+        this.rearm(s, frame.id);
+        this.settleHead(frame.id, frame);
+        return;
+      case "err":
+        // Error before head: settle the fetch() with the err (turns into a plain
+        // error Response). If head was already sent this is a protocol violation
+        // (agent must not err after head); treat it as a reset of the body.
+        if (s.headSettled && s.controller) {
+          this.resetStream(frame.id, frame.message, false);
+        } else {
+          this.rearm(s, frame.id);
+          this.settleHead(frame.id, frame);
+        }
+        return;
+      case "chunk": {
+        this.rearm(s, frame.id);
+        let bytes: Uint8Array;
+        try {
+          bytes = decodeChunk(frame.data);
+        } catch {
+          this.resetStream(frame.id, "bad chunk encoding", false);
+          return;
+        }
+        if (s.controller) {
+          try {
+            s.controller.enqueue(bytes);
+          } catch {
+            // Controller already closed/errored — drop and tear down.
+            this.resetStream(frame.id, "enqueue failed", false);
+          }
+        } else {
+          // head settled but start() hasn't captured the controller yet — buffer
+          // (the input gate normally prevents this; flushed in start()).
+          (s.pending ??= []).push(bytes);
+        }
+        return;
+      }
+      case "end":
+        // Upstream body fully read -> close the readable and retire the stream.
+        clearTimeout(s.timer);
+        if (s.controller) {
+          this.streams.delete(frame.id);
+          try {
+            s.controller.close();
+          } catch {
+            /* already closed */
+          }
+        } else {
+          // `end` won the race against start(): keep the entry so start() can
+          // flush any buffered chunks and then close.
+          s.ended = true;
+        }
+        return;
+      case "reset":
+        // Agent aborted its side. Error the readable (if streaming) or resolve
+        // the pending head 502; do NOT echo a reset back (agent initiated it).
+        this.resetStream(frame.id, frame.message ?? "stream reset", false);
+        return;
+    }
+  }
+
+  /** Settle the fetch()'s await-first-frame promise exactly once and mark the
+   *  head as committed. Subsequent head/err for this id are ignored. */
+  private settleHead(id: string, frame: AgentFrame): void {
+    const s = this.streams.get(id);
+    if (!s || !s.resolveHead) return;
+    const resolve = s.resolveHead;
+    s.resolveHead = undefined;
+    s.headSettled = true;
+    if (frame.type === "err") {
+      // No body stream will follow — retire the entry now.
+      clearTimeout(s.timer);
+      this.streams.delete(id);
+    }
+    resolve(frame);
+  }
+
+  /** Re-arm the idle timer for a live stream (called on every head/chunk). */
+  private rearm(s: Stream, id: string): void {
+    clearTimeout(s.timer);
+    s.timer = setTimeout(() => this.onIdle(id), RELAY_IDLE_MS);
+  }
+
+  /** Idle timeout fired for `id`: no traffic in RELAY_IDLE_MS. If we never got a
+   *  head, resolve the fetch() 504; otherwise error the streaming body and tell
+   *  the agent to abort (it may still be blocked reading a dead upstream). */
+  private onIdle(id: string): void {
+    const s = this.streams.get(id);
+    if (!s) return;
+    if (!s.headSettled) {
+      this.settleHead(id, {
+        id,
+        type: "err",
+        status: 504,
+        message: "upstream timeout",
+      });
+      return;
+    }
+    this.resetStream(id, "idle timeout", true);
+  }
+
+  /** Tear down an in-flight stream: clear its timer, drop it from the map, error
+   *  its readable (or resolve a still-pending head 502), and optionally send a
+   *  `reset` to the agent so it stops reading the upstream into a dead socket. */
+  private resetStream(id: string, message: string, notifyAgent: boolean): void {
+    const s = this.streams.get(id);
+    if (!s) return;
+    clearTimeout(s.timer);
+    this.streams.delete(id);
+    if (s.resolveHead) {
+      // Head never arrived -> the fetch() is still awaiting; 502 it.
+      const resolve = s.resolveHead;
+      s.resolveHead = undefined;
+      resolve({ id, type: "err", status: 502, message });
+    } else if (s.controller) {
+      try {
+        s.controller.error(new Error(message));
+      } catch {
+        /* already closed/errored */
+      }
+    }
+    if (notifyAgent) {
+      const reset: ResetFrame = { id, type: "reset", message };
+      const agent = this.ctx.getWebSockets("agent")[0];
+      try {
+        agent?.send(JSON.stringify(reset));
+      } catch {
+        /* socket gone — nothing to abort */
       }
     }
   }
 
   async webSocketClose(ws: WebSocket, code: number, reason: string) {
-    // A dead link must NOT leave in-flight callers hanging on the 30s timeout —
-    // drain pending now with a fast 502 so they unblock immediately. (#9)
-    this.failPending("appliance link closed");
+    // A dead link must NOT leave in-flight callers hanging — reset ALL in-flight
+    // streams now (error their readables / resolve pending heads 502) so they
+    // unblock immediately.
+    this.resetAll("appliance link closed");
     // Code 1012 means we superseded this socket with a fresh agent connection
     // (single-agent eviction above). The newer socket is the live one, so do NOT
     // mark the machine offline — that would flap a connected machine to offline.
@@ -227,21 +431,20 @@ export class ApplianceDO extends DurableObject<Env> {
   }
 
   async webSocketError(ws: WebSocket, _error: unknown) {
-    // Agent link errored — fail in-flight requests fast instead of waiting out
-    // the 30s timer, and flag the machine offline. (#9)
-    this.failPending("appliance link errored");
+    // Agent link errored — reset all in-flight streams fast and flag the machine
+    // offline.
+    this.resetAll("appliance link errored");
     const meta = ws.deserializeAttachment() as SockMeta | null;
     if (meta) await this.markMachine(meta, false);
   }
 
-  /** Resolve every in-flight pending request with a fast 502 and clear the map.
-   *  Called on socket close/error so a dead link surfaces immediately rather
-   *  than each caller waiting out REQUEST_TIMEOUT_MS. */
-  private failPending(reason: string): void {
-    for (const resolve of this.pending.values()) {
-      resolve({ id: "", type: "res", status: 502, body: reason });
+  /** Reset EVERY in-flight stream: error its readable (or resolve its pending
+   *  head 502) and clear the map. Called on socket close/error so a dead link
+   *  surfaces immediately. We do NOT notify the agent — the socket is gone. */
+  private resetAll(reason: string): void {
+    for (const id of [...this.streams.keys()]) {
+      this.resetStream(id, reason, false);
     }
-    this.pending.clear();
   }
 
   /** Report this machine's connected state to its tenant's TenantDO. Skipped if

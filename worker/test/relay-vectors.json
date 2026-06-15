@@ -1,0 +1,127 @@
+{
+  "$comment": [
+    "RELAY v2 FROZEN FRAME CONTRACT — shared golden vectors for the streaming relay.",
+    "Both the TS codec test (worker/test/relay-stream.test.ts) and the Go codec test",
+    "(agent/relay_vectors_test.go) load THIS SAME file and assert each frame round-trips",
+    "to/from the byte-for-byte JSON in `wire`. If you change the wire shape, change it",
+    "HERE and both sides re-pass — that is the point of a single fixture.",
+    "",
+    "Wire rules (must hold on both sides):",
+    "  - One WS message = one frame = one JSON object, UTF-8 text.",
+    "  - Every frame has { id:string, type:string }. `id` correlates req<->response.",
+    "  - chunk.data is base64 (RFC 4648 standard alphabet, padded) of a body byte slice.",
+    "  - head.headers is an ORDERED list of [lowercased-name, value] pairs and MAY contain",
+    "    duplicate names (e.g. two Set-Cookie). It EXCLUDES hop-by-hop headers:",
+    "    connection, keep-alive, transfer-encoding, upgrade, content-length,",
+    "    content-encoding.",
+    "  - STRICT per-id ordering agent->DO: head, then zero+ chunk, then end.",
+    "",
+    "`wire` is the canonical JSON object each side serializes/parses. Field ORDER in",
+    "`wire` is NOT significant (JSON object); assert by decoding to a struct/object and",
+    "comparing fields, and (for chunks) by decoding base64 and comparing bytes — do not",
+    "string-compare the serialized JSON. `bytes_utf8` on chunks is the decoded payload",
+    "for convenience; it is NOT part of the wire frame."
+  ],
+  "hopByHop": [
+    "connection",
+    "keep-alive",
+    "transfer-encoding",
+    "upgrade",
+    "content-length",
+    "content-encoding"
+  ],
+  "frames": {
+    "req": {
+      "direction": "DO->agent",
+      "note": "The relayed request. body is the buffered request body as a UTF-8 string. headers is a name->value map (request side stays a map; the DO builds it from Object.fromEntries(req.headers), the agent reads it as map[string]string).",
+      "wire": {
+        "id": "11111111-1111-4111-8111-111111111111",
+        "type": "req",
+        "method": "POST",
+        "path": "/mcp",
+        "headers": {
+          "content-type": "application/json",
+          "mcp-session-id": "sess-abc"
+        },
+        "body": "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}"
+      }
+    },
+    "head": {
+      "direction": "agent->DO",
+      "note": "Sent the INSTANT upstream status+headers are known, BEFORE any body. headers is an ORDERED [name,value] list, lowercased, hop-by-hop excluded, and PRESERVES DUPLICATES (two set-cookie below). This is the SSE-unblocking frame.",
+      "wire": {
+        "id": "11111111-1111-4111-8111-111111111111",
+        "type": "head",
+        "status": 200,
+        "headers": [
+          ["content-type", "text/event-stream"],
+          ["mcp-session-id", "sess-abc"],
+          ["set-cookie", "a=1; Path=/"],
+          ["set-cookie", "b=2; Path=/"]
+        ]
+      }
+    },
+    "chunk_hello": {
+      "direction": "agent->DO",
+      "note": "First body chunk. data = base64(std,padded) of the 5 bytes \"hello\".",
+      "bytes_utf8": "hello",
+      "wire": {
+        "id": "11111111-1111-4111-8111-111111111111",
+        "type": "chunk",
+        "data": "aGVsbG8="
+      }
+    },
+    "chunk_world": {
+      "direction": "agent->DO",
+      "note": "Second body chunk. data = base64(std,padded) of the 6 bytes \" world\". Concatenating the decoded bytes of chunk_hello + chunk_world yields exactly \"hello world\".",
+      "bytes_utf8": " world",
+      "wire": {
+        "id": "11111111-1111-4111-8111-111111111111",
+        "type": "chunk",
+        "data": "IHdvcmxk"
+      }
+    },
+    "end": {
+      "direction": "agent->DO",
+      "note": "Upstream body fully read -> close the stream (controller.close()).",
+      "wire": {
+        "id": "11111111-1111-4111-8111-111111111111",
+        "type": "end"
+      }
+    },
+    "err": {
+      "direction": "agent->DO",
+      "note": "Error BEFORE head (dial fail -> 502, SSRF reject -> 403). The DO turns this into new Response(message, { status }). Never sent after a head.",
+      "wire": {
+        "id": "22222222-2222-4222-8222-222222222222",
+        "type": "err",
+        "status": 502,
+        "message": "dial tcp 127.0.0.1:8000: connect: connection refused"
+      }
+    },
+    "reset": {
+      "direction": "either",
+      "note": "Abort an in-flight stream. message is optional. DO->agent on idle-timeout-after-head; agent->DO (or DO errors the readable) on its side. message MUST be omitted from the wire when empty (omitempty), so a reset with no message serializes to exactly {id,type}.",
+      "wire": {
+        "id": "11111111-1111-4111-8111-111111111111",
+        "type": "reset",
+        "message": "idle timeout"
+      }
+    },
+    "reset_no_message": {
+      "direction": "either",
+      "note": "A reset with no message — proves `message` is omitted (not \"\") on the wire.",
+      "wire": {
+        "id": "11111111-1111-4111-8111-111111111111",
+        "type": "reset"
+      }
+    }
+  },
+  "streamScript": {
+    "note": "A full happy-path response stream for the DO integration test: the ordered sequence of agent->DO frames for one id. Feeding these into the DO's webSocketMessage must produce a Response with status 200, the head headers (dupes preserved, hop-by-hop absent), and a body whose bytes equal \"hello world\".",
+    "id": "11111111-1111-4111-8111-111111111111",
+    "expectStatus": 200,
+    "expectBodyUtf8": "hello world",
+    "sequence": ["head", "chunk_hello", "chunk_world", "end"]
+  }
+}

@@ -60,14 +60,120 @@ var agentVersion = "1.4.0"
 // mid-handshake.
 const connectSkew = 5 * time.Second
 
+// headerPair is one ordered [name, value] header tuple. It marshals to / from a
+// JSON 2-element array (e.g. ["set-cookie","a=1"]) so the `head` frame can carry
+// an ORDERED, duplicate-preserving header list (two Set-Cookie survive). It is a
+// distinct shape from the request side's name->value map.
+type headerPair [2]string
+
+// frame is the RELAY v2 wire frame: one WS message = one JSON frame. Every frame
+// carries { id, type }; `id` correlates a request with its streamed response.
+//
+// Variants (see worker/test/relay-vectors.json — the shared golden fixture):
+//
+//	DO -> agent:   req   { id, type, method, path, headers(map), body }
+//	agent -> DO:   head  { id, type, status, headers([][name,value]) }
+//	               chunk { id, type, data }   // data = base64(std,padded) body slice
+//	               end   { id, type }
+//	               err   { id, type, status, message }   // pre-head failure only
+//	either:        reset { id, type, message? }          // abort an in-flight stream
+//
+// CRITICAL: the request side's `headers` is a name->value MAP (ReqHeaders) while
+// the `head` frame's `headers` is an ORDERED [name,value] LIST (HeadHeaders).
+// They are different JSON shapes, so they MUST live in different struct fields —
+// both serialize to the key "headers", but only one is ever set per frame type,
+// so they never collide on the wire (the unused one is omitempty-elided).
 type frame struct {
-	ID      string            `json:"id"`
-	Type    string            `json:"type"` // "req" (hub->agent) | "res" (agent->hub)
-	Method  string            `json:"method,omitempty"`
-	Path    string            `json:"path,omitempty"`
-	Headers map[string]string `json:"headers,omitempty"`
-	Body    string            `json:"body,omitempty"`
-	Status  int               `json:"status,omitempty"`
+	ID   string `json:"id"`
+	Type string `json:"type"` // req | head | chunk | end | err | reset
+
+	// req (DO -> agent)
+	Method     string            `json:"method,omitempty"`
+	Path       string            `json:"path,omitempty"`
+	ReqHeaders map[string]string `json:"-"`
+	Body       string            `json:"body,omitempty"`
+
+	// head (agent -> DO): ordered, duplicate-preserving [name,value] pairs.
+	HeadHeaders []headerPair `json:"-"`
+
+	// chunk (agent -> DO): base64(std,padded) of a body byte slice.
+	Data string `json:"data,omitempty"`
+
+	// err (agent -> DO, pre-head only) / head: HTTP status.
+	Status int `json:"status,omitempty"`
+	// err / reset: human-readable detail (omitted when empty).
+	Message string `json:"message,omitempty"`
+}
+
+// frameWire is the on-the-wire JSON shape. We hand-marshal so the single
+// "headers" key can hold EITHER the request map OR the ordered head list
+// depending on the frame type, while keeping omitempty semantics everywhere.
+type frameWire struct {
+	ID          string            `json:"id"`
+	Type        string            `json:"type"`
+	Method      string            `json:"method,omitempty"`
+	Path        string            `json:"path,omitempty"`
+	ReqHeaders  map[string]string `json:"-"`
+	HeadHeaders []headerPair      `json:"-"`
+	Headers     json.RawMessage   `json:"headers,omitempty"`
+	Body        string            `json:"body,omitempty"`
+	Data        string            `json:"data,omitempty"`
+	Status      int               `json:"status,omitempty"`
+	Message     string            `json:"message,omitempty"`
+}
+
+// MarshalJSON renders a frame to the canonical wire JSON. The "headers" key is
+// the request map for a `req` frame and the ordered list for a `head` frame.
+func (f frame) MarshalJSON() ([]byte, error) {
+	w := frameWire{
+		ID: f.ID, Type: f.Type,
+		Method: f.Method, Path: f.Path, Body: f.Body,
+		Data: f.Data, Status: f.Status, Message: f.Message,
+	}
+	switch {
+	case f.ReqHeaders != nil:
+		raw, err := json.Marshal(f.ReqHeaders)
+		if err != nil {
+			return nil, err
+		}
+		w.Headers = raw
+	case f.HeadHeaders != nil:
+		raw, err := json.Marshal(f.HeadHeaders)
+		if err != nil {
+			return nil, err
+		}
+		w.Headers = raw
+	}
+	return json.Marshal(w)
+}
+
+// UnmarshalJSON parses a wire frame, decoding "headers" into the request map
+// (object) or the ordered head list (array) based on its JSON shape. The agent
+// only ever RECEIVES `req` (object headers), but we handle both for the codec
+// round-trip test against the shared golden vectors.
+func (f *frame) UnmarshalJSON(data []byte) error {
+	var w frameWire
+	if err := json.Unmarshal(data, &w); err != nil {
+		return err
+	}
+	f.ID, f.Type = w.ID, w.Type
+	f.Method, f.Path, f.Body = w.Method, w.Path, w.Body
+	f.Data, f.Status, f.Message = w.Data, w.Status, w.Message
+	f.ReqHeaders, f.HeadHeaders = nil, nil
+	if len(w.Headers) > 0 {
+		trimmed := bytes.TrimSpace(w.Headers)
+		switch {
+		case len(trimmed) > 0 && trimmed[0] == '[':
+			if err := json.Unmarshal(w.Headers, &f.HeadHeaders); err != nil {
+				return err
+			}
+		case len(trimmed) > 0 && trimmed[0] == '{':
+			if err := json.Unmarshal(w.Headers, &f.ReqHeaders); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 type joinResp struct {
@@ -345,17 +451,28 @@ func serve(wsURL string, upstream *url.URL) error {
 	c.SetReadLimit(32 << 20) // 32 MiB frames
 	log.Printf("finch: relay open -> %s", upstream)
 
-	// One writer at a time: coder/websocket forbids concurrent writes.
+	// One writer at a time: coder/websocket forbids concurrent writes. write
+	// returns an error so a streaming forward() can ABORT mid-stream when the DO
+	// link is dead — otherwise the agent would keep reading a whole upstream body
+	// and base64ing it into a void. A write failure also cancels the connection
+	// ctx so the read loop unwinds and the reconnect loop takes over.
 	var wmu sync.Mutex
-	write := func(f frame) {
-		data, _ := json.Marshal(f)
+	write := func(f frame) error {
+		data, err := json.Marshal(f)
+		if err != nil {
+			log.Printf("finch: marshal %s: %v", f.ID, err)
+			return err
+		}
 		wmu.Lock()
 		defer wmu.Unlock()
 		wctx, wcancel := context.WithTimeout(ctx, 30*time.Second)
 		defer wcancel()
 		if err := c.Write(wctx, websocket.MessageText, data); err != nil {
 			log.Printf("finch: write %s: %v", f.ID, err)
+			cancel()
+			return err
 		}
+		return nil
 	}
 
 	// NAT keepalive — hub auto-pongs without waking the Durable Object. Track
@@ -399,35 +516,44 @@ func serve(wsURL string, upstream *url.URL) error {
 		if json.Unmarshal(data, &f) != nil || f.Type != "req" {
 			continue
 		}
-		go write(forward(ctx, upstream, f))
+		go forward(ctx, upstream, f, write)
 	}
 }
 
-// forward replays one hub request against the local MCP server. The hub-supplied
-// path is sanitized (path.Clean + scheme/host-injection reject + base
-// confinement) so a malicious or buggy path can never escape --upstream — the
-// relay is otherwise an SSRF foothold into the box's loopback.
-func forward(ctx context.Context, upstream *url.URL, f frame) frame {
-	out := frame{ID: f.ID, Type: "res"}
+// relayChunkSize is the upstream read granularity. We read the body in ~32KiB
+// slices and base64-encode each into one `chunk` frame, so a streaming/SSE/
+// long-running upstream is relayed incrementally instead of buffered whole.
+const relayChunkSize = 32 << 10
 
+// forward replays one hub request against the local MCP server and STREAMS the
+// response back over the relay: a `head` frame the INSTANT status+headers are
+// known (this is what unblocks SSE / progress / long-running tools), then zero+
+// `chunk` frames of base64'd body slices, then `end`. A failure BEFORE head is
+// reported as a single `err` frame (the DO can still fail over to another
+// machine until head arrives); a failure AFTER head aborts the stream (the DO
+// errors its readable) since we are already committed to this box.
+//
+// The hub-supplied path is sanitized (path.Clean + scheme/host-injection reject
+// + base confinement) so a malicious or buggy path can never escape --upstream —
+// the relay is otherwise an SSRF foothold into the box's loopback.
+//
+// There is NO total timeout: a long-running ("thinking") tool or an open SSE
+// stream may legitimately run for minutes. The relay ctx still cancels the
+// upstream request when the link drops (the DO's idle timeout fires the abort).
+func forward(ctx context.Context, upstream *url.URL, f frame, write func(frame) error) {
 	target, err := resolveUpstream(upstream, f.Path)
 	if err != nil {
-		out.Status, out.Body = 403, err.Error()
-		return out
+		// SSRF reject — pre-head, so the DO turns this into a 403 response.
+		write(frame{ID: f.ID, Type: "err", Status: 403, Message: err.Error()})
+		return
 	}
 
-	// Bound the upstream call below the hub's relay timeout so a hung local
-	// server can't pin a goroutine indefinitely; still cancels on link drop
-	// since it's a child of the relay ctx.
-	reqCtx, cancel := context.WithTimeout(ctx, 28*time.Second)
-	defer cancel()
-
-	req, err := http.NewRequestWithContext(reqCtx, f.Method, target, strings.NewReader(f.Body))
+	req, err := http.NewRequestWithContext(ctx, f.Method, target, strings.NewReader(f.Body))
 	if err != nil {
-		out.Status, out.Body = 502, err.Error()
-		return out
+		write(frame{ID: f.ID, Type: "err", Status: 502, Message: err.Error()})
+		return
 	}
-	for k, v := range f.Headers {
+	for k, v := range f.ReqHeaders {
 		switch strings.ToLower(k) {
 		case "host", "connection", "upgrade", "content-length", "transfer-encoding", "authorization":
 			// hop-by-hop / recomputed / credential — never forward to the box.
@@ -437,31 +563,65 @@ func forward(ctx context.Context, upstream *url.URL, f frame) frame {
 			req.Header.Set(k, v)
 		}
 	}
+
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		out.Status, out.Body = 502, err.Error()
-		return out
+		// Dial / connect failure — pre-head, so the DO maps it to a 502 and may
+		// still fail over to another machine.
+		write(frame{ID: f.ID, Type: "err", Status: 502, Message: err.Error()})
+		return
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
-	out.Status = resp.StatusCode
-	out.Body = string(b)
-	// Forward the FULL upstream header set (minus hop-by-hop / recomputed) so
-	// stateful MCP works end-to-end — collapsing to content-type stripped the
-	// Mcp-Session-Id returned on `initialize`, which 4xx'd every follow-up call.
-	// The hub re-emits these (also minus hop-by-hop) onto the client response.
-	out.Headers = map[string]string{}
+
+	// Build the ORDERED, duplicate-preserving head header list (minus hop-by-hop
+	// / recomputed), lowercased. We iterate EVERY value per key (not just vs[0])
+	// so duplicate Set-Cookie headers survive — collapsing them broke multi-cookie
+	// responses. Stateful MCP relies on this (e.g. Mcp-Session-Id from initialize).
+	// Non-nil so the `head` frame always carries a "headers" key (even when every
+	// upstream header is hop-by-hop) — the DO guards undefined too, but this keeps
+	// the wire shape uniform.
+	headers := []headerPair{}
 	for k, vs := range resp.Header {
 		switch strings.ToLower(k) {
 		case "connection", "keep-alive", "transfer-encoding", "upgrade", "content-length", "content-encoding":
 			// hop-by-hop / recomputed — never forward.
 		default:
-			if len(vs) > 0 {
-				out.Headers[k] = vs[0]
+			lk := strings.ToLower(k)
+			for _, v := range vs {
+				headers = append(headers, headerPair{lk, v})
 			}
 		}
 	}
-	return out
+	// Emit head IMMEDIATELY, before reading any body. A write failure here means
+	// the DO link is gone; abort (write() already cancelled the ctx).
+	if err := write(frame{ID: f.ID, Type: "head", Status: resp.StatusCode, HeadHeaders: headers}); err != nil {
+		return
+	}
+
+	// Stream the body in ~32KiB reads. Each non-empty read becomes one base64
+	// `chunk`; a write failure mid-stream aborts (the DO is dead — don't drain
+	// the whole upstream into a void). On clean EOF send `end`.
+	buf := make([]byte, relayChunkSize)
+	for {
+		n, rerr := resp.Body.Read(buf)
+		if n > 0 {
+			data := base64.StdEncoding.EncodeToString(buf[:n])
+			if werr := write(frame{ID: f.ID, Type: "chunk", Data: data}); werr != nil {
+				return
+			}
+		}
+		if rerr != nil {
+			if rerr == io.EOF {
+				write(frame{ID: f.ID, Type: "end"})
+			} else {
+				// Body read failed AFTER head (e.g. upstream reset, ctx cancel on
+				// link drop). We're committed to this machine; abort the stream so
+				// the DO errors its readable rather than seeing a clean end.
+				write(frame{ID: f.ID, Type: "reset", Message: rerr.Error()})
+			}
+			return
+		}
+	}
 }
 
 // resolveUpstream turns the hub-supplied request path into an absolute upstream
