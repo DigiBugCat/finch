@@ -16,40 +16,9 @@
 
 import "server-only";
 import { auth } from "@clerk/nextjs/server";
-
-/** TTL of a signed tenant assertion (seconds). Short — each hub call mints a
- *  fresh one; this only bounds clock-skew tolerance / replay window. */
-const ASSERTION_TTL_SECONDS = 120;
-
-const te = new TextEncoder();
-
-function bytesToB64url(bytes: Uint8Array): string {
-  let bin = "";
-  for (const b of bytes) bin += String.fromCharCode(b);
-  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-/** Sign a {tenant,exp} assertion with the shared service secret (HMAC-SHA256).
- *  Wire format mirrors the hub's verifyAssertion: b64url(JSON) "." b64url(sig). */
-async function signAssertion(
-  tenant: string,
-  secret: string,
-): Promise<string> {
-  const payload = {
-    tenant,
-    exp: Math.floor(Date.now() / 1000) + ASSERTION_TTL_SECONDS,
-  };
-  const body = bytesToB64url(te.encode(JSON.stringify(payload)));
-  const key = await crypto.subtle.importKey(
-    "raw",
-    te.encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-  const sig = await crypto.subtle.sign("HMAC", key, te.encode(body));
-  return body + "." + bytesToB64url(new Uint8Array(sig));
-}
+// The assertion signer lives in its own dependency-free module so it can be
+// contract-tested against the hub's verifyAssertion (worker/src/auth.ts).
+import { signAssertion } from "./assertion";
 
 /** A thrown HttpError short-circuits a route handler with a JSON response. */
 export class HttpError extends Error {

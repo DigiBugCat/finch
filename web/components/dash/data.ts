@@ -82,6 +82,26 @@ export interface Appliance {
   conn: Connection;
 }
 
+/** A key's reach, in STRUCTURED form — mirrors the worker's KeyScope
+ *  (worker/src/types.ts). Either every appliance ({all:true}) or an explicit
+ *  allow-list of appliance ids. NOT a free-text string: the hub validates this
+ *  shape at mint, and checkKey Gate 1 reads `scope.all === true` / the id list.
+ *  Keep this in sync with the worker type — the two cross the wire verbatim. */
+export type KeyScope = { all: true } | { all?: false; appliances: string[] };
+
+/** Render a KeyScope as a human label for the dashboard (panels.tsx). The hub
+ *  returns a KeyScope OBJECT, so rendering it raw yields "[object Object]";
+ *  this collapses it to "all appliances" or a comma-joined id list. Tolerant of
+ *  a malformed/legacy value so the Keys table never renders garbage. */
+export function formatScope(scope: KeyScope | null | undefined): string {
+  if (!scope) return "—";
+  if ("all" in scope && scope.all === true) return "all appliances";
+  const ids = Array.isArray((scope as { appliances?: unknown }).appliances)
+    ? (scope as { appliances: string[] }).appliances
+    : [];
+  return ids.length ? ids.join(", ") : "no appliances";
+}
+
 export interface AclEntity {
   type: "user" | "group" | "key" | "tag" | "appliance" | "all";
   name?: string;
@@ -136,13 +156,15 @@ export interface Overview {
   latest: string;
 }
 
-/** A key as exposed to the dashboard — no hash, no plaintext. */
+/** A key as exposed to the dashboard — no hash, no plaintext. `scope` is the
+ *  STRUCTURED KeyScope the hub returns (worker/src/types.ts PublicKey), NOT a
+ *  string — render it through formatScope() for display. */
 export interface PublicKey {
   id: string;
   label: string;
   owner: string;
   created: string;
-  scope: string;
+  scope: KeyScope;
   last4: string;
 }
 
@@ -182,11 +204,12 @@ export interface EnrollResp {
   expiresAt: number;
 }
 
-/** Hub POST /api/keys response (plaintext returned ONCE). */
+/** Hub POST /api/keys response (plaintext returned ONCE). `scope` is the
+ *  structured KeyScope the hub minted (worker/src/types.ts MintKeyResp). */
 export interface MintKeyResp {
   key: string;
   label: string;
-  scope: string;
+  scope: KeyScope;
 }
 
 // The agent version the dashboard treats as "latest" for the out-of-date badge

@@ -2,6 +2,7 @@
 // Roost — Enroll + Keys panels.
 import { useState } from 'react';
 import { Button, Card, CopyChip, DuskInput, InlineConfirm, MaskedSecret, SectionLabel } from '@/components/dash/primitives';
+import { formatScope, type PublicKey } from '@/components/dash/data';
 
 // Only the posix platforms the hub actually serves an installer for. The worker
 // serves a single GET /install (curl|sh) shell installer; there's no
@@ -194,11 +195,11 @@ export function KeysView({ keys, users, onMint, onRevoke }: any) {
         {keys.length === 0 && (
           <div className="krow"><span className="dim" style={{ padding: "8px 0" }}>No keys yet — mint one above.</span></div>
         )}
-        {keys.map((k: any) => (
+        {(keys as PublicKey[]).map((k) => (
           <div key={k.id} className="krow">
             <span className="k-label mono">🔑 {k.label}</span>
             <span className="k-owner mono"><span className={k.owner === "you" ? "own-you" : "own-other"}>{k.owner}</span></span>
-            <span className="k-scope mono dim">{k.scope}</span>
+            <span className="k-scope mono dim">{formatScope(k.scope)}</span>
             <span className="k-val mono dim">{`finch_••••${k.last4}`}</span>
             <span className="k-created mono dim">{k.created}</span>
             <span className="k-act"><InlineConfirm prompt="revoke?" trigger="revoke" onConfirm={() => onRevoke(k)} /></span>

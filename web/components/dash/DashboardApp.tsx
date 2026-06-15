@@ -43,7 +43,7 @@ export default function DashboardApp() {
         ...init,
         headers: { "content-type": "application/json", ...(init.headers || {}) },
       });
-      const body = await res.json().catch(() => ({}));
+      const body: any = await res.json().catch(() => ({}));
       if (!res.ok) {
         flash(`⚠ ${body?.error || failMsg || "something went wrong"}`);
         return null;
@@ -121,10 +121,26 @@ export default function DashboardApp() {
   // --- keys (the tenant-level Keys view) ---------------------------
   // Mint a real finch_ key via the hub; returns the MintKeyResp so KeysView can
   // reveal the plaintext once. Revoke by the key's stable id (not its label).
-  const mintKey = ({ label, owner }: any) =>
-    mutate(`/api/finch/keys`,
-      { method: "POST", body: JSON.stringify({ label, owner }) },
+  //
+  // For a minted key to actually REACH an enrolled appliance it must clear BOTH
+  // gates in TenantDO.checkKey (worker/src/tenant-do.ts):
+  //   Gate 1 (scope): the structured KeyScope must be {all:true} or list the
+  //     appliance. We default to {all:true} so a v1 owner key works fleet-wide.
+  //     (A caller MAY pass an explicit `scope` to narrow it to picked appliances.)
+  //   Gate 2 (ACL, default-deny): some allow rule's src must match the key's
+  //     OWNER identity. A fresh tenant ships ONE locked rule: user "you" -> all.
+  //     The single-owner common case (no org / sole user) is that "you" owner —
+  //     so we normalize a sole-owner mint to owner "you" so it matches the
+  //     locked rule and the key works with ZERO extra ACL steps. In a multi-user
+  //     org the picked owner is sent verbatim (the admin scopes ACL per user),
+  //     so this never silently widens a multi-user tenant's access.
+  const mintKey = ({ label, owner, scope }: any) => {
+    const soleOwner = users.length <= 1;
+    const ownerIdentity = soleOwner ? "you" : owner;
+    return mutate(`/api/finch/keys`,
+      { method: "POST", body: JSON.stringify({ label, owner: ownerIdentity, scope: scope ?? { all: true } }) },
       `🔑 key minted — ${label}`, `couldn't mint ${label}`);
+  };
 
   const revokeKey = (k: any) =>
     void mutate(`/api/finch/keys/revoke`,
