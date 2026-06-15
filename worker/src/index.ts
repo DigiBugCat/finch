@@ -35,6 +35,11 @@ export interface Env {
   DEFAULT_TENANT?: string; // DEV-ONLY tenant fallback when no slug resolves
   DEV?: string; // "1" in the dev env; gates the DEFAULT_TENANT fallback
 
+  // Where GET /releases/<asset> redirects to fetch the agent binary. Defaults to
+  // the project's GitHub Releases "latest" assets; override per-env if binaries
+  // are hosted elsewhere (e.g. an R2 bucket).
+  RELEASES_BASE?: string;
+
   // Cloudflare Rate Limiting bindings (unsafe.bindings ratelimit). Optional so
   // tests / `wrangler dev` without the binding still run (limiter() no-ops when
   // absent). RELAY_LIMIT gates per-(tenant,IP) on the MCP relay BEFORE the
@@ -76,6 +81,16 @@ export function clientIp(req: Request): string {
 // buffers the whole body via req.text(); a few-MB cap keeps concurrent POSTs
 // from summing past DO heap. Enforced here pre-stub AND in ApplianceDO.fetch.
 const MAX_RELAY_BODY_BYTES = 4 * 1024 * 1024; // 4 MiB
+
+// Default target for GET /releases/<asset>: the project's GitHub Releases
+// "latest" download URL. Overridable via env.RELEASES_BASE.
+const DEFAULT_RELEASES_BASE =
+  "https://github.com/DigiBugCat/finch/releases/latest/download";
+
+// Allow-listed release asset names — gates the /releases redirect so it can
+// never be turned into an open redirect. Matches the installer's
+// `finch-${os}-${arch}` and GoReleaser's archive name_template.
+const RELEASE_ASSET_RE = /^finch-(darwin|linux)-(amd64|arm64)$/;
 
 /** Percent-decode a path segment, tolerating a malformed encoding (a raw "%"
  *  in a name would make decodeURIComponent throw). Falls back to the raw value
@@ -198,6 +213,25 @@ export default {
           "cache-control": "no-store",
         },
       });
+    }
+
+    // ---- GET /releases/finch-<os>-<arch> — redirect to the published agent
+    //      binary. The installer fetches $HUB/releases/finch-<os>-<arch>; we 302
+    //      to GitHub Releases (env.RELEASES_BASE) so the Worker needn't host
+    //      binaries. The asset name is allow-listed (RELEASE_ASSET_RE) so this
+    //      can never be an open redirect, and a non-matching /releases/* falls
+    //      through to normal routing. ----
+    if (
+      req.method === "GET" &&
+      parts[0] === "releases" &&
+      parts.length === 2 &&
+      RELEASE_ASSET_RE.test(parts[1])
+    ) {
+      const base = (env.RELEASES_BASE || DEFAULT_RELEASES_BASE).replace(
+        /\/+$/,
+        "",
+      );
+      return Response.redirect(`${base}/${parts[1]}`, 302);
     }
 
     // ---- MCP / relay plane. Tenant id resolves from the host slug via the

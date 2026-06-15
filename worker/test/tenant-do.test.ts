@@ -571,3 +571,19 @@ describe("TenantDO.approve — derives liveness from connected (#12)", () => {
     expect(m.state).toBe("resting"); // not "chirping"
   });
 });
+
+describe("TenantDO.machineExists — /refresh revocation gate", () => {
+  it("returns true for a registered machine, false otherwise", async () => {
+    const t = freshTenant();
+    await op(t, "enroll", { name: "Scraper" });
+    await op(t, "registerMachine", {
+      appliance: "scraper",
+      machine: "box-1",
+      os: "linux",
+      version: "1.4.0",
+    });
+    expect(await op<{ exists: boolean }>(t, "machineExists", { appliance: "scraper", machine: "box-1" })).toEqual({ exists: true });
+    expect(await op<{ exists: boolean }>(t, "machineExists", { appliance: "scraper", machine: "ghost" })).toEqual({ exists: false });
+    expect(await op<{ exists: boolean }>(t, "machineExists", { appliance: "nope", machine: "box-1" })).toEqual({ exists: false });
+  });
+});

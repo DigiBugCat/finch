@@ -1,0 +1,47 @@
+# GoReleaser config for the finch agent.
+#
+# The agent is a Go module under agent/ (not the repo root), so the build runs
+# with `dir: agent`. On a tag push the release workflow cross-compiles all four
+# targets and uploads RAW binaries named exactly `finch-<os>-<arch>` to GitHub
+# Releases — which is what the installer (`$HUB/releases/finch-${os}-${arch}`)
+# and the worker /releases redirect resolve to.
+#
+#   tag v1.4.0  ->  stamps -X main.agentVersion=1.4.0 (matches the literal that
+#                   scripts/check-versions.mjs keeps in sync across all three files)
+version: 2
+
+project_name: finch
+
+builds:
+  - id: finch
+    dir: agent
+    main: .
+    binary: finch
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - darwin
+      - linux
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w -X main.agentVersion={{ .Version }}
+
+archives:
+  # Serve un-tarred binaries named exactly finch-<os>-<arch> so the installer's
+  # URL and the worker /releases redirect download a runnable binary directly.
+  - id: raw
+    format: binary
+    name_template: "finch-{{ .Os }}-{{ .Arch }}"
+
+checksum:
+  name_template: "checksums.txt"
+  algorithm: sha256
+
+release:
+  draft: false
+  prerelease: auto
+
+changelog:
+  use: github

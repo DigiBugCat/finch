@@ -22,6 +22,7 @@ import {
 import type {
   EnrollResp,
   JoinResp,
+  RefreshResp,
   MintKeyResp,
   TenantState,
   PublicKey,
@@ -32,6 +33,12 @@ import type {
 // bounding the replay surface a captured ticket exposes. (security M1)
 const TICKET_TTL_SECONDS = 15 * 60; // join tickets live 15m
 const CONNECT_TOKEN_TTL_SECONDS = 120; // per-machine _connect grants live 120s
+// The agent keeps its refresh token across the whole enrollment lifetime and
+// trades it for fresh connect-tokens at /refresh, so it never re-uses the
+// one-shot join ticket. 30 days bounds the credential while comfortably covering
+// any realistic always-on uptime; a machine removed from the dashboard is
+// rejected at /refresh (machineExists) well before this elapses.
+const REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60; // 30d
 
 // Machine-name clamp at the door (M1): bound length + charset before the name
 // ever reaches the registry. Mirrors tenant-do's cleanMachineName.
@@ -47,7 +54,12 @@ function cleanMachine(raw: unknown): string | null {
 
 /** True if this path is handled by the control API (vs the MCP/relay plane). */
 export function isApiPath(path: string): boolean {
-  return path === "/join" || path === "/api" || path.startsWith("/api/");
+  return (
+    path === "/join" ||
+    path === "/refresh" ||
+    path === "/api" ||
+    path.startsWith("/api/")
+  );
 }
 
 async function readJson(req: Request): Promise<any> {
@@ -71,6 +83,14 @@ export async function handleApi(
   if (path === "/join") {
     if (method !== "POST") return json(405, { error: "POST only" });
     return handleJoin(req, env, host);
+  }
+
+  // ---- /refresh — refresh-token-authed (NOT service-authed). The box trades
+  //      its long-lived per-machine refresh token for a fresh connect-token,
+  //      so steady-state reconnection never re-uses the one-shot join ticket. ----
+  if (path === "/refresh") {
+    if (method !== "POST") return json(405, { error: "POST only" });
+    return handleRefresh(req, env, host);
   }
 
   // ---- Everything else under /api requires the service secret + a SIGNED
@@ -346,7 +366,81 @@ async function handleJoin(
     env.TICKET_SECRET,
   );
 
+  // Long-lived per-machine refresh token. The agent keeps this and trades it at
+  // /refresh for fresh connect-tokens — so the one-shot join ticket is never
+  // re-used (it's already burned above by claimTicket). (reconnect fix)
+  const refreshExp =
+    Math.floor(Date.now() / 1000) + REFRESH_TOKEN_TTL_SECONDS;
+  const refreshToken = await signToken(
+    {
+      tenant,
+      appliance,
+      machine,
+      kind: "refresh",
+      exp: refreshExp,
+    },
+    env.TICKET_SECRET,
+  );
+
   const resp: JoinResp = {
+    ok: true,
+    tenant,
+    appliance,
+    machine,
+    connectUrl,
+    connectToken,
+    refreshToken,
+  };
+  return json(200, resp);
+}
+
+// ---- POST /refresh — refresh-token-authed -----------------------------------
+
+async function handleRefresh(
+  req: Request,
+  env: Env,
+  host: string,
+): Promise<Response> {
+  // Rate-limit per-IP like /join — it's a public, unauthenticated-until-verified
+  // endpoint that mints credentials.
+  const ip = clientIp(req);
+  if (!(await rateLimitOk(env.JOIN_LIMIT, `refresh:${ip}`))) {
+    return json(429, { error: "rate limited" });
+  }
+
+  const body = await readJson(req);
+  if (!body.refreshToken) return json(400, { error: "refreshToken required" });
+
+  const payload = await verifyToken(body.refreshToken, env.TICKET_SECRET);
+  if (!payload || payload.kind !== "refresh" || !payload.machine) {
+    return json(401, { error: "invalid or expired refresh token" });
+  }
+  const { tenant, appliance } = payload;
+  const machine = payload.machine;
+
+  // Revocation: a machine removed from the dashboard can no longer refresh, so a
+  // leaked refresh token stops working within one connect-token TTL of removal.
+  const reg = await tenantOp<{ exists: boolean }>(env, tenant, "machineExists", {
+    appliance,
+    machine,
+  });
+  if (!reg.exists) {
+    return json(403, { error: "machine no longer registered" });
+  }
+
+  const connectExp =
+    Math.floor(Date.now() / 1000) + CONNECT_TOKEN_TTL_SECONDS;
+  const connectToken = await signToken(
+    { tenant, appliance, machine, kind: "connect", exp: connectExp },
+    env.TICKET_SECRET,
+  );
+
+  const base = await tenantHostBase(env, tenant, host);
+  const connectUrl = `${base.ws}/${appliance}/${encodeURIComponent(
+    machine,
+  )}/_connect`;
+
+  const resp: RefreshResp = {
     ok: true,
     tenant,
     appliance,

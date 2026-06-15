@@ -198,6 +198,21 @@ export interface JoinResp {
   // _connect dial as ?ct=<connectToken>. The hub verifies it (kind+tenant+
   // appliance+machine match, not expired) BEFORE forwarding the WS upgrade.
   connectToken: string;
+  // Long-lived (~30d) per-machine credential. The agent keeps this and presents
+  // it at POST /refresh to mint fresh connect-tokens, so steady-state reconnects
+  // never re-use the one-shot join ticket (which is burned on first /join).
+  refreshToken: string;
+}
+
+// POST /refresh response — re-mints a connect-token from a still-valid refresh
+// token (no ticket re-use). Same shape as JoinResp minus the refresh token.
+export interface RefreshResp {
+  ok: boolean;
+  tenant: string;
+  appliance: string;
+  machine: string;
+  connectUrl: string;
+  connectToken: string;
 }
 
 export interface MintKeyResp {

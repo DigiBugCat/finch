@@ -224,6 +224,8 @@ export class TenantDO extends DurableObject<Env> {
           );
         case "claimTicket":
           return ok(await this.claimTicket(a.jti, a.exp));
+        case "machineExists":
+          return ok(await this.machineExists(a.appliance, a.machine));
         case "recordCall":
           return ok(
             await this.recordCall(
@@ -928,6 +930,22 @@ export class TenantDO extends DurableObject<Env> {
     used[jti] = typeof exp === "number" && exp > nowSec ? exp : nowSec + 3600;
     await this.save(s);
     return { ok: true };
+  }
+
+  /** True iff `machine` is currently registered under `appliance`. Used by the
+   *  /refresh endpoint so a machine removed from the dashboard can no longer mint
+   *  fresh connect-tokens — revocation takes effect within one connect-token TTL. */
+  private async machineExists(
+    appliance: unknown,
+    machine: unknown,
+  ): Promise<{ exists: boolean }> {
+    if (typeof appliance !== "string" || typeof machine !== "string") {
+      return { exists: false };
+    }
+    const s = await this.load();
+    const ap = this.findAppliance(s, appliance);
+    if (!ap) return { exists: false };
+    return { exists: ap.machines.some((m) => m.name === machine) };
   }
 
   /** Agent join: register (or refresh) a machine under an appliance. Sets the

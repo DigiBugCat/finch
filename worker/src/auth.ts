@@ -75,12 +75,17 @@ export interface TicketPayload {
   tenant: string;
   appliance: string;
   exp: number; // epoch SECONDS; verifyToken rejects once Date.now()/1000 > exp
-  // `kind` distinguishes the two HMAC grants that share this signer:
-  //   - "join"    (or absent) — the short enroll ticket presented at POST /join.
+  // `kind` distinguishes the HMAC grants that share this signer:
+  //   - "join"    (or absent) — the short, single-use enroll ticket presented at
+  //                 POST /join. Burned (jti) on first use.
+  //   - "refresh" — the long-lived (~30d) per-machine credential handed back at
+  //                 /join. The agent persists it in memory and presents it at
+  //                 POST /refresh to mint fresh connect-tokens, so steady-state
+  //                 reconnection never re-uses the one-shot join ticket.
   //   - "connect" — the short-lived (~120s) per-machine grant the agent presents
   //                 on the /_connect WS dial (?ct=…). Bound to a single machine.
-  kind?: "join" | "connect";
-  machine?: string; // present (and verified) only for kind:"connect" tokens
+  kind?: "join" | "connect" | "refresh";
+  machine?: string; // present (and verified) for kind:"connect"|"refresh" tokens
   // Random one-time id. On a join ticket the hub records it (TenantDO used-set)
   // at first /join and rejects any replay until exp, so a captured ticket can't
   // be reused for its whole TTL. Connect tokens don't carry one (they're already
@@ -180,7 +185,10 @@ export function verifyToken(
     typeof p.tenant === "string" &&
     typeof p.appliance === "string" &&
     typeof p.exp === "number" &&
-    (p.kind === undefined || p.kind === "join" || p.kind === "connect") &&
+    (p.kind === undefined ||
+      p.kind === "join" ||
+      p.kind === "connect" ||
+      p.kind === "refresh") &&
     (p.machine === undefined || typeof p.machine === "string") &&
     (p.jti === undefined || typeof p.jti === "string")
       ? (p as TicketPayload)

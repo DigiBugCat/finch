@@ -15,11 +15,16 @@
 // NAT keepalive (the hub auto-pongs them without waking the Durable Object, so
 // they're free).
 //
-// Reconnect model: the enrollment ticket is one-shot (the dashboard consumes it
-// on first /join), but the connect-token lives only ~120s. So we do NOT re-/join
-// on every blip — we keep reconnecting with the SAME still-valid connect-token,
-// and only re-/join (re-using the original ticket while it remains within its own
-// TTL) once the connect-token has expired.
+// Reconnect model: the enrollment ticket is ONE-SHOT — the hub burns it on the
+// first /join and 409s any replay. So /join also hands us a long-lived (~30d)
+// per-machine REFRESH token. While the still-valid connect-token holds we just
+// reconnect with it; once it nears expiry we trade the refresh token at /refresh
+// for a fresh connect-token. The one-shot join ticket is never re-used.
+//
+// We persist that refresh token to --state (0600), so a restart/reboot resumes
+// straight from it without a new dashboard ticket — "authenticate once", like
+// ngrok. --ticket is only needed on first enroll (or if the credential was
+// revoked).
 package main
 
 import (
@@ -35,6 +40,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -73,15 +79,20 @@ type joinResp struct {
 	// dial as ?ct=<connectToken>; the hub verifies it BEFORE accepting the relay
 	// socket. (FLEET_SECRET is gone — this token is the whole proof.)
 	ConnectToken string `json:"connectToken"`
+	// Long-lived (~30d) per-machine credential, returned only by /join. We keep
+	// it and present it at /refresh to mint fresh connect-tokens, so we never
+	// re-use the one-shot enrollment ticket. Empty on a /refresh response.
+	RefreshToken string `json:"refreshToken"`
 	Error        string `json:"error"`
 }
 
 func main() {
 	hostName, _ := os.Hostname()
 	hub := flag.String("hub", "https://finchmcp.com", "finch hub base URL (http[s]://…)")
-	ticket := flag.String("ticket", "", "one-shot enrollment ticket from the dashboard (required)")
+	ticket := flag.String("ticket", "", "one-shot enrollment ticket from the dashboard (first run only; later runs resume from --state)")
 	machine := flag.String("machine", hostName, "this box's name")
 	upstream := flag.String("upstream", "http://127.0.0.1:8000", "local MCP server base URL")
+	statePath := flag.String("state", defaultStatePath(), "file that persists the per-machine refresh credential so a restart needs no new ticket")
 
 	// The dashboard/install one-liner is `finch join --hub … --ticket …`, but
 	// flag.Parse stops at the first non-flag arg (`join`), so --ticket would
@@ -92,10 +103,6 @@ func main() {
 	}
 	flag.Parse()
 
-	if *ticket == "" {
-		log.Fatal("finch: --ticket is required (mint one in the dashboard → Add device)")
-	}
-
 	// Confine forwarded requests to the configured upstream: parse it once so
 	// forward() can reject any path that would escape the base (SSRF guard).
 	upstreamURL, err := url.Parse(strings.TrimRight(*upstream, "/"))
@@ -103,12 +110,46 @@ func main() {
 		log.Fatalf("finch: --upstream %q is not a valid absolute URL", *upstream)
 	}
 
-	// First join: claims the slot and yields the assignment + connect-token.
-	jr, err := join(*hub, *ticket, *machine)
-	if err != nil {
-		log.Fatalf("finch: join failed: %v", err)
+	// Resume-or-enroll. If we have a saved refresh credential for THIS hub, skip
+	// the one-shot ticket entirely and mint a connect-token straight from it — so
+	// a reboot/restart needs no fresh dashboard ticket. Only on first run (or a
+	// revoked/stale credential) do we fall back to --ticket.
+	var jr *joinResp
+	refreshToken := ""
+	if saved, _ := loadState(*statePath); saved != nil && saved.RefreshToken != "" && saved.Hub == *hub {
+		if r, rerr := refresh(*hub, saved.RefreshToken); rerr == nil {
+			jr = r
+			refreshToken = saved.RefreshToken
+			log.Printf("finch: resumed from saved credential (%s)", *statePath)
+		} else {
+			log.Printf("finch: saved credential at %s unusable (%v) — falling back to --ticket", *statePath, rerr)
+		}
 	}
-	log.Printf("finch: joined as appliance=%q machine=%q (tenant %s)", jr.Appliance, jr.Machine, jr.Tenant)
+	if jr == nil {
+		if *ticket == "" {
+			log.Fatal("finch: --ticket is required on first enroll (mint one in the dashboard → Add device)")
+		}
+		r, jerr := join(*hub, *ticket, *machine)
+		if jerr != nil {
+			log.Fatalf("finch: join failed: %v", jerr)
+		}
+		jr = r
+		refreshToken = jr.RefreshToken
+		// Persist the long-lived credential so the next start resumes ticketless.
+		if refreshToken != "" {
+			st := &agentState{
+				Hub:          *hub,
+				Tenant:       jr.Tenant,
+				Appliance:    jr.Appliance,
+				Machine:      jr.Machine,
+				RefreshToken: refreshToken,
+			}
+			if serr := saveState(*statePath, st); serr != nil {
+				log.Printf("finch: warning: could not persist credential to %s: %v", *statePath, serr)
+			}
+		}
+	}
+	log.Printf("finch: active as appliance=%q machine=%q (tenant %s)", jr.Appliance, jr.Machine, jr.Tenant)
 
 	// Build the relay WS URL from the hub base + appliance/machine, so the
 	// scheme/host always match the hub we were given (the hub's connectUrl may
@@ -118,7 +159,7 @@ func main() {
 	connectToken := jr.ConnectToken
 	connectExp := tokenExp(connectToken)
 
-	// Exponential backoff (capped at 30s) shared by the re-join and reconnect
+	// Exponential backoff (capped at 30s) shared by the refresh and reconnect
 	// paths below. Sleeps the current delay, then doubles it for next time.
 	backoff := time.Second
 	backoffSleep := func() {
@@ -128,14 +169,20 @@ func main() {
 		}
 	}
 	for {
-		// Refresh the connect-token if it has (nearly) expired. The dashboard
-		// ticket is one-shot, but re-/join with the SAME ticket succeeds while
-		// the ticket itself is within its (longer) TTL — that's how steady-state
-		// reconnection survives past the 120s connect-token lifetime.
+		// Refresh the connect-token if it has (nearly) expired. We trade the
+		// long-lived refresh token at /refresh — never the one-shot join ticket,
+		// which the hub already burned. (Fall back to re-join only if the hub
+		// gave us no refresh token, e.g. an older hub.)
 		if time.Now().Add(connectSkew).After(connectExp) {
-			fresh, err := join(*hub, *ticket, *machine)
+			var fresh *joinResp
+			var err error
+			if refreshToken != "" {
+				fresh, err = refresh(*hub, refreshToken)
+			} else {
+				fresh, err = join(*hub, *ticket, *machine)
+			}
 			if err != nil {
-				log.Printf("finch: re-join failed: %v (retrying in %s)", err, backoff)
+				log.Printf("finch: connect-token refresh failed: %v (retrying in %s)", err, backoff)
 				backoffSleep()
 				continue
 			}
@@ -195,6 +242,36 @@ func join(hub, ticket, machine string) (*joinResp, error) {
 	}
 	if jr.ConnectToken == "" {
 		return nil, fmt.Errorf("join response missing connectToken")
+	}
+	return &jr, nil
+}
+
+// refresh trades the long-lived per-machine refresh token for a fresh
+// connect-token, without re-using the one-shot enrollment ticket. The hub
+// rejects it (403) if the machine was removed from the dashboard, which is how
+// revocation propagates to the box within a connect-token TTL.
+func refresh(hub, refreshToken string) (*joinResp, error) {
+	body, _ := json.Marshal(map[string]string{"refreshToken": refreshToken})
+	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(hub, "/")+"/refresh", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("content-type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("hub %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+	}
+	var jr joinResp
+	if err := json.Unmarshal(b, &jr); err != nil {
+		return nil, fmt.Errorf("bad refresh response: %w", err)
+	}
+	if !jr.OK || jr.Appliance == "" || jr.Machine == "" || jr.ConnectToken == "" {
+		return nil, fmt.Errorf("refresh rejected: %s", jr.Error)
 	}
 	return &jr, nil
 }
@@ -446,4 +523,56 @@ func resolveUpstream(base *url.URL, rawPath string) (string, error) {
 	out.Path = clean
 	out.RawQuery = rawQuery
 	return out.String(), nil
+}
+
+// agentState is the small credential the agent persists between runs so a
+// restart resumes without a fresh dashboard ticket. It holds the long-lived
+// per-machine refresh token (and the assignment, for clarity).
+type agentState struct {
+	Hub          string `json:"hub"`
+	Tenant       string `json:"tenant"`
+	Appliance    string `json:"appliance"`
+	Machine      string `json:"machine"`
+	RefreshToken string `json:"refreshToken"`
+}
+
+// defaultStatePath is ~/.finch/agent.json (falls back to the cwd if there's no
+// home dir). Boxes running more than one agent should pass a distinct --state.
+func defaultStatePath() string {
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return filepath.Join(home, ".finch", "agent.json")
+	}
+	return ".finch-agent.json"
+}
+
+// loadState reads the persisted credential, returning (nil,nil) if the file
+// doesn't exist yet (first run).
+func loadState(path string) (*agentState, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	var st agentState
+	if err := json.Unmarshal(b, &st); err != nil {
+		return nil, err
+	}
+	return &st, nil
+}
+
+// saveState writes the credential 0600 (dir 0700). The refresh token is a
+// long-lived per-machine credential, so keep it owner-only.
+func saveState(path string, st *agentState) error {
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return err
+		}
+	}
+	b, err := json.MarshalIndent(st, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, b, 0o600)
 }
