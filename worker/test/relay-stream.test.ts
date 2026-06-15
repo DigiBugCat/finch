@@ -81,6 +81,26 @@ function nextFrame(ws: WebSocket): Promise<any> {
   });
 }
 
+/** Resolve with the first frame off `ws` that satisfies `pred`. Frames that
+ *  don't match are dropped. Used to wait for a specific DO->agent control frame
+ *  (e.g. a {type:"window",credits:0}) while ignoring interleaved noise. The
+ *  listener is removed once it fires. */
+function waitForFrame(
+  ws: WebSocket,
+  pred: (f: any) => boolean,
+): Promise<any> {
+  return new Promise((resolve) => {
+    const onMsg = (ev: MessageEvent) => {
+      const f = JSON.parse(ev.data as string);
+      if (pred(f)) {
+        ws.removeEventListener("message", onMsg as EventListener);
+        resolve(f);
+      }
+    };
+    ws.addEventListener("message", onMsg as EventListener);
+  });
+}
+
 const fixture = (name: string) =>
   (vectors.frames as Record<string, { wire: any }>)[name].wire;
 
@@ -413,5 +433,146 @@ describe("ApplianceDO streaming relay — reset / offline", () => {
     // Agent link drops -> webSocketClose -> resetAll errors the in-flight body.
     agent.close(1011, "link gone");
     expect(await bodyErr).toBeInstanceOf(Error);
+  });
+});
+
+describe("ApplianceDO streaming relay — backpressure (window frames)", () => {
+  // RELAY_WINDOW_BYTES in appliance-do.ts. The response ReadableStream uses a
+  // ByteLengthQueuingStrategy with this high-water-mark; once the DO has buffered
+  // >= HWM bytes without the consumer reading, desiredSize<=0 and the DO sends a
+  // {credits:0} PAUSE down to the agent.
+  const HWM = 1 * 1024 * 1024; // 1 MiB
+  const CHUNK_BYTES = 64 * 1024; // 64 KiB body chunks
+
+  /** A `chunk` frame carrying `n` bytes all equal to `fill`, base64-encoded the
+   *  same way the agent encodes (std alphabet, padded). The fill byte lets the
+   *  reassembled body be verified deterministically. */
+  function chunkFrame(id: string, n: number, fill: number) {
+    let bin = "";
+    for (let i = 0; i < n; i++) bin += String.fromCharCode(fill);
+    return JSON.stringify({ id, type: "chunk", data: btoa(bin) });
+  }
+
+  it("pauses the agent (credits:0) past the HWM, then resumes (credits>0) on drain, body intact", async () => {
+    const m = freshMachine();
+    const stub = stubFor(m);
+    const agent = await connectAgent(stub, m);
+
+    const reqSeen = nextFrame(agent);
+    const resPromise = stub.fetch(
+      new Request(relayUrl(m), { method: "POST", body: "x" }),
+    );
+    const { id } = await reqSeen;
+
+    // Head first (head is never paused), then start streaming body chunks. We do
+    // NOT read res.body yet, so every chunk accumulates in the DO's stream queue.
+    agent.send(
+      JSON.stringify({
+        id,
+        type: "head",
+        status: 200,
+        headers: [["content-type", "application/octet-stream"]],
+      }),
+    );
+
+    // Listen for the PAUSE before we start sending so we can't miss it.
+    const pauseSeen = waitForFrame(
+      agent,
+      (f) => f.type === "window" && f.id === id && f.credits === 0,
+    );
+
+    // Send enough 64 KiB chunks to cross the 1 MiB HWM. 24 * 64 KiB = 1.5 MiB,
+    // comfortably over. All bytes are 0x41 ('A') so the body is verifiable.
+    const N = 24;
+    for (let i = 0; i < N; i++) {
+      agent.send(chunkFrame(id, CHUNK_BYTES, 0x41));
+    }
+
+    const res = await resPromise;
+    expect(res.status).toBe(200);
+
+    // The DO must have sent a {type:"window",credits:0} PAUSE down to the agent
+    // once the buffered body crossed the HWM — WITHOUT the consumer draining.
+    const pause = await pauseSeen;
+    expect(pause).toMatchObject({ type: "window", id, credits: 0 });
+
+    // Now arm the RESUME watcher and drain the body. Draining pulls the queue
+    // below the HWM, firing the stream's pull() -> a {credits>0} RESUME frame.
+    const resumeSeen = waitForFrame(
+      agent,
+      (f) => f.type === "window" && f.id === id && f.credits > 0,
+    );
+
+    // Drain concurrently; the agent sends `end` once the read loop has started so
+    // res.text() can resolve. (The DO buffered everything; it only SIGNALS pause —
+    // it does not itself withhold chunks, so the full body is present.)
+    const reader = res.body!.getReader();
+    let total = 0;
+    let allA = true;
+    const readAll = (async () => {
+      // eslint-disable-next-line no-constant-condition
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) {
+          total += value.byteLength;
+          for (let i = 0; i < value.byteLength; i++) {
+            if (value[i] !== 0x41) allA = false;
+          }
+        }
+      }
+    })();
+
+    // The RESUME must fire as the consumer drains below the HWM.
+    const resume = await resumeSeen;
+    expect(resume).toMatchObject({ type: "window", id });
+    expect(resume.credits).toBeGreaterThan(0);
+    expect(resume.credits).toBe(HWM);
+
+    // Close the upstream body so the read loop completes.
+    agent.send(JSON.stringify({ id, type: "end" }));
+    await readAll;
+
+    // The full body reassembled intact: N * 64 KiB bytes, all 0x41.
+    expect(total).toBe(N * CHUNK_BYTES);
+    expect(allA).toBe(true);
+  });
+
+  it("does not pause a small response that never crosses the HWM", async () => {
+    const m = freshMachine();
+    const stub = stubFor(m);
+    const agent = await connectAgent(stub, m);
+
+    const reqSeen = nextFrame(agent);
+    const resPromise = stub.fetch(
+      new Request(relayUrl(m), { method: "POST", body: "x" }),
+    );
+    const { id } = await reqSeen;
+
+    // Track every window frame the DO emits for this id.
+    const windows: any[] = [];
+    agent.addEventListener("message", ((ev: MessageEvent) => {
+      const f = JSON.parse(ev.data as string);
+      if (f.type === "window" && f.id === id) windows.push(f);
+    }) as EventListener);
+
+    agent.send(
+      JSON.stringify({
+        id,
+        type: "head",
+        status: 200,
+        headers: [["content-type", "application/json"]],
+      }),
+    );
+    // A few tiny chunks, well under the 1 MiB HWM, then end.
+    agent.send(JSON.stringify({ id, type: "chunk", data: "aGVsbG8=" })); // "hello"
+    agent.send(JSON.stringify({ id, type: "chunk", data: "IHdvcmxk" })); // " world"
+    agent.send(JSON.stringify({ id, type: "end" }));
+
+    const res = await resPromise;
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe("hello world");
+    // No backpressure ever needed -> no window frames at all.
+    expect(windows).toEqual([]);
   });
 });

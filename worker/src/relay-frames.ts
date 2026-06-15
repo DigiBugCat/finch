@@ -10,6 +10,7 @@
 //
 // Direction summary:
 //   DO -> agent:  req
+//   DO -> agent:  window (flow control; credits===0 PAUSE, credits>0 RESUME)
 //   agent -> DO:  head, then zero+ chunk, then end   (STRICT per-id order)
 //                 OR err (before head only)
 //   either:       reset (abort an in-flight stream; message optional)
@@ -62,6 +63,18 @@ export interface ResetFrame {
   id: string;
   type: "reset";
   message?: string;
+}
+
+/** DO -> agent ONLY. Streaming flow-control (backpressure). credits===0 =>
+ *  PAUSE: the agent stops sending `chunk` frames for this id until resumed.
+ *  credits>0 => RESUME: the agent may send body chunks again. The agent NEVER
+ *  sends a window frame. Emitted by the DO when its response ReadableStream's
+ *  in-memory queue crosses the high-water-mark (pause) or drains below it
+ *  (resume) — bounding the DO's buffered body to ~HWM + in-flight chunks. */
+export interface WindowFrame {
+  id: string;
+  type: "window";
+  credits: number;
 }
 
 /** Any frame the agent may send DOWN to the DO. */

@@ -71,12 +71,18 @@ type headerPair [2]string
 //
 // Variants (see worker/test/relay-vectors.json — the shared golden fixture):
 //
-//	DO -> agent:   req   { id, type, method, path, headers(map), body }
-//	agent -> DO:   head  { id, type, status, headers([][name,value]) }
-//	               chunk { id, type, data }   // data = base64(std,padded) body slice
-//	               end   { id, type }
-//	               err   { id, type, status, message }   // pre-head failure only
-//	either:        reset { id, type, message? }          // abort an in-flight stream
+//	DO -> agent:   req    { id, type, method, path, headers(map), body }
+//	               window { id, type, credits }   // flow control: 0=pause, >0=resume
+//	agent -> DO:   head   { id, type, status, headers([][name,value]) }
+//	               chunk  { id, type, data }   // data = base64(std,padded) body slice
+//	               end    { id, type }
+//	               err    { id, type, status, message }   // pre-head failure only
+//	either:        reset  { id, type, message? }          // abort an in-flight stream
+//
+// `window` is the additive backpressure frame (DO -> agent only). credits===0 is
+// a PAUSE (stop sending body chunks for this id); credits>0 is a RESUME. The DO
+// emits it when its in-memory relay queue crosses / drains below the high-water
+// mark; the agent NEVER sends window frames.
 //
 // CRITICAL: the request side's `headers` is a name->value MAP (ReqHeaders) while
 // the `head` frame's `headers` is an ORDERED [name,value] LIST (HeadHeaders).
@@ -103,6 +109,15 @@ type frame struct {
 	Status int `json:"status,omitempty"`
 	// err / reset: human-readable detail (omitted when empty).
 	Message string `json:"message,omitempty"`
+
+	// window (DO -> agent only): flow-control credits. 0 => pause sending body
+	// chunks for this id; >0 => resume. A pointer so a literal credits:0 frame is
+	// distinguishable from an absent field on the wire (the agent treats nil as
+	// "not a window frame"). The agent only ever RECEIVES window frames — it never
+	// constructs one in any production path. MarshalJSON does serialize Credits
+	// (the *int keeps credits:0 while a nil pointer is omitempty-elided) solely so
+	// the shared golden-vector codec round-trip passes.
+	Credits *int `json:"-"`
 }
 
 // frameWire is the on-the-wire JSON shape. We hand-marshal so the single
@@ -120,6 +135,7 @@ type frameWire struct {
 	Data        string            `json:"data,omitempty"`
 	Status      int               `json:"status,omitempty"`
 	Message     string            `json:"message,omitempty"`
+	Credits     *int              `json:"credits,omitempty"`
 }
 
 // MarshalJSON renders a frame to the canonical wire JSON. The "headers" key is
@@ -129,6 +145,7 @@ func (f frame) MarshalJSON() ([]byte, error) {
 		ID: f.ID, Type: f.Type,
 		Method: f.Method, Path: f.Path, Body: f.Body,
 		Data: f.Data, Status: f.Status, Message: f.Message,
+		Credits: f.Credits,
 	}
 	switch {
 	case f.ReqHeaders != nil:
@@ -159,6 +176,7 @@ func (f *frame) UnmarshalJSON(data []byte) error {
 	f.ID, f.Type = w.ID, w.Type
 	f.Method, f.Path, f.Body = w.Method, w.Path, w.Body
 	f.Data, f.Status, f.Message = w.Data, w.Status, w.Message
+	f.Credits = w.Credits
 	f.ReqHeaders, f.HeadHeaders = nil, nil
 	if len(w.Headers) > 0 {
 		trimmed := bytes.TrimSpace(w.Headers)
@@ -438,6 +456,40 @@ func osLabel() string {
 	}
 }
 
+// outStream is the agent's per-in-flight-forward flow-control + cancel handle.
+// The read loop owns the registry that maps a request id to its outStream; a
+// `window` frame toggles `paused` (and pokes `resume` on a 0->credits resume),
+// and a `reset` frame calls `cancel` to abort the upstream read promptly. The
+// forwarding goroutine reads `paused` under `mu` and blocks on `resume` (or ctx
+// cancel) before each body chunk, which is what bounds the DO's relay queue.
+type outStream struct {
+	mu     sync.Mutex
+	paused bool
+	resume chan struct{} // buffered(1): a non-blocking resume signal
+	cancel context.CancelFunc
+}
+
+// isPaused reports the current pause state under the lock.
+func (o *outStream) isPaused() bool {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.paused
+}
+
+// setPaused records a new pause state and, on a transition to RESUMED, pokes the
+// resume channel non-blockingly so a forward() blocked in waitResume wakes up.
+func (o *outStream) setPaused(p bool) {
+	o.mu.Lock()
+	o.paused = p
+	o.mu.Unlock()
+	if !p {
+		select {
+		case o.resume <- struct{}{}:
+		default:
+		}
+	}
+}
+
 // serve holds one relay connection for its lifetime; returns on disconnect.
 func serve(wsURL string, upstream *url.URL) error {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -507,16 +559,65 @@ func serve(wsURL string, upstream *url.URL) error {
 		}
 	}()
 
+	// In-flight forward registry, keyed by request id. The read loop is the SOLE
+	// writer of this map (serial), so window/reset routing is naturally
+	// serialized against registration; forward() only reads its own outStream
+	// (under outStream.mu) and deletes its entry on return. outMu guards the map
+	// itself against the concurrent delete each forward goroutine does.
+	var outMu sync.Mutex
+	out := map[string]*outStream{}
+	lookup := func(id string) *outStream {
+		outMu.Lock()
+		defer outMu.Unlock()
+		return out[id]
+	}
+	remove := func(id string) {
+		outMu.Lock()
+		delete(out, id)
+		outMu.Unlock()
+	}
+
 	for {
 		_, data, err := c.Read(ctx)
 		if err != nil {
 			return err
 		}
 		var f frame
-		if json.Unmarshal(data, &f) != nil || f.Type != "req" {
+		if json.Unmarshal(data, &f) != nil {
 			continue
 		}
-		go forward(ctx, upstream, f, write)
+		// req/window/reset are the only frame types the agent receives. A req
+		// spawns a registered forward; window toggles its pause state; reset
+		// cancels + deregisters it. Anything else is ignored.
+		switch f.Type {
+		case "req":
+			fctx, fcancel := context.WithCancel(ctx)
+			os := &outStream{resume: make(chan struct{}, 1), cancel: fcancel}
+			outMu.Lock()
+			out[f.ID] = os
+			outMu.Unlock()
+			go func(f frame, os *outStream) {
+				defer remove(f.ID)
+				forward(fctx, upstream, f, write, os)
+			}(f, os)
+		case "window":
+			if os := lookup(f.ID); os != nil {
+				// credits===0 => PAUSE; credits>0 => RESUME. A missing credits
+				// field (nil) is treated as a pause (fail-closed: never grow the
+				// queue on a malformed window).
+				resume := f.Credits != nil && *f.Credits > 0
+				os.setPaused(!resume)
+			}
+		case "reset":
+			// Abort the in-flight forward: cancel its ctx (stops the upstream
+			// read promptly) and drop it from the registry. The DO sends this on
+			// idle-after-head / client-cancel; the old read loop IGNORED it and
+			// kept draining the upstream into a dead stream — this is the fix.
+			if os := lookup(f.ID); os != nil {
+				os.cancel()
+				remove(f.ID)
+			}
+		}
 	}
 }
 
@@ -540,7 +641,13 @@ const relayChunkSize = 32 << 10
 // There is NO total timeout: a long-running ("thinking") tool or an open SSE
 // stream may legitimately run for minutes. The relay ctx still cancels the
 // upstream request when the link drops (the DO's idle timeout fires the abort).
-func forward(ctx context.Context, upstream *url.URL, f frame, write func(frame) error) {
+//
+// Backpressure: `os` carries the flow-control state set by inbound `window`
+// frames. BEFORE sending each body chunk forward() blocks while os.paused (on
+// os.resume or ctx.Done), so a slow client can't grow the DO's relay queue
+// unbounded. The head is emitted before any wait — head is never paused. os may
+// be nil (no flow control / direct unit-test call): then it never pauses.
+func forward(ctx context.Context, upstream *url.URL, f frame, write func(frame) error, os *outStream) {
 	target, err := resolveUpstream(upstream, f.Path)
 	if err != nil {
 		// SSRF reject — pre-head, so the DO turns this into a 403 response.
@@ -605,6 +712,21 @@ func forward(ctx context.Context, upstream *url.URL, f frame, write func(frame) 
 	for {
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
+			// Backpressure: block here while the DO has paused us (window
+			// credits:0), so we don't grow its relay queue beyond the HWM. A
+			// resume (window credits>0) or a ctx cancel (reset / link drop)
+			// releases us. Re-check after each wake: the DO may have re-paused
+			// between our wake and this read. The head was already emitted above,
+			// before any wait — head is never paused.
+			if os != nil {
+				for os.isPaused() {
+					select {
+					case <-os.resume:
+					case <-ctx.Done():
+						return
+					}
+				}
+			}
 			data := base64.StdEncoding.EncodeToString(buf[:n])
 			if werr := write(frame{ID: f.ID, Type: "chunk", Data: data}); werr != nil {
 				return

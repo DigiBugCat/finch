@@ -26,6 +26,7 @@ import {
   type AgentFrame,
   type ReqFrame,
   type ResetFrame,
+  type WindowFrame,
   decodeChunk,
 } from "./relay-frames";
 
@@ -65,6 +66,10 @@ interface Stream {
   pending?: Uint8Array[];
   /** `end` won the same race — start() closes after flushing `pending`. */
   ended?: boolean;
+  /** Flow-control state: true once we've sent the agent a {credits:0} PAUSE for
+   *  this id and not yet resumed it. Drives the pause/resume edge-detection so we
+   *  send exactly one window frame per transition (not one per chunk/pull). */
+  paused?: boolean;
 }
 
 // Per-stream idle timeout. Armed on `req` send, RESET on every head/chunk for
@@ -73,6 +78,15 @@ interface Stream {
 // a long-running ("thinking") tool that keeps streaming never trips it; only a
 // genuinely stalled link does.
 const RELAY_IDLE_MS = 300_000;
+
+// Streaming backpressure high-water-mark (#: no-backpressure OOM). The response
+// ReadableStream uses a ByteLengthQueuingStrategy with this HWM; once the
+// DO's in-memory body queue crosses it (a fast box outrunning a slow client) we
+// send the agent a {credits:0} PAUSE window frame, and resume with {credits:HWM}
+// once the consumer drains below the HWM (the stream's pull() fires). This bounds
+// the DO's buffered body to ~HWM + whatever chunks are already in flight on the
+// wire when the pause is sent.
+const RELAY_WINDOW_BYTES = 1 * 1024 * 1024; // 1 MiB
 
 // Max relay body we'll buffer (#16 / L9). Mirrors index.ts's pre-stub cap; we
 // enforce by STRING LENGTH after req.text() because content-length is
@@ -223,41 +237,55 @@ export class ApplianceDO extends DurableObject<Env> {
     // webSocketMessage can pump into it. If the stream entry is already gone
     // (e.g. a same-tick reset between head and here), close immediately.
     const self = this;
-    const readable = new ReadableStream<Uint8Array>({
-      start(controller) {
-        const s = self.streams.get(id);
-        if (!s) {
-          controller.close();
-          return;
-        }
-        s.controller = controller;
-        // Flush any chunks that landed before we captured the controller, then
-        // close if `end` already arrived during that window.
-        if (s.pending) {
-          for (const bytes of s.pending) {
+    const readable = new ReadableStream<Uint8Array>(
+      {
+        start(controller) {
+          const s = self.streams.get(id);
+          if (!s) {
+            controller.close();
+            return;
+          }
+          s.controller = controller;
+          // Flush any chunks that landed before we captured the controller, then
+          // close if `end` already arrived during that window.
+          if (s.pending) {
+            for (const bytes of s.pending) {
+              try {
+                controller.enqueue(bytes);
+              } catch {
+                /* errored mid-flush */
+              }
+            }
+            s.pending = undefined;
+          }
+          // The flushed pending bytes may already have pushed the queue past the
+          // HWM; apply backpressure now so a slow consumer can't be outrun before
+          // its first read() ever lands.
+          self.maybePause(id);
+          if (s.ended) {
+            self.streams.delete(id);
             try {
-              controller.enqueue(bytes);
+              controller.close();
             } catch {
-              /* errored mid-flush */
+              /* already closed */
             }
           }
-          s.pending = undefined;
-        }
-        if (s.ended) {
-          self.streams.delete(id);
-          try {
-            controller.close();
-          } catch {
-            /* already closed */
-          }
-        }
+        },
+        pull() {
+          // The consumer drained the queue below the HWM and wants more. If we
+          // had paused the agent, RESUME it: send {credits:HWM} and clear the
+          // pause flag. (No-op until the consumer first reads, and a no-op while
+          // un-paused.) This is the only resume path.
+          self.resumeStream(id);
+        },
+        cancel() {
+          // The consumer (the downstream client) went away. Tear the stream down
+          // and tell the agent to stop reading the upstream body into the void.
+          self.resetStream(id, "client cancelled", true);
+        },
       },
-      cancel() {
-        // The consumer (the downstream client) went away. Tear the stream down
-        // and tell the agent to stop reading the upstream body into the void.
-        self.resetStream(id, "client cancelled", true);
-      },
-    });
+      new ByteLengthQueuingStrategy({ highWaterMark: RELAY_WINDOW_BYTES }),
+    );
 
     return new Response(readable, { status: first.status, headers });
   }
@@ -310,7 +338,11 @@ export class ApplianceDO extends DurableObject<Env> {
           } catch {
             // Controller already closed/errored — drop and tear down.
             this.resetStream(frame.id, "enqueue failed", false);
+            return;
           }
+          // Post-enqueue backpressure: if this chunk pushed the in-memory queue
+          // to/over the HWM and we haven't already paused, tell the agent to stop.
+          this.maybePause(frame.id);
         } else {
           // head settled but start() hasn't captured the controller yet — buffer
           // (the input gate normally prevents this; flushed in start()).
@@ -410,6 +442,43 @@ export class ApplianceDO extends DurableObject<Env> {
       } catch {
         /* socket gone — nothing to abort */
       }
+    }
+  }
+
+  /** Backpressure PAUSE edge: if the response stream's in-memory queue has
+   *  reached the high-water-mark (desiredSize <= 0) and we haven't paused this
+   *  id yet, send the agent {credits:0} and mark it paused. desiredSize is null
+   *  only when the controller is closed/errored — nothing left to pause. Called
+   *  after every enqueue and after start() flushes the pending buffer. */
+  private maybePause(id: string): void {
+    const s = this.streams.get(id);
+    if (!s || !s.controller || s.paused) return;
+    const desired = s.controller.desiredSize;
+    if (desired !== null && desired <= 0) {
+      s.paused = true;
+      this.sendWindow(id, 0);
+    }
+  }
+
+  /** Backpressure RESUME edge: if this id is paused (we sent {credits:0}), send
+   *  {credits:RELAY_WINDOW_BYTES} and clear the flag. Fires from the stream's
+   *  pull() when the consumer drains below the HWM. No-op while un-paused. */
+  private resumeStream(id: string): void {
+    const s = this.streams.get(id);
+    if (!s || !s.paused) return;
+    s.paused = false;
+    this.sendWindow(id, RELAY_WINDOW_BYTES);
+  }
+
+  /** Send a window (flow-control) frame DOWN to the agent. Best-effort: a dead
+   *  socket just means there's nothing left to pause/resume. */
+  private sendWindow(id: string, credits: number): void {
+    const frame: WindowFrame = { id, type: "window", credits };
+    const agent = this.ctx.getWebSockets("agent")[0];
+    try {
+      agent?.send(JSON.stringify(frame));
+    } catch {
+      /* socket gone — flow control is moot */
     }
   }
 
