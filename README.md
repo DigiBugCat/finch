@@ -5,44 +5,96 @@
 There are many finches. This one is yours.
 
 Finch turns any always-on box — a Mac mini, a Raspberry Pi, an old laptop —
-into a publicly reachable, authenticated MCP server, without opening a single
-port. You write the tool logic; finch handles **auth, routing, and hosting**.
+into a publicly reachable, authenticated, **streaming** MCP server, without
+opening a single port. The box dials *out*; finch handles **auth, routing, and
+hosting**. It feels like ngrok: you get a stable `https://<slug>.finchmcp.com`
+URL with no DNS to configure — finch owns the wildcard, and a subdomain is just
+a row in a database, not a DNS record.
 
 ```
-MCP client ──HTTPS──▶  finchmcp.com/<id>/mcp   (Cloudflare Worker: auth + routing)
-                          │
-                          ▼
-                       Durable Object  (one per appliance — hibernates when idle)
-                          ▲ outbound WebSocket (the box dialed out)
-                  ────────┘
-                  finch agent on the box ──▶ your local MCP server
+   MCP client                 finch hub (Cloudflare)                 your box
+  ┌──────────┐   HTTPS   ┌─────────────────────────┐   outbound   ┌──────────────┐
+  │ Claude / │ ────────▶ │  Worker: auth + routing │   WebSocket  │ finch agent  │
+  │ Cursor / │  Bearer   │         │               │ ◀─────────── │ (dialed out) │
+  │  …        │ finch_…  │         ▼               │   (no open   │      │        │
+  └──────────┘           │  Durable Objects        │    ports)    │      ▼        │
+        ▲                │  (per tenant + machine) │              │  local MCP    │
+        └────────────────┤  streaming relay        ├──────────────┤  server :8000 │
+          streamed SSE / │                         │  head→chunk… │ (FastMCP, …)  │
+          long-running   └─────────────────────────┘              └──────────────┘
 ```
 
 ## Why
 
 Every layer of "host an MCP server behind auth" is a commodity (ngrok,
 cloudflared, Cloudflare Workers). What's missing is an **opinionated,
-batteries-included** way to ship one: write the tool in a folder, run it, and
-it's authed, public, identity-aware, and supervised — for free. Rails/Vercel
-for MCP appliances. See [`docs/design.md`](docs/design.md).
+batteries-included** way to ship one: write the tool, run it, and it's authed,
+public, identity-aware, and supervised — for free. Rails/Vercel for MCP
+appliances, aimed squarely at the things you **can't** just deploy to the cloud:
+on-prem data, local stdio tools, and physical/IoT devices. See
+[`docs/design.md`](docs/design.md).
+
+## Architecture
+
+The hub is a thin Cloudflare Worker in front of three Durable Objects:
+
+| Object | Role |
+|---|---|
+| **RouterDO** | global `slug → tenant` index — resolves `<slug>.finchmcp.com` |
+| **TenantDO** | per-tenant control plane: `finch_` keys, ACL, metrics, dashboard state |
+| **ApplianceDO** | per-machine hibernatable **streaming relay** — the box parks its outbound WebSocket here |
+
+**Auth has two layers, kept distinct:**
+
+- **Box ↔ hub** — the agent enrolls once with a one-shot ticket, then holds a
+  long-lived per-machine **refresh token** (persisted at `--state`, `0600`) and
+  trades it for short-lived `connect-token`s. It survives restarts and reboots
+  with no new ticket ("authenticate once", like ngrok's authtoken).
+- **Client ↔ MCP server** — callers present a `finch_` bearer key; the hub hashes
+  + checks it (scope + default-deny ACL), **strips it**, and relays the request.
+
+**A request, end to end (streaming):**
+
+```
+client ─POST /<app>/mcp (Bearer finch_…)─▶ Worker
+   Worker: rate-limit → checkKey (scope + ACL) → strip key → pick machine
+      └─▶ ApplianceDO ──req──▶ agent ──HTTP──▶ local MCP server
+                       ◀─head──         (status+headers the instant they're known)
+                       ◀─chunk─ chunk ─ …      (body streams as base64 frames)
+                       ◀─end───                (idle-timeout, not a 30s total cap)
+   Worker streams the Response straight back to the client.
+```
+
+The relay is **MCP-unaware** — it moves raw HTTP bytes, so unmodified
+[FastMCP](https://gofastmcp.com) (or any Streamable-HTTP MCP server) just works:
+SSE, progress notifications, long-running "thinking" tools, and — on a
+single-machine appliance — server-initiated sampling/elicitation. Pause/resume
+**WINDOW** backpressure keeps a fast box from overrunning a slow client.
 
 ## Layout
 
 | Path | What |
 |---|---|
-| `worker/` | The finch hub — a Cloudflare Worker + a Durable Object per appliance. Auth + routing + the hibernatable WebSocket relay. |
-| `agent/` | The box-side agent (Go). Dials out to the hub, proxies to your local MCP server. Cross-compiles to mac/linux/arm. |
-| `docs/` | Design + architecture. |
+| `worker/` | The finch hub — Cloudflare Worker + 3 Durable Objects (TS). Auth, routing, the streaming relay. |
+| `agent/` | The box-side agent (Go). Dials out, streams to your local MCP server. Cross-compiles to mac/linux × amd64/arm64. |
+| `web/` | The dashboard (Next.js + Clerk, deployed to Cloudflare via OpenNext). Enroll devices, mint keys, see your fleet. |
+| `docs/` | Design + the relay protocol spec. |
 
 ## Status
 
-Early, but the spine is real. **Working today:** the Clerk-authed control plane
-(dashboard → enroll a device → mint `finch_` keys), the per-machine outbound
-WebSocket relay with hibernation, and `finch_`-key-gated MCP routing end-to-end
-(`<slug>.finchmcp.com/mcp` → your box). **In progress:** a streaming transport
-(SSE / server-initiated MCP / long-running "thinking" tools — today the relay
-buffers a single response and is best for unary JSON-RPC), the bundle/manifest
-runtime, and a one-command install. See [`docs/`](docs/) for the design.
+**v1 core is real and tested.** Working today:
+
+- ✅ Outbound-dial relay, no open ports, zero per-box DNS (ngrok model)
+- ✅ Two-layer auth (`finch_` keys + ticket/refresh/connect tokens), SSRF-guarded agent
+- ✅ **Streaming** relay — SSE / progress / long-running tools, with backpressure
+- ✅ Reconnect forever, including across reboots (persisted refresh credential)
+- ✅ Dashboard: enroll → mint a key that actually reaches your appliances
+- ✅ One-tag release pipeline (GoReleaser) + a `curl | sh` installer
+- ✅ Full-stack e2e + CI gates on all three packages (`go test -race`, vitest, typecheck/lint)
+
+**Roadmap (v1.1+):** the `finchd` runtime (`finch.toml` + multi-server-per-box +
+a stdio↔Streamable-HTTP bridge — the "drop a folder, it's hosted" piece), edge
+identity injection (`X-Finch-User`), and multi-machine session affinity.
 
 ## Quickstart (local dev)
 
@@ -77,6 +129,14 @@ curl -X POST http://localhost:8787/<appliance>/mcp \
 
 > A frictionless `finch quickstart` (ngrok-style: one command, instant URL) is
 > on the roadmap; today the dashboard is the source of tickets and keys.
+
+## Tests
+
+```bash
+cd worker && npm test          # vitest-pool-workers: relay, auth, full-stack e2e
+cd agent  && go test -race ./...
+cd web    && npm run typecheck && npm test
+```
 
 ## License
 
