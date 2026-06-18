@@ -1,4 +1,5 @@
 import Link from 'next/link';
+import { Show } from '@clerk/nextjs';
 
 export default function Hero() {
   return (
@@ -9,7 +10,12 @@ export default function Hero() {
           <h1>Give your agent<br />a place to <span className="soft">land.</span></h1>
           <p className="hero-sub">Finch turns any always-on box — Mac mini, Pi, the server humming under your desk — into a public, authenticated MCP server. You write the tool logic. Finch handles auth, routing, and hosting. Outbound-only: nothing listens, no ports to open.</p>
           <div className="hero-cta">
-            <Link className="btn btn-lg btn-amber" href="/sign-up">Get started →</Link>
+            <Show when="signed-out">
+              <Link className="btn btn-lg btn-amber" href="/sign-up">Get started →</Link>
+            </Show>
+            <Show when="signed-in">
+              <Link className="btn btn-lg btn-amber" href="/dashboard">Open dashboard →</Link>
+            </Show>
             <a className="btn btn-lg btn-ghost" href="#how">See how it works</a>
           </div>
           <div className="hero-trust">

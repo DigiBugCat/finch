@@ -230,3 +230,20 @@ footer{border-top:1px solid var(--line); background:var(--bg3); padding:56px 0 4
   .final-card{padding:46px 22px}
   .foot-grid{grid-template-columns:1fr}
 }
+
+/* How-it-works flow diagram */
+.how-graphic{
+  margin: 8px auto 44px;
+  padding: 22px 18px;
+  background: var(--bg2);
+  border: 1px solid var(--line);
+  border-radius: 18px;
+}
+.how-graphic-cta{
+  display: flex; align-items: center; gap: 14px;
+  justify-content: center; margin-top: 16px;
+}
+.how-graphic-cta .dim{ font-size: 12.5px; }
+@media (prefers-reduced-motion: reduce){
+  .how-graphic svg animateMotion, .how-graphic svg animate{ display: none; }
+}
