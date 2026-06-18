@@ -281,7 +281,6 @@ export class TenantDO extends DurableObject<Env> {
       settings: {
         org: id,
         subdomain: "",
-        region: "sfo · us-west",
         requireApproval: true,
         defaultGroup: "Home lab",
         keyExpiry: "90 days",

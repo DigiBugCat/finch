@@ -134,7 +134,6 @@ export interface Group {
 export interface Settings {
   org: string;
   subdomain: string;
-  region: string;
   requireApproval: boolean;
   defaultGroup: string;
   keyExpiry: string;

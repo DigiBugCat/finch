@@ -1,6 +1,78 @@
 "use client";
 // Roost — Settings: tenant-wide defaults.
+import { useEffect, useRef, useState } from 'react';
 import { Card, SectionLabel, Toggle } from '@/components/dash/primitives';
+
+// Finch-themed pet-name slug generator (adjective + bird), e.g. "sunny-wren".
+const SLUG_ADJ = ['sunny', 'amber', 'dusk', 'quiet', 'brave', 'lucky', 'misty', 'cozy', 'swift', 'fern', 'maple', 'ember', 'cedar', 'wren', 'pebble', 'noble'];
+const SLUG_BIRD = ['finch', 'wren', 'robin', 'sparrow', 'lark', 'swift', 'martin', 'thrush', 'siskin', 'tanager', 'plover', 'kestrel'];
+function petSlug(): string {
+  const a = SLUG_ADJ[Math.floor(Math.random() * SLUG_ADJ.length)];
+  const b = SLUG_BIRD[Math.floor(Math.random() * SLUG_BIRD.length)];
+  const n = Math.floor(Math.random() * 90) + 10; // 2 digits, keeps it single-label + unlikely to collide
+  return `${a}-${b}-${n}`;
+}
+
+// Hub-domain picker: edit/suggest a slug, live-check availability against the
+// hub (claim-free), then claim it. The slug is the load-bearing routing key —
+// it resolves <slug>.finchmcp.com to this tenant.
+function HubDomain({ current, onClaim }: { current: string; onClaim: (slug: string) => void }) {
+  const [draft, setDraft] = useState(current || '');
+  const [status, setStatus] = useState<'idle' | 'checking' | 'available' | 'taken' | 'invalid'>('idle');
+  const seq = useRef(0);
+
+  // Normalize to a host-safe single label as the user types.
+  const clean = (v: string) => v.toLowerCase().replace(/[^a-z0-9-]/g, '').replace(/^-+/, '').slice(0, 40);
+
+  useEffect(() => {
+    const slug = clean(draft);
+    if (!slug) { setStatus('idle'); return; }
+    if (slug === current) { setStatus('idle'); return; }
+    if (slug.length < 3) { setStatus('invalid'); return; }
+    setStatus('checking');
+    const mine = ++seq.current;
+    const t = setTimeout(async () => {
+      try {
+        const r = await fetch(`/api/finch/slug-check?slug=${encodeURIComponent(slug)}`);
+        const j = await r.json();
+        if (mine !== seq.current) return; // a newer keystroke won
+        setStatus(j.available ? 'available' : 'taken');
+      } catch {
+        if (mine === seq.current) setStatus('idle');
+      }
+    }, 350);
+    return () => clearTimeout(t);
+  }, [draft, current]);
+
+  const slug = clean(draft);
+  const canClaim = status === 'available' && slug && slug !== current;
+  const msg: Record<string, string> = {
+    checking: 'checking…', available: '✓ available', taken: '✗ taken', invalid: 'at least 3 characters', idle: '',
+  };
+
+  return (
+    <div>
+      <div className="set-domain mono" style={{ alignItems: 'center', gap: 8 }}>
+        <input
+          className="set-input"
+          value={draft}
+          placeholder="your-slug"
+          onChange={(e) => setDraft(clean(e.target.value))}
+          style={{ width: 160 }}
+        />
+        <span>.finchmcp.com</span>
+        <button type="button" className="btn btn-sm btn-ghost" onClick={() => setDraft(petSlug())}>Suggest</button>
+        <button type="button" className="btn btn-sm btn-amber" disabled={!canClaim} onClick={() => onClaim(slug)}>Claim</button>
+      </div>
+      <div className="set-hint dim" style={{ marginTop: 6 }}>
+        {current
+          ? <>Live at <a href={`https://${current}.finchmcp.com`} target="_blank" rel="noreferrer">{current}.finchmcp.com</a>. </>
+          : <>No domain claimed yet — clients can’t reach your boxes by name until you claim one. </>}
+        <span className={status === 'taken' || status === 'invalid' ? 'red' : status === 'available' ? 'green' : ''}>{msg[status]}</span>
+      </div>
+    </div>
+  );
+}
 
 function SetRow({ label, hint, children }: any) {
   return (
@@ -27,10 +99,6 @@ export function SettingsView({ settings, groups, onChange }: any) {
     (groups && groups.length ? groups.map((g: any) => g.name) : ["Home lab", "Studio", "Acme · prod"]),
     s.defaultGroup,
   );
-  const regionOptions = withCurrent(
-    ["sfo · us-west", "ord · us-central", "ams · eu-west", "nyc · us-east"],
-    s.region,
-  );
   const expiryOptions = withCurrent(["30 days", "90 days", "180 days", "never"], s.keyExpiry);
   return (
     <div className="view view-narrow">
@@ -39,19 +107,11 @@ export function SettingsView({ settings, groups, onChange }: any) {
 
       <Card className="set-card">
         <SectionLabel>organization</SectionLabel>
-        <SetRow label="Tenant name">
-          <input className="set-input" value={s.org} onChange={(e) => onChange("org", e.target.value)} />
+        <SetRow label="Organization" hint="your account identity — boxes, keys, and teammates all belong to it">
+          <code className="set-input mono" style={{ display: 'inline-block', opacity: 0.85, userSelect: 'all' }}>{s.org}</code>
         </SetRow>
-        <SetRow label="Hub domain" hint="where your MCP endpoints live">
-          <div className="set-domain mono">
-            <input className="set-input" value={s.subdomain} onChange={(e) => onChange("subdomain", e.target.value)} style={{ width: 120 }} />
-            <span>.finchmcp.com</span>
-          </div>
-        </SetRow>
-        <SetRow label="Home region">
-          <select className="acl-select" value={s.region} onChange={(e) => onChange("region", e.target.value)}>
-            {regionOptions.map((r) => <option key={r}>{r}</option>)}
-          </select>
+        <SetRow label="Hub domain" hint="the name clients use to reach your boxes">
+          <HubDomain current={s.subdomain || ''} onClaim={(slug) => onChange('subdomain', slug)} />
         </SetRow>
       </Card>
 

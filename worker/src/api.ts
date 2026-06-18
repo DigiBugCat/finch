@@ -19,6 +19,7 @@ import {
   verifyAssertion,
   genJti,
 } from "./auth";
+import { routerLookup } from "./router-do";
 import type {
   EnrollResp,
   JoinResp,
@@ -119,6 +120,15 @@ export async function handleApi(
   if (method === "GET" && seg.length === 1 && seg[0] === "state") {
     const state = await tenantOp<TenantState>(env, tenant, "getState");
     return json(200, state);
+  }
+
+  // GET /api/slug-available?slug=foo — claim-free availability check for the
+  // Hub-domain picker. Available if unowned, or already owned by THIS tenant.
+  if (method === "GET" && seg.length === 1 && seg[0] === "slug-available") {
+    const slug = (url.searchParams.get("slug") || "").trim().toLowerCase();
+    if (!slug) return json(400, { error: "slug required" });
+    const owner = await routerLookup(env, slug);
+    return json(200, { slug, available: owner === "" || owner === tenant });
   }
 
   // POST /api/enroll {name,group}
