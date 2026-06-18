@@ -8,6 +8,7 @@
     "dev": "wrangler dev",
     "preflight": "node scripts/deploy-preflight.mjs",
     "deploy": "node scripts/deploy-preflight.mjs production && wrangler deploy --env production",
+    "deploy:staging": "node scripts/deploy-preflight.mjs staging && wrangler deploy --env staging",
     "deploy:dev": "node scripts/deploy-preflight.mjs dev && wrangler deploy --env dev",
     "typecheck": "tsc --noEmit",
     "build": "wrangler deploy --dry-run --outdir dist",

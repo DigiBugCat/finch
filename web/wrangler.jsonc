@@ -28,6 +28,27 @@
       }
     },
 
+    // ---- staging: workers.dev, binds to the staging hub ----
+    "staging": {
+      "name": "finch-web-staging",
+      "workers_dev": true,
+      "services": [
+        { "binding": "WORKER_SELF_REFERENCE", "service": "finch-web-staging" },
+        { "binding": "FINCH_HUB", "service": "finch-staging" }
+      ],
+      "vars": {
+        "HUB_URL": "https://finch-staging.pantainos.workers.dev",
+        // Clerk publishable key + URLs are PUBLIC — Clerk's server middleware
+        // reads them from runtime env, so they must be Worker vars (not just
+        // build-time inlined). The secret half (CLERK_SECRET_KEY) is a secret.
+        "NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY": "pk_test_c3Ryb25nLXRlcnJpZXItOTUuY2xlcmsuYWNjb3VudHMuZGV2JA",
+        "NEXT_PUBLIC_CLERK_SIGN_IN_URL": "/sign-in",
+        "NEXT_PUBLIC_CLERK_SIGN_UP_URL": "/sign-up",
+        "NEXT_PUBLIC_CLERK_SIGN_IN_FALLBACK_REDIRECT_URL": "/",
+        "NEXT_PUBLIC_CLERK_SIGN_UP_FALLBACK_REDIRECT_URL": "/"
+      }
+    },
+
     // ---- production: apex route, no workers.dev, prod hub ----
     "production": {
       "name": "finch-web-prod",

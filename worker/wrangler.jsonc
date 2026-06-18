@@ -90,6 +90,53 @@
       ]
     },
 
+    // ---- staging: workers.dev, dev-shaped tenant fallback, OWN namespaces ----
+    // Internet-reachable pre-prod that CI auto-deploys on every push to main.
+    // Like dev it carries DEFAULT_TENANT/DEV (so it's usable on a workers.dev
+    // origin with no registered <slug>.finchmcp.com), but it is a fully separate
+    // Worker (finch-staging) with its OWN ApplianceDO/TenantDO/RouterDO
+    // namespaces and its OWN secrets — it can never read or mutate prod state.
+    // True wildcard host routing is exercised only in production (validated by
+    // the prod smoke test); to upgrade staging to staging.finchmcp.com later,
+    // drop DEFAULT_TENANT/DEV, set workers_dev:false, and add a route + cert.
+    "staging": {
+      "name": "finch-staging",
+      "workers_dev": true,
+      "observability": { "enabled": true },
+      "vars": {
+        "DEFAULT_TENANT": "staging-tenant",
+        "DEV": "1"
+      },
+      "durable_objects": {
+        "bindings": [
+          { "name": "APPLIANCE", "class_name": "ApplianceDO" },
+          { "name": "TENANT", "class_name": "TenantDO" },
+          { "name": "ROUTER", "class_name": "RouterDO" }
+        ]
+      },
+      "unsafe": {
+        "bindings": [
+          {
+            "name": "RELAY_LIMIT",
+            "type": "ratelimit",
+            "namespace_id": "1003",
+            "simple": { "limit": 120, "period": 60 }
+          },
+          {
+            "name": "JOIN_LIMIT",
+            "type": "ratelimit",
+            "namespace_id": "1004",
+            "simple": { "limit": 10, "period": 60 }
+          }
+        ]
+      },
+      "migrations": [
+        { "tag": "v1", "new_sqlite_classes": ["ApplianceDO"] },
+        { "tag": "v2", "new_sqlite_classes": ["TenantDO"] },
+        { "tag": "v3", "new_sqlite_classes": ["RouterDO"] }
+      ]
+    },
+
     // ---- production: real routes, no workers.dev, fail-closed tenant ----
     "production": {
       "name": "finch-prod",
