@@ -624,22 +624,38 @@ body::before{
   .roost-head-right{width:100%; justify-content:space-between}
 }
 
-/* Test-in-chat panel (appliance detail) */
-.chatd-log{display:flex;flex-direction:column;gap:10px;max-height:300px;min-height:120px;overflow-y:auto;padding:4px 2px;margin-top:4px}
-.chatd-empty{margin:auto;text-align:center;color:var(--dim);font-size:13.5px}
-.chatd-chips{margin-top:11px;display:flex;gap:8px;justify-content:center;flex-wrap:wrap}
-.chatd-chip{background:#191309;border:1px solid var(--line2);border-radius:999px;padding:6px 13px;font-size:12.5px;color:var(--ink);cursor:pointer}
-.chatd-chip:hover{border-color:var(--amber);color:var(--amber)}
-.chatd-msg{padding:10px 13px;border-radius:14px;max-width:84%;white-space:pre-wrap;word-wrap:break-word;font-size:14px}
-.chatd-msg.user{align-self:flex-end;background:var(--amber);color:#2a200c;font-weight:700;border-bottom-right-radius:5px}
-.chatd-msg.assistant{align-self:flex-start;background:var(--card-hi,#352d20);border:1px solid var(--line);border-bottom-left-radius:5px}
-.chatd-msg.err{border-color:rgba(232,132,143,.4);color:var(--red)}
-.chatd-tool{align-self:flex-start;font-size:11.5px;color:var(--green);background:var(--green-soft);border:1px solid #2f4733;border-radius:10px;padding:7px 11px;max-width:84%;word-wrap:break-word}
-.chatd-tool b{color:var(--amber)}
-.chatd-bar{display:flex;gap:9px;margin-top:13px}
-.chatd-input{flex:1;background:#191309;border:1px solid var(--line2);border-radius:11px;color:var(--ink);padding:11px 13px;font-size:14px;font-family:inherit}
+/* Test-in-chat — a chat window inside the appliance detail */
+.chatd-win{margin-top:6px;border:1px solid var(--line2);border-radius:14px;overflow:hidden;
+  background:#1a150d;display:flex;flex-direction:column;height:380px}
+.chatd-winbar{display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid var(--line);background:#1f190f}
+.chatd-wintitle{font-weight:800;font-size:13.5px}
+.chatd-winmeta{margin-left:auto;font-size:11px;color:var(--dim)}
+.chatd-log{flex:1;display:flex;flex-direction:column;gap:12px;overflow-y:auto;padding:16px 14px}
+.chatd-empty{margin:auto;text-align:center;color:var(--dim);font-size:13.5px;max-width:38ch;line-height:1.5}
+/* message line: avatar + bubble */
+.chatd-line{display:flex;gap:9px;align-items:flex-start;max-width:88%}
+.chatd-line.user{align-self:flex-end;flex-direction:row-reverse}
+.chatd-ava{width:26px;height:26px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:14px;
+  background:var(--amber-soft);box-shadow:0 0 0 1px rgba(242,180,67,.2);flex-shrink:0}
+.chatd-line.user .chatd-ava{background:#2b2519;box-shadow:0 0 0 1px var(--line)}
+.chatd-bub{padding:10px 13px;border-radius:13px;white-space:pre-wrap;word-wrap:break-word;font-size:14px;line-height:1.45}
+.chatd-line.assistant .chatd-bub{background:var(--card-hi,#352d20);border:1px solid var(--line);border-top-left-radius:4px}
+.chatd-line.user .chatd-bub{background:var(--amber);color:#2a200c;font-weight:600;border-top-right-radius:4px}
+.chatd-bub.err{background:var(--red-soft,#3e2a26);border:1px solid rgba(232,132,143,.4);color:var(--red)}
+/* tool-call chip */
+.chatd-tool{align-self:center;display:flex;gap:8px;flex-wrap:wrap;align-items:center;font-size:11.5px;
+  color:var(--green);background:var(--green-soft);border:1px solid #2f4733;border-radius:999px;padding:5px 12px;max-width:92%}
+.chatd-toolname{font-weight:700;color:var(--amber)}
+.chatd-toolargs{color:var(--dim)}
+.chatd-toolres{color:var(--green)}
+/* composer */
+.chatd-composer{display:flex;align-items:center;gap:9px;padding:11px 12px;border-top:1px solid var(--line);background:#1f190f}
+.chatd-input{flex:1;background:#120e07;border:1px solid var(--line2);border-radius:999px;color:var(--ink);
+  padding:11px 16px;font-size:14px;font-family:inherit}
 .chatd-input:focus{outline:none;border-color:var(--amber)}
-.chatd-send{background:var(--amber);color:#2a200c;border:0;border-radius:999px;padding:0 20px;font-weight:800;cursor:pointer}
-.chatd-send:hover{background:var(--amber2,#f6c66a)}.chatd-send:disabled{opacity:.5;cursor:default}
+.chatd-send{width:38px;height:38px;border-radius:50%;background:var(--amber);color:#2a200c;border:0;
+  font-size:18px;font-weight:900;cursor:pointer;flex-shrink:0;display:flex;align-items:center;justify-content:center;
+  box-shadow:0 8px 20px -8px rgba(242,180,67,.5)}
+.chatd-send:hover{background:var(--amber2,#f6c66a)}.chatd-send:disabled{opacity:.4;box-shadow:none;cursor:default}
 .chatd-dots::after{content:'';animation:chatddots 1.2s steps(4,end) infinite}
 @keyframes chatddots{0%{content:''}25%{content:'.'}50%{content:'..'}75%{content:'...'}}

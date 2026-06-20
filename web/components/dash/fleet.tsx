@@ -277,8 +277,9 @@ export function DetailView({ app, host, onBack, onRelease, onTags, onApprove, on
         {/* Auth + tags */}
         <Card className="auth-card">
           <SectionLabel hint="enforced at the hub, before traffic reaches the box">auth</SectionLabel>
-          <div className="auth-row"><span className="dim">OAuth</span><span className="auth-ok">● WorkOS connected</span></div>
-          <div className="auth-row"><span className="dim">policy</span><span className="mono">allow: listed keys</span></div>
+          <div className="auth-row"><span className="dim">clients</span><span className="mono">finch_ bearer key</span></div>
+          <div className="auth-row"><span className="dim">box link</span><span className="auth-ok">● connect-token</span></div>
+          <div className="auth-row"><span className="dim">policy</span><span className="mono">default-deny ACL</span></div>
           <div className="auth-tags">
             <span className="auth-sub dim">tags</span>
             <TagList tags={app.tags} onRemove={(t: any) => onTags(app.id, app.tags.filter((x: any) => x !== t))} />
