@@ -265,6 +265,22 @@ export async function handleApi(
     return json(out?.ok === false ? 404 : 200, out);
   }
 
+  // PUT /api/appliances/:id/group {group}
+  if (
+    method === "PUT" &&
+    seg[0] === "appliances" &&
+    seg.length === 3 &&
+    seg[2] === "group"
+  ) {
+    const id = decodeURIComponent(seg[1]);
+    const body = await readJson(req);
+    const out = await tenantOp(env, tenant, "setGroup", {
+      id,
+      group: String(body.group ?? ""),
+    });
+    return json(out?.ok === false ? 404 : 200, out);
+  }
+
   // POST /api/keys {label,scope,owner}. scope is the STRUCTURED KeyScope
   // ({all:true} | {appliances:[...]}); TenantDO.mintKey validates every listed
   // appliance id exists and 400s on an unknown id. We pass it through and

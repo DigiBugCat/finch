@@ -193,6 +193,8 @@ export class TenantDO extends DurableObject<Env> {
           return ok(await this.decline(a.id));
         case "setTags":
           return ok(await this.setTags(a.id, a.tags));
+        case "setGroup":
+          return ok(await this.setGroup(a.id, a.group));
         case "mintKey": {
           const r = await this.mintKey(a.label, a.scope, a.owner);
           if ("error" in r) return bad(400, r.error);
@@ -282,7 +284,7 @@ export class TenantDO extends DurableObject<Env> {
         org: id,
         subdomain: "",
         requireApproval: true,
-        defaultGroup: "Home lab",
+        defaultGroup: "default",
         keyExpiry: "90 days",
         enforceExpiry: false,
         require2fa: false,
@@ -543,6 +545,25 @@ export class TenantDO extends DurableObject<Env> {
   }
 
   // ---- mutations: appliances ---------------------------------------------
+
+  /** Move an appliance to a group (creating it if new; pruning a now-empty old
+   *  group). Empty string clears the group. */
+  private async setGroup(id: string, group: string): Promise<{ ok: boolean }> {
+    const s = await this.load();
+    const ap = this.findAppliance(s, id);
+    if (!ap) return { ok: false };
+    const old = ap.group;
+    ap.group = group || "";
+    if (group && !s.groups.some((g) => g.name === group)) {
+      s.groups.push({ name: group, members: ["you"] });
+    }
+    if (old && old !== group && !s.appliances.some((a) => a.group === old)) {
+      s.groups = s.groups.filter((g) => g.name !== old);
+    }
+    this.log(s, { cat: "admin", actor: "you", action: "moved to group", target: `${id} → ${group || "—"}`, ip: "" });
+    await this.save(s);
+    return { ok: true };
+  }
 
   private async enroll(
     name: string,

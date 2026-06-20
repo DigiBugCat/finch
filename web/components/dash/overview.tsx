@@ -44,7 +44,7 @@ export function FleetView({ appliances, machines, overview, host, groups, onOpen
   const byGroupAll: any = {}, byGroup: any = {};
   allNames.forEach((n: any) => { byGroupAll[n] = []; byGroup[n] = []; });
   appliances.forEach((a: any) => {
-    const n = a.group || "Home lab";
+    const n = a.group || "default";
     (byGroupAll[n] = byGroupAll[n] || []).push(a);
     if (matchA(a)) (byGroup[n] = byGroup[n] || []).push(a);
   });

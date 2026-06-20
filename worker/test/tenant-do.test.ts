@@ -55,7 +55,7 @@ describe("TenantDO.enroll — slug derivation + dedup", () => {
     const ap = state.appliances.find((a: any) => a.id === "embeddings");
     expect(ap).toBeTruthy();
     expect(ap.state).toBe("invited");
-    expect(ap.group).toBe("Home lab"); // default group
+    expect(ap.group).toBe("default"); // default group
   });
 
   it("honors an explicit group and creates the group", async () => {

@@ -24,7 +24,7 @@ export function EnrollView({ host, existingIds, groups, onEnrolled, onWatch }: a
   const [enrolled, setEnrolled] = useState<any>(null); // EnrollResp from the hub
   const [mintErr, setMintErr] = useState("");
   const [plat, setPlat] = useState("macos");
-  const [group, setGroup] = useState((groups && groups[0]) || "Home lab");
+  const [group, setGroup] = useState((groups && groups[0]) || "default");
 
   const clean = id.trim().toLowerCase();
   let error = "";
@@ -78,7 +78,7 @@ export function EnrollView({ host, existingIds, groups, onEnrolled, onWatch }: a
         )}
         <div className="enroll-group">
           <span className="dim" style={{ fontSize: 13, fontWeight: 700 }}>group</span>
-          {(groups || ["Home lab"]).map((g: any) => (
+          {(groups || ["default"]).map((g: any) => (
             <button key={g} className={`owner-btn ${group === g ? "owner-on" : ""}`} onClick={() => setGroup(g)}>{g}</button>
           ))}
         </div>
