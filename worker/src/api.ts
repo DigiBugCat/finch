@@ -201,6 +201,14 @@ export async function handleApi(
     if (path === "/api/cli/whoami" && method === "GET") {
       return json(200, { ok: true, tenant: cliTenant });
     }
+    // POST /api/cli/token — an already-authed box mints a FRESH CLI token, so a
+    // new box can be provisioned with no human in the loop:
+    //   ssh newbox "finch login --token $(finch token)"
+    // No new capability (the caller already holds a tenant CLI token); the new
+    // token is epoch-bound and dies on "revoke all CLI tokens".
+    if (path === "/api/cli/token" && method === "POST") {
+      return json(200, await mintCliToken(env, cliTenant, host));
+    }
     // POST /api/cli/enroll {name,group} — enroll an appliance, return its ticket.
     if (path === "/api/cli/enroll" && method === "POST") {
       return handleEnroll(req, env, cliTenant, host);

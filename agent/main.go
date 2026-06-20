@@ -228,6 +228,12 @@ func main() {
 		case "approve":
 			cmdApprove(os.Args[2:])
 			return
+		case "token":
+			cmdToken(os.Args[2:])
+			return
+		case "status":
+			cmdStatus(os.Args[2:])
+			return
 		case "help", "-h", "--help":
 			printUsage()
 			return

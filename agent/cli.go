@@ -39,13 +39,29 @@ Usage:
                     [--name "App"]        <path> becomes the URL: <slug>.finchmcp.com/<path>/mcp
   finch run [--config finch.toml]      Serve every [[ingress]] rule (auto-approves when logged in)
   finch approve <path>                 Approve an appliance (clear the pending gate)
+  finch token [--json|--login]         Mint a fresh CLI token (provision a new box, no browser)
+  finch status [--json]                Show login + what finch.toml serves
   finch join --ticket <t> --upstream <url>   Run one appliance straight from flags
   finch help                           Show this help
 
 Typical first-time setup:
-  finch login --hub https://finchmcp.com <token>
+  finch login --hub https://finchmcp.com   # browser approval, once
   finch add printer --service http://127.0.0.1:8000 --name "Label Printer"
   finch run
+
+Automation / driving finch from an agent (after the one-time 'finch login'):
+  Everything below is non-interactive and supports --json. No browser needed.
+
+    finch status --json                          # introspect: tenant + ingress rules
+    finch add scraper --service http://:8001 --json   # enroll + wire into finch.toml
+    finch run                                    # serve all rules (auto-approves)
+
+  Provision a NEW box from this already-authed one, zero human in the loop:
+    ssh user@newbox 'finch login --token '"$(finch token)"
+    ssh user@newbox 'finch add api --service http://127.0.0.1:9000 && finch run'
+
+  An agent's loop is: finch login (once, human) then finch token / add / run /
+  status freely. Tokens are revocable in the dashboard (Settings, CLI access).
 
 Run 'finch <command> -h' for a command's own flags.
 `)
@@ -263,12 +279,116 @@ func openBrowser(u string) {
 	_ = exec.Command(name, args...).Start()
 }
 
+// cmdToken: finch token [--json] [--login] — an authed box mints a FRESH CLI
+// token, for non-interactive provisioning of a new box:
+//   ssh newbox "finch login --token $(finch token)"
+func cmdToken(args []string) {
+	fs := flag.NewFlagSet("token", flag.ExitOnError)
+	asJSON := fs.Bool("json", false, "print the raw {token,hub,expiresAt} JSON")
+	asLogin := fs.Bool("login", false, "print a full `finch login` command instead of just the token")
+	_ = fs.Parse(args)
+
+	cred, err := loadCliCred()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
+		os.Exit(1)
+	}
+	out, err := cliRequest("POST", cred.Hub, "/api/cli/token", cred.Token, struct{}{})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "finch: could not mint token: %v\n", err)
+		os.Exit(1)
+	}
+	token, _ := out["token"].(string)
+	hub, _ := out["hub"].(string)
+	if token == "" {
+		fmt.Fprintf(os.Stderr, "finch: unexpected response: %v\n", out)
+		os.Exit(1)
+	}
+	switch {
+	case *asJSON:
+		b, _ := json.Marshal(out)
+		fmt.Println(string(b))
+	case *asLogin:
+		fmt.Printf("finch login --hub %s %s\n", hub, token)
+	default:
+		fmt.Println(token) // bare token, for `ssh host "finch login --token $(finch token)"`
+	}
+}
+
+// cmdStatus: finch status [--json] — introspect login + finch.toml (for agents).
+func cmdStatus(args []string) {
+	fs := flag.NewFlagSet("status", flag.ExitOnError)
+	asJSON := fs.Bool("json", false, "machine-readable JSON")
+	configPath := fs.String("config", "finch.toml", "finch.toml to summarize")
+	_ = fs.Parse(args)
+
+	type ingressStatus struct {
+		Name    string `json:"name,omitempty"`
+		Path    string `json:"path"`
+		Service string `json:"service"`
+	}
+	st := struct {
+		LoggedIn bool            `json:"loggedIn"`
+		Hub      string          `json:"hub,omitempty"`
+		Tenant   string          `json:"tenant,omitempty"`
+		Config   string          `json:"config,omitempty"`
+		Ingress  []ingressStatus `json:"ingress"`
+	}{Ingress: []ingressStatus{}}
+
+	if cred := loadCliCredQuiet(); cred != nil {
+		st.Hub = cred.Hub
+		if who, err := cliRequest("GET", cred.Hub, "/api/cli/whoami", cred.Token, nil); err == nil {
+			st.LoggedIn = true
+			st.Tenant, _ = who["tenant"].(string)
+		}
+	}
+	hostName, _ := os.Hostname()
+	if cfg, err := loadConfig(*configPath, hostName); err == nil {
+		st.Config = *configPath
+		if st.Hub == "" {
+			st.Hub = cfg.Hub
+		}
+		for _, ing := range cfg.Ingress {
+			st.Ingress = append(st.Ingress, ingressStatus{Name: ing.Name, Path: ing.Path, Service: ing.Service})
+		}
+	}
+
+	if *asJSON {
+		b, _ := json.MarshalIndent(st, "", "  ")
+		fmt.Println(string(b))
+		return
+	}
+	if st.LoggedIn {
+		fmt.Printf("logged in: %s  (tenant %s)\n", st.Hub, st.Tenant)
+	} else {
+		fmt.Printf("not logged in%s — run `finch login`\n", func() string {
+			if st.Hub != "" {
+				return " to " + st.Hub
+			}
+			return ""
+		}())
+	}
+	if st.Config != "" {
+		fmt.Printf("%s serves %d rule(s):\n", st.Config, len(st.Ingress))
+		for _, ing := range st.Ingress {
+			n := ing.Name
+			if n == "" {
+				n = ing.Path
+			}
+			fmt.Printf("  • %-16s %s → %s\n", ing.Path, n, ing.Service)
+		}
+	} else {
+		fmt.Println("no finch.toml here — `finch add <path> --service <url>` to create one")
+	}
+}
+
 // cmdAdd: finch add <path> --service <url> [--name "..."] [--config finch.toml]
 func cmdAdd(args []string) {
 	fs := flag.NewFlagSet("add", flag.ExitOnError)
 	service := fs.String("service", "", "local MCP server URL to expose (required), e.g. http://127.0.0.1:8000")
 	name := fs.String("name", "", "friendly application name (defaults to <path>)")
 	configPath := fs.String("config", "finch.toml", "finch.toml to append the ingress rule to")
+	asJSON := fs.Bool("json", false, "print the result as JSON (for scripts/agents)")
 
 	// Go's flag parser stops at the first positional, so pull a leading <path>
 	// (the natural `finch add printer --service …` order) before parsing flags.
@@ -327,6 +447,11 @@ func cmdAdd(args []string) {
 	if err := appendIngress(*configPath, cred.Hub, appName, id, *service, ticket); err != nil {
 		fmt.Fprintf(os.Stderr, "finch: could not write %s: %v\n", *configPath, err)
 		os.Exit(1)
+	}
+	if *asJSON {
+		b, _ := json.Marshal(map[string]string{"path": id, "name": appName, "service": *service, "url": pubURL, "config": *configPath})
+		fmt.Println(string(b))
+		return
 	}
 	fmt.Printf("finch: added %q → %s\n", appName, *service)
 	if pubURL != "" {
