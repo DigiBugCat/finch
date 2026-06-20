@@ -397,6 +397,8 @@ async function handleJoin(
     tenant,
     appliance,
     machine,
+    host: base.host,
+    url: `${base.http}/${appliance}/mcp`,
     connectUrl,
     connectToken,
     refreshToken,
@@ -455,6 +457,8 @@ async function handleRefresh(
     tenant,
     appliance,
     machine,
+    host: base.host,
+    url: `${base.http}/${appliance}/mcp`,
     connectUrl,
     connectToken,
   };

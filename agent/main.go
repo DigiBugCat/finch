@@ -200,6 +200,8 @@ type joinResp struct {
 	Tenant    string `json:"tenant"`
 	Appliance string `json:"appliance"`
 	Machine   string `json:"machine"`
+	Host      string `json:"host"` // public host, e.g. <slug>.finchmcp.com
+	URL       string `json:"url"`  // public MCP endpoint for this appliance
 	// Short-lived (~120s) per-machine HMAC grant. We present it on the _connect
 	// dial as ?ct=<connectToken>; the hub verifies it BEFORE accepting the relay
 	// socket. (FLEET_SECRET is gone — this token is the whole proof.)
@@ -251,7 +253,7 @@ func main() {
 	if err != nil || upstreamURL.Scheme == "" || upstreamURL.Host == "" {
 		log.Fatalf("finch: --upstream %q is not a valid absolute URL", *upstream)
 	}
-	runAppliance(*hub, *machine, *ticket, *statePath, upstreamURL, "")
+	runAppliance(*hub, *machine, *ticket, *statePath, upstreamURL, "", "")
 }
 
 // runConfig serves every [[ingress]] rule from a finch.toml — one relay loop per
@@ -276,7 +278,7 @@ func runConfig(cfg *config) {
 		wg.Add(1)
 		go func(ing ingress, up *url.URL, sp string) {
 			defer wg.Done()
-			runAppliance(cfg.Hub, cfg.Machine, ing.Ticket, sp, up, ing.Path)
+			runAppliance(cfg.Hub, cfg.Machine, ing.Ticket, sp, up, ing.Path, ing.Name)
 		}(ing, up, statePath)
 	}
 	if started == 0 {
@@ -290,7 +292,7 @@ func runConfig(cfg *config) {
 // reconnects forever. `label` prefixes logs (the ingress path in config mode,
 // empty in single-service mode). Fatal enroll errors return so a sibling rule
 // in config mode survives; in single-service mode main() has nothing else to do.
-func runAppliance(hub, machine, ticket, statePath string, upstreamURL *url.URL, label string) {
+func runAppliance(hub, machine, ticket, statePath string, upstreamURL *url.URL, label, appName string) {
 	lp := "finch"
 	if label != "" {
 		lp = "finch[" + label + "]"
@@ -328,7 +330,18 @@ func runAppliance(hub, machine, ticket, statePath string, upstreamURL *url.URL, 
 			}
 		}
 	}
-	log.Printf("%s: active as appliance=%q machine=%q (tenant %s)", lp, jr.Appliance, jr.Machine, jr.Tenant)
+	// Describe the rule by its full name: the application, its public endpoint,
+	// and the local service it fronts.
+	name := appName
+	if name == "" {
+		name = jr.Appliance
+	}
+	endpoint := jr.URL
+	if endpoint == "" { // older hub without host/url in the join response
+		endpoint = relayURL(hub, jr.Appliance, jr.Machine)
+	}
+	log.Printf("%s: %q live at %s  →  %s  (machine %q, tenant %s)",
+		lp, name, endpoint, upstreamURL, jr.Machine, jr.Tenant)
 
 	// Build the relay WS URL from the hub base + appliance/machine so scheme/host
 	// always match the hub we were given (the hub's connectUrl may assume prod).
@@ -859,10 +872,14 @@ func resolveUpstream(base *url.URL, rawPath string) (string, error) {
 // ---- finch.toml manifest (cloudflared-style ingress) -----------------------
 
 // ingress is one rule: expose a local `service` as the appliance named `path`.
-// `path` becomes the public URL segment — https://<slug>.finchmcp.com/<path>/mcp
-// — so it must match the appliance enrolled in the dashboard. `ticket` is the
-// one-shot enrollment ticket, needed only on first run (then state takes over).
+//
+//	name    — human label for the application (e.g. "Label Printer"); logs only.
+//	path    — the public URL segment AND the appliance enrolled in the dashboard.
+//	          Full endpoint: https://<your-slug>.finchmcp.com/<path>/mcp
+//	service — the local server to forward to (e.g. http://127.0.0.1:8000).
+//	ticket  — one-shot enrollment ticket, first run only (then state resumes).
 type ingress struct {
+	Name    string `toml:"name"`
 	Path    string `toml:"path"`
 	Service string `toml:"service"`
 	Ticket  string `toml:"ticket"`

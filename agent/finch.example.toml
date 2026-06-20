@@ -9,14 +9,19 @@ hub     = "https://finchmcp.com"   # the finch hub (default; omit for prod)
 machine = "mac-mini"               # this box's name (default: hostname)
 state   = "~/.finch"               # dir for per-appliance refresh credentials
 
-# Each rule: `path` is the public URL segment AND the appliance name enrolled in
-# the dashboard — https://<your-slug>.finchmcp.com/<path>/mcp → `service`.
+# Each rule exposes one application:
+#   name    — friendly label for the application (logs/your reference)
+#   path    — the public URL segment AND the appliance enrolled in the dashboard
+#   service — the local server finch forwards to
+# Full endpoint:  https://<your-slug>.finchmcp.com/<path>/mcp
 [[ingress]]
+name    = "Label Printer"
 path    = "printer"
 service = "http://127.0.0.1:8000"
 ticket  = "REPLACE_WITH_PRINTER_TICKET"     # first run only; then state resumes
 
 [[ingress]]
+name    = "Transcriber"
 path    = "transcribe"
 service = "http://127.0.0.1:8001"
 ticket  = "REPLACE_WITH_TRANSCRIBE_TICKET"

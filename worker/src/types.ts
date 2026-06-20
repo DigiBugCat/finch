@@ -192,6 +192,8 @@ export interface JoinResp {
   tenant: string;
   appliance: string;
   machine: string;
+  host: string; // public host, e.g. <slug>.finchmcp.com — lets the agent print the full URL
+  url: string; // public MCP endpoint, e.g. https://<slug>.finchmcp.com/<appliance>/mcp
   connectUrl: string; // wss URL to open the relay WebSocket
   // Short-lived (~120s) per-machine HMAC grant the agent MUST present on the
   // _connect dial as ?ct=<connectToken>. The hub verifies it (kind+tenant+
@@ -210,6 +212,8 @@ export interface RefreshResp {
   tenant: string;
   appliance: string;
   machine: string;
+  host: string;
+  url: string;
   connectUrl: string;
   connectToken: string;
 }
