@@ -113,6 +113,11 @@
         "DEV": "1",
         "WEB_URL": "https://finch-web-staging.pantainos.workers.dev"
       },
+      "ai": { "binding": "AI" },
+      // Self service-binding: the /chat tool-runner relays MCP calls back through
+      // our own appliance path. A direct fetch to our workers.dev host is blocked
+      // (error 1042); a service binding to ourselves is the supported way.
+      "services": [{ "binding": "SELF", "service": "finch-staging" }],
       "durable_objects": {
         "bindings": [
           { "name": "APPLIANCE", "class_name": "ApplianceDO" },
@@ -153,6 +158,8 @@
       "vars": {
         "WEB_URL": "https://finchmcp.com"
       },
+      "ai": { "binding": "AI" },
+      "services": [{ "binding": "SELF", "service": "finch-prod" }],
       "routes": [
         { "pattern": "finchmcp.com/*", "zone_name": "finchmcp.com" },
         { "pattern": "*.finchmcp.com/*", "zone_name": "finchmcp.com" }

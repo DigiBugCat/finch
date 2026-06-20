@@ -19,6 +19,7 @@ import { ApplianceDO } from "./appliance-do";
 import { TenantDO } from "./tenant-do";
 import { RouterDO, routerLookup } from "./router-do";
 import { handleApi, isApiPath } from "./api";
+import { handleChat } from "./chat";
 import { hashKey, verifyToken } from "./auth";
 
 export { ApplianceDO, TenantDO, RouterDO };
@@ -35,6 +36,8 @@ export interface Env {
   DEFAULT_TENANT?: string; // DEV-ONLY tenant fallback when no slug resolves
   DEV?: string; // "1" in the dev env; gates the DEFAULT_TENANT fallback
   WEB_URL?: string; // dashboard base URL — the `finch login` device page lives at <WEB_URL>/cli
+  AI: Ai; // Workers AI binding — powers the /chat test interface
+  SELF: Fetcher; // self service-binding — /chat relays MCP back through our own appliance path
 
   // Where GET /releases/<asset> redirects to fetch the agent binary. Defaults to
   // the project's GitHub Releases "latest" assets; override per-env if binaries
@@ -195,6 +198,12 @@ export default {
         status: 200,
         headers: { "content-type": "text/plain; charset=utf-8" },
       });
+    }
+
+    // ---- /chat — a tiny test chat that drives an appliance's MCP tools via a
+    //      Workers AI model (a "does my endpoint work" check). ----
+    if (path === "/chat" || path === "/chat/completions") {
+      return handleChat(req, env, url);
     }
 
     // ---- GET /install — the curl|sh agent installer (unauthenticated; the
