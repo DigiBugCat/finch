@@ -2,6 +2,7 @@
 // Roost — fleet tables (Appliance table/cards/compact + Machines) + detail.
 import { useState } from 'react';
 import { Avatar, Button, Card, CopyChip, InlineConfirm, MonoUrl, SectionLabel, StatePill, TagList, isOnline } from '@/components/dash/primitives';
+import { ChatPanel } from '@/components/dash/ChatPanel';
 import { AreaChart } from '@/components/dash/charts';
 import { LATEST_AGENT } from '@/components/dash/data';
 
@@ -220,6 +221,9 @@ export function DetailView({ app, host, onBack, onRelease, onTags, onApprove, on
             <CopyChip value={snippets[tab]} className="snippet-copy" />
           </div>
         </Card>
+
+        {/* Test in chat */}
+        <ChatPanel appliance={app.id} online={online} />
 
         {/* Traffic */}
         <Card className="chart-card connect-card">

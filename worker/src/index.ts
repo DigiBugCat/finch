@@ -20,7 +20,7 @@ import { TenantDO } from "./tenant-do";
 import { RouterDO, routerLookup } from "./router-do";
 import { handleApi, isApiPath } from "./api";
 import { handleChat } from "./chat";
-import { hashKey, verifyToken } from "./auth";
+import { hashKey, verifyToken, serviceOk, verifyAssertion } from "./auth";
 
 export { ApplianceDO, TenantDO, RouterDO };
 
@@ -428,34 +428,45 @@ async function relayMcp(
     return json(413, { error: "request body too large" });
   }
 
-  const auth = req.headers.get("authorization") || "";
-  const m = auth.match(/^Bearer\s+(finch_[A-Za-z0-9_-]+)$/);
-  if (!m) {
-    return json(401, { error: "missing or malformed finch_ bearer key" });
-  }
-  const presented = m[1];
-  const hash = await hashKey(presented);
-  const check = await tenantOp<{
-    allowed: boolean;
-    keyLabel: string;
-    reason?: "no-key" | "scope" | "acl" | "expired";
-  }>(env, tenant, "checkKey", { hash, appliance });
-  if (!check.allowed) {
-    // Distinguish the denial cause so a caller can tell "unknown key" from
-    // "known key, not granted by the tenant's ACL". All are 403 (no oracle on
-    // key existence beyond the bearer-shape 401 above).
-    const error =
-      check.reason === "acl"
-        ? "no ACL rule grants this key access to this appliance"
-        : check.reason === "scope"
-          ? "key scope does not include this appliance"
-          : check.reason === "expired"
-            ? "key has expired"
-            : "key not allowed for this appliance";
-    return json(403, { error });
-  }
+  // TRUSTED INTERNAL RELAY: the dashboard's own "test in chat" panel relays via
+  // the web's service secret + a tenant assertion (no finch_ key). serviceOk +
+  // verifyAssertion proves a first-party caller acting for THIS resolved tenant,
+  // so we skip the per-key checkKey gate. Only the web holds FINCH_SERVICE_SECRET.
+  const svcAuthed =
+    serviceOk(req, env) &&
+    (await verifyAssertion(req.headers.get("x-finch-auth") || "", env.FINCH_SERVICE_SECRET)) ===
+      tenant;
 
-  const caller = check.keyLabel || "finch_key";
+  let caller = "dashboard";
+  if (!svcAuthed) {
+    const auth = req.headers.get("authorization") || "";
+    const m = auth.match(/^Bearer\s+(finch_[A-Za-z0-9_-]+)$/);
+    if (!m) {
+      return json(401, { error: "missing or malformed finch_ bearer key" });
+    }
+    const presented = m[1];
+    const hash = await hashKey(presented);
+    const check = await tenantOp<{
+      allowed: boolean;
+      keyLabel: string;
+      reason?: "no-key" | "scope" | "acl" | "expired";
+    }>(env, tenant, "checkKey", { hash, appliance });
+    if (!check.allowed) {
+      // Distinguish the denial cause so a caller can tell "unknown key" from
+      // "known key, not granted by the tenant's ACL". All are 403 (no oracle on
+      // key existence beyond the bearer-shape 401 above).
+      const error =
+        check.reason === "acl"
+          ? "no ACL rule grants this key access to this appliance"
+          : check.reason === "scope"
+            ? "key scope does not include this appliance"
+            : check.reason === "expired"
+              ? "key has expired"
+              : "key not allowed for this appliance";
+      return json(403, { error });
+    }
+    caller = check.keyLabel || "finch_key";
+  }
   const pool =
     typeof machineOrPool === "string" ? [machineOrPool] : machineOrPool;
 
@@ -467,6 +478,8 @@ async function relayMcp(
   // own auth, inject a per-appliance secret downstream — never the caller key.)
   const relayHeaders = new Headers(req.headers);
   relayHeaders.delete("authorization");
+  relayHeaders.delete("x-finch-service"); // never leak the service secret to a box
+  relayHeaders.delete("x-finch-auth");
   for (const [name, value] of [...relayHeaders.entries()]) {
     if (value.includes("finch_")) relayHeaders.delete(name);
   }

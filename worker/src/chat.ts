@@ -12,6 +12,7 @@
 // real client uses — so a green answer means the whole finch loop works.
 
 import type { Env } from "./index";
+import { serviceOk, verifyAssertion } from "./auth";
 
 const MODEL = "@cf/google/gemma-4-26b-a4b-it";
 const CONTEXT_CHAR_BUDGET = 8000 * 3; // ~8k tokens, roughly 3 chars/token
@@ -39,16 +40,33 @@ async function chatCompletion(req: Request, env: Env, origin: string): Promise<R
     return json(400, { error: "invalid JSON" });
   }
   const appliance = String(body.appliance || "").trim();
-  const key = String(body.key || "").trim();
   const userMessages: Msg[] = Array.isArray(body.messages) ? body.messages : [];
-  if (!appliance || !key || !userMessages.length) {
-    return json(400, { error: "appliance, key and messages are required" });
+  if (!appliance || !userMessages.length) {
+    return json(400, { error: "appliance and messages are required" });
+  }
+
+  // Two ways to authorize the relay this chat performs:
+  //   • the dashboard forwards the web's service secret + tenant assertion
+  //     (no key juggling) — we relay those headers through;
+  //   • the standalone page provides a finch_ key.
+  let authHeaders: Record<string, string>;
+  const svcOk =
+    serviceOk(req, env) && !!(await verifyAssertion(req.headers.get("x-finch-auth") || "", env.FINCH_SERVICE_SECRET));
+  if (svcOk) {
+    authHeaders = {
+      "x-finch-service": req.headers.get("x-finch-service") || "",
+      "x-finch-auth": req.headers.get("x-finch-auth") || "",
+    };
+  } else {
+    const key = String(body.key || "").trim();
+    if (!key) return json(401, { error: "a finch_ key (or first-party auth) is required" });
+    authHeaders = { authorization: `Bearer ${key}` };
   }
 
   // Discover the appliance's tools (this also proves the relay works).
   let tools: any[];
   try {
-    const listed = await mcp(env, origin, appliance, key, "tools/list", {});
+    const listed = await mcp(env, origin, appliance, authHeaders, "tools/list", {});
     tools = listed?.tools || [];
   } catch (e: any) {
     return json(502, { error: `couldn't reach ${appliance}: ${e.message || e}` });
@@ -82,7 +100,7 @@ async function chatCompletion(req: Request, env: Env, origin: string): Promise<R
     if (hop < MAX_TOOL_HOPS && call && toolNames.has(call.tool)) {
       let result: string;
       try {
-        const r = await mcp(env, origin, appliance, key, "tools/call", { name: call.tool, arguments: call.args || {} });
+        const r = await mcp(env, origin, appliance, authHeaders, "tools/call", { name: call.tool, arguments: call.args || {} });
         result = r?.content?.[0]?.text ?? JSON.stringify(r);
       } catch (e: any) {
         result = `tool error: ${e.message || e}`;
@@ -99,10 +117,10 @@ async function chatCompletion(req: Request, env: Env, origin: string): Promise<R
 
 /** Relay a JSON-RPC call to the appliance over our own MCP path. Uses the SELF
  *  service binding — a plain fetch to our own hostname is blocked (error 1042). */
-async function mcp(env: Env, origin: string, appliance: string, key: string, method: string, params: any): Promise<any> {
+async function mcp(env: Env, origin: string, appliance: string, authHeaders: Record<string, string>, method: string, params: any): Promise<any> {
   const res = await env.SELF.fetch(`${origin}/${encodeURIComponent(appliance)}/mcp`, {
     method: "POST",
-    headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
+    headers: { ...authHeaders, "content-type": "application/json" },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
   });
   const text = await res.text();
