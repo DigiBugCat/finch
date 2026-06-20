@@ -165,57 +165,137 @@ function json(status: number, body: unknown): Response {
   });
 }
 
-const CHAT_HTML = `<!doctype html><html><head><meta charset="utf-8"/>
+const CHAT_HTML = `<!doctype html><html lang="en"><head><meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>finch · chat check</title>
+<title>finch · chat</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800;900&display=swap" rel="stylesheet"/>
 <style>
-:root{--bg:#231e16;--card:#2d271c;--line:#3f3725;--line2:#4b4129;--ink:#f1e9d8;--dim:#a89d85;--amber:#f2b443;--green:#79d995;--mono:ui-monospace,Menlo,monospace}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,sans-serif}
-.wrap{max-width:720px;margin:0 auto;padding:22px 16px;display:flex;flex-direction:column;min-height:100vh}
-h1{font-size:20px;margin:0 0 4px}.sub{color:var(--dim);font-size:13px;margin-bottom:16px}
-.cfg{display:flex;gap:8px;margin-bottom:14px}
-input{flex:1;background:#191309;border:1px solid var(--line2);border-radius:9px;color:var(--ink);padding:10px 12px;font:14px var(--mono)}
-input:focus{outline:none;border-color:var(--amber)}
-.log{flex:1;display:flex;flex-direction:column;gap:10px;overflow:auto;padding:6px 2px}
-.msg{padding:10px 13px;border-radius:13px;max-width:85%;white-space:pre-wrap;word-wrap:break-word}
-.u{align-self:flex-end;background:var(--amber);color:#2a200c;font-weight:600}
-.a{align-self:flex-start;background:var(--card);border:1px solid var(--line)}
-.tool{align-self:flex-start;font:12px var(--mono);color:var(--green);background:#1d2a1f;border:1px solid #2f4733;border-radius:9px;padding:7px 11px;max-width:85%;white-space:pre-wrap}
-.bar{display:flex;gap:8px;margin-top:12px}
-button{background:var(--amber);color:#2a200c;border:0;border-radius:999px;padding:11px 20px;font-weight:800;cursor:pointer}
-button:disabled{opacity:.5}
-.hint{color:var(--dim);font-size:12px;margin-top:8px}
-a{color:var(--amber)}
+:root{
+  --bg:#231e16;--card:#2d271c;--card2:#251f15;--card-hi:#352d20;--line:#3f3725;--line2:#4b4129;
+  --ink:#f1e9d8;--dim:#a89d85;--amber:#f2b443;--amber2:#f6c66a;--amber-soft:#41351c;
+  --green:#79d995;--green-soft:#283a2a;--violet:#c4a8ef;--violet-soft:#2e2740;
+  --mono:ui-monospace,"SF Mono",Menlo,monospace;--r:16px;--r-lg:18px;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font-family:"Nunito",system-ui,sans-serif;font-size:15px;line-height:1.5;-webkit-font-smoothing:antialiased;
+  background-image:radial-gradient(900px 460px at 80% -8%,rgba(242,180,67,.10),transparent 64%),radial-gradient(700px 520px at 5% 0%,rgba(196,168,239,.06),transparent 62%)}
+.wrap{max-width:760px;margin:0 auto;padding:26px 18px 18px;display:flex;flex-direction:column;min-height:100vh}
+a{color:var(--amber);text-decoration:none}
+.mono{font-family:var(--mono);font-size:.9em}
+.back{color:var(--dim);font-weight:700;font-size:14px;margin-bottom:16px;display:inline-block}
+.card{background:linear-gradient(180deg,#2f2819,var(--card));border:1px solid var(--line2);border-radius:var(--r-lg);
+  box-shadow:0 28px 64px -34px rgba(0,0,0,.7);margin-bottom:16px}
+.seclabel{display:flex;align-items:baseline;gap:10px;font-weight:800;font-size:12px;text-transform:uppercase;
+  letter-spacing:.07em;color:var(--dim);margin-bottom:13px}
+.seclabel small{text-transform:none;letter-spacing:0;font-weight:600;opacity:.7}
+/* header card */
+.head{display:flex;align-items:center;gap:16px;padding:20px 22px}
+.avatar{width:48px;height:48px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;
+  font-size:22px;background:var(--amber-soft);box-shadow:0 0 0 1px rgba(242,180,67,.25),0 0 14px rgba(242,180,67,.18);flex-shrink:0}
+.head-mid{flex:1;min-width:0}
+.head-id{display:flex;align-items:center;gap:11px}
+.head-id h1{font-size:22px;font-weight:900;margin:0;font-family:var(--mono);color:var(--amber);letter-spacing:-0.01em}
+.head-sub{font-size:13px;color:var(--dim);margin-top:5px}
+.pill{display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:800;padding:4px 11px;border-radius:999px;white-space:nowrap}
+.pill-live{background:var(--green-soft);color:var(--green)}
+.pill-off{background:#2b2519;color:var(--dim)}
+.pill-dot{width:7px;height:7px;border-radius:50%;background:var(--green);animation:pulse 2s infinite}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(121,217,149,.5)}70%{box-shadow:0 0 0 6px rgba(121,217,149,0)}100%{box-shadow:0 0 0 0 rgba(121,217,149,0)}}
+/* connect card */
+.body{padding:18px 22px 20px}
+.fields{display:flex;gap:10px}
+.field{flex:1;background:#191309;border:1px solid var(--line2);border-radius:11px;color:var(--ink);
+  padding:11px 13px;font-family:var(--mono);font-size:13px}
+.field:focus{outline:none;border-color:var(--amber)}
+.hint{color:var(--dim);font-size:12.5px;margin-top:11px}
+/* chat card */
+.chat{flex:1;display:flex;flex-direction:column;min-height:340px}
+.log{flex:1;display:flex;flex-direction:column;gap:11px;overflow:auto;padding:2px}
+.empty{margin:auto;text-align:center;color:var(--dim);font-size:14px;max-width:34ch}
+.empty .chips{margin-top:14px;display:flex;gap:8px;justify-content:center;flex-wrap:wrap}
+.chip{background:#191309;border:1px solid var(--line2);border-radius:999px;padding:7px 13px;font-size:12.5px;cursor:pointer;color:var(--ink)}
+.chip:hover{border-color:var(--amber);color:var(--amber)}
+.msg{padding:11px 14px;border-radius:15px;max-width:84%;white-space:pre-wrap;word-wrap:break-word;font-size:14.5px}
+.u{align-self:flex-end;background:var(--amber);color:#2a200c;font-weight:700;border-bottom-right-radius:5px}
+.a{align-self:flex-start;background:var(--card-hi);border:1px solid var(--line);border-bottom-left-radius:5px}
+.a.err{border-color:rgba(232,132,143,.4);color:#e8848f}
+.tool{align-self:flex-start;display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:12px;
+  color:var(--green);background:var(--green-soft);border:1px solid #2f4733;border-radius:11px;padding:8px 12px;max-width:84%}
+.tool b{color:var(--amber2);font-weight:700}
+.dots{display:inline-block}.dots::after{content:'';animation:dots 1.2s steps(4,end) infinite}
+@keyframes dots{0%{content:''}25%{content:'.'}50%{content:'..'}75%{content:'...'}}
+.bar{display:flex;gap:10px;margin-top:14px}
+.bar .field{font-family:"Nunito",sans-serif;font-size:14.5px}
+.send{background:var(--amber);color:#2a200c;border:0;border-radius:999px;padding:0 22px;font-weight:800;font-size:15px;cursor:pointer;
+  box-shadow:0 10px 26px -10px rgba(242,180,67,.5)}
+.send:hover{background:var(--amber2)}.send:disabled{opacity:.5;box-shadow:none;cursor:default}
+.logo{display:flex;align-items:center;gap:9px;font-weight:900;font-size:19px;margin-bottom:18px}
+.logo-mark{width:28px;height:28px;border-radius:9px;display:inline-flex;align-items:center;justify-content:center;
+  background:radial-gradient(circle at 35% 30%,#4a3a1c,#2a2113);box-shadow:0 0 0 1px var(--line);font-size:15px}
 </style></head><body><div class="wrap">
-<h1>🐦 finch · chat check</h1>
-<div class="sub">Chat with an LLM (Workers AI · gemma) that calls your appliance's MCP tools. If it can roll a die or add numbers, your endpoint works.</div>
-<div class="cfg">
-  <input id="app" placeholder="appliance (e.g. hello)"/>
-  <input id="key" placeholder="finch_… key" type="password"/>
+<div class="logo"><span class="logo-mark">🐦</span> Finch <span style="color:var(--dim);font-weight:700;font-size:14px">· chat</span></div>
+
+<div class="card head">
+  <span class="avatar">🐦</span>
+  <div class="head-mid">
+    <div class="head-id"><h1 id="hId">chat</h1><span class="pill pill-off" id="hPill">not connected</span></div>
+    <div class="head-sub">Chat with an LLM that calls your appliance's MCP tools — a quick "does my endpoint work" check.</div>
+  </div>
 </div>
-<div class="log" id="log"></div>
-<div class="bar"><input id="msg" placeholder="try: roll a d20  ·  what is 40 + 2?" /><button id="send">Send</button></div>
-<div class="hint">Mint a finch_ key in the dashboard → Keys. Stored locally in your browser only.</div>
+
+<div class="card">
+  <div class="body">
+    <div class="seclabel">connect <small>your appliance + a finch_ key (stored in this browser only)</small></div>
+    <div class="fields">
+      <input class="field" id="app" placeholder="appliance — e.g. hello" style="max-width:200px"/>
+      <input class="field" id="key" placeholder="finch_… key" type="password"/>
+    </div>
+    <div class="hint">Mint a key in the dashboard → <b>Keys</b>. The model runs on Cloudflare Workers AI.</div>
+  </div>
+</div>
+
+<div class="card chat"><div class="body" style="flex:1;display:flex;flex-direction:column">
+  <div class="seclabel">chat <small>gemma · workers ai</small></div>
+  <div class="log" id="log"></div>
+  <div class="bar">
+    <input class="field" id="msg" placeholder="Ask something that uses a tool…"/>
+    <button class="send" id="send">Send</button>
+  </div>
+</div></div>
+
 </div><script>
 const $=s=>document.querySelector(s), log=$('#log');
 $('#app').value=localStorage.fchApp||''; $('#key').value=localStorage.fchKey||'';
-const hist=[];
-function add(cls,text){const d=document.createElement('div');d.className='msg '+cls;d.textContent=text;log.appendChild(d);log.scrollTop=log.scrollHeight;return d;}
-function addTool(t){const d=document.createElement('div');d.className='tool';d.textContent='🔧 '+t.tool+'('+JSON.stringify(t.args||{})+') → '+t.result;log.appendChild(d);log.scrollTop=log.scrollHeight;}
+const hist=[]; let empty;
+function syncHead(){const a=$('#app').value.trim();$('#hId').textContent=a||'chat';
+  const p=$('#hPill');if(a){p.className='pill pill-live';p.innerHTML='<span class=pill-dot></span>'+a;}else{p.className='pill pill-off';p.textContent='not connected';}}
+$('#app').addEventListener('input',syncHead); syncHead();
+function showEmpty(){empty=document.createElement('div');empty.className='empty';
+  empty.innerHTML='Try one of these — the model will call your tool to answer:<div class=chips></div>';
+  ['roll a d20','what is 40 + 2?','echo hello finch'].forEach(t=>{const c=document.createElement('div');c.className='chip';c.textContent=t;c.onclick=()=>{$('#msg').value=t;send();};empty.querySelector('.chips').appendChild(c);});
+  log.appendChild(empty);}
+showEmpty();
+function add(cls,text){if(empty){empty.remove();empty=null;}const d=document.createElement('div');d.className='msg '+cls;d.textContent=text;log.appendChild(d);log.scrollTop=log.scrollHeight;return d;}
+function addTool(t){if(empty){empty.remove();empty=null;}const d=document.createElement('div');d.className='tool';
+  d.innerHTML='🔧 <b>'+t.tool+'</b>('+escapeHtml(JSON.stringify(t.args||{}))+') → '+escapeHtml(t.result);log.appendChild(d);log.scrollTop=log.scrollHeight;}
+function escapeHtml(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
 async function send(){
   const app=$('#app').value.trim(), key=$('#key').value.trim(), text=$('#msg').value.trim();
-  if(!app||!key||!text)return;
+  if(!text)return;
+  if(!app||!key){add('a err','Enter your appliance and a finch_ key above first.');return;}
   localStorage.fchApp=app; localStorage.fchKey=key;
   $('#msg').value=''; add('u',text); hist.push({role:'user',content:text});
-  $('#send').disabled=true; const thinking=add('a','…');
+  $('#send').disabled=true; const thinking=add('a','');thinking.innerHTML='<span class=dots></span>';
   try{
     const r=await fetch('/chat/completions',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({appliance:app,key,messages:hist})});
     const j=await r.json();
     thinking.remove();
     (j.trace||[]).forEach(addTool);
-    if(j.error){add('a','⚠️ '+j.error);}
+    if(j.error){add('a err','⚠️ '+j.error);}
     else{add('a',j.reply||'(no reply)'); hist.push({role:'assistant',content:j.reply||''});}
-  }catch(e){thinking.remove();add('a','⚠️ '+e.message);}
+  }catch(e){thinking.remove();add('a err','⚠️ '+e.message);}
   $('#send').disabled=false; $('#msg').focus();
 }
 $('#send').onclick=send; $('#msg').addEventListener('keydown',e=>{if(e.key==='Enter')send();});
