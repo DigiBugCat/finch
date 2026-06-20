@@ -246,6 +246,12 @@ func main() {
 		case "revoke-tokens":
 			cmdRevokeTokens(os.Args[2:])
 			return
+		case "test":
+			cmdTest(os.Args[2:])
+			return
+		case "call":
+			cmdCall(os.Args[2:])
+			return
 		case "help", "-h", "--help":
 			printUsage()
 			return

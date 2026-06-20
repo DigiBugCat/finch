@@ -42,6 +42,8 @@ Usage:
   finch token [--json|--login]         Mint a fresh CLI token (provision a new box, no browser)
   finch status [--json]                Show login + what finch.toml serves
   finch fleet [--json]   (alias: ls)   List this account's appliances + state
+  finch test <appliance>               List an appliance's MCP tools (does-it-work check)
+  finch call <appliance> <tool> [--args '{...}']   Invoke one tool through the hub
   finch keys [list|mint <label> --appliance <id>|revoke <id>]   Manage client finch_ keys
   finch rm <appliance>                 Remove an appliance
   finch revoke-tokens                  De-authorize every CLI login (incl. this box)
@@ -281,6 +283,111 @@ func openBrowser(u string) {
 		name, args = "xdg-open", []string{u}
 	}
 	_ = exec.Command(name, args...).Start()
+}
+
+// cmdTest: finch test <appliance> — list the appliance's MCP tools (a quick
+// "does my endpoint work" check, relayed through the hub via the CLI token).
+func cmdTest(args []string) {
+	fs := flag.NewFlagSet("test", flag.ExitOnError)
+	asJSON := fs.Bool("json", false, "machine-readable JSON")
+	app := ""
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		app, args = args[0], args[1:]
+	}
+	_ = fs.Parse(args)
+	if app == "" {
+		fmt.Fprintln(os.Stderr, "usage: finch test <appliance>")
+		os.Exit(2)
+	}
+	cred := mustCliCred()
+	out, err := cliRequest("POST", cred.Hub, "/api/cli/call", cred.Token, map[string]any{"appliance": app, "method": "tools/list"})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
+		os.Exit(1)
+	}
+	if *asJSON {
+		b, _ := json.Marshal(out)
+		fmt.Println(string(b))
+		return
+	}
+	res, _ := out["result"].(map[string]any)
+	tools, _ := res["tools"].([]any)
+	if e, ok := out["error"]; ok && e != nil {
+		fmt.Fprintf(os.Stderr, "finch: %v\n", e)
+		os.Exit(1)
+	}
+	fmt.Printf("%s — %d tool(s):\n", app, len(tools))
+	for _, t := range tools {
+		m, _ := t.(map[string]any)
+		fmt.Printf("  • %-16v %v\n", m["name"], m["description"])
+	}
+}
+
+// cmdCall: finch call <appliance> <tool> [--args '{...}'] — invoke one tool.
+func cmdCall(args []string) {
+	fs := flag.NewFlagSet("call", flag.ExitOnError)
+	argsJSON := fs.String("args", "{}", "tool arguments as a JSON object")
+	asJSON := fs.Bool("json", false, "print the raw JSON-RPC result")
+	pos := []string{}
+	for len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		pos = append(pos, args[0])
+		args = args[1:]
+	}
+	_ = fs.Parse(args)
+	if len(pos) < 2 {
+		fmt.Fprintln(os.Stderr, "usage: finch call <appliance> <tool> [--args '{\"k\":\"v\"}']")
+		os.Exit(2)
+	}
+	var toolArgs any
+	if err := json.Unmarshal([]byte(*argsJSON), &toolArgs); err != nil {
+		fmt.Fprintf(os.Stderr, "finch: --args is not valid JSON: %v\n", err)
+		os.Exit(2)
+	}
+	cred := mustCliCred()
+	out, err := cliRequest("POST", cred.Hub, "/api/cli/call", cred.Token, map[string]any{
+		"appliance": pos[0],
+		"method":    "tools/call",
+		"params":    map[string]any{"name": pos[1], "arguments": toolArgs},
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
+		os.Exit(1)
+	}
+	if *asJSON {
+		b, _ := json.Marshal(out)
+		fmt.Println(string(b))
+		return
+	}
+	if e, ok := out["error"]; ok && e != nil {
+		fmt.Fprintf(os.Stderr, "finch: %v\n", e)
+		os.Exit(1)
+	}
+	// Pretty-print the text content if present, else the raw result.
+	if res, ok := out["result"].(map[string]any); ok {
+		if content, ok := res["content"].([]any); ok {
+			for _, c := range content {
+				if m, ok := c.(map[string]any); ok && m["type"] == "text" {
+					fmt.Println(m["text"])
+				}
+			}
+			return
+		}
+		b, _ := json.Marshal(res)
+		fmt.Println(string(b))
+		return
+	}
+	b, _ := json.Marshal(out)
+	fmt.Println(string(b))
+}
+
+// mustCliCred loads the CLI credential or exits with the login hint.
+func mustCliCred() *cliCred {
+	cred, err := loadCliCred()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
+		os.Exit(1)
+	}
+	return cred
 }
 
 // cmdKeys: finch keys [list|mint|revoke] — manage the client finch_ keys that

@@ -259,6 +259,33 @@ export async function handleApi(
       return json(200, await tenantOp(env, cliTenant, "revokeCliTokens"));
     }
 
+    // POST /api/cli/call {appliance, method, params} — relay an MCP call to the
+    // tenant's own appliance, so an agent can test it from the CLI (no throwaway
+    // finch_ key). Relays via the SELF binding using a first-party service
+    // assertion for cliTenant (the same trusted internal path the chat uses).
+    if (path === "/api/cli/call" && method === "POST") {
+      const b = await readJson(req);
+      const appliance = String(b.appliance || "").trim();
+      const rpcMethod = String(b.method || "").trim();
+      if (!appliance || !rpcMethod) return json(400, { error: "appliance and method required" });
+      const exp = Math.floor(Date.now() / 1000) + 120;
+      const assertion = await signAssertion({ tenant: cliTenant, exp }, env.FINCH_SERVICE_SECRET);
+      const scheme = host.startsWith("localhost") || host.startsWith("127.") ? "http" : "https";
+      const res = await env.SELF.fetch(`${scheme}://${host}/${encodeURIComponent(appliance)}/mcp`, {
+        method: "POST",
+        headers: {
+          "X-Finch-Service": env.FINCH_SERVICE_SECRET,
+          "X-Finch-Auth": assertion,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: rpcMethod, params: b.params ?? {} }),
+      });
+      return new Response(await res.text(), {
+        status: res.status,
+        headers: { "content-type": res.headers.get("content-type") ?? "application/json" },
+      });
+    }
+
     return json(404, { error: "unknown CLI route", path });
   }
 
