@@ -145,8 +145,10 @@ function withCurrent(options: string[], current: string | undefined): string[] {
 
 export function SettingsView({ settings, groups, onChange }: any) {
   const s = settings;
+  // Real groups if the tenant has any, else just the current default — never
+  // invent placeholder groups the user never created.
   const groupOptions = withCurrent(
-    (groups && groups.length ? groups.map((g: any) => g.name) : ["Home lab", "Studio", "Acme · prod"]),
+    (groups && groups.length ? groups.map((g: any) => g.name) : [s.defaultGroup || "Home lab"]),
     s.defaultGroup,
   );
   const expiryOptions = withCurrent(["30 days", "90 days", "180 days", "never"], s.keyExpiry);
