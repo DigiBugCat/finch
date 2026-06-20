@@ -48,6 +48,20 @@ export class RouterDO extends DurableObject<Env> {
          tenant TEXT NOT NULL
        )`,
     );
+    // CLI device-authorization codes (the `finch login` flow). Short-lived: the
+    // CLI starts one, the browser approves it (stamping tenant+token), the CLI
+    // polls it once, then it's consumed. device_code is the CLI's secret; the
+    // short user_code is what the human confirms in the browser.
+    this.ctx.storage.sql.exec(
+      `CREATE TABLE IF NOT EXISTS device_codes (
+         device_code TEXT PRIMARY KEY,
+         user_code   TEXT NOT NULL,
+         tenant      TEXT,
+         token       TEXT,
+         created     INTEGER NOT NULL,
+         approved    INTEGER NOT NULL DEFAULT 0
+       )`,
+    );
   }
 
   async fetch(req: Request): Promise<Response> {
@@ -69,6 +83,12 @@ export class RouterDO extends DurableObject<Env> {
           return ok(this.register(a.slug, a.tenant));
         case "lookup":
           return ok({ tenant: this.lookup(a.slug) });
+        case "deviceStart":
+          return ok(this.deviceStart(a.deviceCode, a.userCode, a.now));
+        case "deviceApprove":
+          return ok(this.deviceApprove(a.userCode, a.tenant, a.token, a.now));
+        case "devicePoll":
+          return ok(this.devicePoll(a.deviceCode, a.now));
         default:
           return bad(400, `unknown op: ${op}`);
       }
@@ -119,6 +139,83 @@ export class RouterDO extends DurableObject<Env> {
       .toArray();
     return rows.length ? rows[0].tenant : "";
   }
+
+  // ---- CLI device-authorization codes -----------------------------------
+
+  private static DEVICE_TTL_MS = 10 * 60 * 1000; // codes live 10 minutes
+
+  /** Record a freshly-started device code. Best-effort prune of expired rows. */
+  deviceStart(deviceCode: unknown, userCode: unknown, now: number): { ok: boolean } {
+    const d = typeof deviceCode === "string" ? deviceCode : "";
+    const u = typeof userCode === "string" ? userCode.toUpperCase() : "";
+    if (!d || !u) return { ok: false };
+    this.ctx.storage.sql.exec(
+      "DELETE FROM device_codes WHERE created < ?",
+      now - RouterDO.DEVICE_TTL_MS,
+    );
+    this.ctx.storage.sql.exec(
+      "INSERT INTO device_codes (device_code, user_code, created, approved) VALUES (?, ?, ?, 0)",
+      d,
+      u,
+      now,
+    );
+    return { ok: true };
+  }
+
+  /** Browser-side approval: stamp the tenant + minted token onto a pending code. */
+  deviceApprove(
+    userCode: unknown,
+    tenant: unknown,
+    token: unknown,
+    now: number,
+  ): { ok: boolean; reason?: string } {
+    const u = typeof userCode === "string" ? userCode.trim().toUpperCase().replace(/\s+/g, "") : "";
+    const t = typeof tenant === "string" ? tenant : "";
+    const tok = typeof token === "string" ? token : "";
+    if (!u || !t || !tok) return { ok: false, reason: "bad-input" };
+    const rows = this.ctx.storage.sql
+      .exec<{ device_code: string; created: number; approved: number }>(
+        "SELECT device_code, created, approved FROM device_codes WHERE replace(user_code,'-','') = replace(?,'-','')",
+        u,
+      )
+      .toArray();
+    if (!rows.length) return { ok: false, reason: "not-found" };
+    const row = rows[0];
+    if (now - row.created > RouterDO.DEVICE_TTL_MS) return { ok: false, reason: "expired" };
+    if (row.approved) return { ok: false, reason: "already-used" };
+    this.ctx.storage.sql.exec(
+      "UPDATE device_codes SET tenant = ?, token = ?, approved = 1 WHERE device_code = ?",
+      t,
+      tok,
+      row.device_code,
+    );
+    return { ok: true };
+  }
+
+  /** CLI poll: returns the token once approved, then consumes the code. */
+  devicePoll(
+    deviceCode: unknown,
+    now: number,
+  ): { status: string; token?: string; tenant?: string } {
+    const d = typeof deviceCode === "string" ? deviceCode : "";
+    if (!d) return { status: "not_found" };
+    const rows = this.ctx.storage.sql
+      .exec<{ created: number; approved: number; token: string; tenant: string }>(
+        "SELECT created, approved, token, tenant FROM device_codes WHERE device_code = ?",
+        d,
+      )
+      .toArray();
+    if (!rows.length) return { status: "not_found" };
+    const row = rows[0];
+    if (now - row.created > RouterDO.DEVICE_TTL_MS) {
+      this.ctx.storage.sql.exec("DELETE FROM device_codes WHERE device_code = ?", d);
+      return { status: "expired" };
+    }
+    if (!row.approved) return { status: "pending" };
+    // Approved — hand over the token once, then consume the code.
+    this.ctx.storage.sql.exec("DELETE FROM device_codes WHERE device_code = ?", d);
+    return { status: "approved", token: row.token, tenant: row.tenant };
+  }
 }
 
 // ---- helpers used by index.ts + TenantDO --------------------------------
@@ -126,6 +223,42 @@ export class RouterDO extends DurableObject<Env> {
 /** The singleton RouterDO stub. */
 export function routerStub(env: Env): DurableObjectStub {
   return env.ROUTER.get(env.ROUTER.idFromName(ROUTER_SINGLETON));
+}
+
+async function routerOp(env: Env, body: object): Promise<any> {
+  const res = await routerStub(env).fetch("https://router/op", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  return res.json();
+}
+
+/** Record a device-authorization code (the `finch login` flow). */
+export function routerDeviceStart(
+  env: Env,
+  deviceCode: string,
+  userCode: string,
+): Promise<{ ok: boolean }> {
+  return routerOp(env, { op: "deviceStart", deviceCode, userCode, now: Date.now() });
+}
+
+/** Browser-approve a device code: stamp its tenant + minted token. */
+export function routerDeviceApprove(
+  env: Env,
+  userCode: string,
+  tenant: string,
+  token: string,
+): Promise<{ ok: boolean; reason?: string }> {
+  return routerOp(env, { op: "deviceApprove", userCode, tenant, token, now: Date.now() });
+}
+
+/** CLI-poll a device code; returns the token once approved (then consumes it). */
+export function routerDevicePoll(
+  env: Env,
+  deviceCode: string,
+): Promise<{ status: string; token?: string; tenant?: string }> {
+  return routerOp(env, { op: "devicePoll", deviceCode, now: Date.now() });
 }
 
 /** Look up a slug→tenant via the singleton RouterDO. Returns "" if unknown. */

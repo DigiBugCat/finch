@@ -34,6 +34,7 @@ export interface Env {
   TICKET_SECRET: string; // HMAC key for join tickets + per-machine connect-tokens
   DEFAULT_TENANT?: string; // DEV-ONLY tenant fallback when no slug resolves
   DEV?: string; // "1" in the dev env; gates the DEFAULT_TENANT fallback
+  WEB_URL?: string; // dashboard base URL — the `finch login` device page lives at <WEB_URL>/cli
 
   // Where GET /releases/<asset> redirects to fetch the agent binary. Defaults to
   // the project's GitHub Releases "latest" assets; override per-env if binaries

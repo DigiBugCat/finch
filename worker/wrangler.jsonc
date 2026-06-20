@@ -105,7 +105,8 @@
       "observability": { "enabled": true },
       "vars": {
         "DEFAULT_TENANT": "staging-tenant",
-        "DEV": "1"
+        "DEV": "1",
+        "WEB_URL": "https://finch-web-staging.pantainos.workers.dev"
       },
       "durable_objects": {
         "bindings": [
@@ -144,7 +145,9 @@
       "observability": { "enabled": true },
       // NO DEFAULT_TENANT and NO DEV — resolveTenant fails closed (404) for any
       // host without a registered <slug>.finchmcp.com subdomain.
-      "vars": {},
+      "vars": {
+        "WEB_URL": "https://finchmcp.com"
+      },
       "routes": [
         { "pattern": "finchmcp.com/*", "zone_name": "finchmcp.com" },
         { "pattern": "*.finchmcp.com/*", "zone_name": "finchmcp.com" }

@@ -20,8 +20,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"time"
 )
 
 // printUsage is the top-level `finch help` — an overview of the subcommands.
@@ -31,7 +34,7 @@ func printUsage() {
 so nothing listens and no ports are opened.
 
 Usage:
-  finch login [--hub URL] <token>      Save a CLI token (dashboard → Settings → CLI access)
+  finch login [--hub URL]              Log in (opens the browser to approve a code)
   finch add <path> --service <url>     Enroll an appliance and append it to finch.toml
                     [--name "App"]        <path> becomes the URL: <slug>.finchmcp.com/<path>/mcp
   finch run [--config finch.toml]      Serve every [[ingress]] rule (auto-approves when logged in)
@@ -98,7 +101,9 @@ func cliRequest(method, hub, path, token string, body any) (map[string]any, erro
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+token)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -169,10 +174,9 @@ func cmdLogin(args []string) {
 	if token == "" && fs.NArg() > 0 {
 		token = fs.Arg(0)
 	}
+	// No token → run the interactive device flow (open browser, approve a code).
 	if token == "" {
-		fmt.Fprintln(os.Stderr, "usage: finch login [--hub URL] <token>")
-		fmt.Fprintln(os.Stderr, "get a token from the dashboard → Settings → CLI access")
-		os.Exit(2)
+		token = deviceLogin(*hub)
 	}
 
 	// Validate against the hub and learn which tenant the token acts as.
@@ -186,6 +190,77 @@ func cmdLogin(args []string) {
 		os.Exit(1)
 	}
 	fmt.Printf("finch: logged in to tenant %v at %s (saved to %s)\n", who["tenant"], *hub, cliCredPath())
+}
+
+// deviceLogin runs the browser device-authorization flow (`finch login` with no
+// token): start a code, point the user at the dashboard to approve it, poll
+// until approved, and return the issued token. Exits on error/expiry/timeout.
+func deviceLogin(hub string) string {
+	start, err := cliRequest("POST", hub, "/api/cli/device/start", "", struct{}{})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "finch: could not start login: %v\n", err)
+		os.Exit(1)
+	}
+	deviceCode, _ := start["device_code"].(string)
+	userCode, _ := start["user_code"].(string)
+	uri, _ := start["verification_uri_complete"].(string)
+	if uri == "" {
+		uri, _ = start["verification_uri"].(string)
+	}
+	interval := 3.0
+	if v, ok := start["interval"].(float64); ok && v > 0 {
+		interval = v
+	}
+	expires := 600.0
+	if v, ok := start["expires_in"].(float64); ok && v > 0 {
+		expires = v
+	}
+
+	fmt.Printf("\n  To finish login, open this page in your browser:\n\n      %s\n\n  and confirm this code:  %s\n\n", uri, userCode)
+	openBrowser(uri)
+	fmt.Print("  Waiting for approval")
+
+	deadline := time.Now().Add(time.Duration(expires) * time.Second)
+	for time.Now().Before(deadline) {
+		time.Sleep(time.Duration(interval) * time.Second)
+		poll, err := cliRequest("POST", hub, "/api/cli/device/poll", "", map[string]string{"device_code": deviceCode})
+		if err != nil {
+			fmt.Print(".")
+			continue
+		}
+		switch poll["status"] {
+		case "approved":
+			fmt.Println("  ✓")
+			if tok, _ := poll["token"].(string); tok != "" {
+				return tok
+			}
+			fmt.Fprintln(os.Stderr, "\nfinch: approval returned no token")
+			os.Exit(1)
+		case "expired", "not_found":
+			fmt.Fprintln(os.Stderr, "\nfinch: login code expired — run `finch login` again")
+			os.Exit(1)
+		default: // pending
+			fmt.Print(".")
+		}
+	}
+	fmt.Fprintln(os.Stderr, "\nfinch: timed out waiting for approval")
+	os.Exit(1)
+	return ""
+}
+
+// openBrowser best-effort opens a URL in the user's browser.
+func openBrowser(u string) {
+	var name string
+	var args []string
+	switch runtime.GOOS {
+	case "darwin":
+		name, args = "open", []string{u}
+	case "windows":
+		name, args = "rundll32", []string{"url.dll,FileProtocolHandler", u}
+	default:
+		name, args = "xdg-open", []string{u}
+	}
+	_ = exec.Command(name, args...).Start()
 }
 
 // cmdAdd: finch add <path> --service <url> [--name "..."] [--config finch.toml]

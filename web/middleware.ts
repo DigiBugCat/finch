@@ -3,7 +3,7 @@ import { NextResponse } from "next/server";
 
 // Only the dashboard (and future app routes) require auth. The marketing
 // landing, sign-in, and sign-up are public — don't gate the front door.
-const isProtectedRoute = createRouteMatcher(["/dashboard(.*)"]);
+const isProtectedRoute = createRouteMatcher(["/dashboard(.*)", "/cli(.*)"]);
 
 // All cookie-authed bridge handlers live under /api/finch/*.
 const isFinchApiRoute = createRouteMatcher(["/api/finch(.*)"]);

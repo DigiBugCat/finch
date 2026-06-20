@@ -19,7 +19,31 @@ import {
   verifyAssertion,
   genJti,
 } from "./auth";
-import { routerLookup } from "./router-do";
+import {
+  routerLookup,
+  routerDeviceStart,
+  routerDevicePoll,
+  routerDeviceApprove,
+} from "./router-do";
+import { signAssertion } from "./auth";
+
+// A CLI token is a long-lived tenant assertion (same envelope as X-Finch-Auth).
+const CLI_TOKEN_TTL_SECONDS = 90 * 24 * 60 * 60; // 90 days
+
+/** Hex token of `bytes` random bytes. */
+function randomToken(bytes: number): string {
+  const b = crypto.getRandomValues(new Uint8Array(bytes));
+  return Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+}
+
+/** A short, human-friendly device code like "WXYZ-2K7Q" (no ambiguous chars). */
+function randomUserCode(): string {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no I,O,0,1
+  const b = crypto.getRandomValues(new Uint8Array(8));
+  let s = "";
+  for (let i = 0; i < 8; i++) s += alphabet[b[i] % alphabet.length];
+  return s.slice(0, 4) + "-" + s.slice(4);
+}
 import type {
   EnrollResp,
   JoinResp,
@@ -101,6 +125,29 @@ export async function handleApi(
   //      (same trust as X-Finch-Auth). This lets the `finch` CLI enroll
   //      appliances from the box without the dashboard. ----
   if (path.startsWith("/api/cli/")) {
+    // ---- Public device-authorization flow (`finch login`): the CLI has no
+    //      credentials yet, so start/poll are unauthenticated. The browser
+    //      (Clerk-authed) approves the short user_code out of band. ----
+    if (path === "/api/cli/device/start" && method === "POST") {
+      const deviceCode = randomToken(32);
+      const userCode = randomUserCode();
+      await routerDeviceStart(env, deviceCode, userCode);
+      const webBase = (env.WEB_URL || `https://${host}`).replace(/\/$/, "");
+      return json(200, {
+        device_code: deviceCode,
+        user_code: userCode,
+        verification_uri: `${webBase}/cli`,
+        verification_uri_complete: `${webBase}/cli?code=${encodeURIComponent(userCode)}`,
+        expires_in: 600,
+        interval: 3,
+      });
+    }
+    if (path === "/api/cli/device/poll" && method === "POST") {
+      const body = await readJson(req);
+      if (!body.device_code) return json(400, { error: "device_code required" });
+      return json(200, await routerDevicePoll(env, String(body.device_code)));
+    }
+
     const m = (req.headers.get("Authorization") || "").match(/^Bearer\s+(.+)$/i);
     const cliTenant = m ? await verifyAssertion(m[1], env.FINCH_SERVICE_SECRET) : null;
     if (!cliTenant) {
@@ -155,6 +202,30 @@ export async function handleApi(
 
   // GET /api/slug-available?slug=foo — claim-free availability check for the
   // Hub-domain picker. Available if unowned, or already owned by THIS tenant.
+  // POST /api/device-approve {userCode} — the dashboard (Clerk-authed) approves
+  // a `finch login` device code: mint a CLI token for this tenant and stamp it
+  // onto the pending code so the waiting CLI can poll it.
+  if (method === "POST" && seg.length === 1 && seg[0] === "device-approve") {
+    const body = await readJson(req);
+    const userCode = String(body.userCode || "").trim();
+    if (!userCode) return json(400, { error: "userCode required" });
+    const exp = Math.floor(Date.now() / 1000) + CLI_TOKEN_TTL_SECONDS;
+    const token = await signAssertion({ tenant, exp }, env.FINCH_SERVICE_SECRET);
+    const out = await routerDeviceApprove(env, userCode, tenant, token);
+    if (!out.ok) {
+      const msg =
+        out.reason === "not-found"
+          ? "that code wasn't found — check it and try again"
+          : out.reason === "expired"
+            ? "that code has expired — run `finch login` again"
+            : out.reason === "already-used"
+              ? "that code was already approved"
+              : "could not approve code";
+      return json(out.reason === "not-found" ? 404 : 400, { error: msg });
+    }
+    return json(200, { ok: true });
+  }
+
   if (method === "GET" && seg.length === 1 && seg[0] === "slug-available") {
     const slug = (url.searchParams.get("slug") || "").trim().toLowerCase();
     if (!slug) return json(400, { error: "slug required" });
