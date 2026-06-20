@@ -24,6 +24,7 @@ import {
   routerDeviceStart,
   routerDevicePoll,
   routerDeviceApprove,
+  routerDeviceDescribe,
 } from "./router-do";
 import { signAssertion, verifyAssertionPayload } from "./auth";
 
@@ -144,22 +145,24 @@ export async function handleApi(
   //      (same trust as X-Finch-Auth). This lets the `finch` CLI enroll
   //      appliances from the box without the dashboard. ----
   if (path.startsWith("/api/cli/")) {
-    // Throttle the whole CLI surface per-IP (device start/poll AND the bearer
-    // routes) — these are reachable without a finch_ key, so cap brute-force /
-    // flood. Fails open when the binding is absent (dev/test).
-    if (!(await rateLimitOk(env.JOIN_LIMIT, `cli:${clientIp(req)}`))) {
-      return json(429, { error: "rate limited" });
-    }
-
     // ---- Public device-authorization flow (`finch login`): the CLI has no
     //      credentials yet, so start/poll are unauthenticated. The browser
     //      (Clerk-authed) approves the short user_code out of band. We do NOT
-    //      return a one-click ?code= link — the human must TYPE the code on the
-    //      dashboard, which is the anti-phishing binding (see /cli page). ----
+    //      return a one-click ?code= link — the human must TYPE the code, and
+    //      the approval page shows the initiator's context (see /cli). ----
     if (path === "/api/cli/device/start" && method === "POST") {
+      // Throttle code CREATION per IP (you don't start many logins/min). Poll
+      // is intentionally NOT throttled — it needs the 256-bit device_code and
+      // the CLI legitimately polls every few seconds.
+      if (!(await rateLimitOk(env.JOIN_LIMIT, `devstart:${clientIp(req)}`))) {
+        return json(429, { error: "too many login attempts — try again shortly" });
+      }
       const deviceCode = randomToken(32);
       const userCode = randomUserCode();
-      const started = await routerDeviceStart(env, deviceCode, userCode);
+      // Capture the initiator's context so the approver can tell it's THEIR box.
+      const reqIp = clientIp(req);
+      const reqUa = (req.headers.get("user-agent") || "").slice(0, 200);
+      const started = await routerDeviceStart(env, deviceCode, userCode, reqIp, reqUa);
       if (!started.ok) return json(429, { error: "too many pending logins — try again shortly" });
       const webBase = (env.WEB_URL || `https://${host}`).replace(/\/$/, "");
       return json(200, {
@@ -174,6 +177,12 @@ export async function handleApi(
       const body = await readJson(req);
       if (!body.device_code) return json(400, { error: "device_code required" });
       return json(200, await routerDevicePoll(env, String(body.device_code)));
+    }
+
+    // Throttle the AUTHENTICATED bearer routes per-IP (the CLI's real IP) — not
+    // device/poll above, whose secret device_code is the real gate.
+    if (!(await rateLimitOk(env.JOIN_LIMIT, `cli:${clientIp(req)}`))) {
+      return json(429, { error: "rate limited" });
     }
 
     // Bearer must be a CLI token (kind:"cli") whose epoch still matches the
@@ -240,9 +249,19 @@ export async function handleApi(
   // POST /api/device-approve {userCode} — the dashboard (Clerk-authed) approves
   // a `finch login` device code: mint a CLI token for this tenant and stamp it
   // onto the pending code so the waiting CLI can poll it.
+  // POST /api/cli-describe {userCode} — return the pending code's INITIATOR
+  // context so the approver can confirm it's their own device (anti-phishing).
+  if (method === "POST" && seg.length === 1 && seg[0] === "cli-describe") {
+    const body = await readJson(req);
+    const userCode = String(body.userCode || "").trim();
+    if (!userCode) return json(400, { error: "userCode required" });
+    return json(200, await routerDeviceDescribe(env, userCode));
+  }
+
   if (method === "POST" && seg.length === 1 && seg[0] === "device-approve") {
-    // Attempt limiter: a wrong user_code shouldn't be brute-forceable.
-    if (!(await rateLimitOk(env.JOIN_LIMIT, `approve:${clientIp(req)}`))) {
+    // Attempt limiter, keyed on the verified TENANT — the hub only sees the web
+    // BFF's egress IP, so an IP key would collapse to one global bucket.
+    if (!(await rateLimitOk(env.JOIN_LIMIT, `approve:${tenant}`))) {
       return json(429, { error: "rate limited" });
     }
     const body = await readJson(req);

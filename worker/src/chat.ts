@@ -13,10 +13,14 @@
 
 import type { Env } from "./index";
 import { serviceOk, verifyAssertion } from "./auth";
+import { rateLimitOk, clientIp } from "./index";
 
 const MODEL = "@cf/google/gemma-4-26b-a4b-it";
 const CONTEXT_CHAR_BUDGET = 8000 * 3; // ~8k tokens, roughly 3 chars/token
-const MAX_TOOL_HOPS = 4;
+const MAX_TOOL_HOPS = 3;
+const MAX_BODY_BYTES = 256 * 1024; // cap the request body (no streamed uploads here)
+const MAX_MESSAGES = 30; // keep only the most recent turns
+const MAX_MSG_CHARS = 8000; // clamp any single message
 
 export async function handleChat(req: Request, env: Env, url: URL): Promise<Response> {
   if (url.pathname === "/chat" && req.method === "GET") {
@@ -33,6 +37,14 @@ export async function handleChat(req: Request, env: Env, url: URL): Promise<Resp
 type Msg = { role: "system" | "user" | "assistant"; content: string };
 
 async function chatCompletion(req: Request, env: Env, origin: string): Promise<Response> {
+  // Cap inference fan-out: this drives up to MAX_TOOL_HOPS+1 AI calls per request.
+  if (!(await rateLimitOk(env.RELAY_LIMIT, `chat:${clientIp(req)}`))) {
+    return json(429, { error: "rate limited" });
+  }
+  const cl = req.headers.get("content-length");
+  if (cl && Number(cl) > MAX_BODY_BYTES) {
+    return json(413, { error: "request body too large" });
+  }
   let body: any;
   try {
     body = await req.json();
@@ -40,7 +52,14 @@ async function chatCompletion(req: Request, env: Env, origin: string): Promise<R
     return json(400, { error: "invalid JSON" });
   }
   const appliance = String(body.appliance || "").trim();
-  const userMessages: Msg[] = Array.isArray(body.messages) ? body.messages : [];
+  // Keep only the most recent turns, each length-clamped, so a giant history
+  // can't blow up the model context / cost.
+  const userMessages: Msg[] = (Array.isArray(body.messages) ? body.messages : [])
+    .slice(-MAX_MESSAGES)
+    .map((m: any) => ({
+      role: m && m.role === "assistant" ? "assistant" : "user",
+      content: String((m && m.content) || "").slice(0, MAX_MSG_CHARS),
+    }));
   if (!appliance || !userMessages.length) {
     return json(400, { error: "appliance and messages are required" });
   }

@@ -59,7 +59,9 @@ export class RouterDO extends DurableObject<Env> {
          tenant      TEXT,
          token       TEXT,
          created     INTEGER NOT NULL,
-         approved    INTEGER NOT NULL DEFAULT 0
+         approved    INTEGER NOT NULL DEFAULT 0,
+         req_ip      TEXT,
+         req_ua      TEXT
        )`,
     );
   }
@@ -84,7 +86,9 @@ export class RouterDO extends DurableObject<Env> {
         case "lookup":
           return ok({ tenant: this.lookup(a.slug) });
         case "deviceStart":
-          return ok(this.deviceStart(a.deviceCode, a.userCode, a.now));
+          return ok(this.deviceStart(a.deviceCode, a.userCode, a.now, a.reqIp, a.reqUa));
+        case "deviceDescribe":
+          return ok(this.deviceDescribe(a.userCode, a.now));
         case "deviceApprove":
           return ok(this.deviceApprove(a.userCode, a.tenant, a.token, a.now));
         case "devicePoll":
@@ -144,28 +148,71 @@ export class RouterDO extends DurableObject<Env> {
 
   private static DEVICE_TTL_MS = 10 * 60 * 1000; // codes live 10 minutes
 
-  /** Record a freshly-started device code. Best-effort prune of expired rows. */
-  deviceStart(deviceCode: unknown, userCode: unknown, now: number): { ok: boolean } {
+  /** Record a freshly-started device code, with the initiator's context (shown
+   *  at approval so the approver can tell it's their own box). Caps the table to
+   *  bound flood. Device codes live on a SEPARATE DO instance from the slug index
+   *  (see deviceStub) so this write path never contends slug→tenant resolution. */
+  deviceStart(
+    deviceCode: unknown,
+    userCode: unknown,
+    now: number,
+    reqIp: unknown,
+    reqUa: unknown,
+  ): { ok: boolean } {
     const d = typeof deviceCode === "string" ? deviceCode : "";
     const u = typeof userCode === "string" ? userCode.toUpperCase() : "";
     if (!d || !u) return { ok: false };
-    this.ctx.storage.sql.exec(
-      "DELETE FROM device_codes WHERE created < ?",
-      now - RouterDO.DEVICE_TTL_MS,
-    );
-    // Cap concurrent pending codes so an unauthenticated flood can't bloat this
-    // singleton DO's table (rows still auto-expire at the TTL above).
+    // Cheap count FIRST; only prune (a scan) when we're near the cap, so a
+    // capped flood doesn't turn every rejected call into a full-table scan.
     const live = this.ctx.storage.sql
       .exec<{ n: number }>("SELECT COUNT(*) AS n FROM device_codes")
       .toArray();
-    if (live.length && live[0].n >= 1000) return { ok: false };
+    let n = live.length ? live[0].n : 0;
+    if (n >= 800) {
+      this.ctx.storage.sql.exec(
+        "DELETE FROM device_codes WHERE created < ?",
+        now - RouterDO.DEVICE_TTL_MS,
+      );
+      n = this.ctx.storage.sql
+        .exec<{ n: number }>("SELECT COUNT(*) AS n FROM device_codes")
+        .toArray()[0].n;
+    }
+    if (n >= 1000) return { ok: false };
     this.ctx.storage.sql.exec(
-      "INSERT INTO device_codes (device_code, user_code, created, approved) VALUES (?, ?, ?, 0)",
+      "INSERT INTO device_codes (device_code, user_code, created, approved, req_ip, req_ua) VALUES (?, ?, ?, 0, ?, ?)",
       d,
       u,
       now,
+      typeof reqIp === "string" ? reqIp : "",
+      typeof reqUa === "string" ? reqUa : "",
     );
     return { ok: true };
+  }
+
+  /** Describe a pending code's INITIATOR so the approver can confirm it's theirs.
+   *  Returns only coarse, non-secret context (never the device_code/token). */
+  deviceDescribe(
+    userCode: unknown,
+    now: number,
+  ): { found: boolean; reqIp?: string; reqUa?: string; ageSeconds?: number; approved?: boolean } {
+    const u = typeof userCode === "string" ? userCode.trim().toUpperCase().replace(/\s+/g, "") : "";
+    if (!u) return { found: false };
+    const rows = this.ctx.storage.sql
+      .exec<{ created: number; approved: number; req_ip: string; req_ua: string }>(
+        "SELECT created, approved, req_ip, req_ua FROM device_codes WHERE replace(user_code,'-','') = replace(?,'-','')",
+        u,
+      )
+      .toArray();
+    if (!rows.length) return { found: false };
+    const r = rows[0];
+    if (now - r.created > RouterDO.DEVICE_TTL_MS) return { found: false };
+    return {
+      found: true,
+      reqIp: r.req_ip || "",
+      reqUa: r.req_ua || "",
+      ageSeconds: Math.max(0, Math.round((now - r.created) / 1000)),
+      approved: !!r.approved,
+    };
   }
 
   /** Browser-side approval: stamp the tenant + minted token onto a pending code. */
@@ -231,8 +278,15 @@ export function routerStub(env: Env): DurableObjectStub {
   return env.ROUTER.get(env.ROUTER.idFromName(ROUTER_SINGLETON));
 }
 
-async function routerOp(env: Env, body: object): Promise<any> {
-  const res = await routerStub(env).fetch("https://router/op", {
+/** A SEPARATE RouterDO instance dedicated to CLI device codes — so the
+ *  device-login write path never contends the slug→tenant singleton that the
+ *  whole relay plane reads on its hot path. */
+function deviceStub(env: Env): DurableObjectStub {
+  return env.ROUTER.get(env.ROUTER.idFromName("finch-device-codes"));
+}
+
+async function deviceOp(env: Env, body: object): Promise<any> {
+  const res = await deviceStub(env).fetch("https://router/op", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
@@ -240,13 +294,23 @@ async function routerOp(env: Env, body: object): Promise<any> {
   return res.json();
 }
 
-/** Record a device-authorization code (the `finch login` flow). */
+/** Record a device-authorization code (the `finch login` flow) + initiator ctx. */
 export function routerDeviceStart(
   env: Env,
   deviceCode: string,
   userCode: string,
+  reqIp: string,
+  reqUa: string,
 ): Promise<{ ok: boolean }> {
-  return routerOp(env, { op: "deviceStart", deviceCode, userCode, now: Date.now() });
+  return deviceOp(env, { op: "deviceStart", deviceCode, userCode, reqIp, reqUa, now: Date.now() });
+}
+
+/** Describe a pending code's initiator (coarse, non-secret) for the approver. */
+export function routerDeviceDescribe(
+  env: Env,
+  userCode: string,
+): Promise<{ found: boolean; reqIp?: string; reqUa?: string; ageSeconds?: number; approved?: boolean }> {
+  return deviceOp(env, { op: "deviceDescribe", userCode, now: Date.now() });
 }
 
 /** Browser-approve a device code: stamp its tenant + minted token. */
@@ -256,7 +320,7 @@ export function routerDeviceApprove(
   tenant: string,
   token: string,
 ): Promise<{ ok: boolean; reason?: string }> {
-  return routerOp(env, { op: "deviceApprove", userCode, tenant, token, now: Date.now() });
+  return deviceOp(env, { op: "deviceApprove", userCode, tenant, token, now: Date.now() });
 }
 
 /** CLI-poll a device code; returns the token once approved (then consumes it). */
@@ -264,7 +328,7 @@ export function routerDevicePoll(
   env: Env,
   deviceCode: string,
 ): Promise<{ status: string; token?: string; tenant?: string }> {
-  return routerOp(env, { op: "devicePoll", deviceCode, now: Date.now() });
+  return deviceOp(env, { op: "devicePoll", deviceCode, now: Date.now() });
 }
 
 /** Look up a slug→tenant via the singleton RouterDO. Returns "" if unknown. */

@@ -4,8 +4,10 @@
 // auto-fill the code from the URL — a one-click prefilled link is the phishing
 // vector (an attacker starts the flow and sends a victim the link). Requiring a
 // typed code + showing exactly which account is being granted is the binding.
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { UserButton, useUser, useOrganization } from '@clerk/nextjs';
+
+type Origin = { found: boolean; reqIp?: string; reqUa?: string; ageSeconds?: number } | null;
 
 export default function CliApprove() {
   const { user } = useUser();
@@ -13,11 +15,33 @@ export default function CliApprove() {
   const [code, setCode] = useState('');
   const [state, setState] = useState<'idle' | 'busy' | 'done' | 'error'>('idle');
   const [msg, setMsg] = useState('');
+  const [origin, setOrigin] = useState<Origin>(null);   // initiator context for the typed code
+  const seq = useRef(0);
 
   // The account the minted token will act as (org if active, else personal).
   const account = organization?.name
     ? `${organization.name} (organization)`
     : `${user?.primaryEmailAddress?.emailAddress || user?.username || 'your account'} (personal)`;
+
+  // When a full code is typed, look up WHERE it was started so the user can tell
+  // it's their own box (not an attacker-initiated code they were sent).
+  useEffect(() => {
+    const c = code.trim();
+    setOrigin(null);
+    if (c.replace(/[^A-Z0-9]/g, '').length < 8) return;
+    const mine = ++seq.current;
+    const t = setTimeout(async () => {
+      try {
+        const r = await fetch('/api/finch/cli-describe', {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ userCode: c }),
+        });
+        const j = await r.json();
+        if (mine === seq.current) setOrigin(j);
+      } catch { /* ignore */ }
+    }, 300);
+    return () => clearTimeout(t);
+  }, [code]);
 
   async function approve() {
     setState('busy'); setMsg('');
@@ -61,8 +85,15 @@ export default function CliApprove() {
               autoComplete="off"
               autoFocus
             />
+            {origin && (origin.found
+              ? <div className="cli-origin">
+                  <div className="cli-origin-h">This login was started from:</div>
+                  <div className="cli-origin-d mono">{origin.reqIp || 'unknown IP'} · {(origin.reqUa || 'unknown client').slice(0, 60)}</div>
+                  <div className="cli-origin-age dim">{origin.ageSeconds != null ? `${origin.ageSeconds}s ago` : ''} — approve only if that's the box where you ran <code className="mono">finch login</code>.</div>
+                </div>
+              : <div className="cli-err">No active login for that code — check it or run <code className="mono">finch login</code> again.</div>)}
             <div className="cli-grant">This grants a CLI token (~30 days) acting as <b>{account}</b>.</div>
-            <button type="button" className="btn btn-lg btn-amber" onClick={approve} disabled={state === 'busy' || code.trim().length < 4}>
+            <button type="button" className="btn btn-lg btn-amber" onClick={approve} disabled={state === 'busy' || !origin?.found}>
               {state === 'busy' ? 'Approving…' : 'Approve device'}
             </button>
             {state === 'error' && <div className="cli-err">{msg}</div>}

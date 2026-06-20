@@ -374,3 +374,9 @@ footer{border-top:1px solid var(--line); background:var(--bg3); padding:56px 0 4
 .cli-warn{margin-top:16px;text-align:left;font-size:12.5px;line-height:1.5;color:var(--dim);
   background:#2a1f12;border:1px solid var(--line2);border-radius:11px;padding:11px 13px}
 .cli-warn b{color:var(--ink)}
+
+/* CLI approve — initiator context */
+.cli-origin{text-align:left;background:#191309;border:1px solid var(--line2);border-radius:11px;padding:11px 13px;margin:0 0 12px}
+.cli-origin-h{font-size:12px;color:var(--dim);font-weight:700;text-transform:uppercase;letter-spacing:.05em}
+.cli-origin-d{font-size:13px;color:var(--ink);margin:4px 0 4px;word-break:break-all}
+.cli-origin-age{font-size:12px}
