@@ -225,6 +225,9 @@ func main() {
 		case "add":
 			cmdAdd(os.Args[2:])
 			return
+		case "approve":
+			cmdApprove(os.Args[2:])
+			return
 		case "help", "-h", "--help":
 			printUsage()
 			return
@@ -270,7 +273,7 @@ func main() {
 	if err != nil || upstreamURL.Scheme == "" || upstreamURL.Host == "" {
 		log.Fatalf("finch: --upstream %q is not a valid absolute URL", *upstream)
 	}
-	runAppliance(*hub, *machine, *ticket, *statePath, upstreamURL, "", "")
+	runAppliance(*hub, *machine, *ticket, *statePath, upstreamURL, "", "", false)
 }
 
 // runConfig serves every [[ingress]] rule from a finch.toml — one relay loop per
@@ -282,6 +285,10 @@ func runConfig(cfg *config) {
 	if len(cfg.Ingress) == 0 {
 		log.Fatal("finch: finch.toml has no [[ingress]] rules — nothing to serve")
 	}
+	// If this box is logged in (finch login), self-approve the appliances we
+	// serve — the CLI token holder is the tenant admin, so no dashboard hop.
+	autoApprove := loadCliCredQuiet() != nil
+
 	var wg sync.WaitGroup
 	started := 0
 	for _, ing := range cfg.Ingress {
@@ -295,7 +302,7 @@ func runConfig(cfg *config) {
 		wg.Add(1)
 		go func(ing ingress, up *url.URL, sp string) {
 			defer wg.Done()
-			runAppliance(cfg.Hub, cfg.Machine, ing.Ticket, sp, up, ing.Path, ing.Name)
+			runAppliance(cfg.Hub, cfg.Machine, ing.Ticket, sp, up, ing.Path, ing.Name, autoApprove)
 		}(ing, up, statePath)
 	}
 	if started == 0 {
@@ -309,7 +316,7 @@ func runConfig(cfg *config) {
 // reconnects forever. `label` prefixes logs (the ingress path in config mode,
 // empty in single-service mode). Fatal enroll errors return so a sibling rule
 // in config mode survives; in single-service mode main() has nothing else to do.
-func runAppliance(hub, machine, ticket, statePath string, upstreamURL *url.URL, label, appName string) {
+func runAppliance(hub, machine, ticket, statePath string, upstreamURL *url.URL, label, appName string, autoApprove bool) {
 	lp := "finch"
 	if label != "" {
 		lp = "finch[" + label + "]"
@@ -359,6 +366,19 @@ func runAppliance(hub, machine, ticket, statePath string, upstreamURL *url.URL, 
 	}
 	log.Printf("%s: %q live at %s  →  %s  (machine %q, tenant %s)",
 		lp, name, endpoint, upstreamURL, jr.Machine, jr.Tenant)
+
+	// Self-approve via the saved CLI token (best-effort): the machine just
+	// registered as `pending` if the tenant requires approval; clear that so it
+	// goes live once the relay connects — no dashboard hop.
+	if autoApprove {
+		if cred := loadCliCredQuiet(); cred != nil && cred.Hub == hub {
+			if err := cliApprove(cred, jr.Appliance); err != nil {
+				log.Printf("%s: auto-approve skipped (%v) — approve in the dashboard if it stays pending", lp, err)
+			} else {
+				log.Printf("%s: approved", lp)
+			}
+		}
+	}
 
 	// Build the relay WS URL from the hub base + appliance/machine so scheme/host
 	// always match the hub we were given (the hub's connectUrl may assume prod).

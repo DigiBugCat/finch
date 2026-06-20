@@ -34,7 +34,8 @@ Usage:
   finch login [--hub URL] <token>      Save a CLI token (dashboard → Settings → CLI access)
   finch add <path> --service <url>     Enroll an appliance and append it to finch.toml
                     [--name "App"]        <path> becomes the URL: <slug>.finchmcp.com/<path>/mcp
-  finch run [--config finch.toml]      Serve every [[ingress]] rule in finch.toml
+  finch run [--config finch.toml]      Serve every [[ingress]] rule (auto-approves when logged in)
+  finch approve <path>                 Approve an appliance (clear the pending gate)
   finch join --ticket <t> --upstream <url>   Run one appliance straight from flags
   finch help                           Show this help
 
@@ -119,6 +120,42 @@ func cliRequest(method, hub, path, token string, body any) (map[string]any, erro
 		return nil, fmt.Errorf("hub %d: %s", res.StatusCode, msg)
 	}
 	return out, nil
+}
+
+// loadCliCredQuiet returns the saved CLI credential, or nil if not logged in
+// (no error) — for best-effort auto-approve in `finch run`.
+func loadCliCredQuiet() *cliCred {
+	c, err := loadCliCred()
+	if err != nil {
+		return nil
+	}
+	return c
+}
+
+// cliApprove clears the pending gate for appliance `id` via the CLI token.
+func cliApprove(cred *cliCred, id string) error {
+	_, err := cliRequest("POST", cred.Hub, "/api/cli/approve", cred.Token, map[string]string{"id": id})
+	return err
+}
+
+// cmdApprove: finch approve <path> [<path>...]
+func cmdApprove(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: finch approve <path> [<path>...]")
+		os.Exit(2)
+	}
+	cred, err := loadCliCred()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
+		os.Exit(1)
+	}
+	for _, id := range args {
+		if err := cliApprove(cred, id); err != nil {
+			fmt.Fprintf(os.Stderr, "finch: approve %q failed: %v\n", id, err)
+			continue
+		}
+		fmt.Printf("finch: approved %q\n", id)
+	}
 }
 
 // cmdLogin: finch login [--hub URL] <token>

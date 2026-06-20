@@ -114,6 +114,14 @@ export async function handleApi(
     if (path === "/api/cli/enroll" && method === "POST") {
       return handleEnroll(req, env, cliTenant, host);
     }
+    // POST /api/cli/approve {id} — clear the pending gate (the CLI token holder
+    // is the tenant admin, so they can approve their own box from the box).
+    if (path === "/api/cli/approve" && method === "POST") {
+      const body = await readJson(req);
+      if (!body.id) return json(400, { error: "id required" });
+      const out = await tenantOp(env, cliTenant, "approve", { id: body.id });
+      return json(out?.ok === false ? 404 : 200, out);
+    }
     return json(404, { error: "unknown CLI route", path });
   }
 
