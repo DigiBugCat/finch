@@ -12,9 +12,34 @@ A single Go binary with a few subcommands:
 | `finch login` | Log in to your tenant via the browser (device-auth, like `gh auth login`). |
 | `finch add <path> --service <url>` | Enroll an appliance and append an `[[ingress]]` rule to `finch.toml`. |
 | `finch run` | Serve every rule in `finch.toml` — dials out, auto-approves, holds the relay open. |
+| `finch status` | Am I logged in (which tenant)? What does `finch.toml` serve? |
+| `finch fleet` (alias `ls`) | List this account's appliances + state. |
+| `finch test <appliance>` | List an appliance's MCP tools (does-it-work check). |
+| `finch call <appliance> <tool> [--args '{…}']` | Invoke one tool through the hub. |
+| `finch keys [list \| mint <label> --appliance <id> \| revoke <id>]` | Manage the client `finch_` keys callers present (grant + revoke access). |
+| `finch token` | Mint a fresh CLI token — provision a new box with no browser. |
 | `finch approve <path>` | Approve an appliance (clear the pending gate). Usually automatic. |
+| `finch rm <appliance>` | Remove an appliance. |
+| `finch revoke-tokens` | De-authorize every CLI login (including this box). |
 | `finch join --ticket … --upstream …` | Legacy single-service mode straight from flags (no config file). |
-| `finch help` | Command overview + first-time setup. |
+| `finch help` | Command overview, first-time setup, and the **agent/automation** guide. |
+
+Every command is non-interactive and supports `--json`. Because the CLI token is
+a tenant-admin credential, an agent can run the whole loop — introspect, serve,
+test, and grant/revoke access — from the command line, no dashboard. Run
+`finch help` for the worked automation examples.
+
+## Provision a new box from an already-authed one (no human)
+
+```bash
+# on the authed box, mint a token and hand it to the new box over SSH:
+ssh user@newbox "finch login --token $(finch token)"
+ssh user@newbox "finch add api --service http://127.0.0.1:9000 && finch run"
+```
+
+`finch token` mints a fresh, epoch-bound CLI token (revocable via `finch
+revoke-tokens` or the dashboard). The human approval only exists for your very
+first box; after that every device is a scripted one-liner.
 
 ## Quick start (the modern flow)
 

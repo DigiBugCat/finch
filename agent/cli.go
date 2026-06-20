@@ -56,18 +56,31 @@ Typical first-time setup:
   finch run
 
 Automation / driving finch from an agent (after the one-time 'finch login'):
-  Everything below is non-interactive and supports --json. No browser needed.
+  Everything below is non-interactive and supports --json. No browser, no
+  dashboard. The CLI token is a tenant-admin credential, so an agent can do the
+  whole loop: introspect, serve, test, and grant/revoke access.
 
-    finch status --json                          # introspect: tenant + ingress rules
-    finch add scraper --service http://:8001 --json   # enroll + wire into finch.toml
-    finch run                                    # serve all rules (auto-approves)
+  Introspect:
+    finch status --json            # am I logged in? what does finch.toml serve?
+    finch fleet --json             # every appliance + its state
+
+  Serve a local MCP server:
+    finch add scraper --service http://127.0.0.1:8001 --json
+    finch run                      # serves all finch.toml rules, auto-approves
+
+  Test an endpoint:
+    finch test scraper             # list its MCP tools
+    finch call scraper search --args '{"q":"finch"}'   # invoke one tool
+
+  Grant + REVOKE client access (the finch_ keys callers present):
+    finch keys mint web-client --appliance scraper     # prints a finch_ key once
+    finch keys list
+    finch keys revoke <id>         # access stops immediately
+    finch revoke-tokens            # de-authorize every CLI login at once
 
   Provision a NEW box from this already-authed one, zero human in the loop:
     ssh user@newbox 'finch login --token '"$(finch token)"
     ssh user@newbox 'finch add api --service http://127.0.0.1:9000 && finch run'
-
-  An agent's loop is: finch login (once, human) then finch token / add / run /
-  status freely. Tokens are revocable in the dashboard (Settings, CLI access).
 
 Run 'finch <command> -h' for a command's own flags.
 `)
