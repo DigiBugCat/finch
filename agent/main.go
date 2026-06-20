@@ -225,6 +225,9 @@ func main() {
 		case "add":
 			cmdAdd(os.Args[2:])
 			return
+		case "help", "-h", "--help":
+			printUsage()
+			return
 		}
 	}
 

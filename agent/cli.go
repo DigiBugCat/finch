@@ -24,6 +24,29 @@ import (
 	"strings"
 )
 
+// printUsage is the top-level `finch help` — an overview of the subcommands.
+// (Go's flag package only prints per-flag usage; this ties it together.)
+func printUsage() {
+	fmt.Print(`finch — publish local MCP servers through the finch hub. Your box dials OUT,
+so nothing listens and no ports are opened.
+
+Usage:
+  finch login [--hub URL] <token>      Save a CLI token (dashboard → Settings → CLI access)
+  finch add <path> --service <url>     Enroll an appliance and append it to finch.toml
+                    [--name "App"]        <path> becomes the URL: <slug>.finchmcp.com/<path>/mcp
+  finch run [--config finch.toml]      Serve every [[ingress]] rule in finch.toml
+  finch join --ticket <t> --upstream <url>   Run one appliance straight from flags
+  finch help                           Show this help
+
+Typical first-time setup:
+  finch login --hub https://finchmcp.com <token>
+  finch add printer --service http://127.0.0.1:8000 --name "Label Printer"
+  finch run
+
+Run 'finch <command> -h' for a command's own flags.
+`)
+}
+
 // cliCred is the saved CLI login: which hub, and the tenant token for it.
 type cliCred struct {
 	Hub   string `json:"hub"`
