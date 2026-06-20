@@ -252,6 +252,9 @@ export async function handleApi(
   // POST /api/cli-describe {userCode} — return the pending code's INITIATOR
   // context so the approver can confirm it's their own device (anti-phishing).
   if (method === "POST" && seg.length === 1 && seg[0] === "cli-describe") {
+    if (!(await rateLimitOk(env.JOIN_LIMIT, `describe:${tenant}`))) {
+      return json(429, { error: "rate limited" });
+    }
     const body = await readJson(req);
     const userCode = String(body.userCode || "").trim();
     if (!userCode) return json(400, { error: "userCode required" });

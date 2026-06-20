@@ -41,13 +41,20 @@ async function chatCompletion(req: Request, env: Env, origin: string): Promise<R
   if (!(await rateLimitOk(env.RELAY_LIMIT, `chat:${clientIp(req)}`))) {
     return json(429, { error: "rate limited" });
   }
-  const cl = req.headers.get("content-length");
-  if (cl && Number(cl) > MAX_BODY_BYTES) {
+  // Enforce the body cap on the ACTUAL bytes (content-length is client-controlled
+  // and absent for chunked) — buffer then check, like relayMcp does.
+  let raw: ArrayBuffer;
+  try {
+    raw = await req.arrayBuffer();
+  } catch {
+    return json(400, { error: "invalid body" });
+  }
+  if (raw.byteLength > MAX_BODY_BYTES) {
     return json(413, { error: "request body too large" });
   }
   let body: any;
   try {
-    body = await req.json();
+    body = JSON.parse(new TextDecoder().decode(raw));
   } catch {
     return json(400, { error: "invalid JSON" });
   }
