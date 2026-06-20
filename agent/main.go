@@ -252,6 +252,9 @@ func main() {
 		case "call":
 			cmdCall(os.Args[2:])
 			return
+		case "guide":
+			printGuide()
+			return
 		case "help", "-h", "--help":
 			printUsage()
 			return

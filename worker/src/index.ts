@@ -607,6 +607,11 @@ else
 fi
 
 echo "finch: installed to $BIN_DIR/finch"
-echo "finch: now run  finch join --hub $HUB --ticket <ticket>"
+echo ""
+echo "  Next:   finch login --hub $HUB     # log in (once)"
+echo "  Then:   finch add <name> --service http://127.0.0.1:8000 && finch run"
+echo ""
+echo "  Driving finch with an AI agent? Run 'finch guide' for a full manual,"
+echo "  or just tell it: \\"use finch — run 'finch guide' first.\\""
 `;
 }

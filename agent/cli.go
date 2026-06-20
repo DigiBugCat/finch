@@ -27,6 +27,73 @@ import (
 	"time"
 )
 
+// printGuide is `finch guide` — a complete, self-contained operating manual an
+// AI agent can read once and then drive finch end to end. Point an agent at it:
+// "run 'finch guide' and use finch to host this MCP server."
+// (No backticks below — this is a Go raw string, which backticks would close.)
+func printGuide() {
+	fmt.Print(`# Using finch (agent guide)
+
+finch publishes a LOCAL MCP server on the public internet — authenticated, with
+NO open ports. The box dials OUT to the finch hub; clients reach it at a stable
+https://<your-slug>.finchmcp.com/<name>/mcp URL. You (an agent) drive everything
+from this CLI. Every command is non-interactive and supports --json.
+
+## The only human step
+'finch login' needs a human ONCE (it opens a browser to approve a short code).
+After that you operate freely. Already logged in? Check:  finch status --json
+
+## Host an MCP server (the core loop)
+1. Make sure your MCP server is running locally over HTTP, e.g. http://127.0.0.1:8000
+   (any Streamable-HTTP MCP server — FastMCP, etc. Service MUST be an http(s) URL.)
+2. Expose it:        finch add printer --service http://127.0.0.1:8000 --name "Printer" --json
+3. Serve it:         finch run
+   -> prints the public URL, e.g. https://<slug>.finchmcp.com/printer/mcp
+'finch add' writes/extends finch.toml; 'finch run' serves EVERY rule in it (add
+more services with more 'finch add' calls — one process fronts them all, and it
+auto-approves while you are logged in).
+
+## Test an endpoint
+  finch test printer                          # list the appliance's MCP tools
+  finch call printer echo --args '{"text":"hi"}'   # invoke one tool
+
+## Grant + REVOKE client access
+A caller (another agent/app) reaches your server with a finch_ bearer key:
+  finch keys mint web-client --appliance printer   # prints a finch_ key ONCE
+  finch keys list
+  finch keys revoke <id>                            # access stops immediately
+The client then calls:
+  POST https://<slug>.finchmcp.com/printer/mcp   with header  Authorization: Bearer finch_...
+
+## Provision ANOTHER box, no human in the loop
+From a box that is already logged in:
+  ssh user@newbox "finch login --token $(finch token)"
+  ssh user@newbox "finch add api --service http://127.0.0.1:9000 && finch run"
+'finch token' mints a fresh, revocable CLI token. The browser step is only ever
+needed for your FIRST box.
+
+## Inspect state
+  finch status --json     # am I logged in (which tenant)? what does finch.toml serve?
+  finch fleet --json      # every appliance + its state (chirping/resting/pending)
+
+## finch.toml (what 'finch add' writes)
+  hub     = "https://finchmcp.com"
+  machine = "this-box"
+  [[ingress]]
+  name    = "Printer"
+  path    = "printer"                  # becomes <slug>.finchmcp.com/printer/mcp
+  service = "http://127.0.0.1:8000"
+
+## Good to know
+- --json works on add / token / status / fleet / keys / test / call for parsing.
+- The CLI token is a tenant-admin credential (~30 days). Revoke everything with:
+    finch revoke-tokens   (or the dashboard -> Settings -> CLI access)
+- 'finch rm <appliance>' removes an appliance; 'finch approve <path>' is only
+  needed if you are not logged in (otherwise 'finch run' approves automatically).
+- See 'finch help' for the flag-level reference.
+`)
+}
+
 // printUsage is the top-level `finch help` — an overview of the subcommands.
 // (Go's flag package only prints per-flag usage; this ties it together.)
 func printUsage() {
@@ -48,7 +115,11 @@ Usage:
   finch rm <appliance>                 Remove an appliance
   finch revoke-tokens                  De-authorize every CLI login (incl. this box)
   finch join --ticket <t> --upstream <url>   Run one appliance straight from flags
+  finch guide                          Full agent operating manual (point an AI agent at this)
   finch help                           Show this help
+
+Driving finch with an AI agent? Run 'finch guide' for a complete manual it can
+follow, or just tell it: "use finch — run 'finch guide' first."
 
 Typical first-time setup:
   finch login --hub https://finchmcp.com   # browser approval, once
