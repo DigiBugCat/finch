@@ -91,11 +91,11 @@ proxy" lesson).
 
 ## Roadmap
 
-1. ✅ Request/response relay end-to-end (Worker DO ↔ agent ↔ local server), hibernation-correct.
-2. Appliance registry (KV/D1): id → owner, `finch_` key hashes, online state.
-3. Clerk auth + `finch_` key check at the edge; inject `X-Finch-User`.
-4. `finch` CLI: `new` / `connect` / `ls` / enrollment tickets; one-paste install.
-5. Server-initiated bidirectional (session-sticky SSE relay).
-6. Bundle/manifest runtime (folder = one MCP capability; launchd/systemd render).
-7. Dashboard (fleet view + copy-paste MCP URLs + key minting).
-8. Bind `finchmcp.com` zone + deploy.
+1. ✅ Request/response relay end-to-end (Worker DO ↔ agent ↔ local server), hibernation-correct, **streaming**.
+2. ✅ Appliance registry (TenantDO): id → owner, `finch_` key hashes, online state.
+3. ✅ Clerk auth + `finch_` key check at the edge. (Edge `X-Finch-User` injection: still planned.)
+4. ✅ `finch` CLI: `login` (browser device-auth) / `add` / `run` / `approve`; CLI tokens; one-paste install.
+5. ✅ Manifest runtime (`finch.toml` — one process fronts many local servers, cloudflared-style ingress). stdio↔Streamable-HTTP bridge: still planned.
+6. ✅ Dashboard (fleet, keys, settings, audit log, "test in chat").
+7. Server-initiated bidirectional across machines (session-sticky SSE / session affinity). _Single-machine sampling/elicitation already works._
+8. Bind `finchmcp.com` zone + production deploy.

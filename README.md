@@ -88,19 +88,51 @@ single-machine appliance — server-initiated sampling/elicitation. Pause/resume
 - ✅ Two-layer auth (`finch_` keys + ticket/refresh/connect tokens), SSRF-guarded agent
 - ✅ **Streaming** relay — SSE / progress / long-running tools, with backpressure
 - ✅ Reconnect forever, including across reboots (persisted refresh credential)
-- ✅ Dashboard: enroll → mint a key that actually reaches your appliances
+- ✅ **CLI: `finch login` (browser device-auth) → `finch add` → `finch run`** — enroll
+  and serve from the box, no dashboard ticket copying
+- ✅ **`finch.toml` manifest** — one process fronts many local services, each its own
+  appliance (cloudflared-style ingress)
+- ✅ Dashboard: fleet, keys (default-deny ACL), settings (hub-domain slug picker +
+  CLI access tokens), and a **"test in chat"** panel that drives an appliance's MCP
+  tools through an LLM (Cloudflare Workers AI)
 - ✅ One-tag release pipeline (GoReleaser) + a `curl | sh` installer
 - ✅ Full-stack e2e + CI gates on all three packages (`go test -race`, vitest, typecheck/lint)
 
-**Roadmap (v1.1+):** the `finchd` runtime (`finch.toml` + multi-server-per-box +
-a stdio↔Streamable-HTTP bridge — the "drop a folder, it's hosted" piece), edge
-identity injection (`X-Finch-User`), and multi-machine session affinity.
+**Roadmap (v1.1+):** a stdio↔Streamable-HTTP bridge (host non-HTTP servers),
+edge identity injection (`X-Finch-User`), and multi-machine session affinity.
 
-## Quickstart (local dev)
+## Use it
 
-You run three things: the **hub** (worker), the **dashboard** (web, mints
-tickets/keys), and the **agent** on the box. The agent joins with a one-shot
-ticket from the dashboard — there is no DNS or port setup.
+Three commands on the box, from a logged-in CLI (see
+[`agent/README.md`](agent/README.md) for the full reference):
+
+```bash
+# 1. log in — opens the dashboard to approve a short code (like `gh auth login`)
+finch login --hub https://finchmcp.com
+
+# 2. expose a local MCP server (running on :8000) as the appliance "printer"
+finch add printer --service http://127.0.0.1:8000 --name "Label Printer"
+
+# 3. serve it — dials out, auto-approves, prints the public URL
+finch run            #  → https://<your-slug>.finchmcp.com/printer/mcp
+```
+
+`finch add` writes a [`finch.toml`](agent/finch.example.toml) manifest; `finch
+run` serves every rule in it (add more services with more `finch add` calls —
+one process fronts them all). Then point any MCP client at the printed URL with
+a `finch_` key (mint one in the dashboard → **Keys**), or test it right in the
+dashboard with the appliance's **"test in chat"** panel.
+
+A runnable end-to-end example lives in
+[`examples/hello-mcp/`](examples/hello-mcp/).
+
+> No CLI yet? You can also enroll a single box from the dashboard ("Add device")
+> and run `finch join --ticket … --upstream …` — see the agent README.
+
+## Local dev
+
+Run three things: the **hub** (worker), the **dashboard** (web), and the
+**agent** on the box.
 
 ```bash
 # 0. shared secrets — copy the examples and set a matching FINCH_SERVICE_SECRET
@@ -111,24 +143,17 @@ cp web/.dev.vars.example    web/.dev.vars   # also needs Clerk pk_test_/sk_test_
 # 1. run the hub
 cd worker && npm install && npm run dev          # wrangler dev on :8787
 
-# 2. run the dashboard (needs a Clerk dev instance)
+# 2. run the dashboard (Node 22 — see web/.nvmrc; needs a Clerk dev instance)
 cd web && npm install && npm run dev             # next dev on :3000
 
 # 3. run a local MCP server on :8000 (any streamable-http MCP server, e.g.
-#    a FastMCP server started with transport="http")
+#    a FastMCP server, or examples/hello-mcp/server.py)
 
-# 4. in the dashboard: sign in → Add device → copy the printed one-liner, e.g.
-cd agent && go run . join --hub http://localhost:8787 \
-  --ticket <ticket-from-dashboard> --upstream http://127.0.0.1:8000
-
-# 5. mint a finch_ key in the dashboard, then call the appliance through the hub
-curl -X POST http://localhost:8787/<appliance>/mcp \
-  -H "Authorization: Bearer finch_…" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+# 4. enroll + serve, then call it
+cd agent && go build -o finch . && \
+  ./finch login --hub http://localhost:8787 && \
+  ./finch add hello --service http://127.0.0.1:8000 && ./finch run
 ```
-
-> A frictionless `finch quickstart` (ngrok-style: one command, instant URL) is
-> on the roadmap; today the dashboard is the source of tickets and keys.
 
 ## Tests
 

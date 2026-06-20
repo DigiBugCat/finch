@@ -1,8 +1,11 @@
 # finch relay protocol v2 — streaming, MCP-unaware (design + plan)
 
-Status: **spec / not yet implemented.** This is the Phase-0 contract for replacing
-the current buffered JSON-frame relay. Nothing here ships until the phased plan
-below lands behind a feature flag.
+Status: **partially shipped.** The core is LIVE — the relay is now a streaming,
+MCP-unaware channel (`head` → `chunk…` → `end` over per-request ids, with
+pause/resume `WINDOW` backpressure); the older buffered JSON-frame relay is gone.
+This doc remains the reference for the wire format and the parts still in flight:
+multi-server `OPEN.route` routing, multi-machine session affinity, request-body
+streaming, and binary frames.
 
 ## Why
 
