@@ -25,10 +25,29 @@ import {
   routerDevicePoll,
   routerDeviceApprove,
 } from "./router-do";
-import { signAssertion } from "./auth";
+import { signAssertion, verifyAssertionPayload } from "./auth";
 
-// A CLI token is a long-lived tenant assertion (same envelope as X-Finch-Auth).
-const CLI_TOKEN_TTL_SECONDS = 90 * 24 * 60 * 60; // 90 days
+// A CLI token is a long-lived tenant assertion, distinguished from a per-call
+// assertion by kind:"cli" + an epoch the tenant can bump to revoke. 30 days.
+const CLI_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
+
+// Mint a CLI token bound to the tenant's CURRENT cliTokenEpoch (so a later
+// "revoke all CLI tokens" invalidates it without rotating the global secret).
+async function mintCliToken(
+  env: Env,
+  tenant: string,
+  host: string,
+): Promise<{ token: string; expiresAt: number; hub: string }> {
+  const { epoch } = await tenantOp<{ epoch: number }>(env, tenant, "cliEpoch");
+  const exp = Math.floor(Date.now() / 1000) + CLI_TOKEN_TTL_SECONDS;
+  const token = await signAssertion(
+    { tenant, exp, kind: "cli", epoch: epoch ?? 0 },
+    env.FINCH_SERVICE_SECRET,
+  );
+  const scheme =
+    host.startsWith("localhost") || host.startsWith("127.") ? "http" : "https";
+  return { token, expiresAt: exp, hub: `${scheme}://${host}` };
+}
 
 /** Hex token of `bytes` random bytes. */
 function randomToken(bytes: number): string {
@@ -125,19 +144,28 @@ export async function handleApi(
   //      (same trust as X-Finch-Auth). This lets the `finch` CLI enroll
   //      appliances from the box without the dashboard. ----
   if (path.startsWith("/api/cli/")) {
+    // Throttle the whole CLI surface per-IP (device start/poll AND the bearer
+    // routes) — these are reachable without a finch_ key, so cap brute-force /
+    // flood. Fails open when the binding is absent (dev/test).
+    if (!(await rateLimitOk(env.JOIN_LIMIT, `cli:${clientIp(req)}`))) {
+      return json(429, { error: "rate limited" });
+    }
+
     // ---- Public device-authorization flow (`finch login`): the CLI has no
     //      credentials yet, so start/poll are unauthenticated. The browser
-    //      (Clerk-authed) approves the short user_code out of band. ----
+    //      (Clerk-authed) approves the short user_code out of band. We do NOT
+    //      return a one-click ?code= link — the human must TYPE the code on the
+    //      dashboard, which is the anti-phishing binding (see /cli page). ----
     if (path === "/api/cli/device/start" && method === "POST") {
       const deviceCode = randomToken(32);
       const userCode = randomUserCode();
-      await routerDeviceStart(env, deviceCode, userCode);
+      const started = await routerDeviceStart(env, deviceCode, userCode);
+      if (!started.ok) return json(429, { error: "too many pending logins — try again shortly" });
       const webBase = (env.WEB_URL || `https://${host}`).replace(/\/$/, "");
       return json(200, {
         device_code: deviceCode,
         user_code: userCode,
         verification_uri: `${webBase}/cli`,
-        verification_uri_complete: `${webBase}/cli?code=${encodeURIComponent(userCode)}`,
         expires_in: 600,
         interval: 3,
       });
@@ -148,10 +176,17 @@ export async function handleApi(
       return json(200, await routerDevicePoll(env, String(body.device_code)));
     }
 
+    // Bearer must be a CLI token (kind:"cli") whose epoch still matches the
+    // tenant's current cliTokenEpoch (else it was revoked).
     const m = (req.headers.get("Authorization") || "").match(/^Bearer\s+(.+)$/i);
-    const cliTenant = m ? await verifyAssertion(m[1], env.FINCH_SERVICE_SECRET) : null;
+    const payload = m ? await verifyAssertionPayload(m[1], env.FINCH_SERVICE_SECRET) : null;
+    const cliTenant = payload && payload.kind === "cli" ? payload.tenant : null;
     if (!cliTenant) {
       return json(401, { error: "missing, invalid, or expired CLI token (Authorization: Bearer …)" });
+    }
+    const { epoch: curEpoch } = await tenantOp<{ epoch: number }>(env, cliTenant, "cliEpoch");
+    if ((payload!.epoch ?? -1) !== (curEpoch ?? 0)) {
+      return json(401, { error: "CLI token revoked — run `finch login` again" });
     }
     // GET /api/cli/whoami — validate a token + report the tenant it acts as.
     if (path === "/api/cli/whoami" && method === "GET") {
@@ -206,11 +241,14 @@ export async function handleApi(
   // a `finch login` device code: mint a CLI token for this tenant and stamp it
   // onto the pending code so the waiting CLI can poll it.
   if (method === "POST" && seg.length === 1 && seg[0] === "device-approve") {
+    // Attempt limiter: a wrong user_code shouldn't be brute-forceable.
+    if (!(await rateLimitOk(env.JOIN_LIMIT, `approve:${clientIp(req)}`))) {
+      return json(429, { error: "rate limited" });
+    }
     const body = await readJson(req);
     const userCode = String(body.userCode || "").trim();
     if (!userCode) return json(400, { error: "userCode required" });
-    const exp = Math.floor(Date.now() / 1000) + CLI_TOKEN_TTL_SECONDS;
-    const token = await signAssertion({ tenant, exp }, env.FINCH_SERVICE_SECRET);
+    const { token } = await mintCliToken(env, tenant, host);
     const out = await routerDeviceApprove(env, userCode, tenant, token);
     if (!out.ok) {
       const msg =
@@ -224,6 +262,18 @@ export async function handleApi(
       return json(out.reason === "not-found" ? 404 : 400, { error: msg });
     }
     return json(200, { ok: true });
+  }
+
+  // POST /api/cli-mint — mint a CLI token for this tenant (Settings → CLI access
+  // "Generate"). Epoch-bound, so a later cli-revoke kills it.
+  if (method === "POST" && seg.length === 1 && seg[0] === "cli-mint") {
+    return json(200, await mintCliToken(env, tenant, host));
+  }
+
+  // POST /api/cli-revoke — invalidate every outstanding CLI token for this
+  // tenant (bumps cliTokenEpoch). The admin's NEXT `finch login` re-issues.
+  if (method === "POST" && seg.length === 1 && seg[0] === "cli-revoke") {
+    return json(200, await tenantOp(env, tenant, "revokeCliTokens"));
   }
 
   if (method === "GET" && seg.length === 1 && seg[0] === "slug-available") {

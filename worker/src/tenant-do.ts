@@ -61,6 +61,9 @@ interface StoredState {
   // is recorded on first successful /join and rejected thereafter; entries are
   // evicted once expired (a replay past exp is already rejected by verifyToken).
   usedTickets?: Record<string, number>;
+  // Monotonic counter embedded in CLI tokens at mint. Bumped by "revoke all CLI
+  // tokens"; a token whose epoch != this is rejected. Absent == 0 (legacy state).
+  cliTokenEpoch?: number;
 }
 
 const MAX_LOGS = 500;
@@ -189,6 +192,10 @@ export class TenantDO extends DurableObject<Env> {
           return ok(await this.release(a.id));
         case "approve":
           return ok(await this.approve(a.id));
+        case "cliEpoch":
+          return ok(await this.cliEpoch());
+        case "revokeCliTokens":
+          return ok(await this.revokeCliTokens());
         case "decline":
           return ok(await this.decline(a.id));
         case "setTags":
@@ -280,6 +287,7 @@ export class TenantDO extends DurableObject<Env> {
       ],
       logs: [],
       usedTickets: {},
+      cliTokenEpoch: 0,
       settings: {
         org: id,
         subdomain: "",
@@ -542,6 +550,21 @@ export class TenantDO extends DurableObject<Env> {
       recentCalls: [],
       conn: this.emptyConn(),
     };
+  }
+
+  // ---- CLI token epoch (revocation without rotating the global secret) ----
+
+  private async cliEpoch(): Promise<{ epoch: number }> {
+    const s = await this.load();
+    return { epoch: s.cliTokenEpoch ?? 0 };
+  }
+
+  private async revokeCliTokens(): Promise<{ ok: boolean; epoch: number }> {
+    const s = await this.load();
+    s.cliTokenEpoch = (s.cliTokenEpoch ?? 0) + 1;
+    this.log(s, { cat: "key", actor: "you", action: "revoked all CLI tokens", target: "cli access", ip: "" });
+    await this.save(s);
+    return { ok: true, epoch: s.cliTokenEpoch };
   }
 
   // ---- mutations: appliances ---------------------------------------------

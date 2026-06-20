@@ -367,3 +367,10 @@ footer{border-top:1px solid var(--line); background:var(--bg3); padding:56px 0 4
 .cli-page .btn-amber{width:100%; justify-content:center}
 .cli-ok{margin-top:8px; font-weight:800; color:var(--green); font-size:18px}
 .cli-err{margin-top:14px; color:var(--red); font-size:14px}
+
+/* CLI device-approve — account grant + warning */
+.cli-grant{font-size:13px;color:var(--dim);margin:0 0 14px}
+.cli-grant b{color:var(--amber)}
+.cli-warn{margin-top:16px;text-align:left;font-size:12.5px;line-height:1.5;color:var(--dim);
+  background:#2a1f12;border:1px solid var(--line2);border-radius:11px;padding:11px 13px}
+.cli-warn b{color:var(--ink)}

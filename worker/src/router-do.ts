@@ -153,6 +153,12 @@ export class RouterDO extends DurableObject<Env> {
       "DELETE FROM device_codes WHERE created < ?",
       now - RouterDO.DEVICE_TTL_MS,
     );
+    // Cap concurrent pending codes so an unauthenticated flood can't bloat this
+    // singleton DO's table (rows still auto-expire at the TTL above).
+    const live = this.ctx.storage.sql
+      .exec<{ n: number }>("SELECT COUNT(*) AS n FROM device_codes")
+      .toArray();
+    if (live.length && live[0].n >= 1000) return { ok: false };
     this.ctx.storage.sql.exec(
       "INSERT INTO device_codes (device_code, user_code, created, approved) VALUES (?, ?, ?, 0)",
       d,

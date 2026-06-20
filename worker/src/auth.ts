@@ -229,9 +229,19 @@ export function serviceOk(
 export interface TenantAssertion {
   tenant: string;
   exp: number; // epoch SECONDS
+  // `kind` is the audience: a short-lived per-call web→hub assertion ("assertion",
+  // the default for back-compat) vs a long-lived CLI token ("cli"). A CLI token
+  // must NOT be accepted where a per-call assertion is expected, and vice-versa.
+  kind?: string;
+  // `epoch` (CLI tokens only): the tenant's cliTokenEpoch at mint time. The hub
+  // rejects the token once the tenant bumps that epoch ("revoke all CLI tokens"),
+  // giving a revocation path that doesn't require rotating the global secret.
+  epoch?: number;
 }
 
-/** Sign a tenant assertion with the service secret. */
+/** Sign a tenant assertion with the service secret. Per-call assertions pass
+ *  `{tenant,exp}` (kind defaults to "assertion" on verify); CLI tokens pass
+ *  `{tenant,exp,kind:"cli",epoch}`. */
 export function signAssertion(
   payload: TenantAssertion,
   secret: string,
@@ -239,18 +249,35 @@ export function signAssertion(
   return signEnvelope(payload, secret);
 }
 
+/** Verify + decode a tenant assertion's full payload (kind defaulted to
+ *  "assertion"), or null if missing/forged/expired/malformed. */
+export async function verifyAssertionPayload(
+  token: string,
+  secret: string,
+): Promise<TenantAssertion | null> {
+  return verifyEnvelope<TenantAssertion>(token, secret, (p) =>
+    typeof p.tenant === "string" && p.tenant && typeof p.exp === "number"
+      ? {
+          tenant: p.tenant,
+          exp: p.exp,
+          kind: typeof p.kind === "string" ? p.kind : "assertion",
+          ...(typeof p.epoch === "number" ? { epoch: p.epoch } : {}),
+        }
+      : null,
+  );
+}
+
 /**
- * Verify a tenant assertion. Returns the tenant id, or null if the assertion is
- * missing/malformed, the HMAC doesn't match, or it has expired.
+ * Verify a tenant assertion of the expected `kind` (default "assertion").
+ * Returns the tenant id, or null if missing/forged/expired or the kind mismatches
+ * — so a long-lived CLI token can't stand in for a per-call assertion.
  */
 export async function verifyAssertion(
   token: string,
   secret: string,
+  expectedKind = "assertion",
 ): Promise<string | null> {
-  const payload = await verifyEnvelope<TenantAssertion>(token, secret, (p) =>
-    typeof p.tenant === "string" && p.tenant && typeof p.exp === "number"
-      ? (p as TenantAssertion)
-      : null,
-  );
-  return payload?.tenant ?? null;
+  const p = await verifyAssertionPayload(token, secret);
+  if (!p || p.kind !== expectedKind) return null;
+  return p.tenant;
 }

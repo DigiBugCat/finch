@@ -81,9 +81,10 @@ function CliAccess() {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
   const [copied, setCopied] = useState(false);
+  const [revoked, setRevoked] = useState(false);
 
   async function generate() {
-    setBusy(true); setErr(''); setCmd('');
+    setBusy(true); setErr(''); setCmd(''); setRevoked(false);
     try {
       const r = await fetch('/api/finch/cli-token', { method: 'POST' });
       const j = await r.json();
@@ -96,19 +97,40 @@ function CliAccess() {
     }
   }
 
+  async function revokeAll() {
+    if (!confirm('Revoke ALL CLI tokens for this account? Every box logged in via the CLI will need to run `finch login` again.')) return;
+    setBusy(true); setErr(''); setCmd('');
+    try {
+      const r = await fetch('/api/finch/cli-revoke', { method: 'POST' });
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || 'could not revoke');
+      setRevoked(true);
+    } catch (e: any) {
+      setErr(e.message || 'failed');
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <div className="cli-access">
       <p className="set-hint dim" style={{ marginBottom: 12 }}>
-        Run one command on a box, then <code className="mono">finch add &lt;name&gt; --service &lt;url&gt;</code> to expose a local server — no tickets to copy.
+        Prefer <code className="mono">finch login</code> (browser approval). Or generate a token to paste, then{' '}
+        <code className="mono">finch add &lt;name&gt; --service &lt;url&gt;</code> to expose a local server.
       </p>
-      {!cmd && (
-        <button type="button" className="btn btn-sm btn-amber" onClick={generate} disabled={busy}>
-          {busy ? 'generating…' : 'Generate CLI token'}
+      <div style={{ display: 'flex', gap: 8 }}>
+        {!cmd && (
+          <button type="button" className="btn btn-sm btn-amber" onClick={generate} disabled={busy}>
+            {busy ? 'generating…' : 'Generate CLI token'}
+          </button>
+        )}
+        <button type="button" className="btn btn-sm btn-ghost" onClick={revokeAll} disabled={busy}>
+          Revoke all CLI tokens
         </button>
-      )}
+      </div>
       {err && <div className="set-hint red" style={{ marginTop: 8 }}>{err}</div>}
+      {revoked && <div className="set-hint green" style={{ marginTop: 8 }}>✓ All CLI tokens revoked. Logged-in boxes must re-run <code className="mono">finch login</code>.</div>}
       {cmd && (
-        <div>
+        <div style={{ marginTop: 12 }}>
           <div className="cli-cmd mono">
             <span>{cmd.slice(0, 28)}…<span className="dim"> (token hidden)</span></span>
             <button type="button" className="btn btn-sm btn-ghost" onClick={() => { navigator.clipboard.writeText(cmd); setCopied(true); setTimeout(() => setCopied(false), 1200); }}>
@@ -116,7 +138,7 @@ function CliAccess() {
             </button>
           </div>
           <div className="set-hint dim" style={{ marginTop: 8 }}>
-            Paste this on your box. It's a tenant credential valid ~90 days and shown only once — store it safely.
+            Paste this on your box. It's a tenant credential valid ~30 days, shown only once — store it safely. Revoke anytime above.
           </div>
         </div>
       )}
