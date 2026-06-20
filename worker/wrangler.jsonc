@@ -104,7 +104,12 @@
       "workers_dev": true,
       "observability": { "enabled": true },
       "vars": {
-        "DEFAULT_TENANT": "staging-tenant",
+        // Staging has one workers.dev host (no per-tenant subdomains), so the
+        // relay plane resolves every request to this single dev-fallback tenant.
+        // Point it at the operator's own tenant so a `finch login`-enrolled box
+        // actually relays + shows up chirping in their dashboard on staging.
+        // (Prod has none of this — it fails closed and routes by slug subdomain.)
+        "DEFAULT_TENANT": "user_3F74fiQzwjM6UPfl9axNpA1jgyQ",
         "DEV": "1",
         "WEB_URL": "https://finch-web-staging.pantainos.workers.dev"
       },
