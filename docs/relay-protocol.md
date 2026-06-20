@@ -1,11 +1,34 @@
 # finch relay protocol v2 — streaming, MCP-unaware (design + plan)
 
-Status: **partially shipped.** The core is LIVE — the relay is now a streaming,
-MCP-unaware channel (`head` → `chunk…` → `end` over per-request ids, with
-pause/resume `WINDOW` backpressure); the older buffered JSON-frame relay is gone.
-This doc remains the reference for the wire format and the parts still in flight:
-multi-server `OPEN.route` routing, multi-machine session affinity, request-body
-streaming, and binary frames.
+Status: **shipped, with a deliberately simpler design than this spec.** The
+goals are LIVE: a streaming, MCP-unaware relay (`head` → `chunk…` → `end` over
+per-request ids, with pause/resume `WINDOW` backpressure). Several of this spec's
+mechanisms were **superseded by simpler choices** that are sufficient for MCP —
+recorded here so the ambition isn't mistaken for a backlog:
+
+- **Multi-server per box → one connection per appliance** (not `OPEN.route`
+  multiplexing on a single socket). Each `finch.toml` `[[ingress]]` rule is its
+  own appliance with its own outbound WebSocket. Idle appliances hibernate
+  independently (~$0), so the extra sockets cost nothing at rest — and the wire
+  stays trivially simple. **This is the design, not a gap.**
+- **No load balancing / session affinity.** An appliance is served by one box;
+  finch is not a load-balancer and won't pin `Mcp-Session-Id` across a multi-box
+  pool. (Running >1 box for one appliance is best-effort failover only, no
+  session stickiness.) **Out of scope by choice.**
+- **Request body is buffered, not streamed.** MCP requests are small JSON-RPC
+  POSTs; the *response* is what gets large (SSE, long-running tools), and that
+  streams. Buffering a tiny request is correct and cheap — request-body
+  streaming buys nothing for MCP.
+- **JSON frames with base64 bodies** (not binary msgpack/CBOR). Binary-safe
+  today; the ~33% body overhead is a future micro-optimization, not a
+  correctness gap.
+
+**Genuinely future (optional, not blocking anything):** a stdio↔Streamable-HTTP
+bridge so boxes can host MCP servers that speak stdio instead of HTTP. Until
+then, `service` is an HTTP URL.
+
+The wire-format reference below stands; treat the OPEN.route / SessionDO /
+binary-frame sections as the original v2 ambition, superseded as noted above.
 
 ## Why
 

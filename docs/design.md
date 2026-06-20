@@ -95,7 +95,11 @@ proxy" lesson).
 2. ✅ Appliance registry (TenantDO): id → owner, `finch_` key hashes, online state.
 3. ✅ Clerk auth + `finch_` key check at the edge. (Edge `X-Finch-User` injection: still planned.)
 4. ✅ `finch` CLI: `login` (browser device-auth) / `add` / `run` / `approve`; CLI tokens; one-paste install.
-5. ✅ Manifest runtime (`finch.toml` — one process fronts many local servers, cloudflared-style ingress). stdio↔Streamable-HTTP bridge: still planned.
+5. ✅ Manifest runtime (`finch.toml` — one process fronts many local servers as separate appliances, cloudflared-style ingress).
 6. ✅ Dashboard (fleet, keys, settings, audit log, "test in chat").
-7. Server-initiated bidirectional across machines (session-sticky SSE / session affinity). _Single-machine sampling/elicitation already works._
-8. Bind `finchmcp.com` zone + production deploy.
+7. Bind `finchmcp.com` zone + production deploy.
+
+**Optional / later (not blocking):** a stdio↔Streamable-HTTP bridge (host
+stdio MCP servers; today `service` is an HTTP URL). **Out of scope by choice:**
+load balancing / multi-machine session affinity — an appliance is served by one
+box; finch is not a load-balancer.
