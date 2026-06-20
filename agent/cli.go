@@ -41,6 +41,10 @@ Usage:
   finch approve <path>                 Approve an appliance (clear the pending gate)
   finch token [--json|--login]         Mint a fresh CLI token (provision a new box, no browser)
   finch status [--json]                Show login + what finch.toml serves
+  finch fleet [--json]   (alias: ls)   List this account's appliances + state
+  finch keys [list|mint <label> --appliance <id>|revoke <id>]   Manage client finch_ keys
+  finch rm <appliance>                 Remove an appliance
+  finch revoke-tokens                  De-authorize every CLI login (incl. this box)
   finch join --ticket <t> --upstream <url>   Run one appliance straight from flags
   finch help                           Show this help
 
@@ -277,6 +281,157 @@ func openBrowser(u string) {
 		name, args = "xdg-open", []string{u}
 	}
 	_ = exec.Command(name, args...).Start()
+}
+
+// cmdKeys: finch keys [list|mint|revoke] — manage the client finch_ keys that
+// callers present to reach your appliances. The control plane an agent uses to
+// grant + REVOKE access without the dashboard.
+func cmdKeys(args []string) {
+	sub := "list"
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		sub, args = args[0], args[1:]
+	}
+	cred, err := loadCliCred()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
+		os.Exit(1)
+	}
+	switch sub {
+	case "list":
+		fs := flag.NewFlagSet("keys", flag.ExitOnError)
+		asJSON := fs.Bool("json", false, "machine-readable JSON")
+		_ = fs.Parse(args)
+		st, err := cliRequest("GET", cred.Hub, "/api/cli/state", cred.Token, nil)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "finch: %v\n", err)
+			os.Exit(1)
+		}
+		keys, _ := st["keys"].([]any)
+		if *asJSON {
+			b, _ := json.Marshal(keys)
+			fmt.Println(string(b))
+			return
+		}
+		if len(keys) == 0 {
+			fmt.Println("no keys — `finch keys mint <label> --appliance <id>`")
+			return
+		}
+		for _, k := range keys {
+			m, _ := k.(map[string]any)
+			fmt.Printf("  %-12v %v\n", m["id"], m["label"])
+		}
+	case "mint":
+		fs := flag.NewFlagSet("keys mint", flag.ExitOnError)
+		all := fs.Bool("all", false, "key reaches EVERY appliance (default: none — scope it)")
+		appliance := fs.String("appliance", "", "scope the key to one appliance id")
+		asJSON := fs.Bool("json", false, "machine-readable JSON")
+		label := ""
+		if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+			label, args = args[0], args[1:]
+		}
+		_ = fs.Parse(args)
+		if label == "" {
+			fmt.Fprintln(os.Stderr, "usage: finch keys mint <label> (--appliance <id> | --all)")
+			os.Exit(2)
+		}
+		var scope any
+		switch {
+		case *all:
+			scope = map[string]bool{"all": true}
+		case *appliance != "":
+			scope = map[string][]string{"appliances": {*appliance}}
+		default:
+			fmt.Fprintln(os.Stderr, "finch: scope the key with --appliance <id> (or --all)")
+			os.Exit(2)
+		}
+		out, err := cliRequest("POST", cred.Hub, "/api/cli/keys", cred.Token, map[string]any{"label": label, "scope": scope})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "finch: %v\n", err)
+			os.Exit(1)
+		}
+		if *asJSON {
+			b, _ := json.Marshal(out)
+			fmt.Println(string(b))
+			return
+		}
+		fmt.Println(out["key"]) // the finch_ key — shown once
+	case "revoke":
+		if len(args) < 1 {
+			fmt.Fprintln(os.Stderr, "usage: finch keys revoke <id>")
+			os.Exit(2)
+		}
+		if _, err := cliRequest("POST", cred.Hub, "/api/cli/keys/revoke", cred.Token, map[string]string{"id": args[0]}); err != nil {
+			fmt.Fprintf(os.Stderr, "finch: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("finch: revoked key %s\n", args[0])
+	default:
+		fmt.Fprintln(os.Stderr, "usage: finch keys [list | mint <label> --appliance <id> | revoke <id>]")
+		os.Exit(2)
+	}
+}
+
+// cmdFleet: finch fleet [--json] — list this tenant's appliances + state.
+func cmdFleet(args []string) {
+	fs := flag.NewFlagSet("fleet", flag.ExitOnError)
+	asJSON := fs.Bool("json", false, "machine-readable JSON")
+	_ = fs.Parse(args)
+	cred, err := loadCliCred()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
+		os.Exit(1)
+	}
+	st, err := cliRequest("GET", cred.Hub, "/api/cli/state", cred.Token, nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
+		os.Exit(1)
+	}
+	apps, _ := st["appliances"].([]any)
+	if *asJSON {
+		b, _ := json.Marshal(apps)
+		fmt.Println(string(b))
+		return
+	}
+	if len(apps) == 0 {
+		fmt.Println("no appliances — `finch add <path> --service <url>`")
+		return
+	}
+	for _, a := range apps {
+		m, _ := a.(map[string]any)
+		fmt.Printf("  %-16v %v\n", m["id"], m["state"])
+	}
+}
+
+// cmdRm: finch rm <appliance> — remove an appliance from the tenant.
+func cmdRm(args []string) {
+	if len(args) < 1 {
+		fmt.Fprintln(os.Stderr, "usage: finch rm <appliance>")
+		os.Exit(2)
+	}
+	cred, err := loadCliCred()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
+		os.Exit(1)
+	}
+	if _, err := cliRequest("POST", cred.Hub, "/api/cli/appliances/release", cred.Token, map[string]string{"id": args[0]}); err != nil {
+		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("finch: removed %s\n", args[0])
+}
+
+// cmdRevokeTokens: finch revoke-tokens — de-authorize every CLI login (incl. this).
+func cmdRevokeTokens(args []string) {
+	cred, err := loadCliCred()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
+		os.Exit(1)
+	}
+	if _, err := cliRequest("POST", cred.Hub, "/api/cli/revoke-tokens", cred.Token, struct{}{}); err != nil {
+		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("finch: revoked all CLI tokens — every logged-in box (including this one) must `finch login` again")
 }
 
 // cmdToken: finch token [--json] [--login] — an authed box mints a FRESH CLI

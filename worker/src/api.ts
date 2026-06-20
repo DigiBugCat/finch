@@ -221,6 +221,44 @@ export async function handleApi(
       const out = await tenantOp(env, cliTenant, "approve", { id: body.id });
       return json(out?.ok === false ? 404 : 200, out);
     }
+
+    // ---- Tenant control plane over the CLI token (it IS a tenant-admin
+    //      credential, same as the dashboard) — so an agent can manage and
+    //      REVOKE access without the dashboard. ----
+
+    // GET /api/cli/state — full tenant state (fleet, keys, ACL) for finch fleet/keys.
+    if (path === "/api/cli/state" && method === "GET") {
+      return json(200, await tenantOp(env, cliTenant, "getState"));
+    }
+    // POST /api/cli/keys {label,scope,owner} — mint a client finch_ key (once).
+    if (path === "/api/cli/keys" && method === "POST") {
+      const b = await readJson(req);
+      if (!b.label) return json(400, { error: "label required" });
+      const out = await tenantOp<{ plaintext: string; key: PublicKey } | { error: string }>(
+        env, cliTenant, "mintKey", { label: b.label, scope: b.scope, owner: b.owner },
+      );
+      if ("error" in out) return json(400, { error: out.error });
+      return json(200, { key: out.plaintext, ...out.key });
+    }
+    // POST /api/cli/keys/revoke {id} — revoke a client finch_ key by id.
+    if (path === "/api/cli/keys/revoke" && method === "POST") {
+      const b = await readJson(req);
+      if (!b.id) return json(400, { error: "id required" });
+      const out = await tenantOp(env, cliTenant, "revokeMachineKey", { appliance: "", machine: "", key: String(b.id) });
+      return json(out?.ok === false ? 404 : 200, out);
+    }
+    // POST /api/cli/appliances/release {id} — remove an appliance.
+    if (path === "/api/cli/appliances/release" && method === "POST") {
+      const b = await readJson(req);
+      if (!b.id) return json(400, { error: "id required" });
+      const out = await tenantOp(env, cliTenant, "release", { id: String(b.id) });
+      return json(out?.ok === false ? 404 : 200, out);
+    }
+    // POST /api/cli/revoke-tokens — de-authorize ALL CLI logins (incl. this one).
+    if (path === "/api/cli/revoke-tokens" && method === "POST") {
+      return json(200, await tenantOp(env, cliTenant, "revokeCliTokens"));
+    }
+
     return json(404, { error: "unknown CLI route", path });
   }
 

@@ -234,6 +234,18 @@ func main() {
 		case "status":
 			cmdStatus(os.Args[2:])
 			return
+		case "keys":
+			cmdKeys(os.Args[2:])
+			return
+		case "fleet", "ls":
+			cmdFleet(os.Args[2:])
+			return
+		case "rm":
+			cmdRm(os.Args[2:])
+			return
+		case "revoke-tokens":
+			cmdRevokeTokens(os.Args[2:])
+			return
 		case "help", "-h", "--help":
 			printUsage()
 			return
