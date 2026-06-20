@@ -18,7 +18,7 @@ import "server-only";
 import { auth } from "@clerk/nextjs/server";
 // The assertion signer lives in its own dependency-free module so it can be
 // contract-tested against the hub's verifyAssertion (worker/src/auth.ts).
-import { signAssertion } from "./assertion";
+import { signAssertion, signCliToken } from "./assertion";
 
 /** A thrown HttpError short-circuits a route handler with a JSON response. */
 export class HttpError extends Error {
@@ -119,6 +119,22 @@ export async function requireAdmin(): Promise<ResolvedTenant> {
     throw new HttpError(403, "admin role required");
   }
   return ctx;
+}
+
+/** Mint a long-lived CLI token for the admin's tenant — the credential the
+ *  `finch` CLI presents to /api/cli/*. Admin-only. Returns the token, the hub
+ *  the CLI should target, and the expiry. The token is shown to the user once. */
+export async function mintCliToken(): Promise<{
+  token: string;
+  hub: string;
+  expiresAt: number;
+}> {
+  const ctx = await requireAdmin();
+  const secret = await runtimeEnv("FINCH_SERVICE_SECRET");
+  if (!secret) throw new HttpError(500, "FINCH_SERVICE_SECRET is not configured");
+  const hub = (await runtimeEnv("HUB_URL")) || "https://finchmcp.com";
+  const { token, expiresAt } = await signCliToken(ctx.tenant, secret);
+  return { token, hub, expiresAt };
 }
 
 /** Throw 500 unless `hubUrl` is https: or a localhost/127.0.0.1 dev URL. Guards

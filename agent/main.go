@@ -214,6 +214,20 @@ type joinResp struct {
 }
 
 func main() {
+	// Setup subcommands (cloudflared-style): `finch login` saves a CLI token,
+	// `finch add` enrolls an appliance + appends an [[ingress]] rule. These run
+	// and exit; `join`/`run`/bare fall through to the relay agent below.
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "login":
+			cmdLogin(os.Args[2:])
+			return
+		case "add":
+			cmdAdd(os.Args[2:])
+			return
+		}
+	}
+
 	hostName, _ := os.Hostname()
 	hub := flag.String("hub", "https://finchmcp.com", "finch hub base URL (http[s]://…)")
 	ticket := flag.String("ticket", "", "one-shot enrollment ticket from the dashboard (first run only; later runs resume from --state)")

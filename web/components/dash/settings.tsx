@@ -74,6 +74,56 @@ function HubDomain({ current, onClaim }: { current: string; onClaim: (slug: stri
   );
 }
 
+// CLI access: mint a token for `finch login`, so a box can enroll appliances
+// and build its finch.toml from the command line (no dashboard round-trips).
+function CliAccess() {
+  const [cmd, setCmd] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const [copied, setCopied] = useState(false);
+
+  async function generate() {
+    setBusy(true); setErr(''); setCmd('');
+    try {
+      const r = await fetch('/api/finch/cli-token', { method: 'POST' });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || 'could not mint token');
+      setCmd(`finch login --hub ${j.hub} ${j.token}`);
+    } catch (e: any) {
+      setErr(e.message || 'failed');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="cli-access">
+      <p className="set-hint dim" style={{ marginBottom: 12 }}>
+        Run one command on a box, then <code className="mono">finch add &lt;name&gt; --service &lt;url&gt;</code> to expose a local server — no tickets to copy.
+      </p>
+      {!cmd && (
+        <button type="button" className="btn btn-sm btn-amber" onClick={generate} disabled={busy}>
+          {busy ? 'generating…' : 'Generate CLI token'}
+        </button>
+      )}
+      {err && <div className="set-hint red" style={{ marginTop: 8 }}>{err}</div>}
+      {cmd && (
+        <div>
+          <div className="cli-cmd mono">
+            <span>{cmd.slice(0, 28)}…<span className="dim"> (token hidden)</span></span>
+            <button type="button" className="btn btn-sm btn-ghost" onClick={() => { navigator.clipboard.writeText(cmd); setCopied(true); setTimeout(() => setCopied(false), 1200); }}>
+              {copied ? 'copied ✓' : 'Copy'}
+            </button>
+          </div>
+          <div className="set-hint dim" style={{ marginTop: 8 }}>
+            Paste this on your box. It's a tenant credential valid ~90 days and shown only once — store it safely.
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function SetRow({ label, hint, children }: any) {
   return (
     <div className="set-row">
@@ -113,6 +163,11 @@ export function SettingsView({ settings, groups, onChange }: any) {
         <SetRow label="Hub domain" hint="the name clients use to reach your boxes">
           <HubDomain current={s.subdomain || ''} onClaim={(slug) => onChange('subdomain', slug)} />
         </SetRow>
+      </Card>
+
+      <Card className="set-card">
+        <SectionLabel>CLI access</SectionLabel>
+        <CliAccess />
       </Card>
 
       <Card className="set-card">

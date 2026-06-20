@@ -94,6 +94,29 @@ export async function handleApi(
     return handleRefresh(req, env, host);
   }
 
+  // ---- /api/cli/* — authed by a CLI token (a long-lived tenant assertion the
+  //      dashboard issues), presented as `Authorization: Bearer <token>`. NOT
+  //      service-secret-authed: the assertion is itself HMAC-signed with
+  //      FINCH_SERVICE_SECRET, so a valid one already proves tenant authorization
+  //      (same trust as X-Finch-Auth). This lets the `finch` CLI enroll
+  //      appliances from the box without the dashboard. ----
+  if (path.startsWith("/api/cli/")) {
+    const m = (req.headers.get("Authorization") || "").match(/^Bearer\s+(.+)$/i);
+    const cliTenant = m ? await verifyAssertion(m[1], env.FINCH_SERVICE_SECRET) : null;
+    if (!cliTenant) {
+      return json(401, { error: "missing, invalid, or expired CLI token (Authorization: Bearer …)" });
+    }
+    // GET /api/cli/whoami — validate a token + report the tenant it acts as.
+    if (path === "/api/cli/whoami" && method === "GET") {
+      return json(200, { ok: true, tenant: cliTenant });
+    }
+    // POST /api/cli/enroll {name,group} — enroll an appliance, return its ticket.
+    if (path === "/api/cli/enroll" && method === "POST") {
+      return handleEnroll(req, env, cliTenant, host);
+    }
+    return json(404, { error: "unknown CLI route", path });
+  }
+
   // ---- Everything else under /api requires the service secret + a SIGNED
   //      tenant assertion. The shared service secret proves "a first-party web
   //      worker is calling"; the assertion cryptographically binds WHICH tenant

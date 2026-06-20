@@ -23,6 +23,11 @@ function bytesToB64url(bytes: Uint8Array): string {
   return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
+/** Lifetime of a CLI token (seconds). SAME wire format as the per-call
+ *  assertion — just long-lived — so the `finch` CLI can hold it as a tenant
+ *  credential and present it as `Authorization: Bearer <token>` to /api/cli/*. */
+export const CLI_TOKEN_TTL_SECONDS = 90 * 24 * 60 * 60; // 90 days
+
 /** Sign a {tenant,exp} assertion with the shared service secret (HMAC-SHA256).
  *  `nowSeconds` is injectable for deterministic tests; defaults to wall clock. */
 export async function signAssertion(
@@ -30,7 +35,26 @@ export async function signAssertion(
   secret: string,
   nowSeconds: number = Math.floor(Date.now() / 1000),
 ): Promise<string> {
-  const payload = { tenant, exp: nowSeconds + ASSERTION_TTL_SECONDS };
+  return signWithTTL(tenant, secret, ASSERTION_TTL_SECONDS, nowSeconds);
+}
+
+/** Sign a long-lived CLI token (same envelope, longer TTL). */
+export async function signCliToken(
+  tenant: string,
+  secret: string,
+  nowSeconds: number = Math.floor(Date.now() / 1000),
+): Promise<{ token: string; expiresAt: number }> {
+  const expiresAt = nowSeconds + CLI_TOKEN_TTL_SECONDS;
+  return { token: await signWithTTL(tenant, secret, CLI_TOKEN_TTL_SECONDS, nowSeconds), expiresAt };
+}
+
+async function signWithTTL(
+  tenant: string,
+  secret: string,
+  ttlSeconds: number,
+  nowSeconds: number,
+): Promise<string> {
+  const payload = { tenant, exp: nowSeconds + ttlSeconds };
   const body = bytesToB64url(te.encode(JSON.stringify(payload)));
   const key = await crypto.subtle.importKey(
     "raw",
