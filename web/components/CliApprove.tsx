@@ -5,23 +5,21 @@
 // vector (an attacker starts the flow and sends a victim the link). Requiring a
 // typed code + showing exactly which account is being granted is the binding.
 import { useEffect, useRef, useState } from 'react';
-import { UserButton, useUser, useOrganization } from '@clerk/nextjs';
+import { UserButton, useUser } from '@clerk/nextjs';
 
 type Origin = { found: boolean; reqIp?: string; reqUa?: string; ageSeconds?: number } | null;
 
 export default function CliApprove() {
   const { user } = useUser();
-  const { organization } = useOrganization();
   const [code, setCode] = useState('');
   const [state, setState] = useState<'idle' | 'busy' | 'done' | 'error'>('idle');
   const [msg, setMsg] = useState('');
   const [origin, setOrigin] = useState<Origin>(null);   // initiator context for the typed code
   const seq = useRef(0);
 
-  // The account the minted token will act as (org if active, else personal).
-  const account = organization?.name
-    ? `${organization.name} (organization)`
-    : `${user?.primaryEmailAddress?.emailAddress || user?.username || 'your account'} (personal)`;
+  // The account the minted token will act as. Orgs are disabled during beta,
+  // so this is always the personal account.
+  const account = `${user?.primaryEmailAddress?.emailAddress || user?.username || 'your account'} (personal)`;
 
   // When a full code is typed, look up WHERE it was started so the user can tell
   // it's their own box (not an attacker-initiated code they were sent).
