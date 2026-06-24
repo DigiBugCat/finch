@@ -49,6 +49,13 @@ export interface Appliance {
   version: string;
   tags: string[];
   outdated: boolean;
+  // Access mode for the PUBLIC relay endpoint:
+  //   "key"    — callers must present a valid finch_ bearer (the default; MCP).
+  //   "public" — open, no key required (an ngrok-style public webpage). The
+  //              key-strip still runs, so a finch_ key is never forwarded to the
+  //              box even on a public appliance. Defaults to "key" on read for
+  //              legacy stored appliances that predate this field (fail-closed).
+  auth: "key" | "public";
   routes: string[];
   keys: string[];
   components: { name: string; state: "online" | "offline"; log: string }[];
@@ -224,4 +231,4 @@ export interface MintKeyResp {
   scope: KeyScope;
 }
 
-export const LATEST_AGENT = "1.4.0";
+export const LATEST_AGENT = "1.5.0";

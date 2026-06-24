@@ -300,4 +300,106 @@ describe("full-stack worker E2E — enroll → join → refresh → connect → 
 
     agent.close(1000, "e2e done");
   });
+
+  it("public appliance relays any path with NO finch_ key; flipping back to key re-gates it", async () => {
+    const machineName = `box-pub-${Date.now()}`;
+
+    // Enroll → join → connect → approve (same scaffolding as the happy path).
+    const enroll = (await (await api("POST", "/api/enroll", {
+      name: "Public Site",
+    })).json()) as { id: string; ticket: string };
+    const appliance = enroll.id;
+
+    const join = (await (await call(
+      new Request(`${BASE}/join`, {
+        method: "POST",
+        headers: { "content-type": "application/json", host: HOST },
+        body: JSON.stringify({
+          ticket: enroll.ticket,
+          machine: machineName,
+          os: "linux",
+          version: "1.4.0",
+        }),
+      }),
+    )).json()) as { connectToken: string };
+
+    const connectRes = await call(
+      new Request(
+        `${BASE}/${appliance}/${encodeURIComponent(machineName)}/_connect` +
+          `?ct=${encodeURIComponent(join.connectToken)}`,
+        { headers: { Upgrade: "websocket", host: HOST } },
+      ),
+    );
+    expect(connectRes.status).toBe(101);
+    const agent = connectRes.webSocket!;
+    agent.accept();
+    await waitForMachine(appliance, machineName, (m) => m.connected === true);
+    await api(
+      "POST",
+      `/api/appliances/${encodeURIComponent(appliance)}/approve`,
+    );
+    await waitForMachine(
+      appliance,
+      machineName,
+      (m) => m.connected === true && m.state !== "pending",
+    );
+
+    // Default appliance is key-gated: a no-key call still 401s.
+    const preFlip = await call(
+      new Request(`${BASE}/${appliance}/index.html`, { headers: { host: HOST } }),
+    );
+    expect(preFlip.status).toBe(401);
+
+    // Flip to PUBLIC via the BFF route.
+    const flip = await api(
+      "PUT",
+      `/api/appliances/${encodeURIComponent(appliance)}/auth`,
+      { mode: "public" },
+    );
+    expect(flip.status).toBe(200);
+
+    // GET /<app>/index.html with NO Authorization header — a public webpage. The
+    // agent should see the relayed request at path "/index.html" (NOT /mcp, and
+    // not load-balanced away), and the response streams back 200.
+    const reqSeen = nextFrame(agent);
+    const relayPromise = call(
+      new Request(`${BASE}/${appliance}/index.html`, {
+        method: "GET",
+        headers: { host: HOST },
+      }),
+    );
+    const reqFrame = await reqSeen;
+    expect(reqFrame.type).toBe("req");
+    expect(reqFrame.method).toBe("GET");
+    expect(reqFrame.path).toBe("/index.html"); // any path forwards, not just /mcp
+    const id: string = reqFrame.id;
+    agent.send(
+      JSON.stringify({
+        id,
+        type: "head",
+        status: 200,
+        headers: [["content-type", "text/html"]],
+      }),
+    );
+    agent.send(JSON.stringify({ id, type: "chunk", data: btoa("<h1>hi</h1>") }));
+    agent.send(JSON.stringify({ id, type: "end" }));
+    const relayRes = await relayPromise;
+    expect(relayRes.status).toBe(200);
+    expect(relayRes.headers.get("content-type")).toBe("text/html");
+    expect(await relayRes.text()).toBe("<h1>hi</h1>");
+
+    // Flip back to KEY — the same no-key call is re-gated to 401.
+    const unflip = await api(
+      "PUT",
+      `/api/appliances/${encodeURIComponent(appliance)}/auth`,
+      { mode: "key" },
+    );
+    expect(unflip.status).toBe(200);
+    const reGated = await call(
+      new Request(`${BASE}/${appliance}/index.html`, { headers: { host: HOST } }),
+    );
+    expect(reGated.status).toBe(401);
+
+    agent.close(1000, "public e2e done");
+  });
 });

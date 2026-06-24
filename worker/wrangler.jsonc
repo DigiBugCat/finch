@@ -198,5 +198,14 @@
   // Secrets per env (never `secret bulk .dev.vars`):
   //   wrangler secret put FINCH_SERVICE_SECRET --env production
   //   wrangler secret put TICKET_SECRET        --env production
+  //   wrangler secret put SESSION_SECRET       --env production
+  // SESSION_SECRET is the SEPARATE login-wall session-cookie signer (kind:"session")
+  // — keep it distinct from TICKET_SECRET so a leaked session signer can't forge a
+  // join/connect/portal grant. Set it for BOTH staging and production:
+  //   wrangler secret put SESSION_SECRET --env staging
+  //   wrangler secret put SESSION_SECRET --env production
+  // WEB_URL (the login-wall 302 target) is already a var for staging + production
+  // above; dev relies on the same fallback. In dev, add SESSION_SECRET to
+  // .dev.vars alongside FINCH_SERVICE_SECRET/TICKET_SECRET.
   // Deploy: wrangler deploy --env production  (or --env dev)
 }

@@ -12,8 +12,14 @@
   "vars": {
     "FINCH_SERVICE_SECRET": "test-service-secret",
     "TICKET_SECRET": "test-ticket-secret",
+    // SEPARATE login-wall session signer (kind:"session" cookies). Distinct from
+    // TICKET_SECRET so the tests exercise the real two-secret split.
+    "SESSION_SECRET": "test-session-secret",
     "DEFAULT_TENANT": "dev-tenant",
-    "DEV": "1"
+    "DEV": "1",
+    // The login wall 302s here; a stable test value lets the e2e assert the
+    // Location host without depending on prod config.
+    "WEB_URL": "https://web.test"
   },
   "durable_objects": {
     "bindings": [
