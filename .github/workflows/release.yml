@@ -1,7 +1,8 @@
 name: release
 
 # Cut a release by pushing a tag:  git tag v1.4.0 && git push origin v1.4.0
-# GoReleaser cross-compiles the agent (darwin/linux × amd64/arm64) and uploads
+# GoReleaser cross-compiles the agent (darwin/linux × amd64/arm64, plus linux
+# armv6/armv7 for 32-bit Raspberry Pis) and uploads
 # raw `finch-<os>-<arch>` binaries + a checksums.txt to the GitHub Release, which
 # is what the installer one-liner and the worker /releases redirect fetch.
 on:

@@ -1,8 +1,9 @@
 # GoReleaser config for the finch agent.
 #
 # The agent is a Go module under agent/ (not the repo root), so the build runs
-# with `dir: agent`. On a tag push the release workflow cross-compiles all four
-# targets and uploads RAW binaries named exactly `finch-<os>-<arch>` to GitHub
+# with `dir: agent`. On a tag push the release workflow cross-compiles every
+# target (darwin/linux × amd64/arm64, plus linux armv6/armv7 for 32-bit Pis) and
+# uploads RAW binaries named exactly `finch-<os>-<arch>` to GitHub
 # Releases — which is what the installer (`$HUB/releases/finch-${os}-${arch}`)
 # and the worker /releases redirect resolve to.
 #
@@ -25,6 +26,16 @@ builds:
     goarch:
       - amd64
       - arm64
+      - arm
+    # 32-bit ARM variants: armv6 covers the Pi Zero / Pi 1 (uname -m = armv6l),
+    # armv7 covers the Pi 2 / Pi 3 in 32-bit mode (armv7l). 64-bit Pis use arm64.
+    goarm:
+      - "6"
+      - "7"
+    ignore:
+      # No 32-bit ARM macOS target exists.
+      - goos: darwin
+        goarch: arm
     ldflags:
       - -s -w -X main.agentVersion={{ .Version }}
 
@@ -33,7 +44,10 @@ archives:
   # URL and the worker /releases redirect download a runnable binary directly.
   - id: raw
     format: binary
-    name_template: "finch-{{ .Os }}-{{ .Arch }}"
+    # `.Arm` is set only for goarch=arm (6/7), so 32-bit builds become
+    # finch-linux-armv6 / finch-linux-armv7 while amd64/arm64 keep their plain
+    # finch-<os>-<arch> names. The installer maps uname -m (armv6l/armv7l) to these.
+    name_template: "finch-{{ .Os }}-{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}"
 
 checksum:
   name_template: "checksums.txt"
