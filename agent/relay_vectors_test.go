@@ -341,10 +341,12 @@ func TestForward_PreHeadDialFail(t *testing.T) {
 	}
 }
 
-// TestForward_SSRFRejectPreHead asserts an SSRF-rejected path produces a pre-head
-// `err` with status 403 and never touches the network.
+// TestForward_SSRFRejectPreHead asserts a path that escapes a NARROWED service
+// base produces a pre-head `err` with status 403 and never touches the network.
+// (With no base path the whole service is intentionally exposed; a base path like
+// /mcp re-narrows, and escaping it is what gets rejected.)
 func TestForward_SSRFRejectPreHead(t *testing.T) {
-	upstream := mustParse(t, "http://127.0.0.1:8000")
+	upstream := mustParse(t, "http://127.0.0.1:8000/mcp")
 	cw := &collectingWriter{}
 	forward(context.Background(), upstream, frame{ID: "fwd-3", Type: "req", Method: "GET", Path: "/admin"}, cw.write, nil)
 

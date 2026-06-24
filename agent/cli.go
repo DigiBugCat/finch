@@ -1,12 +1,12 @@
 package main
 
 // finch CLI setup commands — `finch login` and `finch add`. Together they let a
-// box enroll appliances and build its finch.toml without ever touching the
+// box enroll appliances and build its finch.yml without ever touching the
 // dashboard (cloudflared's `tunnel login` + `tunnel create`):
 //
 //	finch login <token>                         # paste the CLI token from the dashboard
-//	finch add printer --service http://:8000     # enroll + append an [[ingress]] rule
-//	finch run                                    # serve everything in finch.toml
+//	finch add printer --service http://:8000     # enroll + append an ingress rule
+//	finch run                                    # serve everything in finch.yml
 //
 // The CLI token is a long-lived tenant assertion the dashboard issues; the box
 // presents it as `Authorization: Bearer <token>` to /api/cli/*.
@@ -25,6 +25,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 // printGuide is `finch guide` — a complete, self-contained operating manual an
@@ -34,24 +36,33 @@ import (
 func printGuide() {
 	fmt.Print(`# Using finch (agent guide)
 
-finch publishes a LOCAL MCP server on the public internet — authenticated, with
-NO open ports. The box dials OUT to the finch hub; clients reach it at a stable
-https://<your-slug>.finchmcp.com/<name>/mcp URL. You (an agent) drive everything
-from this CLI. Every command is non-interactive and supports --json.
+finch publishes a LOCAL service on the public internet — authenticated, with NO
+open ports. The box dials OUT to the finch hub; clients reach it at a stable
+https://<your-slug>.finchmcp.com/<app_path>/ URL. finch is a protocol-agnostic
+tunnel: the service can be an MCP server, a website, or any HTTP/WebSocket app.
+You (an agent) drive everything from this CLI. Every command is non-interactive
+and supports --json.
 
 ## The only human step
 'finch login' needs a human ONCE (it opens a browser to approve a short code).
 After that you operate freely. Already logged in? Check:  finch status --json
 
-## Host an MCP server (the core loop)
-1. Make sure your MCP server is running locally over HTTP, e.g. http://127.0.0.1:8000
-   (any Streamable-HTTP MCP server — FastMCP, etc. Service MUST be an http(s) URL.)
-2. Expose it:        finch add printer --service http://127.0.0.1:8000 --name "Printer" --json
+## Host a service (the core loop)
+1. Make sure your service is running locally over HTTP, e.g. http://127.0.0.1:8000
+   (an MCP server, a web app, any HTTP/WS app. Service MUST be an http(s) URL.)
+2. Expose it:        finch add printer --service http://127.0.0.1:8000 --json
 3. Serve it:         finch run
-   -> prints the public URL, e.g. https://<slug>.finchmcp.com/printer/mcp
-'finch add' writes/extends finch.toml; 'finch run' serves EVERY rule in it (add
+   -> prints the public URL, e.g. https://<slug>.finchmcp.com/printer/
+      (an MCP server answers at https://<slug>.finchmcp.com/printer/mcp)
+'finch add' writes/extends finch.yml; 'finch run' serves EVERY rule in it (add
 more services with more 'finch add' calls — one process fronts them all, and it
 auto-approves while you are logged in).
+
+## Enroll on another box (no CLI login there)
+Mint a ticket in the dashboard (Add device), then on the box:
+  finch enroll printer --ticket <ticket>     # writes the credential, one time
+  finch run                                  # resumes ticketless thereafter
+Tickets are one-shot credentials — they live on disk via enroll, NEVER in finch.yml.
 
 ## Test an endpoint
   finch test printer                          # list the appliance's MCP tools
@@ -73,22 +84,21 @@ From a box that is already logged in:
 needed for your FIRST box.
 
 ## Inspect state
-  finch status --json     # am I logged in (which tenant)? what does finch.toml serve?
+  finch status --json     # am I logged in (which tenant)? what does finch.yml serve?
   finch fleet --json      # every appliance + its state (chirping/resting/pending)
 
-## finch.toml (what 'finch add' writes)
-  hub     = "https://finchmcp.com"
-  machine = "this-box"
-  [[ingress]]
-  name    = "Printer"
-  path    = "printer"                  # becomes <slug>.finchmcp.com/printer/mcp
-  service = "http://127.0.0.1:8000"
+## finch.yml (what 'finch add' writes — holds NO secrets)
+  hub: https://finchmcp.com
+  machine: this-box
+  ingress:
+    - app_path: printer                # becomes <slug>.finchmcp.com/printer/
+      service: http://127.0.0.1:8000
 
 ## Good to know
 - --json works on add / token / status / fleet / keys / test / call for parsing.
 - The CLI token is a tenant-admin credential (~30 days). Revoke everything with:
     finch revoke-tokens   (or the dashboard -> Settings -> CLI access)
-- 'finch rm <appliance>' removes an appliance; 'finch approve <path>' is only
+- 'finch rm <appliance>' removes an appliance; 'finch approve <app_path>' is only
   needed if you are not logged in (otherwise 'finch run' approves automatically).
 - See 'finch help' for the flag-level reference.
 `)
@@ -97,17 +107,18 @@ needed for your FIRST box.
 // printUsage is the top-level `finch help` — an overview of the subcommands.
 // (Go's flag package only prints per-flag usage; this ties it together.)
 func printUsage() {
-	fmt.Print(`finch — publish local MCP servers through the finch hub. Your box dials OUT,
-so nothing listens and no ports are opened.
+	fmt.Print(`finch — publish local services (MCP servers, web apps, any HTTP/WS) through the
+finch hub. Your box dials OUT, so nothing listens and no ports are opened.
 
 Usage:
   finch login [--hub URL]              Log in (opens the browser to approve a code)
-  finch add <path> --service <url>     Enroll an appliance and append it to finch.toml
-                    [--name "App"]        <path> becomes the URL: <slug>.finchmcp.com/<path>/mcp
-  finch run [--config finch.toml]      Serve every [[ingress]] rule (auto-approves when logged in)
-  finch approve <path>                 Approve an appliance (clear the pending gate)
+  finch add <app_path> --service <url> Enroll an appliance and append it to finch.yml
+                                          <app_path> becomes the URL: <slug>.finchmcp.com/<app_path>/
+  finch enroll <app_path> --ticket <t> Save a box-side credential from a dashboard ticket (one time)
+  finch run [--config finch.yml]       Serve every ingress rule (auto-approves when logged in)
+  finch approve <app_path>             Approve an appliance (clear the pending gate)
   finch token [--json|--login]         Mint a fresh CLI token (provision a new box, no browser)
-  finch status [--json]                Show login + what finch.toml serves
+  finch status [--json]                Show login + what finch.yml serves
   finch fleet [--json]   (alias: ls)   List this account's appliances + state
   finch test <appliance>               List an appliance's MCP tools (does-it-work check)
   finch call <appliance> <tool> [--args '{...}']   Invoke one tool through the hub
@@ -123,7 +134,7 @@ follow, or just tell it: "use finch — run 'finch guide' first."
 
 Typical first-time setup:
   finch login --hub https://finchmcp.com   # browser approval, once
-  finch add printer --service http://127.0.0.1:8000 --name "Label Printer"
+  finch add printer --service http://127.0.0.1:8000
   finch run
 
 Automation / driving finch from an agent (after the one-time 'finch login'):
@@ -132,12 +143,12 @@ Automation / driving finch from an agent (after the one-time 'finch login'):
   whole loop: introspect, serve, test, and grant/revoke access.
 
   Introspect:
-    finch status --json            # am I logged in? what does finch.toml serve?
+    finch status --json            # am I logged in? what does finch.yml serve?
     finch fleet --json             # every appliance + its state
 
-  Serve a local MCP server:
+  Serve a local service:
     finch add scraper --service http://127.0.0.1:8001 --json
-    finch run                      # serves all finch.toml rules, auto-approves
+    finch run                      # serves all finch.yml rules, auto-approves
 
   Test an endpoint:
     finch test scraper             # list its MCP tools
@@ -267,6 +278,31 @@ func cmdApprove(args []string) {
 		}
 		fmt.Printf("finch: approved %q\n", id)
 	}
+}
+
+// cliSetAuth flips an appliance's public-relay access mode ("key" | "public").
+func cliSetAuth(cred *cliCred, appPath, mode string) error {
+	_, err := cliRequest("POST", cred.Hub, "/api/cli/auth", cred.Token, map[string]string{"appliance": appPath, "mode": mode})
+	return err
+}
+
+// cmdAuth: finch auth <app_path> public|key — set whether the appliance's public
+// endpoint requires a finch_ bearer key. "public" makes it an open webpage.
+func cmdAuth(args []string) {
+	if len(args) != 2 || (args[1] != "public" && args[1] != "key") {
+		fmt.Fprintln(os.Stderr, "usage: finch auth <app_path> public|key")
+		os.Exit(2)
+	}
+	cred, err := loadCliCred()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
+		os.Exit(1)
+	}
+	if err := cliSetAuth(cred, args[0], args[1]); err != nil {
+		fmt.Fprintf(os.Stderr, "finch: set auth %q failed: %v\n", args[0], err)
+		os.Exit(1)
+	}
+	fmt.Printf("finch: %q is now %s\n", args[0], args[1])
 }
 
 // cmdLogin: finch login [--hub URL] <token>
@@ -627,7 +663,8 @@ func cmdRevokeTokens(args []string) {
 
 // cmdToken: finch token [--json] [--login] — an authed box mints a FRESH CLI
 // token, for non-interactive provisioning of a new box:
-//   ssh newbox "finch login --token $(finch token)"
+//
+//	ssh newbox "finch login --token $(finch token)"
 func cmdToken(args []string) {
 	fs := flag.NewFlagSet("token", flag.ExitOnError)
 	asJSON := fs.Bool("json", false, "print the raw {token,hub,expiresAt} JSON")
@@ -661,16 +698,15 @@ func cmdToken(args []string) {
 	}
 }
 
-// cmdStatus: finch status [--json] — introspect login + finch.toml (for agents).
+// cmdStatus: finch status [--json] — introspect login + finch.yml (for agents).
 func cmdStatus(args []string) {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
 	asJSON := fs.Bool("json", false, "machine-readable JSON")
-	configPath := fs.String("config", "finch.toml", "finch.toml to summarize")
+	configPath := fs.String("config", "finch.yml", "finch.yml to summarize")
 	_ = fs.Parse(args)
 
 	type ingressStatus struct {
-		Name    string `json:"name,omitempty"`
-		Path    string `json:"path"`
+		AppPath string `json:"app_path"`
 		Service string `json:"service"`
 	}
 	st := struct {
@@ -695,7 +731,7 @@ func cmdStatus(args []string) {
 			st.Hub = cfg.Hub
 		}
 		for _, ing := range cfg.Ingress {
-			st.Ingress = append(st.Ingress, ingressStatus{Name: ing.Name, Path: ing.Path, Service: ing.Service})
+			st.Ingress = append(st.Ingress, ingressStatus{AppPath: ing.AppPath, Service: ing.Service})
 		}
 	}
 
@@ -717,26 +753,25 @@ func cmdStatus(args []string) {
 	if st.Config != "" {
 		fmt.Printf("%s serves %d rule(s):\n", st.Config, len(st.Ingress))
 		for _, ing := range st.Ingress {
-			n := ing.Name
-			if n == "" {
-				n = ing.Path
-			}
-			fmt.Printf("  • %-16s %s → %s\n", ing.Path, n, ing.Service)
+			fmt.Printf("  • %-16s → %s\n", ing.AppPath, ing.Service)
 		}
 	} else {
-		fmt.Println("no finch.toml here — `finch add <path> --service <url>` to create one")
+		fmt.Println("no finch.yml here — `finch add <app_path> --service <url>` to create one")
 	}
 }
 
-// cmdAdd: finch add <path> --service <url> [--name "..."] [--config finch.toml]
+// cmdAdd: finch add <app_path> --service <url> [--config finch.yml]
+//
+// One-shot convenience for a logged-in box: it enrolls the appliance via the CLI
+// token, saves the box-side refresh credential (so `finch run` resumes without a
+// ticket), and appends a ticketless ingress rule to finch.yml.
 func cmdAdd(args []string) {
 	fs := flag.NewFlagSet("add", flag.ExitOnError)
-	service := fs.String("service", "", "local MCP server URL to expose (required), e.g. http://127.0.0.1:8000")
-	name := fs.String("name", "", "friendly application name (defaults to <path>)")
-	configPath := fs.String("config", "finch.toml", "finch.toml to append the ingress rule to")
+	service := fs.String("service", "", "local server URL to expose (required), e.g. http://127.0.0.1:8000")
+	configPath := fs.String("config", "finch.yml", "finch.yml to append the ingress rule to")
 	asJSON := fs.Bool("json", false, "print the result as JSON (for scripts/agents)")
 
-	// Go's flag parser stops at the first positional, so pull a leading <path>
+	// Go's flag parser stops at the first positional, so pull a leading <app_path>
 	// (the natural `finch add printer --service …` order) before parsing flags.
 	wantPath := ""
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
@@ -749,12 +784,12 @@ func cmdAdd(args []string) {
 	}
 
 	if wantPath == "" || *service == "" {
-		fmt.Fprintln(os.Stderr, "usage: finch add <path> --service <url> [--name \"App Name\"]")
-		fmt.Fprintln(os.Stderr, "  <path> becomes the public URL segment: https://<your-slug>.finchmcp.com/<path>/mcp")
+		fmt.Fprintln(os.Stderr, "usage: finch add <app_path> --service <url>")
+		fmt.Fprintln(os.Stderr, "  <app_path> becomes the public URL segment: https://<your-slug>.finchmcp.com/<app_path>/")
 		os.Exit(2)
 	}
 	if strings.ContainsAny(wantPath, "/ ") {
-		fmt.Fprintf(os.Stderr, "finch: <path> %q must be a single URL segment (no slashes or spaces)\n", wantPath)
+		fmt.Fprintf(os.Stderr, "finch: <app_path> %q must be a single URL segment (no slashes or spaces)\n", wantPath)
 		os.Exit(2)
 	}
 	if u, err := url.Parse(strings.TrimRight(*service, "/")); err != nil || u.Scheme == "" || u.Host == "" {
@@ -769,7 +804,7 @@ func cmdAdd(args []string) {
 	}
 
 	// Enroll the appliance via the CLI token. The hub slugifies the name into the
-	// real appliance id; use THAT as the path so the URL matches.
+	// real appliance id; use THAT as the app_path so the URL matches.
 	out, err := cliRequest("POST", cred.Hub, "/api/cli/enroll", cred.Token, map[string]string{"name": wantPath})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "finch: enroll failed: %v\n", err)
@@ -786,42 +821,115 @@ func cmdAdd(args []string) {
 		fmt.Printf("finch: note: %q was registered as %q (host-safe slug)\n", wantPath, id)
 	}
 
-	appName := *name
-	if appName == "" {
-		appName = wantPath
+	// Trade the ticket for a saved box-side credential now (so the ticket never
+	// lands in the manifest), then append a ticketless ingress rule.
+	host, _ := os.Hostname()
+	statePath := filepath.Join(defaultCredentialsDir(), id+".json")
+	if _, eerr := enrollToState(cred.Hub, host, ticket, statePath); eerr != nil {
+		fmt.Fprintf(os.Stderr, "finch: enroll failed: %v\n", eerr)
+		os.Exit(1)
 	}
-	if err := appendIngress(*configPath, cred.Hub, appName, id, *service, ticket); err != nil {
+	if err := appendIngress(*configPath, cred.Hub, id, *service); err != nil {
 		fmt.Fprintf(os.Stderr, "finch: could not write %s: %v\n", *configPath, err)
 		os.Exit(1)
 	}
 	if *asJSON {
-		b, _ := json.Marshal(map[string]string{"path": id, "name": appName, "service": *service, "url": pubURL, "config": *configPath})
+		b, _ := json.Marshal(map[string]string{"app_path": id, "service": *service, "url": pubURL, "config": *configPath})
 		fmt.Println(string(b))
 		return
 	}
-	fmt.Printf("finch: added %q → %s\n", appName, *service)
+	fmt.Printf("finch: added %q → %s\n", id, *service)
 	if pubURL != "" {
 		fmt.Printf("       public endpoint: %s\n", pubURL)
 	}
 	fmt.Printf("       wrote rule to %s — run `finch run` to serve it\n", *configPath)
 }
 
-// appendIngress appends an [[ingress]] block to a finch.toml, creating the file
-// with a hub/machine header first if it doesn't exist yet.
-func appendIngress(configPath, hub, name, path, service, ticket string) error {
-	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		host, _ := os.Hostname()
-		header := fmt.Sprintf("# finch.toml — generated by `finch add`\nhub     = %q\nmachine = %q\n", hub, host)
-		if err := os.WriteFile(configPath, []byte(header), 0o600); err != nil {
-			return err
+// cmdEnroll: finch enroll <app_path> --ticket <t> [--hub …] [--machine …] [--credentials-dir …]
+//
+// The one-time, imperative enrollment step: it trades a one-shot dashboard ticket
+// for the long-lived box-side refresh credential and writes it to
+// <credentials-dir>/<app_path>.json. After this, `finch run` resumes ticketless.
+// Tickets are a credential, so they live here / on disk — never in finch.yml.
+func cmdEnroll(args []string) {
+	fs := flag.NewFlagSet("enroll", flag.ExitOnError)
+	ticket := fs.String("ticket", "", "one-shot enrollment ticket from the dashboard (required)")
+	hub := fs.String("hub", "https://finchmcp.com", "finch hub base URL")
+	host, _ := os.Hostname()
+	machine := fs.String("machine", host, "this box's name")
+	credDir := fs.String("credentials-dir", defaultCredentialsDir(), "directory the saved credential is written to")
+
+	appPath := ""
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		appPath = args[0]
+		args = args[1:]
+	}
+	_ = fs.Parse(args)
+	if appPath == "" && fs.NArg() > 0 {
+		appPath = fs.Arg(0)
+	}
+	if appPath == "" || *ticket == "" {
+		fmt.Fprintln(os.Stderr, "usage: finch enroll <app_path> --ticket <t>")
+		fmt.Fprintln(os.Stderr, "  mint the ticket in the dashboard (Add device); <app_path> is the appliance/URL segment")
+		os.Exit(2)
+	}
+	if strings.ContainsAny(appPath, "/ ") {
+		fmt.Fprintf(os.Stderr, "finch: <app_path> %q must be a single URL segment (no slashes or spaces)\n", appPath)
+		os.Exit(2)
+	}
+	statePath := filepath.Join(expandHome(*credDir), appPath+".json")
+	if _, err := enrollToState(*hub, *machine, *ticket, statePath); err != nil {
+		fmt.Fprintf(os.Stderr, "finch: enroll failed: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("finch: enrolled %q — credential saved to %s\n", appPath, statePath)
+	fmt.Printf("       add it to finch.yml and run `finch run`:\n")
+	fmt.Printf("         ingress:\n           - app_path: %s\n             service: http://127.0.0.1:8000\n", appPath)
+}
+
+// defaultCredentialsDir mirrors loadConfig's default: ~/.finch (cwd-relative
+// .finch if there's no home dir), so `finch add`/`finch enroll` write the
+// credential where `finch run` will look for it.
+func defaultCredentialsDir() string {
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return filepath.Join(home, ".finch")
+	}
+	return ".finch"
+}
+
+// appendIngress adds a YAML ingress rule to a finch.yml, parsing-then-remarshaling
+// so the result is always valid (an existing rule with the same app_path is
+// replaced). No ticket is written — the box-side credential is saved separately
+// by enroll. Creates the file with a hub/machine header if it doesn't exist.
+func appendIngress(configPath, hub, appPath, service string) error {
+	var c config
+	if b, err := os.ReadFile(configPath); err == nil {
+		if uerr := yaml.Unmarshal(b, &c); uerr != nil {
+			return fmt.Errorf("parsing %s: %w", configPath, uerr)
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if c.Hub == "" {
+		c.Hub = hub
+	}
+	if c.Machine == "" {
+		c.Machine, _ = os.Hostname()
+	}
+	replaced := false
+	for i := range c.Ingress {
+		if c.Ingress[i].AppPath == appPath {
+			c.Ingress[i].Service = service
+			replaced = true
+			break
 		}
 	}
-	f, err := os.OpenFile(configPath, os.O_APPEND|os.O_WRONLY, 0o600)
+	if !replaced {
+		c.Ingress = append(c.Ingress, ingress{AppPath: appPath, Service: service})
+	}
+	out, err := yaml.Marshal(&c)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	block := fmt.Sprintf("\n[[ingress]]\nname    = %q\npath    = %q\nservice = %q\nticket  = %q\n", name, path, service, ticket)
-	_, err = f.WriteString(block)
-	return err
+	return os.WriteFile(configPath, append([]byte("# finch.yml — managed by `finch add`\n"), out...), 0o600)
 }

@@ -6,9 +6,9 @@ import (
 	"testing"
 )
 
-func writeTOML(t *testing.T, body string) string {
+func writeYAML(t *testing.T, body string) string {
 	t.Helper()
-	p := filepath.Join(t.TempDir(), "finch.toml")
+	p := filepath.Join(t.TempDir(), "finch.yml")
 	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -16,19 +16,15 @@ func writeTOML(t *testing.T, body string) string {
 }
 
 func TestLoadConfig_OK(t *testing.T) {
-	p := writeTOML(t, `
-hub     = "https://hub.example.com"
-machine = "box1"
-state   = "/var/finch"
-
-[[ingress]]
-path    = "printer"
-service = "http://127.0.0.1:8001"
-ticket  = "tkt-p"
-
-[[ingress]]
-path    = "transcribe"
-service = "http://127.0.0.1:8002"
+	p := writeYAML(t, `
+hub: https://hub.example.com
+machine: box1
+credentials-dir: /var/finch
+ingress:
+  - app_path: printer
+    service: http://127.0.0.1:8001
+  - app_path: transcribe
+    service: http://127.0.0.1:8002
 `)
 	c, err := loadConfig(p, "fallback-host")
 	if err != nil {
@@ -40,7 +36,7 @@ service = "http://127.0.0.1:8002"
 	if len(c.Ingress) != 2 {
 		t.Fatalf("want 2 ingress, got %d", len(c.Ingress))
 	}
-	if c.Ingress[0].Path != "printer" || c.Ingress[0].Service != "http://127.0.0.1:8001" || c.Ingress[0].Ticket != "tkt-p" {
+	if c.Ingress[0].AppPath != "printer" || c.Ingress[0].Service != "http://127.0.0.1:8001" {
 		t.Fatalf("ingress[0] mismatch: %+v", c.Ingress[0])
 	}
 	if got := c.statePathFor("printer"); got != filepath.Join("/var/finch", "printer.json") {
@@ -49,10 +45,10 @@ service = "http://127.0.0.1:8002"
 }
 
 func TestLoadConfig_Defaults(t *testing.T) {
-	p := writeTOML(t, `
-[[ingress]]
-path    = "a"
-service = "http://127.0.0.1:8000"
+	p := writeYAML(t, `
+ingress:
+  - app_path: a
+    service: http://127.0.0.1:8000
 `)
 	c, err := loadConfig(p, "fallback-host")
 	if err != nil {
@@ -68,14 +64,15 @@ service = "http://127.0.0.1:8000"
 
 func TestLoadConfig_Rejects(t *testing.T) {
 	cases := map[string]string{
-		"missing service": "[[ingress]]\npath = \"a\"\n",
-		"missing path":    "[[ingress]]\nservice = \"http://x\"\n",
-		"slash in path":   "[[ingress]]\npath = \"a/b\"\nservice = \"http://x\"\n",
-		"duplicate path":  "[[ingress]]\npath=\"a\"\nservice=\"http://x\"\n[[ingress]]\npath=\"a\"\nservice=\"http://y\"\n",
+		"missing service":   "ingress:\n  - app_path: a\n",
+		"missing app_path":  "ingress:\n  - service: http://x\n",
+		"slash in app_path": "ingress:\n  - app_path: a/b\n    service: http://x\n",
+		"duplicate app_path": "ingress:\n  - app_path: a\n    service: http://x\n" +
+			"  - app_path: a\n    service: http://y\n",
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
-			if _, err := loadConfig(writeTOML(t, body), "h"); err == nil {
+			if _, err := loadConfig(writeYAML(t, body), "h"); err == nil {
 				t.Fatalf("expected rejection for %s", name)
 			}
 		})

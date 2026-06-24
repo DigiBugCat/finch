@@ -1,0 +1,27 @@
+# finch.yml — a box's manifest (cloudflared-style).
+#
+# One `finch run` reads this and serves every ingress rule from a single process:
+# each rule forwards a local service out to the hub (no open ports). finch is a
+# protocol-agnostic tunnel — point a rule at an MCP server, a website, or any
+# HTTP/WebSocket app. Copy to `finch.yml` and run `finch run`.
+#
+# This file holds NO secrets. Enroll each app once (writes a credential to
+# credentials-dir), then it resumes ticketless on every run:
+#
+#   finch enroll printer --ticket <ticket-from-dashboard>
+#   finch run
+
+hub: https://finchmcp.com        # the finch hub (default; omit for prod)
+machine: mac-mini                # this box's name (default: hostname)
+credentials-dir: ~/.finch        # where `finch enroll` writes per-app credentials
+
+# Each rule forwards one local service:
+#   app_path — the public URL segment AND the appliance you enrolled.
+#              Public URL: https://<your-slug>.finchmcp.com/<app_path>/…
+#   service  — the local server finch forwards the whole /<app_path>/* subtree to.
+#              Add a base path (…:8000/mcp) to expose only that subtree.
+ingress:
+  - app_path: printer
+    service: http://127.0.0.1:8000
+  - app_path: www
+    service: http://127.0.0.1:3000

@@ -17,9 +17,12 @@ func mustParse(t *testing.T, raw string) *url.URL {
 	return u
 }
 
-// resolveUpstream is the SSRF guard: the hub-supplied path must never escape the
-// --upstream base or climb out of the gated /mcp route. This is the highest-risk
-// code in the binary, so we pin the full attack matrix.
+// resolveUpstream is the SSRF guard: host/scheme must come only from the trusted
+// service base, never from the frame. With NO base path the whole service subtree
+// is intentionally exposed (finch is a protocol-agnostic tunnel, not MCP-only), so
+// a cleaned sibling path is allowed; a base path re-narrows (see _BasePath). The
+// host-injection defenses always hold. This is the highest-risk code, so we pin
+// the full attack matrix.
 func TestResolveUpstream(t *testing.T) {
 	base := mustParse(t, "http://127.0.0.1:8000")
 	cases := []struct {
@@ -27,15 +30,17 @@ func TestResolveUpstream(t *testing.T) {
 		want    string // "" means: expect an error (rejected)
 		comment string
 	}{
-		{"/mcp", "http://127.0.0.1:8000/mcp", "canonical route"},
-		{"/mcp/tools", "http://127.0.0.1:8000/mcp/tools", "child of the route"},
+		{"/mcp", "http://127.0.0.1:8000/mcp", "the MCP endpoint still works"},
+		{"/mcp/tools", "http://127.0.0.1:8000/mcp/tools", "child path"},
 		{"/mcp?x=1", "http://127.0.0.1:8000/mcp?x=1", "query preserved"},
-		{"/mcp/../admin", "", "traversal out of /mcp -> reject"},
-		{"/admin", "", "sibling route -> reject"},
+		{"/", "http://127.0.0.1:8000/", "site root (a webpage) forwards"},
+		{"/index.html", "http://127.0.0.1:8000/index.html", "arbitrary asset forwards"},
+		{"/mcp/../admin", "http://127.0.0.1:8000/admin", "no base path => whole service exposed, sibling allowed"},
+		{"/admin", "http://127.0.0.1:8000/admin", "no base path => sibling allowed"},
 		{"//evil.com/x", "", "protocol-relative host injection -> reject"},
 		{"http://evil.com/x", "", "absolute-URL injection -> reject"},
-		{"/mcp/../mcp/ok", "http://127.0.0.1:8000/mcp/ok", "traversal that stays under /mcp is fine"},
-		{"", "", "empty path -> reject (not the /mcp route)"},
+		{"/mcp/../mcp/ok", "http://127.0.0.1:8000/mcp/ok", "traversal collapses, host unchanged"},
+		{"", "http://127.0.0.1:8000/", "empty path -> root"},
 	}
 	for _, c := range cases {
 		got, err := resolveUpstream(base, c.path)
