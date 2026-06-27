@@ -46,15 +46,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/BurntSushi/toml"
 	"github.com/coder/websocket"
+	"gopkg.in/yaml.v3"
 )
 
 // agentVersion is the canonical default. Release builds may stamp it via
 // `-ldflags "-X main.agentVersion=<v>"`; the literal here is the source of
 // truth that CI (scripts/check-versions.mjs) asserts matches the worker's
 // LATEST_AGENT and the web dashboard constant. Keep all three in sync.
-var agentVersion = "1.4.0"
+var agentVersion = "1.5.1"
 
 // connectSkew is how long before a connect-token's exp we treat it as already
 // expired and force a fresh /join, so we never dial with a token that lapses
@@ -215,7 +215,7 @@ type joinResp struct {
 
 func main() {
 	// Setup subcommands (cloudflared-style): `finch login` saves a CLI token,
-	// `finch add` enrolls an appliance + appends an [[ingress]] rule. These run
+	// `finch add` enrolls an appliance + appends an ingress rule. These run
 	// and exit; `join`/`run`/bare fall through to the relay agent below.
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
@@ -225,8 +225,14 @@ func main() {
 		case "add":
 			cmdAdd(os.Args[2:])
 			return
+		case "enroll":
+			cmdEnroll(os.Args[2:])
+			return
 		case "approve":
 			cmdApprove(os.Args[2:])
+			return
+		case "auth":
+			cmdAuth(os.Args[2:])
 			return
 		case "token":
 			cmdToken(os.Args[2:])
@@ -267,22 +273,34 @@ func main() {
 	machine := flag.String("machine", hostName, "this box's name")
 	upstream := flag.String("upstream", "http://127.0.0.1:8000", "local MCP server base URL")
 	statePath := flag.String("state", defaultStatePath(), "file that persists the per-machine refresh credential so a restart needs no new ticket")
-	configPath := flag.String("config", "", "path to a finch.toml manifest; serves every [[ingress]] rule (one local service per appliance) over one process")
+	configPath := flag.String("config", "", "path to a finch.yml manifest; serves every ingress rule (one local service per appliance) over one process")
+	forwardAll := flag.Bool("forward-all", false, "forward the WHOLE loopback host (every path), not just /mcp — for a website or any non-MCP HTTP app (single-service mode)")
 
 	// The install one-liners are `finch join …` (single service) and `finch run`
-	// (read finch.toml). flag.Parse stops at the first non-flag arg, so strip a
+	// (read finch.yml). flag.Parse stops at the first non-flag arg, so strip a
 	// leading subcommand — both `finch join …`/`finch run` and bare `finch …` work.
 	if len(os.Args) > 1 && (os.Args[1] == "join" || os.Args[1] == "run") {
 		os.Args = append(os.Args[:1], os.Args[2:]...)
 	}
 	flag.Parse()
 
-	// Config-driven (cloudflared-style) when --config is given, or a finch.toml
+	// finch.toml support (TOML parsing) was removed in favor of a cloudflared-style
+	// finch.yml. Fail loudly rather than silently dropping an upgraded
+	// multi-appliance box to single-service mode and serving nothing: both when
+	// --config points at a .toml and when a legacy finch.toml is the only manifest
+	// in the working dir.
+	if strings.HasSuffix(strings.ToLower(*configPath), ".toml") {
+		fatalLegacyTOML(*configPath, hostName)
+	}
+
+	// Config-driven (cloudflared-style) when --config is given, or a finch.yml
 	// sits in the working dir and no single-service flags were overridden.
 	cfgPath := *configPath
 	if cfgPath == "" && *ticket == "" {
-		if _, err := os.Stat("finch.toml"); err == nil {
-			cfgPath = "finch.toml"
+		if _, err := os.Stat("finch.yml"); err == nil {
+			cfgPath = "finch.yml"
+		} else if _, terr := os.Stat("finch.toml"); terr == nil {
+			fatalLegacyTOML("finch.toml", hostName)
 		}
 	}
 	if cfgPath != "" {
@@ -300,17 +318,64 @@ func main() {
 	if err != nil || upstreamURL.Scheme == "" || upstreamURL.Host == "" {
 		log.Fatalf("finch: --upstream %q is not a valid absolute URL", *upstream)
 	}
-	runAppliance(*hub, *machine, *ticket, *statePath, upstreamURL, "", "", false)
+	// `finch join --ticket <t>` enrolls inline (first run), then resumes from the
+	// saved credential — the same enroll-then-resume split `finch enroll`/`finch
+	// run` use, collapsed into one command for the single-service path.
+	if *ticket != "" {
+		if saved, _ := loadState(*statePath); saved == nil || saved.RefreshToken == "" || saved.Hub != *hub {
+			if _, _, eerr := enrollToState(*hub, *machine, *ticket, *statePath); eerr != nil {
+				log.Fatalf("finch: enroll failed: %v", eerr)
+			}
+			log.Printf("finch: enrolled — credential saved to %s", *statePath)
+		}
+	}
+	// Thread the ticket into the run path so a same-hub-but-revoked credential can
+	// still recover from a fresh ticket: runAppliance re-enrolls if resume fails.
+	runAppliance(applianceOpts{
+		hub: *hub, statePath: *statePath, upstream: upstreamURL,
+		ticket: *ticket, machine: *machine, forwardAll: *forwardAll,
+	})
 }
 
-// runConfig serves every [[ingress]] rule from a finch.toml — one relay loop per
+// enrollToState trades a one-shot ticket for a long-lived refresh credential via
+// /join and persists it (0600) to statePath, returning the join response too so
+// callers can read the hub-slugified appliance id. Shared by the single-service
+// `finch join` path and `finch add` (both write a fixed state file).
+func enrollToState(hub, machine, ticket, statePath string) (*agentState, *joinResp, error) {
+	jr, err := join(hub, ticket, machine)
+	if err != nil {
+		return nil, nil, err
+	}
+	st, err := persistJoin(hub, jr, statePath)
+	if err != nil {
+		return nil, nil, err
+	}
+	return st, jr, nil
+}
+
+// persistJoin saves a /join result as the box-side refresh credential (0600).
+// Only /join returns the long-lived refresh token, so it must be present. Split
+// out of enrollToState so `finch enroll` can read the hub-slugified appliance id
+// from the join response BEFORE choosing the credential filename.
+func persistJoin(hub string, jr *joinResp, statePath string) (*agentState, error) {
+	if jr.RefreshToken == "" {
+		return nil, fmt.Errorf("hub returned no refresh token")
+	}
+	st := &agentState{Hub: hub, Tenant: jr.Tenant, Appliance: jr.Appliance, Machine: jr.Machine, RefreshToken: jr.RefreshToken}
+	if err := saveState(statePath, st); err != nil {
+		return nil, fmt.Errorf("persisting credential to %s: %w", statePath, err)
+	}
+	return st, nil
+}
+
+// runConfig serves every ingress rule from a finch.yml — one relay loop per
 // appliance, concurrently, over a single process (the cloudflared model). Each
-// rule maps a public path (<slug>.finchmcp.com/<path>/mcp) to a local service.
-// A rule with a bad service or a fatal enroll error is logged and skipped; its
-// siblings keep running.
+// rule maps a public path (<slug>.finchmcp.com/<app_path>/…) to a local service.
+// A rule with a bad service or a not-yet-enrolled appliance is logged and
+// skipped; its siblings keep running.
 func runConfig(cfg *config) {
 	if len(cfg.Ingress) == 0 {
-		log.Fatal("finch: finch.toml has no [[ingress]] rules — nothing to serve")
+		log.Fatal("finch: finch.yml has no ingress rules — nothing to serve")
 	}
 	// If this box is logged in (finch login), self-approve the appliances we
 	// serve — the CLI token holder is the tenant admin, so no dashboard hop.
@@ -321,36 +386,58 @@ func runConfig(cfg *config) {
 	for _, ing := range cfg.Ingress {
 		up, err := url.Parse(strings.TrimRight(ing.Service, "/"))
 		if err != nil || up.Scheme == "" || up.Host == "" {
-			log.Printf("finch[%s]: service %q is not a valid absolute URL — skipping", ing.Path, ing.Service)
+			log.Printf("finch[%s]: service %q is not a valid absolute URL — skipping", ing.AppPath, ing.Service)
 			continue
 		}
-		statePath := cfg.statePathFor(ing.Path)
+		statePath := cfg.statePathFor(ing.AppPath)
 		started++
 		wg.Add(1)
 		go func(ing ingress, up *url.URL, sp string) {
 			defer wg.Done()
-			runAppliance(cfg.Hub, cfg.Machine, ing.Ticket, sp, up, ing.Path, ing.Name, autoApprove)
+			runAppliance(applianceOpts{
+				hub: cfg.Hub, statePath: sp, upstream: up,
+				label: ing.AppPath, autoApprove: autoApprove, forwardAll: ing.ForwardAll,
+			})
 		}(ing, up, statePath)
 	}
 	if started == 0 {
-		log.Fatal("finch: no valid [[ingress]] rules to serve")
+		log.Fatal("finch: no valid ingress rules to serve")
 	}
-	log.Printf("finch: serving %d ingress rule(s) from finch.toml as machine %q", started, cfg.Machine)
+	log.Printf("finch: serving %d ingress rule(s) from finch.yml as machine %q", started, cfg.Machine)
 	wg.Wait()
 }
 
-// runAppliance resumes-or-enrolls one appliance, then holds its relay open and
-// reconnects forever. `label` prefixes logs (the ingress path in config mode,
-// empty in single-service mode). Fatal enroll errors return so a sibling rule
-// in config mode survives; in single-service mode main() has nothing else to do.
-func runAppliance(hub, machine, ticket, statePath string, upstreamURL *url.URL, label, appName string, autoApprove bool) {
+// applianceOpts bundles one relay loop's inputs: the hub + saved-credential path,
+// the local upstream, a log label, whether to auto-approve, the whole-host
+// forwarding opt-in, and the single-service ticket fallback (ticket+machine, both
+// empty in config mode).
+type applianceOpts struct {
+	hub         string
+	statePath   string
+	upstream    *url.URL
+	label       string
+	autoApprove bool
+	forwardAll  bool
+	ticket      string // single-service `finch join --ticket` recovery; "" in config mode
+	machine     string // machine name the ticket fallback enrolls under
+}
+
+// runAppliance resumes one already-enrolled appliance from its saved credential,
+// then holds its relay open and reconnects forever. `o.label` prefixes logs (the
+// ingress app_path in config mode, empty in single-service mode). Enrollment is
+// normally a separate one-time step (`finch enroll`); in single-service mode a
+// fresh `o.ticket` is a fallback that re-enrolls when the saved credential is
+// missing/revoked. If no usable credential and no ticket are found this logs how
+// to enroll and returns, so a sibling rule in config mode survives.
+func runAppliance(o applianceOpts) {
+	hub, statePath, upstreamURL, label, autoApprove := o.hub, o.statePath, o.upstream, o.label, o.autoApprove
 	lp := "finch"
 	if label != "" {
 		lp = "finch[" + label + "]"
 	}
 
-	// Resume-or-enroll. A saved refresh credential for THIS hub skips the one-shot
-	// ticket; only first run (or a revoked/stale credential) falls back to it.
+	// Resume from a saved refresh credential for THIS hub. Enrollment (minting the
+	// credential from a one-shot ticket) happens out-of-band in `finch enroll`.
 	var jr *joinResp
 	refreshToken := ""
 	if saved, _ := loadState(statePath); saved != nil && saved.RefreshToken != "" && saved.Hub == hub {
@@ -359,31 +446,35 @@ func runAppliance(hub, machine, ticket, statePath string, upstreamURL *url.URL, 
 			refreshToken = saved.RefreshToken
 			log.Printf("%s: resumed from saved credential (%s)", lp, statePath)
 		} else {
-			log.Printf("%s: saved credential at %s unusable (%v) — falling back to a ticket", lp, statePath, rerr)
+			log.Printf("%s: saved credential at %s unusable (%v)", lp, statePath, rerr)
+		}
+	}
+	// Resume-then-ticket fallback (single-service `finch join --ticket`): if the
+	// saved credential is missing/revoked/expired and we hold an enrollment ticket,
+	// re-enroll with it (overwriting the stale state) and proceed — so a fresh valid
+	// ticket always recovers a box whose credential was revoked server-side. The
+	// join response already carries a connect-token, so no extra /refresh is needed.
+	// Config mode passes no ticket and falls through to the enroll hint below.
+	if jr == nil && o.ticket != "" {
+		if st, ejr, eerr := enrollToState(hub, o.machine, o.ticket, statePath); eerr != nil {
+			log.Printf("%s: re-enroll from ticket failed: %v", lp, eerr)
+		} else {
+			jr = ejr
+			refreshToken = st.RefreshToken
+			log.Printf("%s: re-enrolled from ticket — credential saved to %s", lp, statePath)
 		}
 	}
 	if jr == nil {
-		if ticket == "" {
-			log.Printf("%s: no ticket and no saved credential — enroll this appliance in the dashboard and add its ticket (mint one in → Add device)", lp)
-			return
+		enrollHint := label
+		if enrollHint == "" {
+			enrollHint = "<app_path>"
 		}
-		r, jerr := join(hub, ticket, machine)
-		if jerr != nil {
-			log.Printf("%s: join failed: %v", lp, jerr)
-			return
-		}
-		jr = r
-		refreshToken = jr.RefreshToken
-		if refreshToken != "" {
-			st := &agentState{Hub: hub, Tenant: jr.Tenant, Appliance: jr.Appliance, Machine: jr.Machine, RefreshToken: refreshToken}
-			if serr := saveState(statePath, st); serr != nil {
-				log.Printf("%s: warning: could not persist credential to %s: %v", lp, statePath, serr)
-			}
-		}
+		log.Printf("%s: not enrolled — run: finch enroll %s --ticket <t>", lp, enrollHint)
+		return
 	}
 	// Describe the rule by its full name: the application, its public endpoint,
 	// and the local service it fronts.
-	name := appName
+	name := label
 	if name == "" {
 		name = jr.Appliance
 	}
@@ -425,13 +516,7 @@ func runAppliance(hub, machine, ticket, statePath string, upstreamURL *url.URL, 
 		// Refresh the connect-token near expiry by trading the long-lived refresh
 		// token at /refresh — never the one-shot join ticket (the hub burned it).
 		if time.Now().Add(connectSkew).After(connectExp) {
-			var fresh *joinResp
-			var err error
-			if refreshToken != "" {
-				fresh, err = refresh(hub, refreshToken)
-			} else {
-				fresh, err = join(hub, ticket, machine)
-			}
+			fresh, err := refresh(hub, refreshToken)
 			if err != nil {
 				log.Printf("%s: connect-token refresh failed: %v (retrying in %s)", lp, err, backoff)
 				backoffSleep()
@@ -445,7 +530,7 @@ func runAppliance(hub, machine, ticket, statePath string, upstreamURL *url.URL, 
 
 		wsURL := wsBase + "?ct=" + url.QueryEscape(connectToken)
 		start := time.Now()
-		if err := serve(wsURL, upstreamURL); err != nil {
+		if err := serve(wsURL, upstreamURL, o.forwardAll); err != nil {
 			log.Printf("%s: link down: %v (reconnecting in %s)", lp, err, backoff)
 			backoffSleep()
 			continue
@@ -614,7 +699,9 @@ func (o *outStream) setPaused(p bool) {
 }
 
 // serve holds one relay connection for its lifetime; returns on disconnect.
-func serve(wsURL string, upstream *url.URL) error {
+// forwardAll is threaded down to each forward() so resolveUpstream knows whether
+// to confine to /mcp (default) or forward the whole host.
+func serve(wsURL string, upstream *url.URL, forwardAll bool) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -721,7 +808,7 @@ func serve(wsURL string, upstream *url.URL) error {
 			outMu.Unlock()
 			go func(f frame, os *outStream) {
 				defer remove(f.ID)
-				forward(fctx, upstream, f, write, os)
+				forward(fctx, upstream, f, write, os, forwardAll)
 			}(f, os)
 		case "window":
 			if os := lookup(f.ID); os != nil {
@@ -770,8 +857,8 @@ const relayChunkSize = 32 << 10
 // os.resume or ctx.Done), so a slow client can't grow the DO's relay queue
 // unbounded. The head is emitted before any wait — head is never paused. os may
 // be nil (no flow control / direct unit-test call): then it never pauses.
-func forward(ctx context.Context, upstream *url.URL, f frame, write func(frame) error, os *outStream) {
-	target, err := resolveUpstream(upstream, f.Path)
+func forward(ctx context.Context, upstream *url.URL, f frame, write func(frame) error, os *outStream, forwardAll bool) {
+	target, err := resolveUpstream(upstream, f.Path, forwardAll)
 	if err != nil {
 		// SSRF reject — pre-head, so the DO turns this into a 403 response.
 		write(frame{ID: f.ID, Type: "err", Status: 403, Message: err.Error()})
@@ -870,21 +957,23 @@ func forward(ctx context.Context, upstream *url.URL, f frame, write func(frame) 
 }
 
 // resolveUpstream turns the hub-supplied request path into an absolute upstream
-// URL, refusing anything that would escape the configured --upstream base.
+// URL, refusing anything that would escape the allowed prefix.
 // Defenses, in order:
 //   - reject scheme/authority injection (a path that itself parses to an
 //     absolute URL, or starts with "//" → protocol-relative host).
-//   - path.Clean to collapse "." / ".." segments, then confine the cleaned
-//     path to the allowed route prefix so a "/mcp/../admin" can't climb out of
-//     the MCP route the hub gated and SSRF something else on loopback.
+//   - path.Clean to collapse "." / ".." segments, then confine the cleaned path
+//     to the allowed prefix so "/mcp/../admin" can't climb out and SSRF
+//     something else on loopback.
 //   - rebuild the URL from the trusted base host/scheme + the cleaned path +
 //     the (query-only) raw query, so host/scheme can never come from the frame.
 //
-// The confinement prefix is the upstream's own base path when one is configured
-// (e.g. --upstream http://127.0.0.1:8000/mcp), otherwise the canonical "/mcp"
-// route the hub forwards. Either way the result must equal the prefix or be a
-// child of it — collapsing "/mcp/../admin" to "/admin" is therefore rejected.
-func resolveUpstream(base *url.URL, rawPath string) (string, error) {
+// The allowed prefix is: the service's configured base path when one is set
+// (service: http://127.0.0.1:8000/mcp → /mcp); else /mcp by DEFAULT (finch is an
+// MCP tunnel first, so the loopback host isn't exposed wholesale). Set forwardAll
+// (ingress forward_all: true / --forward-all) to opt OUT of that default and
+// forward the WHOLE /<app_path>/* subtree — for a website or any non-MCP HTTP
+// app. In every case host/scheme come only from the trusted base, never the frame.
+func resolveUpstream(base *url.URL, rawPath string, forwardAll bool) (string, error) {
 	if rawPath == "" {
 		rawPath = "/"
 	}
@@ -909,15 +998,16 @@ func resolveUpstream(base *url.URL, rawPath string) (string, error) {
 	// result that climbs above "/", so the cleaned path is always rooted.
 	clean := path.Clean(reqPath)
 
-	// Confine to the allowed prefix: the upstream's configured base path if any,
-	// else the canonical "/mcp" route. The cleaned path must BE the prefix or a
-	// child of it — this is what makes the hub's "/mcp"-only gate un-bypassable
-	// by traversal (e.g. "/mcp/../admin" → "/admin" is rejected here).
+	// Confine to the allowed prefix: the service's configured base path when one is
+	// set (e.g. service http://127.0.0.1:8000/mcp confines to /mcp), else /mcp by
+	// DEFAULT — UNLESS forwardAll is set, which opts out and forwards the whole
+	// /<app_path>/* subtree ("" prefix). When a prefix IS set the cleaned path must
+	// BE it or a child of it, so "/mcp/../admin" → "/admin" stays rejected.
 	prefix := strings.TrimRight(base.Path, "/")
-	if prefix == "" {
+	if prefix == "" && !forwardAll {
 		prefix = "/mcp"
 	}
-	if clean != prefix && !strings.HasPrefix(clean, prefix+"/") {
+	if prefix != "" && clean != prefix && !strings.HasPrefix(clean, prefix+"/") {
 		return "", fmt.Errorf("rejected path (escapes upstream prefix %q): %q", prefix, clean)
 	}
 
@@ -933,7 +1023,7 @@ func resolveUpstream(base *url.URL, rawPath string) (string, error) {
 // agentState is the small credential the agent persists between runs so a
 // restart resumes without a fresh dashboard ticket. It holds the long-lived
 // per-machine refresh token (and the assignment, for clarity).
-// ---- finch.toml manifest (cloudflared-style ingress) -----------------------
+// ---- finch.yml manifest (cloudflared-style ingress) ------------------------
 
 // ingress is one rule: expose a local `service` as the appliance named `path`.
 //
@@ -943,28 +1033,54 @@ func resolveUpstream(base *url.URL, rawPath string) (string, error) {
 //	service — the local server to forward to (e.g. http://127.0.0.1:8000).
 //	ticket  — one-shot enrollment ticket, first run only (then state resumes).
 type ingress struct {
-	Name    string `toml:"name"`
-	Path    string `toml:"path"`
-	Service string `toml:"service"`
-	Ticket  string `toml:"ticket"`
+	AppPath string `yaml:"app_path"`
+	Service string `yaml:"service"`
+	// ForwardAll opts this rule out of the default /mcp confinement and forwards
+	// the WHOLE /<app_path>/* subtree to the service (for a website or any non-MCP
+	// HTTP app). Off by default — the default exposes only /mcp.
+	ForwardAll bool `yaml:"forward_all,omitempty"`
 }
 
-// config is a parsed finch.toml. `state` is a DIRECTORY in config mode — each
-// appliance's refresh credential is persisted at <state>/<path>.json, so one box
-// can front many appliances without their credentials colliding.
+// config is a parsed finch.yml. `credentials-dir` is a DIRECTORY — each
+// appliance's refresh credential is persisted at <credentials-dir>/<app_path>.json,
+// so one box can front many appliances without their credentials colliding. The
+// credentials are written out-of-band by `finch enroll`, never by this manifest.
 type config struct {
-	Hub     string    `toml:"hub"`
-	Machine string    `toml:"machine"`
-	State   string    `toml:"state"`
-	Ingress []ingress `toml:"ingress"`
+	Hub            string    `yaml:"hub"`
+	Machine        string    `yaml:"machine"`
+	CredentialsDir string    `yaml:"credentials-dir,omitempty"`
+	Ingress        []ingress `yaml:"ingress"`
 }
 
-// loadConfig reads + validates a finch.toml, applying defaults (prod hub, this
-// box's hostname, ~/.finch state dir).
+// fatalLegacyTOML aborts with a migration message. finch.toml support (TOML
+// parsing) was removed in favor of a cloudflared-style finch.yml; an upgraded
+// multi-appliance box must migrate rather than silently fall through to
+// single-service mode and stop serving every appliance.
+func fatalLegacyTOML(path, hostName string) {
+	if hostName == "" {
+		hostName = "this-box"
+	}
+	log.Fatalf("finch: %s is no longer supported — finch now reads a finch.yml manifest.\n"+
+		"Migrate to finch.yml (one ingress rule per local service):\n\n"+
+		"  hub: https://finchmcp.com\n"+
+		"  machine: %s\n"+
+		"  ingress:\n"+
+		"    - app_path: printer\n"+
+		"      service: http://127.0.0.1:8000\n\n"+
+		"Enroll each app once with `finch enroll <app_path> --ticket <t>`, then run `finch run`.",
+		path, hostName)
+}
+
+// loadConfig reads + validates a finch.yml, applying defaults (prod hub, this
+// box's hostname, ~/.finch credentials dir).
 func loadConfig(path, hostName string) (*config, error) {
-	var c config
-	if _, err := toml.DecodeFile(path, &c); err != nil {
+	b, err := os.ReadFile(path)
+	if err != nil {
 		return nil, fmt.Errorf("reading %s: %w", path, err)
+	}
+	var c config
+	if err := yaml.Unmarshal(b, &c); err != nil {
+		return nil, fmt.Errorf("parsing %s: %w", path, err)
 	}
 	if c.Hub == "" {
 		c.Hub = "https://finchmcp.com"
@@ -972,34 +1088,35 @@ func loadConfig(path, hostName string) (*config, error) {
 	if c.Machine == "" {
 		c.Machine = hostName
 	}
-	if c.State == "" {
+	if c.CredentialsDir == "" {
 		if home, err := os.UserHomeDir(); err == nil && home != "" {
-			c.State = filepath.Join(home, ".finch")
+			c.CredentialsDir = filepath.Join(home, ".finch")
 		} else {
-			c.State = ".finch"
+			c.CredentialsDir = ".finch"
 		}
 	}
-	c.State = expandHome(c.State)
+	c.CredentialsDir = expandHome(c.CredentialsDir)
 	seen := map[string]bool{}
 	for i, ing := range c.Ingress {
-		if ing.Path == "" || ing.Service == "" {
-			return nil, fmt.Errorf("[[ingress]] #%d: both `path` and `service` are required", i+1)
+		if ing.AppPath == "" || ing.Service == "" {
+			return nil, fmt.Errorf("ingress #%d: both `app_path` and `service` are required", i+1)
 		}
-		if strings.ContainsAny(ing.Path, "/ ") {
-			return nil, fmt.Errorf("[[ingress]] path %q must be a single URL segment (no slashes or spaces)", ing.Path)
+		if strings.ContainsAny(ing.AppPath, "/ ") {
+			return nil, fmt.Errorf("ingress app_path %q must be a single URL segment (no slashes or spaces)", ing.AppPath)
 		}
-		if seen[ing.Path] {
-			return nil, fmt.Errorf("[[ingress]] path %q is listed twice", ing.Path)
+		if seen[ing.AppPath] {
+			return nil, fmt.Errorf("ingress app_path %q is listed twice", ing.AppPath)
 		}
-		seen[ing.Path] = true
+		seen[ing.AppPath] = true
 	}
 	return &c, nil
 }
 
-// statePathFor is where appliance `path`'s refresh credential lives: a per-rule
-// file under the state dir, so concurrent ingress rules never clobber each other.
-func (c *config) statePathFor(path string) string {
-	return filepath.Join(c.State, path+".json")
+// statePathFor is where appliance `appPath`'s refresh credential lives: a per-rule
+// file under the credentials dir, so concurrent ingress rules never clobber each
+// other.
+func (c *config) statePathFor(appPath string) string {
+	return filepath.Join(c.CredentialsDir, appPath+".json")
 }
 
 // expandHome resolves a leading ~ to the user's home dir.

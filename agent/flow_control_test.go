@@ -152,7 +152,7 @@ func TestForward_BackpressurePausesChunks(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		forward(ctx, upstream, frame{ID: "bp-1", Type: "req", Method: "GET", Path: "/mcp"}, cw.write, os)
+		forward(ctx, upstream, frame{ID: "bp-1", Type: "req", Method: "GET", Path: "/mcp"}, cw.write, os, false)
 		close(done)
 	}()
 
@@ -235,7 +235,7 @@ func TestForward_ResetCancelsBlockingUpstream(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		forward(ctx, upstream, frame{ID: "rst-1", Type: "req", Method: "GET", Path: "/mcp"}, cw.write, os)
+		forward(ctx, upstream, frame{ID: "rst-1", Type: "req", Method: "GET", Path: "/mcp"}, cw.write, os, false)
 		close(done)
 	}()
 
@@ -420,7 +420,7 @@ func TestServe_FakeDOBackpressureAndReset(t *testing.T) {
 	defer httpSrv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(httpSrv.URL, "http")
-	go func() { serveErr <- serve(wsURL, upstream) }()
+	go func() { serveErr <- serve(wsURL, upstream, false) }()
 
 	// The fake DO drives the whole script then closes; serve() returns on the
 	// closed link. Bound the whole test so a hang fails loudly.

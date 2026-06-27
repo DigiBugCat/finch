@@ -125,12 +125,12 @@ describe("TenantDO.registerMachine — machine state", () => {
       appliance: "scraper",
       machine: "box-1",
       os: "linux",
-      version: "1.4.0",
+      version: "1.5.1",
     });
     const state = await op<any>(t, "getState");
     const ap = state.appliances.find((a: any) => a.id === "scraper");
     expect(ap.machines).toHaveLength(1);
-    expect(ap.machines[0].version).toBe("1.4.0");
+    expect(ap.machines[0].version).toBe("1.5.1");
     expect(ap.machines[0].outdated).toBe(false); // matches LATEST_AGENT
   });
 

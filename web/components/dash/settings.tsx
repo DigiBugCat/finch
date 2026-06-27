@@ -146,6 +146,42 @@ function CliAccess() {
   );
 }
 
+// Web sessions: sign everyone out of the login-wall. Hits the BFF which bumps
+// the tenant's sessionEpoch on the hub, invalidating every live finch_session
+// cookie so every browser viewing a hosted appliance must sign in again.
+function WebSessions() {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const [done, setDone] = useState(false);
+
+  async function signOutAll() {
+    if (!confirm('Sign out ALL web sessions for this account? Everyone viewing one of your hosted appliances will have to sign in again.')) return;
+    setBusy(true); setErr(''); setDone(false);
+    try {
+      const r = await fetch('/api/finch/sessions/revoke', { method: 'POST' });
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || 'could not sign out sessions');
+      setDone(true);
+    } catch (e: any) {
+      setErr(e.message || 'failed');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="web-sessions">
+      <p className="set-hint dim" style={{ marginBottom: 12 }}>
+        Force a fresh sign-in on every browser currently viewing one of your hosted appliances. Use this if a teammate left or a session may be compromised.
+      </p>
+      <button type="button" className="btn btn-sm btn-ghost" onClick={signOutAll} disabled={busy}>
+        {busy ? 'signing out…' : 'Sign out all web sessions'}
+      </button>
+      {err && <div className="set-hint red" style={{ marginTop: 8 }}>{err}</div>}
+      {done && <div className="set-hint green" style={{ marginTop: 8 }}>✓ All web sessions signed out — viewers must sign in again at the appliance gate.</div>}
+    </div>
+  );
+}
+
 function SetRow({ label, hint, children }: any) {
   return (
     <div className="set-row">
@@ -192,6 +228,11 @@ export function SettingsView({ settings, groups, onChange }: any) {
       <Card className="set-card">
         <SectionLabel>CLI access</SectionLabel>
         <CliAccess />
+      </Card>
+
+      <Card className="set-card">
+        <SectionLabel>web sessions</SectionLabel>
+        <WebSessions />
       </Card>
 
       <Card className="set-card">

@@ -84,6 +84,10 @@ const CONNECT_TOKEN_TTL_SECONDS = 120; // per-machine _connect grants live 120s
 // any realistic always-on uptime; a machine removed from the dashboard is
 // rejected at /refresh (machineExists) well before this elapses.
 const REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60; // 30d
+// Browser login-wall portal grant: short + single-use (jti). 60s is ample for the
+// portal page → /__finch/cb hand-off while sharply bounding the replay window of
+// a captured grant (which is also burned on first use). (login-wall contract)
+const PORTAL_GRANT_TTL_SECONDS = 60;
 
 // Machine-name clamp at the door (M1): bound length + charset before the name
 // ever reaches the registry. Mirrors tenant-do's cleanMachineName.
@@ -112,6 +116,18 @@ async function readJson(req: Request): Promise<any> {
     return await req.json();
   } catch {
     return {};
+  }
+}
+
+/** Percent-decode a path segment, tolerating a malformed encoding (a lone "%"
+ *  makes decodeURIComponent throw a URIError → an unhandled 500). Falls back to
+ *  the raw value so a bad id degrades to a clean not-found/4xx. Mirrors index.ts's
+ *  safeDecode. (code-review #15) */
+function safeDecode(seg: string): string {
+  try {
+    return decodeURIComponent(seg);
+  } catch {
+    return seg;
   }
 }
 
@@ -220,6 +236,23 @@ export async function handleApi(
       if (!body.id) return json(400, { error: "id required" });
       const out = await tenantOp(env, cliTenant, "approve", { id: body.id });
       return json(out?.ok === false ? 404 : 200, out);
+    }
+
+    // POST /api/cli/auth {appliance, mode} — set an appliance's public-relay
+    // access mode ("key" requires a finch_ bearer; "public" is an open webpage).
+    if (path === "/api/cli/auth" && method === "POST") {
+      const body = await readJson(req);
+      if (!body.appliance) return json(400, { error: "appliance required" });
+      const out = await tenantOp<{ ok: boolean; error?: string }>(
+        env,
+        cliTenant,
+        "setAuth",
+        { appliance: body.appliance, mode: body.mode },
+      );
+      if (out?.ok === false) {
+        return json(out.error === "unknown appliance" ? 404 : 400, out);
+      }
+      return json(200, out);
     }
 
     // ---- Tenant control plane over the CLI token (it IS a tenant-admin
@@ -371,6 +404,45 @@ export async function handleApi(
     return json(200, await tenantOp(env, tenant, "revokeCliTokens"));
   }
 
+  // POST /api/sessions-revoke — "sign everyone out" of the browser login wall:
+  // bump the tenant's sessionEpoch so every live finch_session cookie (stamped
+  // with the old epoch) is rejected at the relay gate (browserGate). The web BFF
+  // calls this; mirrors cli-revoke for the CLI-token plane.
+  if (method === "POST" && seg.length === 1 && seg[0] === "sessions-revoke") {
+    return json(200, await tenantOp(env, tenant, "bumpSessionEpoch"));
+  }
+
+  // POST /api/portal-grant {slug,userId} — the login-wall hand-off. The Clerk-
+  // gated portal page (web) calls this for a browser that hit a private appliance
+  // with no session cookie. The TENANT is the security-critical part and comes
+  // from the verified assertion (NOT the body); userId is carried for the cookie's
+  // identity/audit. We VERIFY OWNERSHIP — routerLookup(slug) MUST resolve to this
+  // tenant — so a tenant can't mint a portal grant for a slug it doesn't own (which
+  // would let it set a session cookie on someone else's slug host). 403 otherwise.
+  // Returns a short (~60s), single-use (jti) portal grant the browser carries to
+  // <slug>.finchmcp.com/__finch/cb.
+  if (method === "POST" && seg.length === 1 && seg[0] === "portal-grant") {
+    const body = await readJson(req);
+    const slug = String(body.slug || "").trim().toLowerCase();
+    const userId = String(body.userId || "").trim();
+    if (!slug || !userId) {
+      return json(400, { error: "slug and userId required" });
+    }
+    // Ownership check: the slug must belong to THIS tenant (the assertion's
+    // tenant). A slug owned by another tenant (or unregistered) is refused — a
+    // portal grant for it could otherwise set a cookie on a foreign slug host.
+    const owner = await routerLookup(env, slug);
+    if (owner !== tenant) {
+      return json(403, { error: "slug is not owned by this tenant" });
+    }
+    const exp = Math.floor(Date.now() / 1000) + PORTAL_GRANT_TTL_SECONDS;
+    const grant = await signToken(
+      { kind: "portal", tenant, slug, userId, exp, jti: genJti() },
+      env.TICKET_SECRET,
+    );
+    return json(200, { grant });
+  }
+
   if (method === "GET" && seg.length === 1 && seg[0] === "slug-available") {
     const slug = (url.searchParams.get("slug") || "").trim().toLowerCase();
     if (!slug) return json(400, { error: "slug required" });
@@ -385,13 +457,36 @@ export async function handleApi(
 
   // POST /api/appliances/:id/release|approve|decline
   if (method === "POST" && seg[0] === "appliances" && seg.length === 3) {
-    const id = decodeURIComponent(seg[1]);
+    const id = safeDecode(seg[1]);
     const action = seg[2];
     if (action === "release" || action === "approve" || action === "decline") {
       const out = await tenantOp(env, tenant, action, { id });
       return json(out?.ok === false ? 404 : 200, out);
     }
     return json(404, { error: "unknown appliance action", action });
+  }
+
+  // PUT /api/appliances/:id/auth {mode} — set the public-relay access mode
+  // ("key" requires a finch_ bearer; "public" is an open webpage). The dashboard
+  // BFF half of the generic-HTTP-hosting feature (same op as `finch auth`).
+  if (
+    method === "PUT" &&
+    seg[0] === "appliances" &&
+    seg.length === 3 &&
+    seg[2] === "auth"
+  ) {
+    const id = safeDecode(seg[1]);
+    const body = await readJson(req);
+    const out = await tenantOp<{ ok: boolean; error?: string }>(
+      env,
+      tenant,
+      "setAuth",
+      { appliance: id, mode: body.mode },
+    );
+    if (out?.ok === false) {
+      return json(out.error === "unknown appliance" ? 404 : 400, out);
+    }
+    return json(200, out);
   }
 
   // PUT /api/appliances/:id/tags {tags}
@@ -401,7 +496,7 @@ export async function handleApi(
     seg.length === 3 &&
     seg[2] === "tags"
   ) {
-    const id = decodeURIComponent(seg[1]);
+    const id = safeDecode(seg[1]);
     const body = await readJson(req);
     const out = await tenantOp(env, tenant, "setTags", {
       id,
@@ -417,7 +512,7 @@ export async function handleApi(
     seg.length === 3 &&
     seg[2] === "group"
   ) {
-    const id = decodeURIComponent(seg[1]);
+    const id = safeDecode(seg[1]);
     const body = await readJson(req);
     const out = await tenantOp(env, tenant, "setGroup", {
       id,
@@ -457,7 +552,7 @@ export async function handleApi(
     seg[2] === "keys" &&
     seg[3] === "revoke"
   ) {
-    const machine = decodeURIComponent(seg[1]);
+    const machine = safeDecode(seg[1]);
     const body = await readJson(req);
     if (!body.appliance || !body.key) {
       return json(400, { error: "appliance and key required" });
@@ -485,7 +580,7 @@ export async function handleApi(
 
   // DELETE /api/acl/:id
   if (method === "DELETE" && seg[0] === "acl" && seg.length === 2) {
-    const id = decodeURIComponent(seg[1]);
+    const id = safeDecode(seg[1]);
     const out = await tenantOp(env, tenant, "removeAcl", { id });
     return json(out?.ok === false ? 404 : 200, out);
   }
@@ -589,7 +684,14 @@ async function handleJoin(
     });
   }
   const payload = await verifyToken(body.ticket, env.TICKET_SECRET);
-  if (!payload || (payload.kind !== undefined && payload.kind !== "join")) {
+  // A join ticket is appliance-scoped — validateTicket already requires
+  // `appliance` for non-browser kinds, but narrow it here for the type checker
+  // (TicketPayload.appliance is optional for the browser portal/session kinds).
+  if (
+    !payload ||
+    (payload.kind !== undefined && payload.kind !== "join") ||
+    !payload.appliance
+  ) {
     return json(401, { error: "invalid or expired ticket" });
   }
   const { tenant, appliance } = payload;
@@ -687,7 +789,14 @@ async function handleRefresh(
   if (!body.refreshToken) return json(400, { error: "refreshToken required" });
 
   const payload = await verifyToken(body.refreshToken, env.TICKET_SECRET);
-  if (!payload || payload.kind !== "refresh" || !payload.machine) {
+  // A refresh token is appliance- AND machine-scoped (browser kinds carry
+  // neither); narrow `appliance` for the type checker as well.
+  if (
+    !payload ||
+    payload.kind !== "refresh" ||
+    !payload.machine ||
+    !payload.appliance
+  ) {
     return json(401, { error: "invalid or expired refresh token" });
   }
   const { tenant, appliance } = payload;

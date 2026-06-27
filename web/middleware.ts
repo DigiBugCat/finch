@@ -3,7 +3,17 @@ import { NextResponse } from "next/server";
 
 // Only the dashboard (and future app routes) require auth. The marketing
 // landing, sign-in, and sign-up are public — don't gate the front door.
-const isProtectedRoute = createRouteMatcher(["/dashboard(.*)", "/cli(.*)"]);
+//
+// /portal(.*) is the appliance login-wall bounce: an unauthenticated browser
+// hitting a gated <slug>.finchmcp.com appliance is 302'd by the worker to
+// /portal/start. Protecting it here means Clerk forces sign-in BEFORE the
+// route handler runs, so resolveTenant() always sees a real session and we
+// can mint a portal grant bound to the signed-in user.
+const isProtectedRoute = createRouteMatcher([
+  "/dashboard(.*)",
+  "/cli(.*)",
+  "/portal(.*)",
+]);
 
 // All cookie-authed bridge handlers live under /api/finch/*.
 const isFinchApiRoute = createRouteMatcher(["/api/finch(.*)"]);

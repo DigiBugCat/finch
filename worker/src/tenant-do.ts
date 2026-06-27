@@ -64,6 +64,11 @@ interface StoredState {
   // Monotonic counter embedded in CLI tokens at mint. Bumped by "revoke all CLI
   // tokens"; a token whose epoch != this is rejected. Absent == 0 (legacy state).
   cliTokenEpoch?: number;
+  // Monotonic counter stamped into the browser login-wall session cookie at mint
+  // (/__finch/cb). Bumped by "bumpSessionEpoch" ("sign everyone out"); browserGate
+  // rejects a cookie whose epoch != this. Absent == 0 (legacy state). Mirrors
+  // cliTokenEpoch exactly.
+  sessionEpoch?: number;
 }
 
 const MAX_LOGS = 500;
@@ -196,12 +201,18 @@ export class TenantDO extends DurableObject<Env> {
           return ok(await this.cliEpoch());
         case "revokeCliTokens":
           return ok(await this.revokeCliTokens());
+        case "sessionEpoch":
+          return ok(await this.sessionEpoch());
+        case "bumpSessionEpoch":
+          return ok(await this.bumpSessionEpoch());
         case "decline":
           return ok(await this.decline(a.id));
         case "setTags":
           return ok(await this.setTags(a.id, a.tags));
         case "setGroup":
           return ok(await this.setGroup(a.id, a.group));
+        case "setAuth":
+          return ok(await this.setAuth(a.appliance ?? a.id, a.mode));
         case "mintKey": {
           const r = await this.mintKey(a.label, a.scope, a.owner);
           if ("error" in r) return bad(400, r.error);
@@ -288,6 +299,7 @@ export class TenantDO extends DurableObject<Env> {
       logs: [],
       usedTickets: {},
       cliTokenEpoch: 0,
+      sessionEpoch: 0,
       settings: {
         org: id,
         subdomain: "",
@@ -353,6 +365,7 @@ export class TenantDO extends DurableObject<Env> {
       const latency24h = rollBuckets(a.lat24h, a.lastBucketHour, now);
       return {
         ...a,
+        auth: a.auth ?? "key", // legacy appliances predate this field → key-gated
         state,
         machines,
         machineCount: machines.length,
@@ -535,6 +548,7 @@ export class TenantDO extends DurableObject<Env> {
       version: LATEST_AGENT,
       tags: [],
       outdated: false,
+      auth: "key", // key-gated by default; flip to "public" for a public webpage
       routes: [],
       keys: [],
       components: [],
@@ -565,6 +579,25 @@ export class TenantDO extends DurableObject<Env> {
     this.log(s, { cat: "key", actor: "you", action: "revoked all CLI tokens", target: "cli access", ip: "" });
     await this.save(s);
     return { ok: true, epoch: s.cliTokenEpoch };
+  }
+
+  // ---- session epoch (browser login-wall "sign everyone out") -------------
+  // Exact mirror of the cliTokenEpoch pair: /__finch/cb stamps the CURRENT
+  // sessionEpoch into the cookie at mint; browserGate rejects a cookie whose
+  // epoch != this. bumpSessionEpoch increments it, invalidating every live
+  // session cookie at once — without rotating the global SESSION_SECRET.
+
+  private async sessionEpoch(): Promise<{ epoch: number }> {
+    const s = await this.load();
+    return { epoch: s.sessionEpoch ?? 0 };
+  }
+
+  private async bumpSessionEpoch(): Promise<{ ok: boolean; epoch: number }> {
+    const s = await this.load();
+    s.sessionEpoch = (s.sessionEpoch ?? 0) + 1;
+    this.log(s, { cat: "access", actor: "you", action: "signed out all sessions", target: "web access", ip: "" });
+    await this.save(s);
+    return { ok: true, epoch: s.sessionEpoch };
   }
 
   // ---- mutations: appliances ---------------------------------------------
@@ -680,6 +713,31 @@ export class TenantDO extends DurableObject<Env> {
       actor: "you",
       action: "declined",
       target: id,
+      ip: "",
+    });
+    await this.save(s);
+    return { ok: true };
+  }
+
+  /** Flip an appliance's public-relay access mode between "key" (require a
+   *  finch_ bearer) and "public" (open webpage). The control-plane half of the
+   *  generic-HTTP-hosting feature; the relay reads it via checkKey. */
+  private async setAuth(
+    id: string,
+    mode: unknown,
+  ): Promise<{ ok: boolean; error?: string }> {
+    if (mode !== "key" && mode !== "public") {
+      return { ok: false, error: 'mode must be "key" or "public"' };
+    }
+    const s = await this.load();
+    const ap = this.findAppliance(s, id);
+    if (!ap) return { ok: false, error: "unknown appliance" };
+    ap.auth = mode;
+    this.log(s, {
+      cat: "device",
+      actor: "you",
+      action: "set-auth",
+      target: `${id} → ${mode}`,
       ip: "",
     });
     await this.save(s);
@@ -1229,9 +1287,21 @@ export class TenantDO extends DurableObject<Env> {
   ): Promise<{
     allowed: boolean;
     keyLabel: string;
+    public?: boolean;
     reason?: "no-key" | "scope" | "acl" | "expired";
   }> {
     const s = await this.load();
+
+    // Gate −1: PUBLIC appliance. A public appliance (an ngrok-style open webpage)
+    // needs no finch_ key — allow regardless of what (if anything) was presented,
+    // BEFORE the key lookup so a missing/empty hash still passes. `public:true`
+    // tells the relay to label the caller "public" and skip the bearer 401.
+    // (auth defaults to "key" when the field is absent → fail-closed.)
+    const ap = this.findAppliance(s, appliance);
+    if (ap && ap.auth === "public") {
+      return { allowed: true, keyLabel: "public", public: true };
+    }
+
     const key = s.keys.find((k) => k.hash === hash);
     if (!key) return { allowed: false, keyLabel: "", reason: "no-key" };
 

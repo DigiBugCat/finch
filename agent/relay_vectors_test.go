@@ -269,7 +269,7 @@ func TestForward_HeadChunkEndSequence(t *testing.T) {
 	forward(context.Background(), upstream, frame{
 		ID: "fwd-1", Type: "req", Method: "GET", Path: "/mcp",
 		ReqHeaders: map[string]string{"accept": "text/event-stream", "authorization": "Bearer secret"},
-	}, cw.write, nil)
+	}, cw.write, nil, false)
 
 	frames := cw.snapshot()
 	if len(frames) < 3 {
@@ -330,7 +330,7 @@ func TestForward_PreHeadDialFail(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	cw := &collectingWriter{}
-	forward(ctx, upstream, frame{ID: "fwd-2", Type: "req", Method: "POST", Path: "/mcp", Body: "{}"}, cw.write, nil)
+	forward(ctx, upstream, frame{ID: "fwd-2", Type: "req", Method: "POST", Path: "/mcp", Body: "{}"}, cw.write, nil, false)
 
 	frames := cw.snapshot()
 	if len(frames) != 1 {
@@ -341,12 +341,14 @@ func TestForward_PreHeadDialFail(t *testing.T) {
 	}
 }
 
-// TestForward_SSRFRejectPreHead asserts an SSRF-rejected path produces a pre-head
-// `err` with status 403 and never touches the network.
+// TestForward_SSRFRejectPreHead asserts a path that escapes a NARROWED service
+// base produces a pre-head `err` with status 403 and never touches the network.
+// (With no base path the whole service is intentionally exposed; a base path like
+// /mcp re-narrows, and escaping it is what gets rejected.)
 func TestForward_SSRFRejectPreHead(t *testing.T) {
-	upstream := mustParse(t, "http://127.0.0.1:8000")
+	upstream := mustParse(t, "http://127.0.0.1:8000/mcp")
 	cw := &collectingWriter{}
-	forward(context.Background(), upstream, frame{ID: "fwd-3", Type: "req", Method: "GET", Path: "/admin"}, cw.write, nil)
+	forward(context.Background(), upstream, frame{ID: "fwd-3", Type: "req", Method: "GET", Path: "/admin"}, cw.write, nil, false)
 
 	frames := cw.snapshot()
 	if len(frames) != 1 || frames[0].Type != "err" || frames[0].Status != 403 {
@@ -374,7 +376,7 @@ func TestForward_AuthorizationStripped(t *testing.T) {
 			"x-forwarded-host-marker": "kept",
 			"content-length":          "999", // recomputed; must be dropped
 		},
-	}, cw.write, nil)
+	}, cw.write, nil, false)
 
 	if sawAuth != "" {
 		t.Errorf("authorization header leaked to upstream: %q", sawAuth)
@@ -400,7 +402,7 @@ func TestForward_WriteFailureAborts(t *testing.T) {
 	upstream := mustParse(t, srv.URL+"/mcp")
 	// Fail on the very first write (the head): forward must return immediately.
 	cw := &collectingWriter{failAt: 1}
-	forward(context.Background(), upstream, frame{ID: "fwd-5", Type: "req", Method: "GET", Path: "/mcp"}, cw.write, nil)
+	forward(context.Background(), upstream, frame{ID: "fwd-5", Type: "req", Method: "GET", Path: "/mcp"}, cw.write, nil, false)
 
 	if got := cw.snapshot(); len(got) != 0 {
 		t.Errorf("after head write failure, expected no captured frames, got %+v", got)
@@ -429,7 +431,7 @@ func TestForward_StreamScript(t *testing.T) {
 
 	upstream := mustParse(t, srv.URL+"/mcp")
 	cw := &collectingWriter{}
-	forward(context.Background(), upstream, frame{ID: "11111111-1111-4111-8111-111111111111", Type: "req", Method: "GET", Path: "/mcp"}, cw.write, nil)
+	forward(context.Background(), upstream, frame{ID: "11111111-1111-4111-8111-111111111111", Type: "req", Method: "GET", Path: "/mcp"}, cw.write, nil, false)
 
 	frames := cw.snapshot()
 	if frames[0].Type != "head" || frames[0].Status != 200 {
