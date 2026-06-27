@@ -27,7 +27,9 @@
   // does not inherit top-level `unsafe` into named environments (same as
   // durable_objects / migrations / vars), and deploys always target --env. See
   // each env's "unsafe" block. RELAY_LIMIT gates the MCP relay per-(tenant,IP)
-  // BEFORE the checkKey DO round-trip; JOIN_LIMIT gates /join per-IP. The code
+  // BEFORE any DO round-trip (login-wall probe + checkKey); its 600/60s budget
+  // covers a single web page's sub-resource burst (one HTML hit fans out to many
+  // asset requests sharing the bucket). JOIN_LIMIT gates /join per-IP. The code
   // fails OPEN when the binding is absent (dev/test). (security M5)
   "migrations": [
     {
@@ -73,7 +75,7 @@
             "name": "RELAY_LIMIT",
             "type": "ratelimit",
             "namespace_id": "1001",
-            "simple": { "limit": 120, "period": 60 }
+            "simple": { "limit": 600, "period": 60 }
           },
           {
             "name": "JOIN_LIMIT",
@@ -131,7 +133,7 @@
             "name": "RELAY_LIMIT",
             "type": "ratelimit",
             "namespace_id": "1003",
-            "simple": { "limit": 120, "period": 60 }
+            "simple": { "limit": 600, "period": 60 }
           },
           {
             "name": "JOIN_LIMIT",
@@ -178,7 +180,7 @@
             "name": "RELAY_LIMIT",
             "type": "ratelimit",
             "namespace_id": "1001",
-            "simple": { "limit": 120, "period": 60 }
+            "simple": { "limit": 600, "period": 60 }
           },
           {
             "name": "JOIN_LIMIT",

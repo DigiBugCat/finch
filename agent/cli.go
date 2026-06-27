@@ -821,15 +821,20 @@ func cmdAdd(args []string) {
 		fmt.Printf("finch: note: %q was registered as %q (host-safe slug)\n", wantPath, id)
 	}
 
+	// Honor the finch.yml at --config (best-effort): the box should register under
+	// the manifest's `machine:` (falling back to the hostname), and the credential
+	// MUST land in the manifest's credentials-dir so `finch run` finds it.
+	host, _ := os.Hostname()
+	machine, credDir := addPaths(*configPath, host)
+
 	// Trade the ticket for a saved box-side credential now (so the ticket never
 	// lands in the manifest), then append a ticketless ingress rule.
-	host, _ := os.Hostname()
-	statePath := filepath.Join(defaultCredentialsDir(), id+".json")
-	if _, eerr := enrollToState(cred.Hub, host, ticket, statePath); eerr != nil {
+	statePath := filepath.Join(credDir, id+".json")
+	if _, _, eerr := enrollToState(cred.Hub, machine, ticket, statePath); eerr != nil {
 		fmt.Fprintf(os.Stderr, "finch: enroll failed: %v\n", eerr)
 		os.Exit(1)
 	}
-	if err := appendIngress(*configPath, cred.Hub, id, *service); err != nil {
+	if err := appendIngress(*configPath, cred.Hub, id, *service, machine); err != nil {
 		fmt.Fprintf(os.Stderr, "finch: could not write %s: %v\n", *configPath, err)
 		os.Exit(1)
 	}
@@ -855,8 +860,10 @@ func cmdEnroll(args []string) {
 	fs := flag.NewFlagSet("enroll", flag.ExitOnError)
 	ticket := fs.String("ticket", "", "one-shot enrollment ticket from the dashboard (required)")
 	hub := fs.String("hub", "https://finchmcp.com", "finch hub base URL")
+	// Default --machine to finch.yml's `machine:` when a manifest is present, so the
+	// box registers under the name the manifest declares; else the hostname.
 	host, _ := os.Hostname()
-	machine := fs.String("machine", host, "this box's name")
+	machine := fs.String("machine", configMachine("finch.yml", host), "this box's name")
 	credDir := fs.String("credentials-dir", defaultCredentialsDir(), "directory the saved credential is written to")
 
 	appPath := ""
@@ -877,14 +884,27 @@ func cmdEnroll(args []string) {
 		fmt.Fprintf(os.Stderr, "finch: <app_path> %q must be a single URL segment (no slashes or spaces)\n", appPath)
 		os.Exit(2)
 	}
-	statePath := filepath.Join(expandHome(*credDir), appPath+".json")
-	if _, err := enrollToState(*hub, *machine, *ticket, statePath); err != nil {
+
+	// Join FIRST so we can name the credential by the hub's slugified appliance id
+	// (the relay resolves the appliance by THAT id, so `finch enroll Printer` must
+	// land as "printer", not the raw arg, or its URL/credential never matches).
+	jr, err := join(*hub, *ticket, *machine)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "finch: enroll failed: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("finch: enrolled %q — credential saved to %s\n", appPath, statePath)
+	id := jr.Appliance
+	statePath := filepath.Join(expandHome(*credDir), id+".json")
+	if _, err := persistJoin(*hub, jr, statePath); err != nil {
+		fmt.Fprintf(os.Stderr, "finch: enroll failed: %v\n", err)
+		os.Exit(1)
+	}
+	if id != appPath {
+		fmt.Printf("finch: note: %q was registered as %q (host-safe slug)\n", appPath, id)
+	}
+	fmt.Printf("finch: enrolled %q — credential saved to %s\n", id, statePath)
 	fmt.Printf("       add it to finch.yml and run `finch run`:\n")
-	fmt.Printf("         ingress:\n           - app_path: %s\n             service: http://127.0.0.1:8000\n", appPath)
+	fmt.Printf("         ingress:\n           - app_path: %s\n             service: http://127.0.0.1:8000\n", id)
 }
 
 // defaultCredentialsDir mirrors loadConfig's default: ~/.finch (cwd-relative
@@ -897,39 +917,150 @@ func defaultCredentialsDir() string {
 	return ".finch"
 }
 
-// appendIngress adds a YAML ingress rule to a finch.yml, parsing-then-remarshaling
-// so the result is always valid (an existing rule with the same app_path is
-// replaced). No ticket is written — the box-side credential is saved separately
-// by enroll. Creates the file with a hub/machine header if it doesn't exist.
-func appendIngress(configPath, hub, appPath, service string) error {
-	var c config
-	if b, err := os.ReadFile(configPath); err == nil {
-		if uerr := yaml.Unmarshal(b, &c); uerr != nil {
-			return fmt.Errorf("parsing %s: %w", configPath, uerr)
+// configMachine returns the finch.yml `machine:` at configPath, or host when the
+// manifest is absent / sets no machine — so `finch enroll`/`finch add` register
+// the box under the name the manifest declares (matching the run-time log line).
+func configMachine(configPath, host string) string {
+	if c, err := loadConfig(configPath, host); err == nil && c.Machine != "" {
+		return c.Machine
+	}
+	return host
+}
+
+// addPaths resolves the machine name + credentials dir `finch add` should use,
+// honoring an existing finch.yml at configPath (best-effort): the credential must
+// land in the manifest's credentials-dir so `finch run` finds it, and the box
+// should register under the manifest's machine name. Falls back to the hostname +
+// the default ~/.finch when the manifest is absent. loadConfig already expands ~
+// and applies the credentials-dir default, so its values are used as-is.
+func addPaths(configPath, host string) (machine, credDir string) {
+	machine, credDir = host, defaultCredentialsDir()
+	if c, err := loadConfig(configPath, host); err == nil {
+		if c.Machine != "" {
+			machine = c.Machine
 		}
-	} else if !os.IsNotExist(err) {
-		return err
-	}
-	if c.Hub == "" {
-		c.Hub = hub
-	}
-	if c.Machine == "" {
-		c.Machine, _ = os.Hostname()
-	}
-	replaced := false
-	for i := range c.Ingress {
-		if c.Ingress[i].AppPath == appPath {
-			c.Ingress[i].Service = service
-			replaced = true
-			break
+		if c.CredentialsDir != "" {
+			credDir = c.CredentialsDir
 		}
 	}
-	if !replaced {
-		c.Ingress = append(c.Ingress, ingress{AppPath: appPath, Service: service})
+	return machine, credDir
+}
+
+// appendIngress adds (or updates) one ingress rule in finch.yml WITHOUT clobbering
+// user comments or keys finch doesn't model: it edits an existing file through a
+// yaml.Node (yaml.v3 preserves comments + unknown content across a Node round-trip)
+// rather than unmarshaling into the fixed `config` struct and re-marshaling. An
+// existing rule with the same app_path is updated in place; hub/machine are filled
+// only when absent. A missing file is created from the managed header + a minimal
+// struct marshal. No ticket is written — the credential is saved separately by enroll.
+func appendIngress(configPath, hub, appPath, service, machine string) error {
+	b, err := os.ReadFile(configPath)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return err
+		}
+		// New file: a minimal struct marshal under the managed header is fine.
+		if machine == "" {
+			machine, _ = os.Hostname()
+		}
+		c := config{Hub: hub, Machine: machine, Ingress: []ingress{{AppPath: appPath, Service: service}}}
+		out, merr := yaml.Marshal(&c)
+		if merr != nil {
+			return merr
+		}
+		return os.WriteFile(configPath, append([]byte("# finch.yml — managed by `finch add`\n"), out...), 0o600)
 	}
-	out, err := yaml.Marshal(&c)
+
+	// Existing file: edit through a yaml.Node so comments + unmodeled keys survive.
+	var doc yaml.Node
+	if uerr := yaml.Unmarshal(b, &doc); uerr != nil {
+		return fmt.Errorf("parsing %s: %w", configPath, uerr)
+	}
+	var root *yaml.Node
+	if doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 {
+		root = doc.Content[0]
+	} else { // empty/whitespace file — start a fresh mapping document
+		root = &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+		doc = yaml.Node{Kind: yaml.DocumentNode, Content: []*yaml.Node{root}}
+	}
+	if root.Kind != yaml.MappingNode {
+		return fmt.Errorf("%s: top-level YAML is not a mapping", configPath)
+	}
+
+	// Fill hub/machine only when absent (don't overwrite a user's values).
+	if yamlMapValue(root, "hub") == nil && hub != "" {
+		yamlMapSet(root, "hub", yamlScalar(hub))
+	}
+	if yamlMapValue(root, "machine") == nil {
+		if machine == "" {
+			machine, _ = os.Hostname()
+		}
+		if machine != "" {
+			yamlMapSet(root, "machine", yamlScalar(machine))
+		}
+	}
+
+	// Locate (or create) the ingress sequence.
+	seq := yamlMapValue(root, "ingress")
+	if seq == nil || seq.Kind != yaml.SequenceNode {
+		seq = &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
+		yamlMapSet(root, "ingress", seq)
+	}
+	// Update an existing rule with the same app_path in place; else append one.
+	for _, item := range seq.Content {
+		if item.Kind != yaml.MappingNode {
+			continue
+		}
+		if ap := yamlMapValue(item, "app_path"); ap != nil && ap.Value == appPath {
+			yamlMapSet(item, "service", yamlScalar(service))
+			return yamlWriteFile(configPath, &doc)
+		}
+	}
+	seq.Content = append(seq.Content, &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map", Content: []*yaml.Node{
+		yamlScalar("app_path"), yamlScalar(appPath),
+		yamlScalar("service"), yamlScalar(service),
+	}})
+	return yamlWriteFile(configPath, &doc)
+}
+
+// --- minimal yaml.Node helpers (comment-preserving finch.yml edits) ---
+
+// yamlScalar builds a plain string scalar node.
+func yamlScalar(v string) *yaml.Node {
+	return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: v}
+}
+
+// yamlMapValue returns the value node for key in a mapping node, or nil.
+func yamlMapValue(m *yaml.Node, key string) *yaml.Node {
+	if m == nil || m.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if m.Content[i].Value == key {
+			return m.Content[i+1]
+		}
+	}
+	return nil
+}
+
+// yamlMapSet sets key to val in a mapping node, replacing the value if the key
+// already exists (preserving the key node + its comments) or appending otherwise.
+func yamlMapSet(m *yaml.Node, key string, val *yaml.Node) {
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if m.Content[i].Value == key {
+			m.Content[i+1] = val
+			return
+		}
+	}
+	m.Content = append(m.Content, yamlScalar(key), val)
+}
+
+// yamlWriteFile marshals a yaml document node (0600). yaml.v3 preserves comments
+// and unmodeled keys through the Node, so a hand-edited finch.yml survives edits.
+func yamlWriteFile(configPath string, doc *yaml.Node) error {
+	out, err := yaml.Marshal(doc)
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(configPath, append([]byte("# finch.yml — managed by `finch add`\n"), out...), 0o600)
+	return os.WriteFile(configPath, out, 0o600)
 }

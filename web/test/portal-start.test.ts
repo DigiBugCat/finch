@@ -130,6 +130,37 @@ describe("GET /portal/start", () => {
     expect(body).toMatch(/registered to your account/i);
   });
 
+  it("returns a clean 502 (not a 500) when the hub's 200 body isn't JSON", async () => {
+    // A 200 with an empty/non-JSON body would throw in res.json(); the handler
+    // must catch it and surface the same clean 502 as the missing-grant case
+    // rather than letting the throw become an opaque 500.
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response("", {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+
+    const res = await GET(startReq("?slug=printer&rd=%2F"));
+
+    expect(res.status).toBe(502);
+    expect(await res.text()).toMatch(/could not start the appliance session/i);
+  });
+
+  it("returns a clean 502 when the hub's 200 body omits the grant", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
+    );
+
+    const res = await GET(startReq("?slug=printer&rd=%2F"));
+
+    expect(res.status).toBe(502);
+    expect(await res.text()).toMatch(/could not start the appliance session/i);
+  });
+
   it("redirects to /sign-in when unauthenticated", async () => {
     authMock.mockResolvedValue({ userId: null, orgId: null, orgRole: null });
     const fetchSpy = vi.spyOn(globalThis, "fetch");

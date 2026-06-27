@@ -76,13 +76,18 @@ credentials-dir: ~/.finch        # where `finch enroll` writes per-app credentia
 
 # Each rule forwards one local service.
 #   app_path → the public URL segment: https://<your-slug>.finchmcp.com/<app_path>/
-#              (and the appliance name in the dashboard). finch forwards the whole
-#              /<app_path>/* subtree; an MCP server just answers at …/<app_path>/mcp.
+#              (and the appliance name in the dashboard). By default finch forwards
+#              only …/<app_path>/mcp (it's an MCP tunnel first). Set forward_all: true
+#              (or point service at a base path) to forward the whole subtree — for a
+#              website or any non-MCP HTTP app.
 ingress:
   - app_path: printer
     service: http://127.0.0.1:8000
   - app_path: transcribe
     service: http://127.0.0.1:8001
+  - app_path: www                    # a plain website needs the whole subtree
+    service: http://127.0.0.1:3000
+    forward_all: true
 ```
 
 Enrollment is a separate one-time step that keeps the ticket out of the manifest:
@@ -128,14 +133,16 @@ ticketless.
 | `--machine` | hostname | this box's name |
 | `--upstream` | `http://127.0.0.1:8000` | local service (single-service mode) |
 | `--state` | `~/.finch/agent.json` | persisted per-machine refresh credential |
+| `--forward-all` | off | forward the whole loopback host, not just `/mcp` (single-service mode) |
 
 ## How it relays
 
 On connect the agent dials `wss://<hub>/<appliance>/<machine>/_connect?ct=<token>`
 and parks the socket. For each request frame the hub sends, the agent forwards
 it to the matching local `service`, streams the response back (`head` →
-`chunk…` → `end`), and confines forwarded paths to the upstream's base (an SSRF
-guard). The caller's `finch_` key never reaches your box — the hub strips it.
+`chunk…` → `end`), and confines forwarded paths to `/mcp` by default (or the
+service's base path; `forward_all` / `--forward-all` opts out to the whole host) —
+an SSRF guard. The caller's `finch_` key never reaches your box — the hub strips it.
 
 ## Build / test
 

@@ -135,8 +135,17 @@ export async function GET(req: Request) {
     });
   }
 
-  const data = (await res.json()) as { grant?: string };
-  const grant = data?.grant;
+  // Read the grant out of the 200 body. An empty/non-JSON body throws in
+  // res.json() — treat that the same as a missing grant (a malformed success)
+  // and return the clean 502 rather than letting the throw surface as an opaque
+  // 500.
+  let grant: string | undefined;
+  try {
+    const data = (await res.json()) as { grant?: string };
+    grant = data?.grant;
+  } catch {
+    grant = undefined;
+  }
   if (!grant) {
     return new Response("Could not start the appliance session. Try again.", {
       status: 502,

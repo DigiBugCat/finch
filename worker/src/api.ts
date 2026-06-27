@@ -119,6 +119,18 @@ async function readJson(req: Request): Promise<any> {
   }
 }
 
+/** Percent-decode a path segment, tolerating a malformed encoding (a lone "%"
+ *  makes decodeURIComponent throw a URIError → an unhandled 500). Falls back to
+ *  the raw value so a bad id degrades to a clean not-found/4xx. Mirrors index.ts's
+ *  safeDecode. (code-review #15) */
+function safeDecode(seg: string): string {
+  try {
+    return decodeURIComponent(seg);
+  } catch {
+    return seg;
+  }
+}
+
 export async function handleApi(
   req: Request,
   env: Env,
@@ -392,6 +404,14 @@ export async function handleApi(
     return json(200, await tenantOp(env, tenant, "revokeCliTokens"));
   }
 
+  // POST /api/sessions-revoke — "sign everyone out" of the browser login wall:
+  // bump the tenant's sessionEpoch so every live finch_session cookie (stamped
+  // with the old epoch) is rejected at the relay gate (browserGate). The web BFF
+  // calls this; mirrors cli-revoke for the CLI-token plane.
+  if (method === "POST" && seg.length === 1 && seg[0] === "sessions-revoke") {
+    return json(200, await tenantOp(env, tenant, "bumpSessionEpoch"));
+  }
+
   // POST /api/portal-grant {slug,userId} — the login-wall hand-off. The Clerk-
   // gated portal page (web) calls this for a browser that hit a private appliance
   // with no session cookie. The TENANT is the security-critical part and comes
@@ -437,7 +457,7 @@ export async function handleApi(
 
   // POST /api/appliances/:id/release|approve|decline
   if (method === "POST" && seg[0] === "appliances" && seg.length === 3) {
-    const id = decodeURIComponent(seg[1]);
+    const id = safeDecode(seg[1]);
     const action = seg[2];
     if (action === "release" || action === "approve" || action === "decline") {
       const out = await tenantOp(env, tenant, action, { id });
@@ -455,7 +475,7 @@ export async function handleApi(
     seg.length === 3 &&
     seg[2] === "auth"
   ) {
-    const id = decodeURIComponent(seg[1]);
+    const id = safeDecode(seg[1]);
     const body = await readJson(req);
     const out = await tenantOp<{ ok: boolean; error?: string }>(
       env,
@@ -476,7 +496,7 @@ export async function handleApi(
     seg.length === 3 &&
     seg[2] === "tags"
   ) {
-    const id = decodeURIComponent(seg[1]);
+    const id = safeDecode(seg[1]);
     const body = await readJson(req);
     const out = await tenantOp(env, tenant, "setTags", {
       id,
@@ -492,7 +512,7 @@ export async function handleApi(
     seg.length === 3 &&
     seg[2] === "group"
   ) {
-    const id = decodeURIComponent(seg[1]);
+    const id = safeDecode(seg[1]);
     const body = await readJson(req);
     const out = await tenantOp(env, tenant, "setGroup", {
       id,
@@ -532,7 +552,7 @@ export async function handleApi(
     seg[2] === "keys" &&
     seg[3] === "revoke"
   ) {
-    const machine = decodeURIComponent(seg[1]);
+    const machine = safeDecode(seg[1]);
     const body = await readJson(req);
     if (!body.appliance || !body.key) {
       return json(400, { error: "appliance and key required" });
@@ -560,7 +580,7 @@ export async function handleApi(
 
   // DELETE /api/acl/:id
   if (method === "DELETE" && seg[0] === "acl" && seg.length === 2) {
-    const id = decodeURIComponent(seg[1]);
+    const id = safeDecode(seg[1]);
     const out = await tenantOp(env, tenant, "removeAcl", { id });
     return json(out?.ok === false ? 404 : 200, out);
   }

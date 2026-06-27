@@ -18,11 +18,11 @@ func mustParse(t *testing.T, raw string) *url.URL {
 }
 
 // resolveUpstream is the SSRF guard: host/scheme must come only from the trusted
-// service base, never from the frame. With NO base path the whole service subtree
-// is intentionally exposed (finch is a protocol-agnostic tunnel, not MCP-only), so
-// a cleaned sibling path is allowed; a base path re-narrows (see _BasePath). The
-// host-injection defenses always hold. This is the highest-risk code, so we pin
-// the full attack matrix.
+// service base, never from the frame. With NO base path and forwardAll=false the
+// service is confined to /mcp by DEFAULT (a sibling path is rejected); a service
+// base path re-narrows to it (see _BasePath) and forwardAll opts out to expose the
+// whole subtree (see _ForwardAll). The host-injection defenses always hold. This
+// is the highest-risk code, so we pin the full attack matrix.
 func TestResolveUpstream(t *testing.T) {
 	base := mustParse(t, "http://127.0.0.1:8000")
 	cases := []struct {
@@ -30,20 +30,20 @@ func TestResolveUpstream(t *testing.T) {
 		want    string // "" means: expect an error (rejected)
 		comment string
 	}{
-		{"/mcp", "http://127.0.0.1:8000/mcp", "the MCP endpoint still works"},
+		{"/mcp", "http://127.0.0.1:8000/mcp", "the MCP endpoint works (default /mcp confinement)"},
 		{"/mcp/tools", "http://127.0.0.1:8000/mcp/tools", "child path"},
 		{"/mcp?x=1", "http://127.0.0.1:8000/mcp?x=1", "query preserved"},
-		{"/", "http://127.0.0.1:8000/", "site root (a webpage) forwards"},
-		{"/index.html", "http://127.0.0.1:8000/index.html", "arbitrary asset forwards"},
-		{"/mcp/../admin", "http://127.0.0.1:8000/admin", "no base path => whole service exposed, sibling allowed"},
-		{"/admin", "http://127.0.0.1:8000/admin", "no base path => sibling allowed"},
+		{"/", "", "no base path defaults to /mcp -> site root rejected"},
+		{"/index.html", "", "arbitrary asset rejected under default /mcp"},
+		{"/mcp/../admin", "", "traversal out of /mcp -> reject"},
+		{"/admin", "", "sibling rejected under default /mcp"},
 		{"//evil.com/x", "", "protocol-relative host injection -> reject"},
 		{"http://evil.com/x", "", "absolute-URL injection -> reject"},
-		{"/mcp/../mcp/ok", "http://127.0.0.1:8000/mcp/ok", "traversal collapses, host unchanged"},
-		{"", "http://127.0.0.1:8000/", "empty path -> root"},
+		{"/mcp/../mcp/ok", "http://127.0.0.1:8000/mcp/ok", "traversal collapses, stays under /mcp"},
+		{"", "", "empty path -> / -> rejected under default /mcp"},
 	}
 	for _, c := range cases {
-		got, err := resolveUpstream(base, c.path)
+		got, err := resolveUpstream(base, c.path, false)
 		if c.want == "" {
 			if err == nil {
 				t.Errorf("%s: resolveUpstream(%q) = %q, want REJECT", c.comment, c.path, got)
@@ -60,13 +60,42 @@ func TestResolveUpstream(t *testing.T) {
 	}
 }
 
-// A configured base path widens the confinement prefix to that base path.
+// forwardAll=true opts out of the default /mcp confinement: any rooted path under
+// the service host is forwarded (a website / non-MCP HTTP app), while the
+// host-injection defenses still hold.
+func TestResolveUpstream_ForwardAll(t *testing.T) {
+	base := mustParse(t, "http://127.0.0.1:8000")
+	ok := []struct{ path, want string }{
+		{"/", "http://127.0.0.1:8000/"},
+		{"/index.html", "http://127.0.0.1:8000/index.html"},
+		{"/admin", "http://127.0.0.1:8000/admin"},
+		{"/mcp", "http://127.0.0.1:8000/mcp"},
+	}
+	for _, c := range ok {
+		got, err := resolveUpstream(base, c.path, true)
+		if err != nil {
+			t.Errorf("forward_all: resolveUpstream(%q) errored: %v", c.path, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("forward_all: resolveUpstream(%q) = %q, want %q", c.path, got, c.want)
+		}
+	}
+	for _, bad := range []string{"//evil.com/x", "http://evil.com/x"} {
+		if _, err := resolveUpstream(base, bad, true); err == nil {
+			t.Errorf("forward_all must still reject host injection %q", bad)
+		}
+	}
+}
+
+// A configured base path widens the confinement prefix to that base path (and
+// forwardAll is irrelevant once a base path is set).
 func TestResolveUpstream_BasePath(t *testing.T) {
 	base := mustParse(t, "http://127.0.0.1:8000/api")
-	if _, err := resolveUpstream(base, "/api/mcp"); err != nil {
+	if _, err := resolveUpstream(base, "/api/mcp", false); err != nil {
 		t.Errorf("/api/mcp under base /api should pass: %v", err)
 	}
-	if _, err := resolveUpstream(base, "/mcp"); err == nil {
+	if _, err := resolveUpstream(base, "/mcp", false); err == nil {
 		t.Errorf("/mcp should be rejected when base path is /api")
 	}
 }

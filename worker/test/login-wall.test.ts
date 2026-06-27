@@ -298,6 +298,62 @@ describe("login wall — keyless browser hit on a private appliance", () => {
     agent.close(1000, "done");
   });
 
+  it("strips ONLY finch_session from the Cookie header — the app's own cookies survive (#1)", async () => {
+    const { host, base, slug, tenant, appliance, agent } =
+      await standUpAppliance();
+    const cookie = await mintSession({ tenant, slug });
+
+    const reqSeen = nextFrame(agent);
+    const relayP = call(
+      new Request(`${base}/${appliance}/index.html`, {
+        method: "GET",
+        headers: {
+          host,
+          // A logged-in browser carries BOTH the login-wall cookie AND the hosted
+          // app's own cookies. A blanket "contains finch_" strip would delete the
+          // whole header and break the site; only finch_session must be removed.
+          cookie: `finch_session=${cookie}; app_sid=abc123; theme=dark`,
+        },
+        redirect: "manual",
+      }),
+    );
+    const reqFrame = await reqSeen;
+    expect(reqFrame.type).toBe("req");
+    const fwd = (reqFrame.headers ?? {}) as Record<string, string>;
+    // The hosted app's OWN cookies survive to the box...
+    expect(fwd.cookie).toContain("app_sid=abc123");
+    expect(fwd.cookie).toContain("theme=dark");
+    // ...but the login-wall cookie is gone (never crosses the trust boundary).
+    expect(fwd.cookie).not.toContain("finch_session");
+    reply200(agent, reqFrame.id, "<h1>ok</h1>");
+    expect((await relayP).status).toBe(200);
+
+    agent.close(1000, "done");
+  });
+
+  it("deletes the Cookie header entirely when finch_session is the only cookie (#1)", async () => {
+    const { host, base, slug, tenant, appliance, agent } =
+      await standUpAppliance();
+    const cookie = await mintSession({ tenant, slug });
+
+    const reqSeen = nextFrame(agent);
+    const relayP = call(
+      new Request(`${base}/${appliance}/index.html`, {
+        method: "GET",
+        headers: { host, cookie: `finch_session=${cookie}` },
+        redirect: "manual",
+      }),
+    );
+    const reqFrame = await reqSeen;
+    const fwd = (reqFrame.headers ?? {}) as Record<string, string>;
+    // Nothing left to forward → no cookie header at all (not an empty string).
+    expect(fwd.cookie).toBeUndefined();
+    reply200(agent, reqFrame.id, "<ok/>");
+    expect((await relayP).status).toBe(200);
+
+    agent.close(1000, "done");
+  });
+
   it("does NOT wall a finch_ bearer call (key plane unchanged: 403 bad-key / relay good-key)", async () => {
     const { host, base, tenant, appliance, agent } = await standUpAppliance();
 
@@ -478,6 +534,41 @@ describe("login wall — session cookie validity", () => {
     expect(res.status).toBe(302);
     agent.close(1000, "done");
   });
+
+  it("POST /api/sessions-revoke bumps the epoch; an old-epoch cookie is then walled (#7)", async () => {
+    const { host, base, slug, tenant, appliance, agent } =
+      await standUpAppliance();
+    // A cookie minted under the CURRENT (epoch 0) session works...
+    const cookie = await mintSession({ tenant, slug, epoch: 0 });
+    const reqSeen = nextFrame(agent);
+    const relayP = call(
+      new Request(`${base}/${appliance}/index.html`, {
+        method: "GET",
+        headers: { host, cookie: `finch_session=${cookie}` },
+        redirect: "manual",
+      }),
+    );
+    const f = await reqSeen;
+    reply200(agent, f.id, "<ok/>");
+    expect((await relayP).status).toBe(200);
+
+    // ...the web BFF calls the service-authed revocation route ("sign everyone
+    // out"), which bumps the tenant's sessionEpoch via bumpSessionEpoch...
+    const revoke = await api(tenant, host, "POST", "/api/sessions-revoke");
+    expect(revoke.status).toBe(200);
+    expect(((await revoke.json()) as any).epoch).toBe(1);
+
+    // ...and the SAME epoch-0 cookie is now rejected by the relay gate → wall.
+    const res = await call(
+      new Request(`${base}/${appliance}/index.html`, {
+        method: "GET",
+        headers: { host, cookie: `finch_session=${cookie}` },
+        redirect: "manual",
+      }),
+    );
+    expect(res.status).toBe(302);
+    agent.close(1000, "done");
+  });
 });
 
 describe("/__finch/cb — portal grant → session cookie hand-off", () => {
@@ -499,6 +590,9 @@ describe("/__finch/cb — portal grant → session cookie hand-off", () => {
     expect(setCookie).toContain("Secure");
     expect(setCookie).toContain("SameSite=Lax");
     expect(setCookie).toContain("Path=/");
+    // PERSISTENT cookie: Max-Age matches the 12h session TTL (#11). Without it the
+    // browser would drop the cookie when the tab closes (a session cookie).
+    expect(setCookie).toContain(`Max-Age=${12 * 60 * 60}`);
     // HOST-scoped: no Domain attribute (can't be replayed against a sibling slug).
     expect(setCookie.toLowerCase()).not.toContain("domain=");
   });
@@ -586,6 +680,20 @@ describe("/__finch/cb — portal grant → session cookie hand-off", () => {
     );
     expect(r2.status).toBe(302);
     expect(r2.headers.get("location")).toBe("/");
+  });
+});
+
+describe("control-plane id decode — malformed percent-encoding (#15)", () => {
+  it("degrades a malformed %-encoded appliance id to a clean 4xx, not a 500", async () => {
+    const { host, tenant } = await freshTenantSlug();
+    // A lone/partial %-escape (%zz) makes decodeURIComponent throw a URIError;
+    // safeDecode must catch it so the route resolves the (now unknown) id to a
+    // clean 404 instead of bubbling the throw into an unhandled 500.
+    const res = await api(tenant, host, "PUT", "/api/appliances/%zz/auth", {
+      mode: "public",
+    });
+    expect(res.status).not.toBe(500);
+    expect(res.status).toBe(404);
   });
 });
 

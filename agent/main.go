@@ -274,6 +274,7 @@ func main() {
 	upstream := flag.String("upstream", "http://127.0.0.1:8000", "local MCP server base URL")
 	statePath := flag.String("state", defaultStatePath(), "file that persists the per-machine refresh credential so a restart needs no new ticket")
 	configPath := flag.String("config", "", "path to a finch.yml manifest; serves every ingress rule (one local service per appliance) over one process")
+	forwardAll := flag.Bool("forward-all", false, "forward the WHOLE loopback host (every path), not just /mcp — for a website or any non-MCP HTTP app (single-service mode)")
 
 	// The install one-liners are `finch join …` (single service) and `finch run`
 	// (read finch.yml). flag.Parse stops at the first non-flag arg, so strip a
@@ -283,12 +284,23 @@ func main() {
 	}
 	flag.Parse()
 
+	// finch.toml support (TOML parsing) was removed in favor of a cloudflared-style
+	// finch.yml. Fail loudly rather than silently dropping an upgraded
+	// multi-appliance box to single-service mode and serving nothing: both when
+	// --config points at a .toml and when a legacy finch.toml is the only manifest
+	// in the working dir.
+	if strings.HasSuffix(strings.ToLower(*configPath), ".toml") {
+		fatalLegacyTOML(*configPath, hostName)
+	}
+
 	// Config-driven (cloudflared-style) when --config is given, or a finch.yml
 	// sits in the working dir and no single-service flags were overridden.
 	cfgPath := *configPath
 	if cfgPath == "" && *ticket == "" {
 		if _, err := os.Stat("finch.yml"); err == nil {
 			cfgPath = "finch.yml"
+		} else if _, terr := os.Stat("finch.toml"); terr == nil {
+			fatalLegacyTOML("finch.toml", hostName)
 		}
 	}
 	if cfgPath != "" {
@@ -311,23 +323,41 @@ func main() {
 	// run` use, collapsed into one command for the single-service path.
 	if *ticket != "" {
 		if saved, _ := loadState(*statePath); saved == nil || saved.RefreshToken == "" || saved.Hub != *hub {
-			if _, eerr := enrollToState(*hub, *machine, *ticket, *statePath); eerr != nil {
+			if _, _, eerr := enrollToState(*hub, *machine, *ticket, *statePath); eerr != nil {
 				log.Fatalf("finch: enroll failed: %v", eerr)
 			}
 			log.Printf("finch: enrolled — credential saved to %s", *statePath)
 		}
 	}
-	runAppliance(*hub, *statePath, upstreamURL, "", false)
+	// Thread the ticket into the run path so a same-hub-but-revoked credential can
+	// still recover from a fresh ticket: runAppliance re-enrolls if resume fails.
+	runAppliance(applianceOpts{
+		hub: *hub, statePath: *statePath, upstream: upstreamURL,
+		ticket: *ticket, machine: *machine, forwardAll: *forwardAll,
+	})
 }
 
 // enrollToState trades a one-shot ticket for a long-lived refresh credential via
-// /join and persists it (0600) to statePath, so later runs resume ticketless.
-// Shared by the single-service `finch join` path and `finch enroll`.
-func enrollToState(hub, machine, ticket, statePath string) (*agentState, error) {
+// /join and persists it (0600) to statePath, returning the join response too so
+// callers can read the hub-slugified appliance id. Shared by the single-service
+// `finch join` path and `finch add` (both write a fixed state file).
+func enrollToState(hub, machine, ticket, statePath string) (*agentState, *joinResp, error) {
 	jr, err := join(hub, ticket, machine)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	st, err := persistJoin(hub, jr, statePath)
+	if err != nil {
+		return nil, nil, err
+	}
+	return st, jr, nil
+}
+
+// persistJoin saves a /join result as the box-side refresh credential (0600).
+// Only /join returns the long-lived refresh token, so it must be present. Split
+// out of enrollToState so `finch enroll` can read the hub-slugified appliance id
+// from the join response BEFORE choosing the credential filename.
+func persistJoin(hub string, jr *joinResp, statePath string) (*agentState, error) {
 	if jr.RefreshToken == "" {
 		return nil, fmt.Errorf("hub returned no refresh token")
 	}
@@ -364,7 +394,10 @@ func runConfig(cfg *config) {
 		wg.Add(1)
 		go func(ing ingress, up *url.URL, sp string) {
 			defer wg.Done()
-			runAppliance(cfg.Hub, sp, up, ing.AppPath, autoApprove)
+			runAppliance(applianceOpts{
+				hub: cfg.Hub, statePath: sp, upstream: up,
+				label: ing.AppPath, autoApprove: autoApprove, forwardAll: ing.ForwardAll,
+			})
 		}(ing, up, statePath)
 	}
 	if started == 0 {
@@ -374,12 +407,30 @@ func runConfig(cfg *config) {
 	wg.Wait()
 }
 
+// applianceOpts bundles one relay loop's inputs: the hub + saved-credential path,
+// the local upstream, a log label, whether to auto-approve, the whole-host
+// forwarding opt-in, and the single-service ticket fallback (ticket+machine, both
+// empty in config mode).
+type applianceOpts struct {
+	hub         string
+	statePath   string
+	upstream    *url.URL
+	label       string
+	autoApprove bool
+	forwardAll  bool
+	ticket      string // single-service `finch join --ticket` recovery; "" in config mode
+	machine     string // machine name the ticket fallback enrolls under
+}
+
 // runAppliance resumes one already-enrolled appliance from its saved credential,
-// then holds its relay open and reconnects forever. `label` prefixes logs (the
-// ingress app_path in config mode, empty in single-service mode). Enrollment is a
-// separate one-time step (`finch enroll`); if no usable credential is found this
-// logs how to enroll and returns, so a sibling rule in config mode survives.
-func runAppliance(hub, statePath string, upstreamURL *url.URL, label string, autoApprove bool) {
+// then holds its relay open and reconnects forever. `o.label` prefixes logs (the
+// ingress app_path in config mode, empty in single-service mode). Enrollment is
+// normally a separate one-time step (`finch enroll`); in single-service mode a
+// fresh `o.ticket` is a fallback that re-enrolls when the saved credential is
+// missing/revoked. If no usable credential and no ticket are found this logs how
+// to enroll and returns, so a sibling rule in config mode survives.
+func runAppliance(o applianceOpts) {
+	hub, statePath, upstreamURL, label, autoApprove := o.hub, o.statePath, o.upstream, o.label, o.autoApprove
 	lp := "finch"
 	if label != "" {
 		lp = "finch[" + label + "]"
@@ -395,7 +446,22 @@ func runAppliance(hub, statePath string, upstreamURL *url.URL, label string, aut
 			refreshToken = saved.RefreshToken
 			log.Printf("%s: resumed from saved credential (%s)", lp, statePath)
 		} else {
-			log.Printf("%s: saved credential at %s unusable (%v) — re-enroll with `finch enroll %s --ticket <t>`", lp, statePath, rerr, label)
+			log.Printf("%s: saved credential at %s unusable (%v)", lp, statePath, rerr)
+		}
+	}
+	// Resume-then-ticket fallback (single-service `finch join --ticket`): if the
+	// saved credential is missing/revoked/expired and we hold an enrollment ticket,
+	// re-enroll with it (overwriting the stale state) and proceed — so a fresh valid
+	// ticket always recovers a box whose credential was revoked server-side. The
+	// join response already carries a connect-token, so no extra /refresh is needed.
+	// Config mode passes no ticket and falls through to the enroll hint below.
+	if jr == nil && o.ticket != "" {
+		if st, ejr, eerr := enrollToState(hub, o.machine, o.ticket, statePath); eerr != nil {
+			log.Printf("%s: re-enroll from ticket failed: %v", lp, eerr)
+		} else {
+			jr = ejr
+			refreshToken = st.RefreshToken
+			log.Printf("%s: re-enrolled from ticket — credential saved to %s", lp, statePath)
 		}
 	}
 	if jr == nil {
@@ -464,7 +530,7 @@ func runAppliance(hub, statePath string, upstreamURL *url.URL, label string, aut
 
 		wsURL := wsBase + "?ct=" + url.QueryEscape(connectToken)
 		start := time.Now()
-		if err := serve(wsURL, upstreamURL); err != nil {
+		if err := serve(wsURL, upstreamURL, o.forwardAll); err != nil {
 			log.Printf("%s: link down: %v (reconnecting in %s)", lp, err, backoff)
 			backoffSleep()
 			continue
@@ -633,7 +699,9 @@ func (o *outStream) setPaused(p bool) {
 }
 
 // serve holds one relay connection for its lifetime; returns on disconnect.
-func serve(wsURL string, upstream *url.URL) error {
+// forwardAll is threaded down to each forward() so resolveUpstream knows whether
+// to confine to /mcp (default) or forward the whole host.
+func serve(wsURL string, upstream *url.URL, forwardAll bool) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -740,7 +808,7 @@ func serve(wsURL string, upstream *url.URL) error {
 			outMu.Unlock()
 			go func(f frame, os *outStream) {
 				defer remove(f.ID)
-				forward(fctx, upstream, f, write, os)
+				forward(fctx, upstream, f, write, os, forwardAll)
 			}(f, os)
 		case "window":
 			if os := lookup(f.ID); os != nil {
@@ -789,8 +857,8 @@ const relayChunkSize = 32 << 10
 // os.resume or ctx.Done), so a slow client can't grow the DO's relay queue
 // unbounded. The head is emitted before any wait — head is never paused. os may
 // be nil (no flow control / direct unit-test call): then it never pauses.
-func forward(ctx context.Context, upstream *url.URL, f frame, write func(frame) error, os *outStream) {
-	target, err := resolveUpstream(upstream, f.Path)
+func forward(ctx context.Context, upstream *url.URL, f frame, write func(frame) error, os *outStream, forwardAll bool) {
+	target, err := resolveUpstream(upstream, f.Path, forwardAll)
 	if err != nil {
 		// SSRF reject — pre-head, so the DO turns this into a 403 response.
 		write(frame{ID: f.ID, Type: "err", Status: 403, Message: err.Error()})
@@ -889,23 +957,23 @@ func forward(ctx context.Context, upstream *url.URL, f frame, write func(frame) 
 }
 
 // resolveUpstream turns the hub-supplied request path into an absolute upstream
-// URL, refusing anything that would escape the configured service base.
+// URL, refusing anything that would escape the allowed prefix.
 // Defenses, in order:
 //   - reject scheme/authority injection (a path that itself parses to an
 //     absolute URL, or starts with "//" → protocol-relative host).
-//   - path.Clean to collapse "." / ".." segments, then (when the service has a
-//     base path) confine the cleaned path to it so "/mcp/../admin" can't climb
-//     out and SSRF something else on loopback.
+//   - path.Clean to collapse "." / ".." segments, then confine the cleaned path
+//     to the allowed prefix so "/mcp/../admin" can't climb out and SSRF
+//     something else on loopback.
 //   - rebuild the URL from the trusted base host/scheme + the cleaned path +
 //     the (query-only) raw query, so host/scheme can never come from the frame.
 //
-// finch is a protocol-agnostic byte tunnel: by default it forwards the WHOLE
-// /<app_path>/* subtree to the service (so a website or any HTTP API works, not
-// just an MCP /mcp endpoint). Point the service at a base path
-// (service: http://127.0.0.1:8000/mcp) to re-narrow exposure to that subtree;
-// the cleaned path must then BE it or a child of it. In every case host/scheme
-// come only from the trusted base, never from the frame.
-func resolveUpstream(base *url.URL, rawPath string) (string, error) {
+// The allowed prefix is: the service's configured base path when one is set
+// (service: http://127.0.0.1:8000/mcp → /mcp); else /mcp by DEFAULT (finch is an
+// MCP tunnel first, so the loopback host isn't exposed wholesale). Set forwardAll
+// (ingress forward_all: true / --forward-all) to opt OUT of that default and
+// forward the WHOLE /<app_path>/* subtree — for a website or any non-MCP HTTP
+// app. In every case host/scheme come only from the trusted base, never the frame.
+func resolveUpstream(base *url.URL, rawPath string, forwardAll bool) (string, error) {
 	if rawPath == "" {
 		rawPath = "/"
 	}
@@ -930,13 +998,15 @@ func resolveUpstream(base *url.URL, rawPath string) (string, error) {
 	// result that climbs above "/", so the cleaned path is always rooted.
 	clean := path.Clean(reqPath)
 
-	// Confine to the allowed prefix: the upstream's configured base path when one
-	// is set (e.g. service http://127.0.0.1:8000/mcp re-narrows to /mcp), else the
-	// whole service ("" prefix = forward the entire /<app_path>/* subtree — finch
-	// is a protocol-agnostic tunnel, not MCP-only). When a prefix IS set the
-	// cleaned path must BE it or a child of it, so "/mcp/../admin" → "/admin" stays
-	// rejected; with no prefix any rooted path under the service host is allowed.
+	// Confine to the allowed prefix: the service's configured base path when one is
+	// set (e.g. service http://127.0.0.1:8000/mcp confines to /mcp), else /mcp by
+	// DEFAULT — UNLESS forwardAll is set, which opts out and forwards the whole
+	// /<app_path>/* subtree ("" prefix). When a prefix IS set the cleaned path must
+	// BE it or a child of it, so "/mcp/../admin" → "/admin" stays rejected.
 	prefix := strings.TrimRight(base.Path, "/")
+	if prefix == "" && !forwardAll {
+		prefix = "/mcp"
+	}
 	if prefix != "" && clean != prefix && !strings.HasPrefix(clean, prefix+"/") {
 		return "", fmt.Errorf("rejected path (escapes upstream prefix %q): %q", prefix, clean)
 	}
@@ -965,6 +1035,10 @@ func resolveUpstream(base *url.URL, rawPath string) (string, error) {
 type ingress struct {
 	AppPath string `yaml:"app_path"`
 	Service string `yaml:"service"`
+	// ForwardAll opts this rule out of the default /mcp confinement and forwards
+	// the WHOLE /<app_path>/* subtree to the service (for a website or any non-MCP
+	// HTTP app). Off by default — the default exposes only /mcp.
+	ForwardAll bool `yaml:"forward_all,omitempty"`
 }
 
 // config is a parsed finch.yml. `credentials-dir` is a DIRECTORY — each
@@ -976,6 +1050,25 @@ type config struct {
 	Machine        string    `yaml:"machine"`
 	CredentialsDir string    `yaml:"credentials-dir,omitempty"`
 	Ingress        []ingress `yaml:"ingress"`
+}
+
+// fatalLegacyTOML aborts with a migration message. finch.toml support (TOML
+// parsing) was removed in favor of a cloudflared-style finch.yml; an upgraded
+// multi-appliance box must migrate rather than silently fall through to
+// single-service mode and stop serving every appliance.
+func fatalLegacyTOML(path, hostName string) {
+	if hostName == "" {
+		hostName = "this-box"
+	}
+	log.Fatalf("finch: %s is no longer supported — finch now reads a finch.yml manifest.\n"+
+		"Migrate to finch.yml (one ingress rule per local service):\n\n"+
+		"  hub: https://finchmcp.com\n"+
+		"  machine: %s\n"+
+		"  ingress:\n"+
+		"    - app_path: printer\n"+
+		"      service: http://127.0.0.1:8000\n\n"+
+		"Enroll each app once with `finch enroll <app_path> --ticket <t>`, then run `finch run`.",
+		path, hostName)
 }
 
 // loadConfig reads + validates a finch.yml, applying defaults (prod hub, this

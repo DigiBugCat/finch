@@ -16,12 +16,16 @@ machine: mac-mini                # this box's name (default: hostname)
 credentials-dir: ~/.finch        # where `finch enroll` writes per-app credentials
 
 # Each rule forwards one local service:
-#   app_path — the public URL segment AND the appliance you enrolled.
-#              Public URL: https://<your-slug>.finchmcp.com/<app_path>/…
-#   service  — the local server finch forwards the whole /<app_path>/* subtree to.
-#              Add a base path (…:8000/mcp) to expose only that subtree.
+#   app_path    — the public URL segment AND the appliance you enrolled.
+#                 Public URL: https://<your-slug>.finchmcp.com/<app_path>/…
+#   service     — the local server to forward to. By default finch confines a rule
+#                 to /mcp (it's an MCP tunnel first); add a base path (…:8000/mcp)
+#                 to confine to a different subtree.
+#   forward_all — set true to forward the WHOLE /<app_path>/* subtree instead of
+#                 just /mcp — for a website or any non-MCP HTTP app.
 ingress:
   - app_path: printer
     service: http://127.0.0.1:8000
   - app_path: www
     service: http://127.0.0.1:3000
+    forward_all: true

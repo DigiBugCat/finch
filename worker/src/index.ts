@@ -60,8 +60,10 @@ export interface Env {
 
   // Cloudflare Rate Limiting bindings (unsafe.bindings ratelimit). Optional so
   // tests / `wrangler dev` without the binding still run (limiter() no-ops when
-  // absent). RELAY_LIMIT gates per-(tenant,IP) on the MCP relay BEFORE the
-  // checkKey DO round-trip; JOIN_LIMIT gates per-IP on /join.
+  // absent). RELAY_LIMIT gates per-(tenant,IP) on the MCP relay BEFORE any DO
+  // round-trip (login-wall probe + checkKey); its budget (600/60s) is sized for a
+  // web page's sub-resource burst — one HTML hit fans out to many asset requests
+  // that all share the (tenant,IP) bucket. JOIN_LIMIT gates per-IP on /join.
   RELAY_LIMIT?: RateLimiter;
   JOIN_LIMIT?: RateLimiter;
 }
@@ -123,6 +125,24 @@ function readCookie(req: Request, name: string): string {
     if (part.slice(0, eq).trim() === name) return part.slice(eq + 1).trim();
   }
   return "";
+}
+
+/** Strip ONLY the finch_session login-wall cookie out of a Cookie header,
+ *  preserving the hosted app's OWN cookies (e.g. app_sid). Parses the header into
+ *  name=value pairs, drops the SESSION_COOKIE pair, and re-serializes the rest.
+ *  Returns "" if nothing remains (caller then deletes the header). The login-wall
+ *  cookie must never cross to the box, but a blanket "contains finch_" strip would
+ *  delete the whole Cookie header and break every cookie-based hosted site. (#1) */
+function stripSessionCookie(cookieHeader: string): string {
+  const kept: string[] = [];
+  for (const part of cookieHeader.split(";")) {
+    const eq = part.indexOf("=");
+    const name = (eq < 0 ? part : part.slice(0, eq)).trim();
+    if (name === SESSION_COOKIE) continue; // drop only the login-wall cookie pair
+    const pair = part.trim();
+    if (pair) kept.push(pair);
+  }
+  return kept.join("; ");
 }
 
 /** Validate a redirect target as a SAFE RELATIVE path (open-redirect guard).
@@ -499,6 +519,17 @@ export default {
     // the upstream and we load-balance across the appliance's healthy pool.
     // (`_connect` is the one reserved segment, handled above before we get here.)
     if (appliance) {
+      // THROTTLE FIRST — per-(tenant,IP), BEFORE any DO round-trip. The login wall
+      // below (maybeBrowserGate's checkKey probe + browserGate's sessionEpoch DO
+      // call) and the relay itself all hit Durable Objects; gating here makes a
+      // cheap DO-invocation DoS expensive. relayMcp does NOT re-check this limiter
+      // (it is only reachable through this gated path). Fails open in dev/test
+      // (no binding). (security M5 / code-review #6)
+      const ip = clientIp(req);
+      if (!(await rateLimitOk(env.RELAY_LIMIT, `${tenant}:${ip}`))) {
+        return json(429, { error: "rate limited" });
+      }
+
       // LOGIN WALL (auth-by-request-type). For a browser hit (no finch_ bearer,
       // not svc-authed) on a PRIVATE appliance, bounce to the Clerk-gated portal
       // unless a valid finch_session cookie is present. finch_ key calls, the
@@ -525,7 +556,13 @@ export default {
         // `machine` is the DECODED name (safeDecode at the edge) — it matches the
         // stored registry entry and keys the ApplianceDO. A path whose first
         // segment merely COLLIDES with a machine name pins that machine; this
-        // positional ambiguity is inherent to /<app>/<machine?>/<path> routing.
+        // positional ambiguity is INHERENT to /<app>/<machine?>/<path> routing
+        // once finch hosts arbitrary websites (e.g. /<app>/somepage must route to
+        // a page named "somepage", not error). So we MUST NOT error when the
+        // second segment is not a registered machine: a stale/removed machine pin
+        // (or any non-machine second segment) deliberately FALLS THROUGH to the
+        // load-balanced branch below with that segment KEPT in the upstream path
+        // (parts.slice(1)). (code-review #8 — accepted by design)
         const ex = await tenantOp<{ exists: boolean }>(
           env,
           tenant,
@@ -643,13 +680,10 @@ async function relayMcp(
   upstream: string,
   browserAuthed = false,
 ): Promise<Response> {
-  // THROTTLE FIRST — before the checkKey DO round-trip. A well-formed-but-wrong
-  // Bearer finch_ otherwise forces a checkKey + state load per request; gating
-  // per-(tenant,IP) here makes a cheap DO-invocation DoS expensive. (security M5)
-  const ip = clientIp(req);
-  if (!(await rateLimitOk(env.RELAY_LIMIT, `${tenant}:${ip}`))) {
-    return json(429, { error: "rate limited" });
-  }
+  // NOTE: the per-(tenant,IP) RELAY_LIMIT is applied by the caller at the TOP of
+  // the `if (appliance)` block — BEFORE the login-wall DO round-trips — so it is
+  // NOT re-checked here (relayMcp is only reachable through that gated path; a
+  // second check would double-count the limiter). (security M5 / code-review #6)
 
   // REQUEST-SIZE CAP — reject oversized bodies before buffering them into a DO.
   // content-length is client-controlled/absent for chunked, so this is a cheap
@@ -721,7 +755,19 @@ async function relayMcp(
   relayHeaders.delete("authorization");
   relayHeaders.delete("x-finch-service"); // never leak the service secret to a box
   relayHeaders.delete("x-finch-auth");
+  // Surgically remove ONLY the finch_session login-wall cookie from the Cookie
+  // header, leaving the hosted app's own cookies (e.g. app_sid) intact. (#1)
+  const cookieHeader = relayHeaders.get("cookie");
+  if (cookieHeader) {
+    const remaining = stripSessionCookie(cookieHeader);
+    if (remaining) relayHeaders.set("cookie", remaining);
+    else relayHeaders.delete("cookie");
+  }
   for (const [name, value] of [...relayHeaders.entries()]) {
+    // SKIP the cookie header — it's already sanitized above, and a hosted app's
+    // own cookie value could legitimately contain "finch_"; only a bearer KEY is
+    // the real secret. Strip any OTHER header still carrying a finch_ value.
+    if (name === "cookie") continue;
     if (value.includes("finch_")) relayHeaders.delete(name);
   }
 
@@ -877,12 +923,15 @@ async function handleFinchCb(
   );
 
   // HOST-scoped cookie (NO Domain) so it can't be replayed against a sibling
-  // tenant's slug host. HttpOnly + Secure + SameSite=Lax + Path=/.
+  // tenant's slug host. HttpOnly + Secure + SameSite=Lax + Path=/. Max-Age makes
+  // it a PERSISTENT cookie for the full session lifetime — without it the browser
+  // treats it as a session cookie that dies when the tab closes (the 12h TTL
+  // baked into the signed envelope would then be moot). (code-review #11)
   return new Response(null, {
     status: 302,
     headers: {
       location: rd,
-      "set-cookie": `${SESSION_COOKIE}=${session}; HttpOnly; Secure; SameSite=Lax; Path=/`,
+      "set-cookie": `${SESSION_COOKIE}=${session}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${SESSION_TTL_SECONDS}`,
     },
   });
 }
