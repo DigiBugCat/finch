@@ -231,4 +231,4 @@ export interface MintKeyResp {
   scope: KeyScope;
 }
 
-export const LATEST_AGENT = "1.5.0";
+export const LATEST_AGENT = "1.5.1";

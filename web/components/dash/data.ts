@@ -213,4 +213,4 @@ export interface MintKeyResp {
 
 // The agent version the dashboard treats as "latest" for the out-of-date badge
 // (fleet.tsx). Kept in sync with the hub's LATEST_AGENT.
-export const LATEST_AGENT = "1.5.0";
+export const LATEST_AGENT = "1.5.1";
