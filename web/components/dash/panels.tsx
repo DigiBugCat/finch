@@ -1,6 +1,6 @@
 "use client";
 // Roost — Enroll + Keys panels.
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { Button, Card, CopyChip, DuskInput, InlineConfirm, MaskedSecret, SectionLabel } from '@/components/dash/primitives';
 import { formatScope, type PublicKey } from '@/components/dash/data';
 
@@ -19,6 +19,28 @@ const PLATS = [
 // hub and resolves to the EnrollResp ({ id, ticket, url, install, expiresAt }).
 // We render that verbatim — no client-side ticket fabrication.
 export function EnrollView({ host, existingIds, groups, onEnrolled, onWatch }: any) {
+  // ---- Primary path: ONE command that installs finch + signs the box in via
+  // the browser device-auth flow (no appliance id, no one-shot ticket). The hub
+  // origin is fetched from the BFF so the command targets THIS environment
+  // (staging vs prod), not a tenant's stored slug host. ----
+  const [connect, setConnect] = useState<any>(null);
+  const [connErr, setConnErr] = useState("");
+  useEffect(() => {
+    let live = true;
+    fetch("/api/finch/connect")
+      .then((r) => (r.ok ? r.json() : Promise.reject(r)))
+      .then((d) => { if (live) setConnect(d); })
+      .catch(() => { if (live) setConnErr("couldn't load the connect command — refresh to retry"); });
+    return () => { live = false; };
+  }, []);
+  const connectCmd: string = connect?.command ?? "";
+  const cliUrl = typeof window !== "undefined" ? `${window.location.origin}/cli` : "/cli";
+  const exposeCmd = "finch add myapp --service http://127.0.0.1:8000 && finch run";
+
+  // ---- Advanced path (headless / no browser): mint a one-shot ticket for a
+  // NAMED appliance — the original flow. Kept for boxes that can't open a
+  // browser (CI provisioning, the embeddable SDK). Collapsed by default. ----
+  const [advanced, setAdvanced] = useState(false);
   const [id, setId] = useState("");
   const [phase, setPhase] = useState("idle"); // idle | minting | minted
   const [enrolled, setEnrolled] = useState<any>(null); // EnrollResp from the hub
@@ -60,31 +82,64 @@ export function EnrollView({ host, existingIds, groups, onEnrolled, onWatch }: a
   return (
     <div className="view view-narrow">
       <h1 className="page-title">Add a device <span className="page-emoji">🐣</span></h1>
-      <p className="page-lede">Name the capability, mint a one-time ticket, and paste a single command on the box. It'll fly home and join the roost.</p>
+      <p className="page-lede">Run one command on the box — it installs finch and signs in. Approve the code here in your browser, then expose a service with <code className="mono">finch add</code>.</p>
 
       <Card className="enroll-card">
-        <SectionLabel hint="lowercase · digits · dashes · ≤40">appliance id</SectionLabel>
-        <div className="enroll-input-row">
-          <DuskInput value={id} onChange={(v: any) => { setId(v); if (phase === "minted") { setPhase("idle"); setEnrolled(null); } }}
-            placeholder="calendar-sync" prefix={`${host}/`} error={!!error} autoFocus />
-          <Button kind="accent" onClick={mint} disabled={!canMint}>
-            {phase === "minting" ? "minting…" : phase === "minted" ? "mint another" : "Mint ticket"}
-          </Button>
+        <SectionLabel hint="installs the finch CLI, then signs this box in">run this on the box</SectionLabel>
+        <div className="command-block" style={{ marginTop: 8 }}>
+          <pre className="mono">{connectCmd || (connErr ? `# ${connErr}` : "loading…")}</pre>
+          {connectCmd && <CopyChip value={connectCmd} className="command-copy" />}
         </div>
-        {error && <div className="field-err">⚠ {error}</div>}
-        {mintErr && <div className="field-err">⚠ {mintErr}</div>}
-        {clean && !error && (
-          <div className="enroll-preview mono dim">→ {enrolled?.url ?? `https://${host}/${clean}/mcp`}</div>
-        )}
-        <div className="enroll-group">
-          <span className="dim" style={{ fontSize: 13, fontWeight: 700 }}>group</span>
-          {(groups || ["default"]).map((g: any) => (
-            <button key={g} className={`owner-btn ${group === g ? "owner-on" : ""}`} onClick={() => setGroup(g)}>{g}</button>
-          ))}
+        <ol className="enroll-steps dim" style={{ fontSize: 13.5, lineHeight: 1.6, marginTop: 12, paddingLeft: 18 }}>
+          <li>Run it on the box — it installs finch and prints a short code.</li>
+          <li>Approve that code here: <a className="own-you" href="/cli">{cliUrl}</a> (signed in as you).</li>
+          <li>Expose a local service on the box:</li>
+        </ol>
+        <div className="command-block" style={{ marginTop: 6 }}>
+          <pre className="mono">{exposeCmd}</pre>
+          <CopyChip value={exposeCmd} className="command-copy" />
+        </div>
+        <div style={{ marginTop: 14, display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <Button kind="accent" onClick={() => { window.location.href = "/cli"; }}>Approve a device code →</Button>
+          <Button kind="ghost" onClick={onWatch}>Watch the fleet →</Button>
         </div>
       </Card>
 
-      {phase === "minted" && enrolled && (
+      <div className="enroll-advanced" style={{ marginTop: 18 }}>
+        <button
+          onClick={() => setAdvanced((v: boolean) => !v)}
+          className="dim"
+          style={{ background: "none", border: 0, cursor: "pointer", fontSize: 13, fontWeight: 700, padding: 0 }}
+        >
+          {advanced ? "▾ " : "▸ "}Headless box (no browser)? Pre-enroll a named appliance with a one-time ticket
+        </button>
+      </div>
+
+      {advanced && (
+        <Card className="enroll-card" style={{ marginTop: 12 }}>
+          <SectionLabel hint="lowercase · digits · dashes · ≤40">appliance id</SectionLabel>
+          <div className="enroll-input-row">
+            <DuskInput value={id} onChange={(v: any) => { setId(v); if (phase === "minted") { setPhase("idle"); setEnrolled(null); } }}
+              placeholder="calendar-sync" prefix={`${host}/`} error={!!error} autoFocus />
+            <Button kind="accent" onClick={mint} disabled={!canMint}>
+              {phase === "minting" ? "minting…" : phase === "minted" ? "mint another" : "Mint ticket"}
+            </Button>
+          </div>
+          {error && <div className="field-err">⚠ {error}</div>}
+          {mintErr && <div className="field-err">⚠ {mintErr}</div>}
+          {clean && !error && (
+            <div className="enroll-preview mono dim">→ {enrolled?.url ?? `https://${host}/${clean}/mcp`}</div>
+          )}
+          <div className="enroll-group">
+            <span className="dim" style={{ fontSize: 13, fontWeight: 700 }}>group</span>
+            {(groups || ["default"]).map((g: any) => (
+              <button key={g} className={`owner-btn ${group === g ? "owner-on" : ""}`} onClick={() => setGroup(g)}>{g}</button>
+            ))}
+          </div>
+        </Card>
+      )}
+
+      {advanced && phase === "minted" && enrolled && (
         <Card className="ticket-card">
           <SectionLabel hint="pick the box's platform — the same ticket works on any">one paste, and it's live</SectionLabel>
           <div className="plat-tabs">

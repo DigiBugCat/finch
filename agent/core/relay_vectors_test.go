@@ -1,4 +1,4 @@
-package main
+package core
 
 import (
 	"context"
@@ -22,7 +22,9 @@ import (
 // the wire shapes — that is the whole point of a single fixture.
 func vectorsPath(t *testing.T) string {
 	t.Helper()
-	p, err := filepath.Abs(filepath.Join("..", "worker", "test", "relay-vectors.json"))
+	// core/ is one level deeper than the old agent/ package root, so the shared
+	// fixture at <repo>/worker/test/ is now two parents up, not one.
+	p, err := filepath.Abs(filepath.Join("..", "..", "worker", "test", "relay-vectors.json"))
 	if err != nil {
 		t.Fatalf("abs vectors path: %v", err)
 	}

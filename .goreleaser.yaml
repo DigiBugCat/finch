@@ -7,7 +7,7 @@
 # Releases — which is what the installer (`$HUB/releases/finch-${os}-${arch}`)
 # and the worker /releases redirect resolve to.
 #
-#   tag v1.4.0  ->  stamps -X main.agentVersion=1.4.0 (matches the literal that
+#   tag v1.4.0  ->  stamps -X .../agent/core.agentVersion=1.4.0 (matches the literal
 #                   scripts/check-versions.mjs keeps in sync across all three files)
 version: 2
 
@@ -37,7 +37,7 @@ builds:
       - goos: darwin
         goarch: arm
     ldflags:
-      - -s -w -X main.agentVersion={{ .Version }}
+      - -s -w -X github.com/digibugcat/finch/agent/core.agentVersion={{ .Version }}
 
 archives:
   # Serve un-tarred binaries named exactly finch-<os>-<arch> so the installer's

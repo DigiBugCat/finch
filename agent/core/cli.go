@@ -1,4 +1,4 @@
-package main
+package core
 
 // finch CLI setup commands — `finch login` and `finch add`. Together they let a
 // box enroll appliances and build its finch.yml without ever touching the
