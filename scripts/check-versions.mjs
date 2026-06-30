@@ -3,7 +3,7 @@
 // version on drift. There's no shared build artifact across Go + two TS workers,
 // so instead of a single import we make the three literals a CI invariant.
 //
-//   agent/main.go             var agentVersion = "x.y.z"   (canonical default)
+//   agent/core/agent.go       var agentVersion = "x.y.z"   (canonical default)
 //   worker/src/types.ts       export const LATEST_AGENT = "x.y.z"
 //   web/components/dash/data.ts export const LATEST_AGENT = "x.y.z"
 //
@@ -16,8 +16,8 @@ const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 const sources = [
   {
-    label: "agent/main.go (agentVersion)",
-    file: "agent/main.go",
+    label: "agent/core/agent.go (agentVersion)",
+    file: "agent/core/agent.go",
     re: /agentVersion\s*=\s*"([^"]+)"/,
   },
   {
