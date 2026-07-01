@@ -13,6 +13,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -57,6 +58,7 @@ var (
 	otherParent *systray.MenuItem
 	machParent  []*systray.MenuItem   // "Other machines" -> per-machine submenu parents
 	machRows    [][]*systray.MenuItem // machParent[j] -> its appliance rows
+	machRowApp  [][]string            // machRows[j][k] -> the appliance id it shows
 	authItem    *systray.MenuItem
 
 	cancel context.CancelFunc // non-nil while relays run
@@ -107,8 +109,7 @@ func onReady() {
 	thisParent = systray.AddMenuItem("This machine", "Appliances this box publishes")
 	rows = make([]*systray.MenuItem, maxRows)
 	for i := range rows {
-		it := thisParent.AddSubMenuItem("", "")
-		it.Disable()
+		it := thisParent.AddSubMenuItem("", "Open this appliance in the dashboard")
 		it.Hide()
 		rows[i] = it
 	}
@@ -117,14 +118,15 @@ func onReady() {
 	otherParent = systray.AddMenuItem("Other machines", "Other boxes in your tenant")
 	machParent = make([]*systray.MenuItem, maxMachines)
 	machRows = make([][]*systray.MenuItem, maxMachines)
+	machRowApp = make([][]string, maxMachines)
 	for j := range machParent {
 		p := otherParent.AddSubMenuItem("", "")
 		p.Hide()
 		machParent[j] = p
 		machRows[j] = make([]*systray.MenuItem, maxAppsPerMachine)
+		machRowApp[j] = make([]string, maxAppsPerMachine)
 		for k := range machRows[j] {
-			it := p.AddSubMenuItem("", "")
-			it.Disable()
+			it := p.AddSubMenuItem("", "Open this appliance in the dashboard")
 			it.Hide()
 			machRows[j][k] = it
 		}
@@ -162,6 +164,44 @@ func onReady() {
 	for i := range rmItems {
 		i := i
 		go clickLoop(rmItems[i], func() { onRemoveSlot(i) })
+	}
+	// Clicking an appliance opens its dashboard page.
+	for i := range rows {
+		i := i
+		go clickLoop(rows[i], func() { onLocalRowClick(i) })
+	}
+	for j := range machRows {
+		j := j
+		for k := range machRows[j] {
+			k := k
+			go clickLoop(machRows[j][k], func() { onOtherRowClick(j, k) })
+		}
+	}
+}
+
+// onLocalRowClick opens the dashboard for the appliance in "This machine" slot i.
+func onLocalRowClick(i int) {
+	mu.Lock()
+	app := ""
+	if i < len(order) {
+		app = order[i]
+	}
+	mu.Unlock()
+	if app != "" {
+		openBrowser(dashboardAppURL(app))
+	}
+}
+
+// onOtherRowClick opens the dashboard for the appliance in "Other machines" slot.
+func onOtherRowClick(j, k int) {
+	mu.Lock()
+	app := ""
+	if j < len(machRowApp) && k < len(machRowApp[j]) {
+		app = machRowApp[j][k]
+	}
+	mu.Unlock()
+	if app != "" {
+		openBrowser(dashboardAppURL(app))
 	}
 }
 
@@ -231,13 +271,13 @@ func refreshFleet() {
 		return
 	}
 	// Group appliances by machine, excluding this box.
-	byMachine := map[string][]string{}
+	type fleetApp struct{ id, label string }
+	byMachine := map[string][]fleetApp{}
 	for _, n := range nodes {
 		if n.Machine == localMachine {
 			continue
 		}
-		label := n.Appliance + " — " + prettyState(n.State)
-		byMachine[n.Machine] = append(byMachine[n.Machine], label)
+		byMachine[n.Machine] = append(byMachine[n.Machine], fleetApp{n.Appliance, n.Appliance + " — " + prettyState(n.State)})
 	}
 	names := make([]string, 0, len(byMachine))
 	for name := range byMachine {
@@ -254,14 +294,19 @@ func refreshFleet() {
 			p.Show()
 			for k, row := range machRows[j] {
 				if k < len(apps) {
-					row.SetTitle("• " + apps[k])
+					row.SetTitle("• " + apps[k].label)
+					machRowApp[j][k] = apps[k].id
 					row.Show()
 				} else {
+					machRowApp[j][k] = ""
 					row.Hide()
 				}
 			}
 		} else {
 			p.Hide()
+			for k := range machRowApp[j] {
+				machRowApp[j][k] = ""
+			}
 		}
 	}
 	count := len(names)
@@ -497,6 +542,11 @@ func dashboardURL() string {
 		base = "https://finchmcp.com"
 	}
 	return strings.TrimRight(base, "/") + "/dashboard"
+}
+
+// dashboardAppURL deep-links to one appliance's detail view in the dashboard.
+func dashboardAppURL(id string) string {
+	return dashboardURL() + "?appliance=" + url.QueryEscape(id)
 }
 
 func openBrowser(url string) {

@@ -5,7 +5,7 @@
 // /api/finch/state). Every mutation calls the Next bridge under /api/finch/*
 // and then refetch()es so the UI reflects real hub state. The view components
 // are prop-driven and unchanged — only the data source + action handlers here.
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { UserButton, useUser } from '@clerk/nextjs';
 import { HomeView } from './home';
 import { FleetView } from './overview';
@@ -29,6 +29,14 @@ export default function DashboardApp() {
 
   const flash = (msg: any) => { setToast(msg); setTimeout(() => setToast(null), 2200); };
   const go = (v: any) => { setView(v); window.scrollTo({ top: 0 }); };
+
+  // Deep-link: /dashboard?appliance=<id> opens that appliance's detail view
+  // straight away (the menubar app links here when you click an appliance). The
+  // id is set before appliances load; DetailView renders once `current` resolves.
+  useEffect(() => {
+    const id = new URLSearchParams(window.location.search).get("appliance");
+    if (id) { setOpenId(id); setView("detail"); }
+  }, []);
 
   // POST/PUT/DELETE a bridge endpoint, then refetch live state. Returns the
   // parsed JSON body so callers can read minted secrets / install strings.
