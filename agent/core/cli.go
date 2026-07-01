@@ -318,8 +318,11 @@ func cmdLogin(args []string) {
 		token = fs.Arg(0)
 	}
 	// No token → run the interactive device flow (open browser, approve a code).
+	// The device flow also hands back the approver's email (for the account label);
+	// the --token path has none.
+	email := ""
 	if token == "" {
-		token = deviceLogin(*hub)
+		token, email = deviceLogin(*hub)
 	}
 
 	// Validate against the hub and learn which tenant the token acts as.
@@ -328,7 +331,7 @@ func cmdLogin(args []string) {
 		fmt.Fprintf(os.Stderr, "finch: login failed: %v\n", err)
 		os.Exit(1)
 	}
-	if err := saveCliCred(&cliCred{Hub: *hub, Token: token}); err != nil {
+	if err := saveCliCred(&cliCred{Hub: *hub, Token: token, Email: email}); err != nil {
 		fmt.Fprintf(os.Stderr, "finch: could not save credential: %v\n", err)
 		os.Exit(1)
 	}
@@ -336,9 +339,10 @@ func cmdLogin(args []string) {
 }
 
 // deviceLogin runs the browser device-authorization flow (`finch login` with no
-// token): start a code, point the user at the dashboard to approve it, poll
-// until approved, and return the issued token. Exits on error/expiry/timeout.
-func deviceLogin(hub string) string {
+// token): start a code, point the user at the dashboard to approve it, poll until
+// approved, and return the issued token plus the approver's email (for the account
+// label; may be ""). Exits on error/expiry/timeout.
+func deviceLogin(hub string) (string, string) {
 	start, err := cliRequest("POST", hub, "/api/cli/device/start", "", struct{}{})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "finch: could not start login: %v\n", err)
@@ -375,7 +379,8 @@ func deviceLogin(hub string) string {
 		case "approved":
 			fmt.Println("  ✓")
 			if tok, _ := poll["token"].(string); tok != "" {
-				return tok
+				email, _ := poll["email"].(string)
+				return tok, email
 			}
 			fmt.Fprintln(os.Stderr, "\nfinch: approval returned no token")
 			os.Exit(1)
@@ -388,7 +393,7 @@ func deviceLogin(hub string) string {
 	}
 	fmt.Fprintln(os.Stderr, "\nfinch: timed out waiting for approval")
 	os.Exit(1)
-	return ""
+	return "", ""
 }
 
 // openBrowser best-effort opens a URL in the user's browser.
