@@ -50,10 +50,15 @@ export default function CliApprove() {
   async function approve() {
     setState('busy'); setMsg('');
     try {
+      // Send the email we already resolved client-side (useUser). On staging the
+      // server can't look it up — ctx.userId is the forced DEFAULT_TENANT id, not
+      // the real Clerk user — so the client value is what makes the box's account
+      // label work. It's a cosmetic label shown only on the approver's own box.
+      const email = user?.primaryEmailAddress?.emailAddress || user?.username || '';
       const r = await fetch('/api/finch/cli-approve', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ userCode: code.trim() }),
+        body: JSON.stringify({ userCode: code.trim(), email }),
       });
       const j = await r.json().catch(() => ({}));
       if (!r.ok) throw new Error(j.error || 'could not approve');

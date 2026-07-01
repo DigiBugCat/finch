@@ -15,26 +15,27 @@ export async function POST(req: Request) {
       return Response.json({ error: "userCode required" }, { status: 400 });
     }
 
-    // Best-effort: the approver's email/handle, for the box's account label.
-    // Mirror the fallback chain the working state route uses — primaryEmailAddress
-    // alone comes back empty for org/SSO-provisioned users.
-    let email = "";
+    // The approver's email, for the box's account label. Prefer the authoritative
+    // server lookup, but fall back to the email the client sent (from useUser).
+    // On staging the server lookup fails — ctx.userId is the forced DEFAULT_TENANT
+    // id, not a real Clerk user — so the client value is what makes it work.
+    const clientEmail = String(body.email || "").slice(0, 200);
+    let serverEmail = "";
     try {
       const user = await (await clerkClient()).users.getUser(ctx.userId);
       const primary = user.emailAddresses?.find(
         (e) => e.id === user.primaryEmailAddressId,
       )?.emailAddress;
-      email =
+      serverEmail =
         primary ||
         user.emailAddresses?.[0]?.emailAddress ||
         user.primaryEmailAddress?.emailAddress ||
         user.username ||
         "";
-    } catch (err) {
-      // email is a nicety — approval proceeds without it — but log so an empty
-      // account label is observable rather than silently dropped.
-      console.warn("cli-approve: could not resolve approver email", err);
+    } catch {
+      // Expected on staging (synthetic tenant id) — the client email covers it.
     }
+    const email = serverEmail || clientEmail;
 
     return await hubProxy("/api/device-approve", {
       method: "POST",
