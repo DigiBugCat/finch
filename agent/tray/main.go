@@ -59,7 +59,10 @@ var (
 	machParent  []*systray.MenuItem   // "Other machines" -> per-machine submenu parents
 	machRows    [][]*systray.MenuItem // machParent[j] -> its appliance rows
 	machRowApp  [][]string            // machRows[j][k] -> the appliance id it shows
-	authItem    *systray.MenuItem
+
+	connItem      *systray.MenuItem // "Connected"/"Disconnected" toggle (Tailscale-style)
+	accountParent *systray.MenuItem // account row (submenu with Log out) when signed in
+	loginItem     *systray.MenuItem // "Log in…" when signed out
 
 	cancel context.CancelFunc // non-nil while relays run
 	runWG  sync.WaitGroup
@@ -102,8 +105,15 @@ func onReady() {
 	systray.SetTemplateIcon(iconPNG, iconPNG)
 	systray.SetTooltip("finch — local services, published")
 
+	// Header + connect toggle + account row (Tailscale-style top block).
 	header := systray.AddMenuItem("finch", "")
 	header.Disable()
+	connItem = systray.AddMenuItemCheckbox("Connected", "Connect or disconnect every relay", true)
+	systray.AddSeparator()
+	accountParent = systray.AddMenuItem("", "Your finch account")
+	logoutItem := accountParent.AddSubMenuItem("Log out", "Sign out of this box")
+	loginItem = systray.AddMenuItem("Log in…", "Sign in to your finch tenant")
+	systray.AddSeparator()
 
 	// "This machine" — the appliances this box publishes, with live relay state.
 	thisParent = systray.AddMenuItem("This machine", "Appliances this box publishes")
@@ -142,24 +152,26 @@ func onReady() {
 		it.Hide()
 		rmItems[i] = it
 	}
+	systray.AddSeparator()
 	openManifest := systray.AddMenuItem("Open manifest", "Open finch.yml in your editor")
 	openDash := systray.AddMenuItem("Open dashboard", "Open the finch dashboard in your browser")
-	restart := systray.AddMenuItem("Reconnect all", "Stop and restart every relay")
 	systray.AddSeparator()
-	authItem = systray.AddMenuItem("", "") // "Log in…" / "Log out"
 	quit := systray.AddMenuItem("Quit", "Stop relays and quit")
 
-	updateAuthItem()
+	updateAccount()
 	reloadRows()
 	startRelays()
+	updateConnItem()
 	go refreshFleet() // first paint of "Other machines"
 	go fleetTicker()  // keep it fresh
 
+	go clickLoop(connItem, onToggleConn)
+	go clickLoop(accountParent, func() {}) // parent is just a container for Log out
+	go clickLoop(logoutItem, onLogout)
+	go clickLoop(loginItem, onLogin)
 	go clickLoop(addItem, onAdd)
 	go clickLoop(openManifest, func() { openPath(configPath) })
 	go clickLoop(openDash, func() { openBrowser(dashboardURL()) })
-	go clickLoop(restart, func() { stopRelays(); reloadRows(); startRelays(); go refreshFleet() })
-	go clickLoop(authItem, onAuth)
 	go clickLoop(quit, func() { systray.Quit() })
 	for i := range rmItems {
 		i := i
@@ -437,6 +449,7 @@ func refreshTooltip() {
 	default:
 		systray.SetTooltip(fmt.Sprintf("finch — %d/%d live on this machine", live, total))
 	}
+	updateConnItem()
 }
 
 func rowTitle(app, state, detail string) string {
@@ -479,32 +492,65 @@ func truncate(s string, n int) string {
 	return s[:n-1] + "…"
 }
 
-// updateAuthItem paints the Log in / Log out row from the current credential.
-func updateAuthItem() {
-	if authItem == nil {
+// updateAccount paints the account row (its host, with a Log out submenu) or the
+// "Log in…" item, depending on whether a credential is saved.
+func updateAccount() {
+	if accountParent == nil || loginItem == nil {
 		return
 	}
 	if hub, in := core.LoginInfo(); in {
-		authItem.SetTitle("Log out")
-		authItem.SetTooltip("Signed in to " + hub)
+		accountParent.SetTitle(hostOf(hub))
+		accountParent.SetTooltip("Signed in to " + hub)
+		accountParent.Show()
+		loginItem.Hide()
 	} else {
-		authItem.SetTitle("Log in…")
-		authItem.SetTooltip("Sign in to your finch tenant")
+		accountParent.Hide()
+		loginItem.Show()
 	}
 }
 
-// onAuth logs out, or runs the browser device-login flow (code shown in a dialog).
-func onAuth() {
-	if _, in := core.LoginInfo(); in {
-		if err := core.Logout(); err != nil {
-			alert("finch — logout failed", err.Error())
-			return
-		}
-		updateAuthItem()
-		go refreshFleet()
-		alert("finch", "Logged out.")
+// updateConnItem reflects the relay state on the Connected/Disconnected toggle.
+func updateConnItem() {
+	if connItem == nil {
 		return
 	}
+	mu.Lock()
+	running := cancel != nil
+	mu.Unlock()
+	if running {
+		connItem.Check()
+		connItem.SetTitle("Connected")
+	} else {
+		connItem.Uncheck()
+		connItem.SetTitle("Disconnected")
+	}
+}
+
+// onToggleConn connects (starts) or disconnects (stops) every relay.
+func onToggleConn() {
+	if cancel != nil {
+		stopRelays()
+	} else {
+		reloadRows()
+		startRelays()
+		go refreshFleet()
+	}
+	updateConnItem()
+}
+
+// onLogout drops the CLI token (already-enrolled appliances keep working).
+func onLogout() {
+	if err := core.Logout(); err != nil {
+		alert("finch — logout failed", err.Error())
+		return
+	}
+	updateAccount()
+	go refreshFleet()
+	alert("finch", "Logged out.")
+}
+
+// onLogin runs the browser device-login flow (code shown in a native dialog).
+func onLogin() {
 	go func() {
 		err := core.Login(loginHub(), func(uri, code string) {
 			openBrowser(uri)
@@ -514,13 +560,23 @@ func onAuth() {
 			alert("finch — login failed", err.Error())
 			return
 		}
-		updateAuthItem()
+		updateAccount()
 		stopRelays()
 		reloadRows()
 		startRelays()
+		updateConnItem()
 		refreshFleet()
 		alert("finch", "Logged in.")
 	}()
+}
+
+// hostOf strips the scheme from a hub URL for a compact account label.
+func hostOf(hub string) string {
+	h := hub
+	if i := strings.Index(h, "://"); i >= 0 {
+		h = h[i+3:]
+	}
+	return strings.TrimRight(h, "/")
 }
 
 // loginHub is the WORKER hub the device-login talks to (manifest hub, else prod).
