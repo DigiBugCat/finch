@@ -46,6 +46,17 @@ async function runtimeEnv(name: string): Promise<string | undefined> {
   return typeof pv === "string" && pv.length ? pv : undefined;
 }
 
+/** The hub origin a box should install from and `finch login` against — the
+ *  HUB_URL runtime var (trailing slash trimmed). This is the ACTUAL hub the web
+ *  talks to (e.g. the staging hub on staging), unlike a tenant's stored slug
+ *  host, so the connect one-liner always targets the right environment. Throws
+ *  500 if unset. */
+export async function getHubUrl(): Promise<string> {
+  const hubUrl = await runtimeEnv("HUB_URL");
+  if (!hubUrl) throw new HttpError(500, "HUB_URL is not configured");
+  return hubUrl.replace(/\/+$/, "");
+}
+
 /** What resolveTenant() returns: the tenant id plus the caller's identity and
  *  org role so handlers can authorize without re-calling Clerk. */
 export interface ResolvedTenant {
