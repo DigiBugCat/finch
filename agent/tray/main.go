@@ -1,12 +1,12 @@
 // Command finch-tray is a menubar / system-tray front-end for the finch relay.
 //
 // It's the desktop sibling of `finch run`: one binary that reads a finch.yml
-// manifest and supervises a relay per ingress rule, but instead of logging to a
-// terminal it lives in the macOS menubar (and the Windows/Linux system tray),
-// surfaces each appliance's live state as a menu item, auto-starts the relays on
-// launch, and lets you add/remove appliances via native dialogs. The relay logic,
-// auth, and finch.yml semantics are identical to the CLI because both drive the
-// same agent/core engine (core.RunConfig / core.Add / core.Remove).
+// manifest and supervises a relay per ingress rule, living in the macOS menubar
+// (and the Windows/Linux tray). It auto-starts the relays on launch and, like
+// Tailscale, shows the fleet grouped into "This machine" (the appliances this box
+// publishes, with live relay state) and "Other machines" (every other box in the
+// tenant and what it serves, from the hub). Add/remove appliances and log in/out
+// via native dialogs. Everything runs on the same agent/core engine as the CLI.
 package main
 
 import (
@@ -17,8 +17,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	_ "embed"
 
@@ -29,27 +31,36 @@ import (
 //go:embed icon.png
 var iconPNG []byte
 
-// maxRows bounds the pre-created pool of appliance rows (and Remove sub-items).
-// systray can't reorder or delete items after creation, so we allocate a fixed
-// pool up-front and Show/Hide slots as the manifest changes — keeping menu order
-// stable. Bumped only if someone fronts more than this many services from one box.
-const maxRows = 24
+// Fixed pools: systray can't reorder or delete items after creation, so we
+// allocate slots up-front and Show/Hide them as the manifest + fleet change.
+const (
+	maxRows           = 16 // appliances this box publishes
+	maxMachines       = 8  // other boxes shown under "Other machines"
+	maxAppsPerMachine = 12 // appliances per other box
+	fleetPoll         = 15 * time.Second
+)
 
 var (
-	configPath string
-	hubFlag    string
+	configPath   string
+	hubFlag      string
+	localMachine string // this box's name (finch.yml machine: or hostname)
 
 	mu        sync.Mutex
-	order     []string                     // app_paths, in manifest order
-	rowByApp  map[string]*systray.MenuItem // app_path -> its status row
-	lastState map[string]string            // app_path -> last relay state
-	rows      []*systray.MenuItem          // the fixed status-row pool
-	rmItems   []*systray.MenuItem          // the fixed Remove-submenu pool
-	rmApp     []string                     // rmItems[i] currently removes rmApp[i]
+	order     []string                     // local app_paths, in manifest order
+	rowByApp  map[string]*systray.MenuItem // local app_path -> its "This machine" row
+	lastState map[string]string            // local app_path -> last relay state
+	rows      []*systray.MenuItem          // "This machine" row pool
+	rmItems   []*systray.MenuItem          // Remove-submenu pool
+	rmApp     []string                     // rmItems[i] removes rmApp[i]
 
-	cancel   context.CancelFunc // non-nil while relays run
-	runWG    sync.WaitGroup
-	authItem *systray.MenuItem // the Log in / Log out row
+	thisParent  *systray.MenuItem
+	otherParent *systray.MenuItem
+	machParent  []*systray.MenuItem   // "Other machines" -> per-machine submenu parents
+	machRows    [][]*systray.MenuItem // machParent[j] -> its appliance rows
+	authItem    *systray.MenuItem
+
+	cancel context.CancelFunc // non-nil while relays run
+	runWG  sync.WaitGroup
 )
 
 func main() {
@@ -61,11 +72,10 @@ func main() {
 	}
 	rowByApp = map[string]*systray.MenuItem{}
 	lastState = map[string]string{}
+	localMachine = localMachineName()
 	systray.Run(onReady, onExit)
 }
 
-// defaultConfigPath is ~/.finch/finch.yml (the installed-app home), creating the
-// ~/.finch dir so `finch add` from the tray has somewhere to write.
 func defaultConfigPath() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -76,28 +86,53 @@ func defaultConfigPath() string {
 	return filepath.Join(dir, "finch.yml")
 }
 
+// localMachineName is the manifest's machine:, else the OS hostname — the name
+// this box registers under, so we can tell "this machine" from the others.
+func localMachineName() string {
+	if m := readMachine(configPath); m != "" {
+		return m
+	}
+	h, _ := os.Hostname()
+	return h
+}
+
 func onReady() {
-	// Template icon: a black finch silhouette macOS/Linux recolor to match the
-	// menubar (light on dark, dark on light).
 	systray.SetTemplateIcon(iconPNG, iconPNG)
 	systray.SetTooltip("finch — local services, published")
 
 	header := systray.AddMenuItem("finch", "")
 	header.Disable()
-	systray.AddSeparator()
 
-	// Fixed pool of status rows (hidden until reloadRows assigns them).
+	// "This machine" — the appliances this box publishes, with live relay state.
+	thisParent = systray.AddMenuItem("This machine", "Appliances this box publishes")
 	rows = make([]*systray.MenuItem, maxRows)
 	for i := range rows {
-		it := systray.AddMenuItem("", "")
+		it := thisParent.AddSubMenuItem("", "")
 		it.Disable()
 		it.Hide()
 		rows[i] = it
 	}
+
+	// "Other machines" — every other box in the tenant, from the hub (read-only).
+	otherParent = systray.AddMenuItem("Other machines", "Other boxes in your tenant")
+	machParent = make([]*systray.MenuItem, maxMachines)
+	machRows = make([][]*systray.MenuItem, maxMachines)
+	for j := range machParent {
+		p := otherParent.AddSubMenuItem("", "")
+		p.Hide()
+		machParent[j] = p
+		machRows[j] = make([]*systray.MenuItem, maxAppsPerMachine)
+		for k := range machRows[j] {
+			it := p.AddSubMenuItem("", "")
+			it.Disable()
+			it.Hide()
+			machRows[j][k] = it
+		}
+	}
 	systray.AddSeparator()
 
-	addItem := systray.AddMenuItem("Add appliance…", "Enroll a local service and publish it")
-	rmParent := systray.AddMenuItem("Remove appliance", "Remove a published appliance")
+	addItem := systray.AddMenuItem("Add application…", "Enroll a local service and publish it")
+	rmParent := systray.AddMenuItem("Remove application", "Remove a published appliance")
 	rmItems = make([]*systray.MenuItem, maxRows)
 	rmApp = make([]string, maxRows)
 	for i := range rmItems {
@@ -105,24 +140,23 @@ func onReady() {
 		it.Hide()
 		rmItems[i] = it
 	}
-	systray.AddSeparator()
-
 	openManifest := systray.AddMenuItem("Open manifest", "Open finch.yml in your editor")
 	openDash := systray.AddMenuItem("Open dashboard", "Open the finch dashboard in your browser")
 	restart := systray.AddMenuItem("Reconnect all", "Stop and restart every relay")
 	systray.AddSeparator()
-	authItem = systray.AddMenuItem("", "") // "Log in…" / "Log out", set below
+	authItem = systray.AddMenuItem("", "") // "Log in…" / "Log out"
 	quit := systray.AddMenuItem("Quit", "Stop relays and quit")
 
 	updateAuthItem()
 	reloadRows()
-	startRelays() // auto-start on launch
+	startRelays()
+	go refreshFleet() // first paint of "Other machines"
+	go fleetTicker()  // keep it fresh
 
-	// One click-loop goroutine per interactive item (the systray idiom).
 	go clickLoop(addItem, onAdd)
 	go clickLoop(openManifest, func() { openPath(configPath) })
 	go clickLoop(openDash, func() { openBrowser(dashboardURL()) })
-	go clickLoop(restart, func() { stopRelays(); reloadRows(); startRelays() })
+	go clickLoop(restart, func() { stopRelays(); reloadRows(); startRelays(); go refreshFleet() })
 	go clickLoop(authItem, onAuth)
 	go clickLoop(quit, func() { systray.Quit() })
 	for i := range rmItems {
@@ -139,8 +173,14 @@ func clickLoop(it *systray.MenuItem, fn func()) {
 	}
 }
 
-// reloadRows re-reads the manifest and paints the status-row + Remove-submenu
-// pools to match its appliances, hiding the unused slots.
+func fleetTicker() {
+	for {
+		time.Sleep(fleetPoll)
+		refreshFleet()
+	}
+}
+
+// reloadRows repaints the "This machine" pool from the manifest.
 func reloadRows() {
 	apps := readAppPaths(configPath)
 	mu.Lock()
@@ -166,11 +206,71 @@ func reloadRows() {
 			it.Hide()
 		}
 	}
+	n := len(apps)
 	mu.Unlock()
+	if thisParent != nil {
+		thisParent.SetTitle(fmt.Sprintf("This machine — %s (%d)", localMachine, n))
+	}
 	refreshTooltip()
 }
 
-// onStatus is core.RunConfig's per-appliance callback (on relay goroutines).
+// refreshFleet repaints "Other machines" from the hub: every box that isn't this
+// one, each a submenu of the appliances it serves. Best-effort — a login/network
+// error just leaves a hint on the parent.
+func refreshFleet() {
+	nodes, err := core.FleetNodes()
+	if err != nil {
+		if otherParent != nil {
+			otherParent.SetTitle("Other machines — (log in)")
+			mu.Lock()
+			for _, p := range machParent {
+				p.Hide()
+			}
+			mu.Unlock()
+		}
+		return
+	}
+	// Group appliances by machine, excluding this box.
+	byMachine := map[string][]string{}
+	for _, n := range nodes {
+		if n.Machine == localMachine {
+			continue
+		}
+		label := n.Appliance + " — " + prettyState(n.State)
+		byMachine[n.Machine] = append(byMachine[n.Machine], label)
+	}
+	names := make([]string, 0, len(byMachine))
+	for name := range byMachine {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	mu.Lock()
+	for j, p := range machParent {
+		if j < len(names) {
+			name := names[j]
+			apps := byMachine[name]
+			p.SetTitle(fmt.Sprintf("%s (%d)", name, len(apps)))
+			p.Show()
+			for k, row := range machRows[j] {
+				if k < len(apps) {
+					row.SetTitle("• " + apps[k])
+					row.Show()
+				} else {
+					row.Hide()
+				}
+			}
+		} else {
+			p.Hide()
+		}
+	}
+	count := len(names)
+	mu.Unlock()
+	if otherParent != nil {
+		otherParent.SetTitle(fmt.Sprintf("Other machines (%d)", count))
+	}
+}
+
 func onStatus(appPath, state, detail string) {
 	mu.Lock()
 	lastState[appPath] = state
@@ -182,9 +282,7 @@ func onStatus(appPath, state, detail string) {
 	refreshTooltip()
 }
 
-// onAdd runs the add flow: two native prompts (name + port) → core.Add → reload
-// + restart. The port is turned into http://127.0.0.1:<port>; a full URL (with
-// "://") is also accepted verbatim for non-localhost or https services.
+// onAdd: two native prompts (name + port) → core.Add → reload + restart.
 func onAdd() {
 	name, ok := askText("finch — add application", "Application name (becomes the URL path):", "")
 	if !ok || name == "" {
@@ -211,9 +309,9 @@ func onAdd() {
 	}
 	reloadRows()
 	startRelays()
+	go refreshFleet()
 }
 
-// onRemoveSlot removes whatever appliance the given Remove sub-item points at.
 func onRemoveSlot(i int) {
 	mu.Lock()
 	app := ""
@@ -233,11 +331,12 @@ func onRemoveSlot(i int) {
 	mu.Unlock()
 	reloadRows()
 	startRelays()
+	go refreshFleet()
 }
 
 func startRelays() {
 	if cancel != nil {
-		return // already running
+		return
 	}
 	if len(order) == 0 {
 		refreshTooltip()
@@ -250,7 +349,6 @@ func startRelays() {
 		defer runWG.Done()
 		if err := core.RunConfig(ctx, configPath, onStatus); err != nil {
 			mu.Lock()
-			// Surface a manifest-level failure on the first row.
 			for _, it := range rowByApp {
 				it.SetTitle("• relay error — " + truncate(err.Error(), 48))
 				break
@@ -286,15 +384,14 @@ func refreshTooltip() {
 	}
 	running := cancel != nil
 	mu.Unlock()
-	if total == 0 {
-		systray.SetTooltip("finch — no appliances (Add appliance…)")
-		return
-	}
-	if !running {
+	switch {
+	case total == 0:
+		systray.SetTooltip("finch — no appliances (Add application…)")
+	case !running:
 		systray.SetTooltip("finch — stopped")
-		return
+	default:
+		systray.SetTooltip(fmt.Sprintf("finch — %d/%d live on this machine", live, total))
 	}
-	systray.SetTooltip(fmt.Sprintf("finch — %d/%d appliances live", live, total))
 }
 
 func rowTitle(app, state, detail string) string {
@@ -307,7 +404,7 @@ func rowTitle(app, state, detail string) string {
 
 func prettyState(s string) string {
 	switch s {
-	case "connected", "live":
+	case "connected", "live", "chirping", "in_use":
 		return "live"
 	case "connecting":
 		return "connecting…"
@@ -315,6 +412,10 @@ func prettyState(s string) string {
 		return "reconnecting…"
 	case "enrolled":
 		return "enrolled"
+	case "invited":
+		return "invited"
+	case "offline":
+		return "offline"
 	case "error":
 		return "error"
 	case "warn":
@@ -347,8 +448,7 @@ func updateAuthItem() {
 	}
 }
 
-// onAuth logs out (drops the CLI token) or runs the browser device-login flow,
-// showing the short code in a dialog and opening the approval page.
+// onAuth logs out, or runs the browser device-login flow (code shown in a dialog).
 func onAuth() {
 	if _, in := core.LoginInfo(); in {
 		if err := core.Logout(); err != nil {
@@ -356,6 +456,7 @@ func onAuth() {
 			return
 		}
 		updateAuthItem()
+		go refreshFleet()
 		alert("finch", "Logged out.")
 		return
 	}
@@ -372,12 +473,12 @@ func onAuth() {
 		stopRelays()
 		reloadRows()
 		startRelays()
+		refreshFleet()
 		alert("finch", "Logged in.")
 	}()
 }
 
-// loginHub is the WORKER hub the device-login talks to — the manifest's hub:,
-// falling back to prod. (Distinct from the web dashboard URL below.)
+// loginHub is the WORKER hub the device-login talks to (manifest hub, else prod).
 func loginHub() string {
 	if h := readHub(configPath); h != "" {
 		return h
@@ -385,8 +486,8 @@ func loginHub() string {
 	return "https://finchmcp.com"
 }
 
-// dashboardURL is the WEB dashboard page: the -hub flag (baked at install as the
-// web origin) or the manifest hub, with the /dashboard route appended.
+// dashboardURL is the WEB dashboard page: the -hub flag (web origin) or the
+// manifest hub, with /dashboard appended.
 func dashboardURL() string {
 	base := hubFlag
 	if base == "" {
@@ -398,7 +499,20 @@ func dashboardURL() string {
 	return strings.TrimRight(base, "/") + "/dashboard"
 }
 
-// openPath opens a local file with the OS default handler (finch.yml in an editor).
+func openBrowser(url string) {
+	var name string
+	var args []string
+	switch runtime.GOOS {
+	case "darwin":
+		name, args = "open", []string{url}
+	case "windows":
+		name, args = "rundll32", []string{"url.dll,FileProtocolHandler", url}
+	default:
+		name, args = "xdg-open", []string{url}
+	}
+	_ = exec.Command(name, args...).Start()
+}
+
 func openPath(p string) {
 	var name string
 	var args []string
@@ -411,18 +525,4 @@ func openPath(p string) {
 		name, args = "xdg-open", []string{p}
 	}
 	_ = exec.Command(name, args...).Start()
-}
-
-func openBrowser(url string) {
-	var cmd string
-	var args []string
-	switch runtime.GOOS {
-	case "darwin":
-		cmd, args = "open", []string{url}
-	case "windows":
-		cmd, args = "rundll32", []string{"url.dll,FileProtocolHandler", url}
-	default:
-		cmd, args = "xdg-open", []string{url}
-	}
-	_ = exec.Command(cmd, args...).Start()
 }

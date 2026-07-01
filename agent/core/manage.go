@@ -118,6 +118,48 @@ func Fleet() ([]AppInfo, error) {
 	return out, nil
 }
 
+// Node is one appliance-on-a-machine as the hub reports it (the tenant's fleet is
+// a flat list of these). Lets a GUI group by Machine — "this machine" vs "other
+// machines", Tailscale-style.
+type Node struct {
+	Machine   string // the box's name
+	Appliance string // the appliance id it serves
+	State     string // "chirping"/"in_use"/"offline"/…
+	OS        string
+	Connected bool
+}
+
+// FleetNodes returns every appliance-on-a-machine across the tenant (the flattened
+// `machines` list from GET /api/cli/state). Requires `finch login`.
+func FleetNodes() ([]Node, error) {
+	cred, err := loadCliCred()
+	if err != nil {
+		return nil, err
+	}
+	st, err := cliRequest("GET", cred.Hub, "/api/cli/state", cred.Token, nil)
+	if err != nil {
+		return nil, err
+	}
+	ms, _ := st["machines"].([]any)
+	out := make([]Node, 0, len(ms))
+	for _, mi := range ms {
+		m, _ := mi.(map[string]any)
+		if m == nil {
+			continue
+		}
+		name, _ := m["name"].(string)
+		conn, _ := m["connected"].(bool)
+		n := Node{Machine: name, Connected: conn}
+		n.Appliance, _ = m["appliance"].(string)
+		n.State, _ = m["state"].(string)
+		n.OS, _ = m["os"].(string)
+		if name != "" {
+			out = append(out, n)
+		}
+	}
+	return out, nil
+}
+
 // Add enrolls an appliance and appends a ticketless ingress rule to configPath —
 // the in-process equivalent of `finch add <appPath> --service <service>`. It
 // returns the registered id (the hub slugifies the name, so it may differ from

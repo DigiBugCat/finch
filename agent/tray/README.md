@@ -6,21 +6,28 @@ supervises a relay per ingress rule, living in the **macOS menubar**, the
 terminal. It drives the same `agent/core` relay engine as the CLI — identical
 auth, `finch.yml` semantics, and dial-out behaviour — via `core.RunConfig`.
 
-Menu:
+Menu (Tailscale-style fleet view):
 
-- a row per appliance showing live state (`connecting…` / `live` /
-  `reconnecting…` / `error`),
-- **Add appliance…** — native dialog (name + local service URL) → enrolls and
-  publishes it (`core.Add`), then reloads and reconnects,
-- **Remove appliance ▸** — submenu of the current appliances; pick one to release
+- **This machine — `<name>` (N) ▸** — the appliances this box publishes (from
+  `finch.yml`) with live relay state (`connecting…` / `live` / `reconnecting…` /
+  `error`),
+- **Other machines (M) ▸** — every other box in your tenant (from the hub), each a
+  submenu of the appliances it serves + their state (read-only),
+- **Add application… ▸** — native dialog (name + port) → enrolls and publishes it
+  (`core.Add`), then reloads and reconnects,
+- **Remove application ▸** — submenu of this box's appliances; pick one to release
   it (`core.Remove`) and drop its ingress rule,
-- **Open dashboard** — opens the manifest's hub in your browser,
+- **Open manifest** — opens `finch.yml` in your editor,
+- **Open dashboard** — opens the `/dashboard` route in your browser,
 - **Reconnect all** — stop and restart every relay,
+- **Log in… / Log out** — browser device-auth (`core.Login`, code shown in a
+  dialog) / drop the CLI token (`core.Logout`),
 - **Quit**.
 
-Relays **auto-start on launch**. When the box is logged in (`finch login`), the
-tray best-effort self-approves each appliance, so nothing gets stuck `pending` —
-same as `finch run`. It reads `~/.finch/finch.yml` by default.
+Relays **auto-start on launch**, and "Other machines" refreshes every 15s. When the
+box is logged in (`finch login`), the tray best-effort self-approves each appliance,
+so nothing gets stuck `pending` — same as `finch run`. It reads `~/.finch/finch.yml`
+by default.
 
 ## Run
 
@@ -56,8 +63,29 @@ launchctl bootout gui/$(id -u)/com.finchmcp.tray
 rm -rf ~/Applications/Finch.app ~/Library/LaunchAgents/com.finchmcp.tray.plist
 ```
 
-Logs land in `~/.finch/tray.log`. Windows/Linux install packaging (Start-menu /
-`.desktop` autostart) is a follow-up; the binary already runs on those platforms.
+Logs land in `~/.finch/tray.log`.
+
+## Install (Linux)
+
+Installs to `~/.local/bin`, adds a `.desktop` launcher, and autostarts at login:
+
+```sh
+# prereqs (system tray needs a GUI toolkit + CGo):
+#   Debian/Ubuntu: sudo apt install gcc libgtk-3-dev libayatana-appindicator3-dev
+sh agent/tray/scripts/install-linux.sh
+FINCH_HUB=https://finch-staging.pantainos.workers.dev sh agent/tray/scripts/install-linux.sh
+```
+
+## Install (Windows)
+
+Installs to `%LOCALAPPDATA%\Finch` with Start-menu + Startup (login) shortcuts:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File agent\tray\scripts\install-windows.ps1
+$env:FINCH_HUB="https://…"; powershell -ExecutionPolicy Bypass -File agent\tray\scripts\install-windows.ps1
+```
+
+(Windows needs no CGo — systray uses win32 directly.)
 
 ## Build
 
