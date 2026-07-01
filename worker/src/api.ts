@@ -610,8 +610,14 @@ async function tenantHostBase(
 ): Promise<{ http: string; ws: string; host: string }> {
   const local =
     inboundHost.startsWith("localhost") || inboundHost.startsWith("127.");
+  // In dev/staging (DEV=1: a single DEFAULT_TENANT, no per-slug subdomains) the
+  // ONLY reachable host is the inbound workers.dev host we were called on. The
+  // tenant's stored <slug>.finchmcp.com resolves only in prod (wildcard DNS +
+  // slug routing), so using it here hands operators an unresolvable install/URL.
+  // Prod (DEV unset) routes by slug subdomain, so there we must use it.
+  const useInbound = local || env.DEV === "1";
   let host = inboundHost;
-  if (!local) {
+  if (!useInbound) {
     const state = await tenantOp<{ host?: string }>(env, tenant, "getState");
     if (state?.host) host = state.host;
   }
