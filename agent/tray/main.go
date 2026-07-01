@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 
 	_ "embed"
@@ -46,8 +47,9 @@ var (
 	rmItems   []*systray.MenuItem          // the fixed Remove-submenu pool
 	rmApp     []string                     // rmItems[i] currently removes rmApp[i]
 
-	cancel context.CancelFunc // non-nil while relays run
-	runWG  sync.WaitGroup
+	cancel   context.CancelFunc // non-nil while relays run
+	runWG    sync.WaitGroup
+	authItem *systray.MenuItem // the Log in / Log out row
 )
 
 func main() {
@@ -75,13 +77,13 @@ func defaultConfigPath() string {
 }
 
 func onReady() {
-	systray.SetIcon(iconPNG)
+	// Template icon: a black finch silhouette macOS/Linux recolor to match the
+	// menubar (light on dark, dark on light).
+	systray.SetTemplateIcon(iconPNG, iconPNG)
 	systray.SetTooltip("finch — local services, published")
 
 	header := systray.AddMenuItem("finch", "")
 	header.Disable()
-	cfgItem := systray.AddMenuItem("manifest: "+shortPath(configPath), configPath)
-	cfgItem.Disable()
 	systray.AddSeparator()
 
 	// Fixed pool of status rows (hidden until reloadRows assigns them).
@@ -105,17 +107,23 @@ func onReady() {
 	}
 	systray.AddSeparator()
 
+	openManifest := systray.AddMenuItem("Open manifest", "Open finch.yml in your editor")
 	openDash := systray.AddMenuItem("Open dashboard", "Open the finch dashboard in your browser")
 	restart := systray.AddMenuItem("Reconnect all", "Stop and restart every relay")
+	systray.AddSeparator()
+	authItem = systray.AddMenuItem("", "") // "Log in…" / "Log out", set below
 	quit := systray.AddMenuItem("Quit", "Stop relays and quit")
 
+	updateAuthItem()
 	reloadRows()
 	startRelays() // auto-start on launch
 
 	// One click-loop goroutine per interactive item (the systray idiom).
 	go clickLoop(addItem, onAdd)
+	go clickLoop(openManifest, func() { openPath(configPath) })
 	go clickLoop(openDash, func() { openBrowser(dashboardURL()) })
 	go clickLoop(restart, func() { stopRelays(); reloadRows(); startRelays() })
+	go clickLoop(authItem, onAuth)
 	go clickLoop(quit, func() { systray.Quit() })
 	for i := range rmItems {
 		i := i
@@ -174,15 +182,21 @@ func onStatus(appPath, state, detail string) {
 	refreshTooltip()
 }
 
-// onAdd runs the add flow: two native prompts → core.Add → reload + restart.
+// onAdd runs the add flow: two native prompts (name + port) → core.Add → reload
+// + restart. The port is turned into http://127.0.0.1:<port>; a full URL (with
+// "://") is also accepted verbatim for non-localhost or https services.
 func onAdd() {
-	name, ok := askText("finch — add appliance", "Appliance name (becomes the URL path):", "")
+	name, ok := askText("finch — add application", "Application name (becomes the URL path):", "")
 	if !ok || name == "" {
 		return
 	}
-	service, ok := askText("finch — add appliance", "Local service URL to publish:", "http://127.0.0.1:8000")
-	if !ok || service == "" {
+	portOrURL, ok := askText("finch — add application", "Port (the local port it runs on):", "8000")
+	if !ok || portOrURL == "" {
 		return
+	}
+	service := portOrURL
+	if !strings.Contains(portOrURL, "://") {
+		service = "http://127.0.0.1:" + strings.TrimSpace(portOrURL)
 	}
 	stopRelays()
 	id, url, err := core.Add(configPath, name, service)
@@ -319,21 +333,84 @@ func truncate(s string, n int) string {
 	return s[:n-1] + "…"
 }
 
-func shortPath(p string) string {
-	if home, err := os.UserHomeDir(); err == nil && len(p) > len(home) && p[:len(home)] == home {
-		return "~" + p[len(home):]
+// updateAuthItem paints the Log in / Log out row from the current credential.
+func updateAuthItem() {
+	if authItem == nil {
+		return
 	}
-	return p
+	if hub, in := core.LoginInfo(); in {
+		authItem.SetTitle("Log out")
+		authItem.SetTooltip("Signed in to " + hub)
+	} else {
+		authItem.SetTitle("Log in…")
+		authItem.SetTooltip("Sign in to your finch tenant")
+	}
 }
 
-func dashboardURL() string {
-	if hubFlag != "" {
-		return hubFlag
+// onAuth logs out (drops the CLI token) or runs the browser device-login flow,
+// showing the short code in a dialog and opening the approval page.
+func onAuth() {
+	if _, in := core.LoginInfo(); in {
+		if err := core.Logout(); err != nil {
+			alert("finch — logout failed", err.Error())
+			return
+		}
+		updateAuthItem()
+		alert("finch", "Logged out.")
+		return
 	}
+	go func() {
+		err := core.Login(loginHub(), func(uri, code string) {
+			openBrowser(uri)
+			alert("finch — approve login", "Your browser is opening the approval page.\n\nEnter this code:\n\n    "+code)
+		})
+		if err != nil {
+			alert("finch — login failed", err.Error())
+			return
+		}
+		updateAuthItem()
+		stopRelays()
+		reloadRows()
+		startRelays()
+		alert("finch", "Logged in.")
+	}()
+}
+
+// loginHub is the WORKER hub the device-login talks to — the manifest's hub:,
+// falling back to prod. (Distinct from the web dashboard URL below.)
+func loginHub() string {
 	if h := readHub(configPath); h != "" {
 		return h
 	}
 	return "https://finchmcp.com"
+}
+
+// dashboardURL is the WEB dashboard page: the -hub flag (baked at install as the
+// web origin) or the manifest hub, with the /dashboard route appended.
+func dashboardURL() string {
+	base := hubFlag
+	if base == "" {
+		base = readHub(configPath)
+	}
+	if base == "" {
+		base = "https://finchmcp.com"
+	}
+	return strings.TrimRight(base, "/") + "/dashboard"
+}
+
+// openPath opens a local file with the OS default handler (finch.yml in an editor).
+func openPath(p string) {
+	var name string
+	var args []string
+	switch runtime.GOOS {
+	case "darwin":
+		name, args = "open", []string{p}
+	case "windows":
+		name, args = "cmd", []string{"/c", "start", "", p}
+	default:
+		name, args = "xdg-open", []string{p}
+	}
+	_ = exec.Command(name, args...).Start()
 }
 
 func openBrowser(url string) {

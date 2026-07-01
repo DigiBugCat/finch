@@ -80,4 +80,4 @@ launchctl bootstrap "gui/$(id -u)" "$PLIST"
 launchctl kickstart -k "gui/$(id -u)/$APP_ID" 2>/dev/null || true
 
 echo "✓ installed $APP (v$VERSION) — running now and at every login."
-echo "  Look for the teal dot in your menubar. Logs: ~/.finch/tray.log"
+echo "  Look for the finch icon in your menubar. Logs: ~/.finch/tray.log"

@@ -12,9 +12,80 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
+
+// LoginInfo reports whether this box holds a saved CLI credential and, if so, the
+// hub it's for. Lets a GUI show "Log in" vs "Log out".
+func LoginInfo() (hub string, loggedIn bool) {
+	if c := loadCliCredQuiet(); c != nil {
+		return c.Hub, true
+	}
+	return "", false
+}
+
+// Logout removes the saved CLI credential (the in-process equivalent of deleting
+// ~/.finch/cli.json). Already-enrolled appliances keep working from their own
+// refresh credentials; this only drops the admin CLI token.
+func Logout() error {
+	if err := os.Remove(cliCredPath()); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+// Login runs the browser device-authorization flow against hub (the in-process,
+// non-fatal equivalent of `finch login`): it starts a code, invokes onCode with
+// the verification URL + short code for the caller to display/open, polls until
+// approved, and saves the CLI credential. Blocks until approved, expired, or timed
+// out — call it from a goroutine.
+func Login(hub string, onCode func(verificationURI, userCode string)) error {
+	if hub == "" {
+		hub = "https://finchmcp.com"
+	}
+	start, err := cliRequest("POST", hub, "/api/cli/device/start", "", struct{}{})
+	if err != nil {
+		return fmt.Errorf("could not start login: %w", err)
+	}
+	deviceCode, _ := start["device_code"].(string)
+	userCode, _ := start["user_code"].(string)
+	uri, _ := start["verification_uri_complete"].(string)
+	if uri == "" {
+		uri, _ = start["verification_uri"].(string)
+	}
+	interval := 3.0
+	if v, ok := start["interval"].(float64); ok && v > 0 {
+		interval = v
+	}
+	expires := 600.0
+	if v, ok := start["expires_in"].(float64); ok && v > 0 {
+		expires = v
+	}
+	if onCode != nil {
+		onCode(uri, userCode)
+	}
+	deadline := time.Now().Add(time.Duration(expires) * time.Second)
+	for time.Now().Before(deadline) {
+		time.Sleep(time.Duration(interval) * time.Second)
+		poll, perr := cliRequest("POST", hub, "/api/cli/device/poll", "", map[string]string{"device_code": deviceCode})
+		if perr != nil {
+			continue
+		}
+		switch poll["status"] {
+		case "approved":
+			tok, _ := poll["token"].(string)
+			if tok == "" {
+				return fmt.Errorf("approval returned no token")
+			}
+			return saveCliCred(&cliCred{Hub: hub, Token: tok})
+		case "expired", "not_found":
+			return fmt.Errorf("login code expired — try again")
+		}
+	}
+	return fmt.Errorf("timed out waiting for approval")
+}
 
 // AppInfo is one appliance as the hub reports it: its id (the app_path / URL
 // segment) and current state ("chirping"/"pending"/"invited"/…).
