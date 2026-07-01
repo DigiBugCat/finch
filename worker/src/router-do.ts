@@ -58,12 +58,20 @@ export class RouterDO extends DurableObject<Env> {
          user_code   TEXT NOT NULL,
          tenant      TEXT,
          token       TEXT,
+         email       TEXT,
          created     INTEGER NOT NULL,
          approved    INTEGER NOT NULL DEFAULT 0,
          req_ip      TEXT,
          req_ua      TEXT
        )`,
     );
+    // Add the email column to a table created before it existed (idempotent —
+    // ALTER throws "duplicate column" once it's there, which we swallow).
+    try {
+      this.ctx.storage.sql.exec("ALTER TABLE device_codes ADD COLUMN email TEXT");
+    } catch {
+      /* column already present */
+    }
   }
 
   async fetch(req: Request): Promise<Response> {
@@ -90,7 +98,7 @@ export class RouterDO extends DurableObject<Env> {
         case "deviceDescribe":
           return ok(this.deviceDescribe(a.userCode, a.now));
         case "deviceApprove":
-          return ok(this.deviceApprove(a.userCode, a.tenant, a.token, a.now));
+          return ok(this.deviceApprove(a.userCode, a.tenant, a.token, a.email, a.now));
         case "devicePoll":
           return ok(this.devicePoll(a.deviceCode, a.now));
         default:
@@ -220,11 +228,13 @@ export class RouterDO extends DurableObject<Env> {
     userCode: unknown,
     tenant: unknown,
     token: unknown,
+    email: unknown,
     now: number,
   ): { ok: boolean; reason?: string } {
     const u = typeof userCode === "string" ? userCode.trim().toUpperCase().replace(/\s+/g, "") : "";
     const t = typeof tenant === "string" ? tenant : "";
     const tok = typeof token === "string" ? token : "";
+    const em = typeof email === "string" ? email.slice(0, 200) : "";
     if (!u || !t || !tok) return { ok: false, reason: "bad-input" };
     const rows = this.ctx.storage.sql
       .exec<{ device_code: string; created: number; approved: number }>(
@@ -237,9 +247,10 @@ export class RouterDO extends DurableObject<Env> {
     if (now - row.created > RouterDO.DEVICE_TTL_MS) return { ok: false, reason: "expired" };
     if (row.approved) return { ok: false, reason: "already-used" };
     this.ctx.storage.sql.exec(
-      "UPDATE device_codes SET tenant = ?, token = ?, approved = 1 WHERE device_code = ?",
+      "UPDATE device_codes SET tenant = ?, token = ?, email = ?, approved = 1 WHERE device_code = ?",
       t,
       tok,
+      em,
       row.device_code,
     );
     return { ok: true };
@@ -249,12 +260,12 @@ export class RouterDO extends DurableObject<Env> {
   devicePoll(
     deviceCode: unknown,
     now: number,
-  ): { status: string; token?: string; tenant?: string } {
+  ): { status: string; token?: string; tenant?: string; email?: string } {
     const d = typeof deviceCode === "string" ? deviceCode : "";
     if (!d) return { status: "not_found" };
     const rows = this.ctx.storage.sql
-      .exec<{ created: number; approved: number; token: string; tenant: string }>(
-        "SELECT created, approved, token, tenant FROM device_codes WHERE device_code = ?",
+      .exec<{ created: number; approved: number; token: string; tenant: string; email: string | null }>(
+        "SELECT created, approved, token, tenant, email FROM device_codes WHERE device_code = ?",
         d,
       )
       .toArray();
@@ -267,7 +278,7 @@ export class RouterDO extends DurableObject<Env> {
     if (!row.approved) return { status: "pending" };
     // Approved — hand over the token once, then consume the code.
     this.ctx.storage.sql.exec("DELETE FROM device_codes WHERE device_code = ?", d);
-    return { status: "approved", token: row.token, tenant: row.tenant };
+    return { status: "approved", token: row.token, tenant: row.tenant, email: row.email ?? "" };
   }
 }
 
@@ -319,15 +330,16 @@ export function routerDeviceApprove(
   userCode: string,
   tenant: string,
   token: string,
+  email: string,
 ): Promise<{ ok: boolean; reason?: string }> {
-  return deviceOp(env, { op: "deviceApprove", userCode, tenant, token, now: Date.now() });
+  return deviceOp(env, { op: "deviceApprove", userCode, tenant, token, email, now: Date.now() });
 }
 
 /** CLI-poll a device code; returns the token once approved (then consumes it). */
 export function routerDevicePoll(
   env: Env,
   deviceCode: string,
-): Promise<{ status: string; token?: string; tenant?: string }> {
+): Promise<{ status: string; token?: string; tenant?: string; email?: string }> {
   return deviceOp(env, { op: "devicePoll", deviceCode, now: Date.now() });
 }
 

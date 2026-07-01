@@ -18,12 +18,13 @@ import (
 )
 
 // LoginInfo reports whether this box holds a saved CLI credential and, if so, the
-// hub it's for. Lets a GUI show "Log in" vs "Log out".
-func LoginInfo() (hub string, loggedIn bool) {
+// hub it's for and the signed-in user's email (empty for pre-email logins). Lets a
+// GUI show the account and "Log in" vs "Log out".
+func LoginInfo() (hub, email string, loggedIn bool) {
 	if c := loadCliCredQuiet(); c != nil {
-		return c.Hub, true
+		return c.Hub, c.Email, true
 	}
-	return "", false
+	return "", "", false
 }
 
 // Logout removes the saved CLI credential (the in-process equivalent of deleting
@@ -79,7 +80,8 @@ func Login(hub string, onCode func(verificationURI, userCode string)) error {
 			if tok == "" {
 				return fmt.Errorf("approval returned no token")
 			}
-			return saveCliCred(&cliCred{Hub: hub, Token: tok})
+			email, _ := poll["email"].(string)
+			return saveCliCred(&cliCred{Hub: hub, Token: tok, Email: email})
 		case "expired", "not_found":
 			return fmt.Errorf("login code expired — try again")
 		}

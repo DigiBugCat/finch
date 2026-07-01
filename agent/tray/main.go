@@ -498,8 +498,12 @@ func updateAccount() {
 	if accountParent == nil || loginItem == nil {
 		return
 	}
-	if hub, in := core.LoginInfo(); in {
-		accountParent.SetTitle(hostOf(hub))
+	if hub, email, in := core.LoginInfo(); in {
+		label := email
+		if label == "" {
+			label = hostOf(hub) // pre-email login: fall back to the hub host
+		}
+		accountParent.SetTitle(label)
 		accountParent.SetTooltip("Signed in to " + hub)
 		accountParent.Show()
 		loginItem.Hide()
@@ -516,7 +520,7 @@ func updateStatus() {
 	if statusItem == nil {
 		return
 	}
-	_, in := core.LoginInfo()
+	_, _, in := core.LoginInfo()
 	mu.Lock()
 	live, total := 0, len(order)
 	for _, s := range lastState {

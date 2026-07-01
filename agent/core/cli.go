@@ -172,6 +172,7 @@ Run 'finch <command> -h' for a command's own flags.
 type cliCred struct {
 	Hub   string `json:"hub"`
 	Token string `json:"token"`
+	Email string `json:"email,omitempty"` // the signed-in user's email (for display)
 }
 
 func cliCredPath() string {

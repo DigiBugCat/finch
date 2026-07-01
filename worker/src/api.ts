@@ -376,8 +376,11 @@ export async function handleApi(
     const body = await readJson(req);
     const userCode = String(body.userCode || "").trim();
     if (!userCode) return json(400, { error: "userCode required" });
+    // The web BFF (Clerk-authed) passes the approver's email so the box can show
+    // who it's signed in as. Best-effort — approval succeeds without it.
+    const email = String(body.email || "").slice(0, 200);
     const { token } = await mintCliToken(env, tenant, host);
-    const out = await routerDeviceApprove(env, userCode, tenant, token);
+    const out = await routerDeviceApprove(env, userCode, tenant, token, email);
     if (!out.ok) {
       const msg =
         out.reason === "not-found"
