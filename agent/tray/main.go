@@ -249,7 +249,7 @@ func reloadRows() {
 	n := len(apps)
 	mu.Unlock()
 	if thisParent != nil {
-		thisParent.SetTitle(fmt.Sprintf("This machine — %s (%d)", localMachine, n))
+		thisParent.SetTitle(fmt.Sprintf("This machine (%d)", n))
 	}
 	refreshTooltip()
 }
