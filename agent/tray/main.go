@@ -60,7 +60,7 @@ var (
 	machRows    [][]*systray.MenuItem // machParent[j] -> its appliance rows
 	machRowApp  [][]string            // machRows[j][k] -> the appliance id it shows
 
-	connItem      *systray.MenuItem // "Connected"/"Disconnected" toggle (Tailscale-style)
+	statusItem    *systray.MenuItem // "Connected" / "Signed out" status line
 	accountParent *systray.MenuItem // account row (submenu with Log out) when signed in
 	loginItem     *systray.MenuItem // "Log in…" when signed out
 
@@ -105,10 +105,11 @@ func onReady() {
 	systray.SetTemplateIcon(iconPNG, iconPNG)
 	systray.SetTooltip("finch — local services, published")
 
-	// Header + connect toggle + account row (Tailscale-style top block).
+	// Header + status + account row (Tailscale-style top block).
 	header := systray.AddMenuItem("finch", "")
 	header.Disable()
-	connItem = systray.AddMenuItemCheckbox("Connected", "Connect or disconnect every relay", true)
+	statusItem = systray.AddMenuItem("Connected", "")
+	statusItem.Disable()
 	systray.AddSeparator()
 	accountParent = systray.AddMenuItem("", "Your finch account")
 	logoutItem := accountParent.AddSubMenuItem("Log out", "Sign out of this box")
@@ -161,11 +162,10 @@ func onReady() {
 	updateAccount()
 	reloadRows()
 	startRelays()
-	updateConnItem()
+	updateStatus()
 	go refreshFleet() // first paint of "Other machines"
 	go fleetTicker()  // keep it fresh
 
-	go clickLoop(connItem, onToggleConn)
 	go clickLoop(accountParent, func() {}) // parent is just a container for Log out
 	go clickLoop(logoutItem, onLogout)
 	go clickLoop(loginItem, onLogin)
@@ -449,7 +449,7 @@ func refreshTooltip() {
 	default:
 		systray.SetTooltip(fmt.Sprintf("finch — %d/%d live on this machine", live, total))
 	}
-	updateConnItem()
+	updateStatus()
 }
 
 func rowTitle(app, state, detail string) string {
@@ -509,33 +509,35 @@ func updateAccount() {
 	}
 }
 
-// updateConnItem reflects the relay state on the Connected/Disconnected toggle.
-func updateConnItem() {
-	if connItem == nil {
+// updateStatus paints the header status line (Tailscale's "Connected"): signed-in
+// state first, then how many local appliances are live. "Connected" whenever you
+// hold a credential — 0 local apps is normal, not a disconnection.
+func updateStatus() {
+	if statusItem == nil {
 		return
 	}
+	_, in := core.LoginInfo()
 	mu.Lock()
+	live, total := 0, len(order)
+	for _, s := range lastState {
+		if s == "connected" || s == "live" {
+			live++
+		}
+	}
 	running := cancel != nil
 	mu.Unlock()
-	if running {
-		connItem.Check()
-		connItem.SetTitle("Connected")
-	} else {
-		connItem.Uncheck()
-		connItem.SetTitle("Disconnected")
+	switch {
+	case !in:
+		statusItem.SetTitle("Signed out")
+	case total == 0:
+		statusItem.SetTitle("Connected · no applications here")
+	case running && live == total:
+		statusItem.SetTitle("Connected")
+	case running:
+		statusItem.SetTitle(fmt.Sprintf("Connecting… (%d/%d)", live, total))
+	default:
+		statusItem.SetTitle("Connected · idle")
 	}
-}
-
-// onToggleConn connects (starts) or disconnects (stops) every relay.
-func onToggleConn() {
-	if cancel != nil {
-		stopRelays()
-	} else {
-		reloadRows()
-		startRelays()
-		go refreshFleet()
-	}
-	updateConnItem()
 }
 
 // onLogout drops the CLI token (already-enrolled appliances keep working).
@@ -564,7 +566,7 @@ func onLogin() {
 		stopRelays()
 		reloadRows()
 		startRelays()
-		updateConnItem()
+		updateStatus()
 		refreshFleet()
 		alert("finch", "Logged in.")
 	}()
