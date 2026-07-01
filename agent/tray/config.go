@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"sort"
 
 	"gopkg.in/yaml.v3"
 )
@@ -38,3 +39,14 @@ func readAppPaths(path string) []string {
 
 // readHub returns the manifest's hub URL, or "" if unset/unreadable.
 func readHub(path string) string { return loadManifest(path).Hub }
+
+// sortedAppPaths returns the keys of set in stable (sorted) order, so the menu
+// rows don't reshuffle between reloads.
+func sortedAppPaths(set map[string]struct{}) []string {
+	out := make([]string, 0, len(set))
+	for k := range set {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}

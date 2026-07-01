@@ -2,14 +2,11 @@
 //
 // It's the desktop sibling of `finch run`: one binary that reads a finch.yml
 // manifest and supervises a relay per ingress rule, but instead of logging to a
-// terminal it lives in the macOS menubar (and the Windows/Linux system tray) and
-// surfaces each appliance's live state as a menu item. Start/stop the whole roost
-// from the menu; the relay logic, auth, and finch.yml semantics are identical to
-// the CLI because both drive the same agent/core engine (core.RunConfig).
-//
-// One binary, three platforms: getlantern/systray abstracts the tray, and the
-// relay engine is pure Go. Build per-OS with the normal `go build` (macOS/Linux
-// need CGo + the platform GUI libs; see README).
+// terminal it lives in the macOS menubar (and the Windows/Linux system tray),
+// surfaces each appliance's live state as a menu item, auto-starts the relays on
+// launch, and lets you add/remove appliances via native dialogs. The relay logic,
+// auth, and finch.yml semantics are identical to the CLI because both drive the
+// same agent/core engine (core.RunConfig / core.Add / core.Remove).
 package main
 
 import (
@@ -20,7 +17,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"sync"
 
 	_ "embed"
@@ -32,174 +28,267 @@ import (
 //go:embed icon.png
 var iconPNG []byte
 
+// maxRows bounds the pre-created pool of appliance rows (and Remove sub-items).
+// systray can't reorder or delete items after creation, so we allocate a fixed
+// pool up-front and Show/Hide slots as the manifest changes — keeping menu order
+// stable. Bumped only if someone fronts more than this many services from one box.
+const maxRows = 24
+
 var (
-	configPath string // resolved finch.yml path
-	hubURL     string // dashboard/hub base, for the "Open dashboard" item
+	configPath string
+	hubFlag    string
 
-	mu        sync.Mutex               // guards the maps below (status arrives on relay goroutines)
-	items     map[string]*systray.MenuItem // app_path -> its menu row
-	lastState map[string]string            // app_path -> last state, for the summary title
+	mu        sync.Mutex
+	order     []string                     // app_paths, in manifest order
+	rowByApp  map[string]*systray.MenuItem // app_path -> its status row
+	lastState map[string]string            // app_path -> last relay state
+	rows      []*systray.MenuItem          // the fixed status-row pool
+	rmItems   []*systray.MenuItem          // the fixed Remove-submenu pool
+	rmApp     []string                     // rmItems[i] currently removes rmApp[i]
 
-	cancel context.CancelFunc // non-nil while relays are running
+	cancel context.CancelFunc // non-nil while relays run
 	runWG  sync.WaitGroup
 )
 
 func main() {
-	flag.StringVar(&configPath, "config", "", "path to finch.yml (default: ./finch.yml, else ~/.finch/finch.yml)")
-	flag.StringVar(&hubURL, "hub", "", "hub/dashboard base URL for the Open-dashboard menu item")
+	flag.StringVar(&configPath, "config", "", "path to finch.yml (default: ~/.finch/finch.yml)")
+	flag.StringVar(&hubFlag, "hub", "", "hub/dashboard base URL for the Open-dashboard item")
 	flag.Parse()
-
 	if configPath == "" {
-		configPath = discoverConfig()
+		configPath = defaultConfigPath()
 	}
-	items = map[string]*systray.MenuItem{}
+	rowByApp = map[string]*systray.MenuItem{}
 	lastState = map[string]string{}
-
 	systray.Run(onReady, onExit)
 }
 
-// discoverConfig mirrors the CLI's finch.yml lookup: prefer one in the working
-// directory, then fall back to ~/.finch/finch.yml.
-func discoverConfig() string {
-	if _, err := os.Stat("finch.yml"); err == nil {
+// defaultConfigPath is ~/.finch/finch.yml (the installed-app home), creating the
+// ~/.finch dir so `finch add` from the tray has somewhere to write.
+func defaultConfigPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
 		return "finch.yml"
 	}
-	if home, err := os.UserHomeDir(); err == nil {
-		p := filepath.Join(home, ".finch", "finch.yml")
-		if _, err := os.Stat(p); err == nil {
-			return p
-		}
-	}
-	return "finch.yml" // report the miss against the conventional name
+	dir := filepath.Join(home, ".finch")
+	_ = os.MkdirAll(dir, 0o700)
+	return filepath.Join(dir, "finch.yml")
 }
 
 func onReady() {
 	systray.SetIcon(iconPNG)
-	systray.SetTitle("") // icon-only in the menubar; title is noisy on macOS
 	systray.SetTooltip("finch — local services, published")
 
 	header := systray.AddMenuItem("finch", "")
 	header.Disable()
-	cfgItem := systray.AddMenuItem("manifest: "+configPath, configPath)
+	cfgItem := systray.AddMenuItem("manifest: "+shortPath(configPath), configPath)
 	cfgItem.Disable()
 	systray.AddSeparator()
 
-	// One row per appliance in the manifest, created up-front so the menu has
-	// shape before the first relay connects. A bad/missing manifest leaves just
-	// the controls, with the error surfaced on the toggle row.
-	appErr := ""
-	for _, app := range readAppPaths(configPath) {
-		it := systray.AddMenuItem("• "+app+" — idle", app)
+	// Fixed pool of status rows (hidden until reloadRows assigns them).
+	rows = make([]*systray.MenuItem, maxRows)
+	for i := range rows {
+		it := systray.AddMenuItem("", "")
 		it.Disable()
-		items[app] = it
-	}
-	if len(items) == 0 {
-		appErr = "no appliances in " + configPath
+		it.Hide()
+		rows[i] = it
 	}
 	systray.AddSeparator()
 
-	toggle := systray.AddMenuItem("Start relay", "Connect every appliance in the manifest")
-	if appErr != "" {
-		toggle.SetTitle(appErr)
-		toggle.Disable()
+	addItem := systray.AddMenuItem("Add appliance…", "Enroll a local service and publish it")
+	rmParent := systray.AddMenuItem("Remove appliance", "Remove a published appliance")
+	rmItems = make([]*systray.MenuItem, maxRows)
+	rmApp = make([]string, maxRows)
+	for i := range rmItems {
+		it := rmParent.AddSubMenuItem("", "")
+		it.Hide()
+		rmItems[i] = it
 	}
+	systray.AddSeparator()
+
 	openDash := systray.AddMenuItem("Open dashboard", "Open the finch dashboard in your browser")
+	restart := systray.AddMenuItem("Reconnect all", "Stop and restart every relay")
 	quit := systray.AddMenuItem("Quit", "Stop relays and quit")
 
-	go func() {
-		for {
-			select {
-			case <-toggle.ClickedCh:
-				if cancel == nil {
-					startRelays(toggle)
-				} else {
-					stopRelays(toggle)
-				}
-			case <-openDash.ClickedCh:
-				openBrowser(dashboardURL())
-			case <-quit.ClickedCh:
-				systray.Quit()
-				return
-			}
-		}
-	}()
-}
+	reloadRows()
+	startRelays() // auto-start on launch
 
-func onExit() {
-	stopRelays(nil)
-}
-
-// startRelays launches core.RunConfig in the background, streaming per-appliance
-// status into the menu rows. The toggle flips to a Stop control.
-func startRelays(toggle *systray.MenuItem) {
-	ctx, c := context.WithCancel(context.Background())
-	cancel = c
-	toggle.SetTitle("Stop relay")
-	setSummary("connecting…")
-
-	runWG.Add(1)
-	go func() {
-		defer runWG.Done()
-		err := core.RunConfig(ctx, configPath, onStatus)
-		if err != nil {
-			setSummary("error: " + err.Error())
-		}
-	}()
-}
-
-// stopRelays cancels the run and waits for the relays to wind down. Safe to call
-// with a nil toggle (from onExit) and when nothing is running.
-func stopRelays(toggle *systray.MenuItem) {
-	if cancel != nil {
-		cancel()
-		cancel = nil
-		runWG.Wait()
+	// One click-loop goroutine per interactive item (the systray idiom).
+	go clickLoop(addItem, onAdd)
+	go clickLoop(openDash, func() { openBrowser(dashboardURL()) })
+	go clickLoop(restart, func() { stopRelays(); reloadRows(); startRelays() })
+	go clickLoop(quit, func() { systray.Quit() })
+	for i := range rmItems {
+		i := i
+		go clickLoop(rmItems[i], func() { onRemoveSlot(i) })
 	}
-	if toggle != nil {
-		toggle.SetTitle("Start relay")
+}
+
+func onExit() { stopRelays() }
+
+func clickLoop(it *systray.MenuItem, fn func()) {
+	for range it.ClickedCh {
+		fn()
 	}
+}
+
+// reloadRows re-reads the manifest and paints the status-row + Remove-submenu
+// pools to match its appliances, hiding the unused slots.
+func reloadRows() {
+	apps := readAppPaths(configPath)
 	mu.Lock()
-	for app, it := range items {
-		it.SetTitle("• " + app + " — idle")
-		lastState[app] = "idle"
+	order = apps
+	rowByApp = map[string]*systray.MenuItem{}
+	for i, it := range rows {
+		if i < len(apps) {
+			app := apps[i]
+			rowByApp[app] = it
+			it.SetTitle(rowTitle(app, lastState[app], ""))
+			it.Show()
+		} else {
+			it.Hide()
+		}
+	}
+	for i, it := range rmItems {
+		if i < len(apps) {
+			rmApp[i] = apps[i]
+			it.SetTitle(apps[i])
+			it.Show()
+		} else {
+			rmApp[i] = ""
+			it.Hide()
+		}
 	}
 	mu.Unlock()
-	systray.SetTooltip("finch — stopped")
+	refreshTooltip()
 }
 
-// onStatus is core.RunConfig's per-appliance callback (invoked on relay
-// goroutines). It updates that appliance's menu row and the tray tooltip summary.
+// onStatus is core.RunConfig's per-appliance callback (on relay goroutines).
 func onStatus(appPath, state, detail string) {
 	mu.Lock()
 	lastState[appPath] = state
-	it := items[appPath]
+	it := rowByApp[appPath]
 	mu.Unlock()
-	title := "• " + appPath + " — " + prettyState(state)
-	if detail != "" && (state == "reconnecting" || state == "error" || state == "warn") {
-		title += " (" + truncate(detail, 40) + ")"
-	}
 	if it != nil {
-		it.SetTitle(title)
+		it.SetTitle(rowTitle(appPath, state, detail))
 	}
-	setSummary("")
+	refreshTooltip()
 }
 
-// setSummary refreshes the tooltip with a live count of connected appliances, or
-// a one-off message when non-empty.
-func setSummary(msg string) {
-	if msg != "" {
-		systray.SetTooltip("finch — " + msg)
+// onAdd runs the add flow: two native prompts → core.Add → reload + restart.
+func onAdd() {
+	name, ok := askText("finch — add appliance", "Appliance name (becomes the URL path):", "")
+	if !ok || name == "" {
 		return
 	}
+	service, ok := askText("finch — add appliance", "Local service URL to publish:", "http://127.0.0.1:8000")
+	if !ok || service == "" {
+		return
+	}
+	stopRelays()
+	id, url, err := core.Add(configPath, name, service)
+	if err != nil {
+		alert("finch — couldn't add", err.Error())
+	} else {
+		msg := "Added " + id
+		if url != "" {
+			msg += "\n" + url
+		}
+		alert("finch", msg)
+	}
+	reloadRows()
+	startRelays()
+}
+
+// onRemoveSlot removes whatever appliance the given Remove sub-item points at.
+func onRemoveSlot(i int) {
 	mu.Lock()
-	live, total := 0, len(items)
+	app := ""
+	if i < len(rmApp) {
+		app = rmApp[i]
+	}
+	mu.Unlock()
+	if app == "" {
+		return
+	}
+	stopRelays()
+	if err := core.Remove(configPath, app); err != nil {
+		alert("finch — couldn't remove", err.Error())
+	}
+	mu.Lock()
+	delete(lastState, app)
+	mu.Unlock()
+	reloadRows()
+	startRelays()
+}
+
+func startRelays() {
+	if cancel != nil {
+		return // already running
+	}
+	if len(order) == 0 {
+		refreshTooltip()
+		return
+	}
+	ctx, c := context.WithCancel(context.Background())
+	cancel = c
+	runWG.Add(1)
+	go func() {
+		defer runWG.Done()
+		if err := core.RunConfig(ctx, configPath, onStatus); err != nil {
+			mu.Lock()
+			// Surface a manifest-level failure on the first row.
+			for _, it := range rowByApp {
+				it.SetTitle("• relay error — " + truncate(err.Error(), 48))
+				break
+			}
+			mu.Unlock()
+		}
+	}()
+	refreshTooltip()
+}
+
+func stopRelays() {
+	if cancel == nil {
+		return
+	}
+	cancel()
+	cancel = nil
+	runWG.Wait()
+	mu.Lock()
+	for app, it := range rowByApp {
+		lastState[app] = "idle"
+		it.SetTitle(rowTitle(app, "idle", ""))
+	}
+	mu.Unlock()
+}
+
+func refreshTooltip() {
+	mu.Lock()
+	live, total := 0, len(order)
 	for _, s := range lastState {
 		if s == "connected" || s == "live" {
 			live++
 		}
 	}
+	running := cancel != nil
 	mu.Unlock()
+	if total == 0 {
+		systray.SetTooltip("finch — no appliances (Add appliance…)")
+		return
+	}
+	if !running {
+		systray.SetTooltip("finch — stopped")
+		return
+	}
 	systray.SetTooltip(fmt.Sprintf("finch — %d/%d appliances live", live, total))
+}
+
+func rowTitle(app, state, detail string) string {
+	t := "• " + app + " — " + prettyState(state)
+	if detail != "" && (state == "reconnecting" || state == "error" || state == "warn") {
+		t += " (" + truncate(detail, 36) + ")"
+	}
+	return t
 }
 
 func prettyState(s string) string {
@@ -216,6 +305,8 @@ func prettyState(s string) string {
 		return "error"
 	case "warn":
 		return "warning"
+	case "", "idle":
+		return "idle"
 	default:
 		return s
 	}
@@ -228,10 +319,16 @@ func truncate(s string, n int) string {
 	return s[:n-1] + "…"
 }
 
-// dashboardURL prefers the -hub flag, then the manifest's hub, then prod.
+func shortPath(p string) string {
+	if home, err := os.UserHomeDir(); err == nil && len(p) > len(home) && p[:len(home)] == home {
+		return "~" + p[len(home):]
+	}
+	return p
+}
+
 func dashboardURL() string {
-	if hubURL != "" {
-		return hubURL
+	if hubFlag != "" {
+		return hubFlag
 	}
 	if h := readHub(configPath); h != "" {
 		return h
@@ -251,14 +348,4 @@ func openBrowser(url string) {
 		cmd, args = "xdg-open", []string{url}
 	}
 	_ = exec.Command(cmd, args...).Start()
-}
-
-// sortedAppPaths is a small helper kept for a stable menu order in readAppPaths.
-func sortedAppPaths(m map[string]struct{}) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
 }

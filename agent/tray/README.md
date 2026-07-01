@@ -10,12 +10,17 @@ Menu:
 
 - a row per appliance showing live state (`connecting…` / `live` /
   `reconnecting…` / `error`),
-- **Start / Stop relay** — connect or disconnect the whole roost,
+- **Add appliance…** — native dialog (name + local service URL) → enrolls and
+  publishes it (`core.Add`), then reloads and reconnects,
+- **Remove appliance ▸** — submenu of the current appliances; pick one to release
+  it (`core.Remove`) and drop its ingress rule,
 - **Open dashboard** — opens the manifest's hub in your browser,
+- **Reconnect all** — stop and restart every relay,
 - **Quit**.
 
-When the box is logged in (`finch login`), the tray best-effort self-approves each
-appliance, so nothing gets stuck `pending` — same as `finch run`.
+Relays **auto-start on launch**. When the box is logged in (`finch login`), the
+tray best-effort self-approves each appliance, so nothing gets stuck `pending` —
+same as `finch run`. It reads `~/.finch/finch.yml` by default.
 
 ## Run
 
@@ -32,6 +37,27 @@ finch login --hub <hub>
 finch add myapp --service http://127.0.0.1:8000
 finch-tray
 ```
+
+## Install (macOS)
+
+Build a dockless `Finch.app`, install it to `~/Applications`, and register a
+LaunchAgent so it starts at login:
+
+```sh
+sh agent/tray/scripts/install-macos.sh
+# bake a dashboard hub (else it reads hub: from finch.yml):
+FINCH_HUB=https://finch-staging.pantainos.workers.dev sh agent/tray/scripts/install-macos.sh
+```
+
+Uninstall:
+
+```sh
+launchctl bootout gui/$(id -u)/com.finchmcp.tray
+rm -rf ~/Applications/Finch.app ~/Library/LaunchAgents/com.finchmcp.tray.plist
+```
+
+Logs land in `~/.finch/tray.log`. Windows/Linux install packaging (Start-menu /
+`.desktop` autostart) is a follow-up; the binary already runs on those platforms.
 
 ## Build
 
