@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -80,6 +81,69 @@ func EmbedEnroll(o EmbedOptions) error {
 		return err
 	}
 	return nil
+}
+
+// RunConfig loads a finch.yml manifest and serves every ingress rule concurrently
+// — the same multi-appliance model as `finch run`, but ctx-aware and non-fatal so
+// a host program (the desktop tray app) can drive it and Stop() it cleanly. It
+// reuses the per-appliance Embed loop, and when the box is logged in (finch login)
+// best-effort self-approves each appliance so none are stuck pending — the CLI
+// token holder is the tenant admin. status, if non-nil, receives per-appliance
+// lifecycle updates (app_path, state, detail); the caller marshals to its UI.
+//
+// Returns nil once ctx is cancelled and all relays have wound down; a non-nil
+// error only for a terminal manifest problem (unreadable finch.yml, no rules).
+func RunConfig(ctx context.Context, configPath string, status func(appPath, state, detail string)) error {
+	if status == nil {
+		status = func(string, string, string) {}
+	}
+	host, _ := os.Hostname()
+	cfg, err := loadConfig(configPath, host)
+	if err != nil {
+		return err
+	}
+	if len(cfg.Ingress) == 0 {
+		return fmt.Errorf("finch.yml has no ingress rules — nothing to serve")
+	}
+
+	// Self-approve via the saved CLI token (best-effort, idempotent): clears the
+	// pending gate so appliances go live without a dashboard hop. Only when the
+	// token targets this manifest's hub.
+	if cred := loadCliCredQuiet(); cred != nil && cred.Hub == cfg.hubBase() {
+		for _, ing := range cfg.Ingress {
+			_ = cliApprove(cred, ing.AppPath)
+		}
+	}
+
+	var wg sync.WaitGroup
+	for _, ing := range cfg.Ingress {
+		ing := ing
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := Embed(ctx, EmbedOptions{
+				Hub:            cfg.Hub,
+				Machine:        cfg.Machine,
+				AppPath:        ing.AppPath,
+				Upstream:       ing.Service,
+				CredentialPath: cfg.statePathFor(ing.AppPath),
+				ForwardAll:     ing.ForwardAll,
+			}, func(state, detail string) { status(ing.AppPath, state, detail) }); err != nil {
+				status(ing.AppPath, "error", err.Error())
+			}
+		}()
+	}
+	wg.Wait()
+	return nil
+}
+
+// hubBase mirrors EmbedOptions.hub()'s normalization for the config's hub, so the
+// CLI-token hub comparison in RunConfig matches how relays actually dial out.
+func (c *config) hubBase() string {
+	if c.Hub == "" {
+		return "https://finchmcp.com"
+	}
+	return strings.TrimRight(c.Hub, "/")
 }
 
 // Embed resumes the appliance from its saved credential and holds the relay open,
