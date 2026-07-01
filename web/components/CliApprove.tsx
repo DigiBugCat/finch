@@ -1,17 +1,23 @@
 "use client";
-// The browser side of `finch login`: the user TYPES the short device code their
-// CLI printed and approves it (the hub mints + stamps a CLI token). We do NOT
-// auto-fill the code from the URL — a one-click prefilled link is the phishing
-// vector (an attacker starts the flow and sends a victim the link). Requiring a
-// typed code + showing exactly which account is being granted is the binding.
+// The browser side of `finch login`: the user approves the short device code
+// their CLI printed and the hub mints + stamps a CLI token. The code MAY be
+// pre-filled from ?code= (one-click UX from verification_uri_complete), but a
+// prefilled link alone grants NOTHING: approval still requires a Clerk-signed-in
+// session, a deliberate Approve click, and the displayed initiator IP/UA context
+// so the user can confirm it's their own box (the anti-phishing binding).
 import { useEffect, useRef, useState } from 'react';
+import { useSearchParams } from 'next/navigation';
 import { UserButton, useUser } from '@clerk/nextjs';
 
 type Origin = { found: boolean; reqIp?: string; reqUa?: string; ageSeconds?: number } | null;
 
 export default function CliApprove() {
   const { user } = useUser();
-  const [code, setCode] = useState('');
+  // Seed the code from ?code= (pre-filled one-click link). This auto-runs the
+  // describe/initiator-context step below; the user still clicks Approve.
+  const params = useSearchParams();
+  const initialCode = (params.get('code') || '').toUpperCase();
+  const [code, setCode] = useState(initialCode);
   const [state, setState] = useState<'idle' | 'busy' | 'done' | 'error'>('idle');
   const [msg, setMsg] = useState('');
   const [origin, setOrigin] = useState<Origin>(null);   // initiator context for the typed code

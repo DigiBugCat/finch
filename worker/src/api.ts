@@ -163,9 +163,12 @@ export async function handleApi(
   if (path.startsWith("/api/cli/")) {
     // ---- Public device-authorization flow (`finch login`): the CLI has no
     //      credentials yet, so start/poll are unauthenticated. The browser
-    //      (Clerk-authed) approves the short user_code out of band. We do NOT
-    //      return a one-click ?code= link — the human must TYPE the code, and
-    //      the approval page shows the initiator's context (see /cli). ----
+    //      (Clerk-authed) approves the short user_code out of band. device/start
+    //      ALSO returns verification_uri_complete = <web>/cli?code=<user_code> to
+    //      pre-fill the code for one-click UX. The security binding is preserved:
+    //      /cli still requires a Clerk-authed, deliberate Approve click and shows
+    //      the initiator's IP/UA context (anti-phishing) — pre-filling the code
+    //      does not auto-approve. ----
     if (path === "/api/cli/device/start" && method === "POST") {
       // Throttle code CREATION per IP (you don't start many logins/min). Poll
       // is intentionally NOT throttled — it needs the 256-bit device_code and
@@ -185,6 +188,9 @@ export async function handleApi(
         device_code: deviceCode,
         user_code: userCode,
         verification_uri: `${webBase}/cli`,
+        // Pre-filled one-click link — the agent prefers this over verification_uri.
+        // encodeURIComponent is defensive; userCode is [A-Z0-9-] and already safe.
+        verification_uri_complete: `${webBase}/cli?code=${encodeURIComponent(userCode)}`,
         expires_in: 600,
         interval: 3,
       });
