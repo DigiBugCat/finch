@@ -269,7 +269,7 @@ func Main() {
 
 	hostName, _ := os.Hostname()
 	hub := flag.String("hub", "https://finchmcp.com", "finch hub base URL (http[s]://…)")
-	ticket := flag.String("ticket", "", "one-shot enrollment ticket from the dashboard (first run only; later runs resume from --state)")
+	ticket := flag.String("ticket", "", "one-shot enrollment ticket from the dashboard (first run only; '-' reads it from stdin, or set FINCH_TICKET; later runs resume from --state)")
 	machine := flag.String("machine", hostName, "this box's name")
 	upstream := flag.String("upstream", "http://127.0.0.1:8000", "local MCP server base URL")
 	statePath := flag.String("state", defaultStatePath(), "file that persists the per-machine refresh credential so a restart needs no new ticket")
@@ -283,6 +283,11 @@ func Main() {
 		os.Args = append(os.Args[:1], os.Args[2:]...)
 	}
 	flag.Parse()
+
+	// Argv-free ticket intake (--ticket - from stdin, FINCH_TICKET from env),
+	// same as `finch enroll`: keep the refresh-token-minting ticket off the
+	// process table / shell history on the single-service `finch join` path.
+	*ticket = resolveTicket(*ticket)
 
 	// finch.toml support (TOML parsing) was removed in favor of a cloudflared-style
 	// finch.yml. Fail loudly rather than silently dropping an upgraded
@@ -881,7 +886,7 @@ func forward(ctx context.Context, upstream *url.URL, f frame, write func(frame) 
 		}
 	}
 
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := relayClient(upstream, forwardAll).Do(req)
 	if err != nil {
 		// Dial / connect failure — pre-head, so the DO maps it to a 502 and may
 		// still fail over to another machine.
@@ -953,6 +958,37 @@ func forward(ctx context.Context, upstream *url.URL, f frame, write func(frame) 
 			}
 			return
 		}
+	}
+}
+
+// relayClient returns an http.Client for the relay forward path whose redirect
+// policy re-runs the SSRF confinement on EVERY hop. Go's default client follows
+// up to 10 redirects to an ARBITRARY host/scheme, which would let a fronted
+// service (via an open redirect or reflected Location) steer the agent to
+// http://169.254.169.254/ or another loopback port — the exact escape
+// resolveUpstream exists to prevent. We re-derive the allowed target from the
+// trusted base + the redirect's path and refuse the hop if it doesn't match,
+// so a Location can never move host/scheme or climb out of the prefix.
+func relayClient(base *url.URL, forwardAll bool) *http.Client {
+	return &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("stopped after 10 redirects")
+			}
+			// The redirect target must stay on the trusted base host+scheme AND
+			// pass the same prefix confinement. Host/scheme is pinned by direct
+			// comparison (a Location to another host/port/scheme is the SSRF
+			// escape). The path is validated through resolveUpstream, which rejects
+			// a prefix escape; we compare on the trailing-slash-normalized path so
+			// a legitimate canonicalizing 302 (/docs -> /docs/) is still followed.
+			if req.URL.Scheme != base.Scheme || req.URL.Host != base.Host {
+				return fmt.Errorf("redirect blocked (SSRF confinement): %q leaves %s://%s", req.URL.String(), base.Scheme, base.Host)
+			}
+			if _, err := resolveUpstream(base, req.URL.Path, forwardAll); err != nil {
+				return fmt.Errorf("redirect blocked (SSRF confinement): %w", err)
+			}
+			return nil
+		},
 	}
 }
 

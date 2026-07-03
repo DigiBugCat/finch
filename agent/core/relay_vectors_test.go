@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -355,6 +356,103 @@ func TestForward_SSRFRejectPreHead(t *testing.T) {
 	frames := cw.snapshot()
 	if len(frames) != 1 || frames[0].Type != "err" || frames[0].Status != 403 {
 		t.Fatalf("SSRF reject should emit one 403 err, got %+v", frames)
+	}
+}
+
+// TestForward_RedirectToForeignHostBlocked asserts the SSRF fix: a fronted
+// service that emits a 3xx to a DIFFERENT host (the open-redirect / metadata-SSRF
+// primitive) must NOT be followed. Go's default client would chase the Location
+// to an arbitrary host (e.g. 169.254.169.254); relayClient's CheckRedirect
+// re-runs resolveUpstream per hop and refuses the cross-host jump, so forward()
+// surfaces a 502 err (or a 3xx head) but NEVER the foreign body.
+func TestForward_RedirectToForeignHostBlocked(t *testing.T) {
+	const secret = "INTERNAL-METADATA-SECRET"
+	internal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, secret)
+	}))
+	defer internal.Close()
+
+	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, internal.URL+"/latest/meta-data/", http.StatusFound)
+	}))
+	defer front.Close()
+
+	upstream := mustParse(t, front.URL) // forward_all: whole host exposed
+	cw := &collectingWriter{}
+	forward(context.Background(), upstream, frame{
+		ID: "ssrf-1", Type: "req", Method: "GET", Path: "/",
+	}, cw.write, nil, true)
+
+	for _, f := range cw.snapshot() {
+		if f.Type == "chunk" {
+			dec, _ := base64.StdEncoding.DecodeString(f.Data)
+			if strings.Contains(string(dec), secret) {
+				t.Fatalf("SSRF: foreign-host redirect body leaked through the relay: %q", dec)
+			}
+		}
+	}
+}
+
+// TestForward_RedirectToLoopbackPortBlocked asserts a redirect that keeps the
+// host but jumps to a DIFFERENT loopback port (another local-only service) is
+// also refused — host-pinning must include the port, not just the hostname.
+func TestForward_RedirectToLoopbackPortBlocked(t *testing.T) {
+	const secret = "OTHER-LOOPBACK-PORT"
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, secret)
+	}))
+	defer other.Close()
+
+	front := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, other.URL+"/", http.StatusFound)
+	}))
+	defer front.Close()
+
+	upstream := mustParse(t, front.URL)
+	cw := &collectingWriter{}
+	forward(context.Background(), upstream, frame{
+		ID: "ssrf-2", Type: "req", Method: "GET", Path: "/",
+	}, cw.write, nil, true)
+
+	for _, f := range cw.snapshot() {
+		if f.Type == "chunk" {
+			dec, _ := base64.StdEncoding.DecodeString(f.Data)
+			if strings.Contains(string(dec), secret) {
+				t.Fatalf("SSRF: cross-port redirect body leaked through the relay: %q", dec)
+			}
+		}
+	}
+}
+
+// TestForward_SameOriginRedirectFollowed asserts the guard is not over-broad: a
+// redirect that stays on the SAME host+scheme and within the allowed prefix is
+// still followed (a normal app 302 like a trailing-slash canonicalization).
+func TestForward_SameOriginRedirectFollowed(t *testing.T) {
+	const body = "FINAL-PAGE"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/docs" {
+			http.Redirect(w, r, "/docs/", http.StatusFound)
+			return
+		}
+		io.WriteString(w, body)
+	}))
+	defer srv.Close()
+
+	upstream := mustParse(t, srv.URL)
+	cw := &collectingWriter{}
+	forward(context.Background(), upstream, frame{
+		ID: "ssrf-3", Type: "req", Method: "GET", Path: "/docs",
+	}, cw.write, nil, true)
+
+	var assembled []byte
+	for _, f := range cw.snapshot() {
+		if f.Type == "chunk" {
+			dec, _ := base64.StdEncoding.DecodeString(f.Data)
+			assembled = append(assembled, dec...)
+		}
+	}
+	if !strings.Contains(string(assembled), body) {
+		t.Fatalf("same-origin redirect should be followed; got body %q, want it to contain %q", assembled, body)
 	}
 }
 
