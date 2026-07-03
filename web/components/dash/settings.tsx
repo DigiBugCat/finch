@@ -335,7 +335,7 @@ export function SettingsView({ settings, groups, onChange }: any) {
       </Card>
 
       <Card className="set-card">
-        <SectionLabel>custom domains <span className="beta-badge">beta</span></SectionLabel>
+        <SectionLabel>custom domains <span className="beta-badge">free while in beta</span></SectionLabel>
         <CustomDomains />
       </Card>
 
