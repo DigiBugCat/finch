@@ -16,12 +16,12 @@ A single Go binary with a few subcommands:
 | `finch run` | Serve every rule in `finch.yml` — dials out, auto-approves, holds the relay open. |
 | `finch status` | Am I logged in (which tenant)? What does `finch.yml` serve? |
 | `finch fleet` (alias `ls`) | List this account's services + state. |
-| `finch test <appliance>` | List a service's MCP tools (does-it-work check). |
-| `finch call <appliance> <tool> [--args '{…}']` | Invoke one tool through the hub. |
-| `finch keys [list \| mint <label> --appliance <id> \| revoke <id>]` | Manage the client `finch_` keys callers present (grant + revoke access). |
+| `finch test <service>` | List a service's MCP tools (does-it-work check). |
+| `finch call <service> <tool> [--args '{…}']` | Invoke one tool through the hub. |
+| `finch keys [list \| mint <label> --service <id> \| revoke <id>]` | Manage the client `finch_` keys callers present (grant + revoke access). |
 | `finch token` | Mint a fresh CLI token — provision a new box with no browser. |
 | `finch approve <path>` | Approve a service (clear the pending gate). Usually automatic. |
-| `finch rm <appliance>` | Remove a service. |
+| `finch rm <service>` | Remove a service. |
 | `finch revoke-tokens` | De-authorize every CLI login (including this box). |
 | `finch join --ticket … --upstream …` | Legacy single-service mode straight from flags (no config file). |
 | `finch help` | Command overview, first-time setup, and the **agent/automation** guide. |
@@ -71,7 +71,7 @@ outbound link. The manifest holds **no secrets** — it's a pure wiring table of
 
 ```yaml
 hub: https://finchmcp.com        # default; omit for prod
-machine: mac-mini                # this box's name (default: hostname)
+box: mac-mini                # this box's name (default: hostname)
 credentials-dir: ~/.finch        # where `finch enroll` writes per-app credentials
 
 # Each rule forwards one local service.
@@ -130,14 +130,14 @@ ticketless.
 | `--hub` | `https://finchmcp.com` | finch hub base URL |
 | `--config` | `finch.yml` (auto-detected) | manifest to serve (`finch run`) |
 | `--ticket` | — | one-shot enrollment ticket (first run, single-service mode) |
-| `--machine` | hostname | this box's name |
+| `--box` | hostname | this box's name |
 | `--upstream` | `http://127.0.0.1:8000` | local service (single-service mode) |
 | `--state` | `~/.finch/agent.json` | persisted per-box refresh credential |
 | `--forward-all` | off | forward the whole loopback host, not just `/mcp` (single-service mode) |
 
 ## How it relays
 
-On connect the agent dials `wss://<hub>/<appliance>/<machine>/_connect?ct=<token>`
+On connect the agent dials `wss://<hub>/<service>/<box>/_connect?ct=<token>`
 and parks the socket. For each request frame the hub sends, the agent forwards
 it to the matching local `service`, streams the response back (`head` →
 `chunk…` → `end`), and confines forwarded paths to `/mcp` by default (or the

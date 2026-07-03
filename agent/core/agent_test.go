@@ -142,7 +142,7 @@ func TestState_RoundTrip(t *testing.T) {
 
 	want := &agentState{
 		Hub: "https://finchmcp.com", Tenant: "org_1",
-		Appliance: "scraper", Machine: "box-1", RefreshToken: "finch_refresh_abc",
+		Service: "scraper", Box: "box-1", RefreshToken: "finch_refresh_abc",
 	}
 	if err := saveState(path, want); err != nil {
 		t.Fatalf("saveState: %v", err)

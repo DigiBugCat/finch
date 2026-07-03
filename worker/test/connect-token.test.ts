@@ -1,24 +1,24 @@
 import { describe, it, expect } from "vitest";
 import { signToken, verifyToken, type TicketPayload } from "../src/auth";
 
-// The /<appliance>/<machine>/_connect handler in index.ts authenticates the
-// agent WS dial by verifying the per-machine connect-token (?ct=…). The accept
+// The /<service>/<box>/_connect handler in index.ts authenticates the
+// agent WS dial by verifying the per-box connect-token (?ct=…). The accept
 // predicate is exactly:
 //
 //   payload && payload.kind === "connect" &&
-//   payload.tenant === tenant && payload.appliance === appliance &&
-//   payload.machine === machine
+//   payload.tenant === tenant && payload.service === service &&
+//   payload.box === box
 //
 // We mint connect-tokens the same way api.ts does (signToken with kind:"connect"
-// + a 120s exp) and assert the FULL reject matrix: wrong machine / tenant /
-// appliance / kind / expiry all fail closed, only the exactly-matching token is
+// + a 120s exp) and assert the FULL reject matrix: wrong box / tenant /
+// service / kind / expiry all fail closed, only the exactly-matching token is
 // accepted.
 
 const SECRET = "test-ticket-secret";
 const nowSec = () => Math.floor(Date.now() / 1000);
 
 // The resolved route the WS dial landed on.
-const ROUTE = { tenant: "org_1", appliance: "scraper", machine: "box-1" };
+const ROUTE = { tenant: "org_1", service: "scraper", box: "box-1" };
 
 /** Mint a connect-token exactly as api.ts's join handler does. */
 async function mintConnect(
@@ -27,8 +27,8 @@ async function mintConnect(
 ): Promise<string> {
   const payload: TicketPayload = {
     tenant: ROUTE.tenant,
-    appliance: ROUTE.appliance,
-    machine: ROUTE.machine,
+    service: ROUTE.service,
+    box: ROUTE.box,
     kind: "connect",
     exp: nowSec() + ttl,
     ...over,
@@ -47,8 +47,8 @@ async function accepts(
     payload &&
     payload.kind === "connect" &&
     payload.tenant === route.tenant &&
-    payload.appliance === route.appliance &&
-    payload.machine === route.machine
+    payload.service === route.service &&
+    payload.box === route.box
   );
 }
 
@@ -63,8 +63,8 @@ describe("connect-token verify — reject matrix (fail closed)", () => {
     expect(await accepts("")).toBe(false);
   });
 
-  it("rejects when the machine differs", async () => {
-    const ct = await mintConnect({ machine: "box-2" });
+  it("rejects when the box differs", async () => {
+    const ct = await mintConnect({ box: "box-2" });
     expect(await accepts(ct)).toBe(false);
   });
 
@@ -73,17 +73,17 @@ describe("connect-token verify — reject matrix (fail closed)", () => {
     expect(await accepts(ct)).toBe(false);
   });
 
-  it("rejects when the appliance differs", async () => {
-    const ct = await mintConnect({ appliance: "printer" });
+  it("rejects when the service differs", async () => {
+    const ct = await mintConnect({ service: "printer" });
     expect(await accepts(ct)).toBe(false);
   });
 
   it("rejects a join-kind token presented on the _connect dial", async () => {
-    // A valid join ticket (no machine binding) must NOT authenticate a WS dial.
+    // A valid join ticket (no box binding) must NOT authenticate a WS dial.
     const join = await signToken(
       {
         tenant: ROUTE.tenant,
-        appliance: ROUTE.appliance,
+        service: ROUTE.service,
         kind: "join",
         exp: nowSec() + 3600,
       },
@@ -106,8 +106,8 @@ describe("connect-token verify — reject matrix (fail closed)", () => {
     const ct = await signToken(
       {
         tenant: ROUTE.tenant,
-        appliance: ROUTE.appliance,
-        machine: ROUTE.machine,
+        service: ROUTE.service,
+        box: ROUTE.box,
         kind: "connect",
         exp: nowSec() + 120,
       },
@@ -129,8 +129,8 @@ describe("connect-token verify — reject matrix (fail closed)", () => {
     expect(
       await accepts(ct, {
         tenant: "org_1",
-        appliance: "scraper",
-        machine: "box-9",
+        service: "scraper",
+        box: "box-9",
       }),
     ).toBe(false);
   });

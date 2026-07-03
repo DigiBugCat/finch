@@ -30,11 +30,11 @@ export default function DashboardApp() {
   const flash = (msg: any) => { setToast(msg); setTimeout(() => setToast(null), 2200); };
   const go = (v: any) => { setView(v); window.scrollTo({ top: 0 }); };
 
-  // Deep-link: /dashboard?appliance=<id> opens that appliance's detail view
-  // straight away (the menubar app links here when you click an appliance). The
-  // id is set before appliances load; DetailView renders once `current` resolves.
+  // Deep-link: /dashboard?service=<id> opens that service's detail view
+  // straight away (the menubar app links here when you click a service). The
+  // id is set before services load; DetailView renders once `current` resolves.
   useEffect(() => {
-    const id = new URLSearchParams(window.location.search).get("appliance");
+    const id = new URLSearchParams(window.location.search).get("service");
     if (id) { setOpenId(id); setView("detail"); }
   }, []);
 
@@ -67,7 +67,7 @@ export default function DashboardApp() {
 
   // ----- live state (with safe fallbacks while loading) -------------
   const host = state?.host ?? "";
-  const appliances = state?.appliances ?? [];
+  const services = state?.services ?? [];
   const keys = state?.keys ?? [];
   const logs = state?.logs ?? [];
   const users = state?.users ?? [];
@@ -76,17 +76,17 @@ export default function DashboardApp() {
   const acl = state?.acl ?? [];
   const overview = state?.overview ?? ({} as any);
 
-  // machines lens is derived from appliance state so it stays in sync; the hub
-  // also flattens it into state.machines — prefer that, fall back to derive.
-  const machines = (state?.machines && state.machines.length)
-    ? state.machines
-    : appliances.flatMap((a: any) => (a.machines || []).map((m: any) => ({ ...m, group: a.group, tags: a.tags, owner: a.owner })));
+  // boxes lens is derived from service state so it stays in sync; the hub
+  // also flattens it into state.boxes — prefer that, fall back to derive.
+  const boxes = (state?.boxes && state.boxes.length)
+    ? state.boxes
+    : services.flatMap((a: any) => (a.boxes || []).map((m: any) => ({ ...m, group: a.group, tags: a.tags, owner: a.owner })));
 
   // --- device actions ----------------------------------------------
   const openDevice = (id: any) => { setOpenId(id); go("detail"); };
 
   const releaseDevice = (id: any) => {
-    void mutate(`/api/finch/appliances/${encodeURIComponent(id)}/release`,
+    void mutate(`/api/finch/services/${encodeURIComponent(id)}/release`,
       { method: "POST" }, `🕊 ${id} set free`, `couldn't release ${id}`);
     if (view === "detail") go("overview");
   };
@@ -94,7 +94,7 @@ export default function DashboardApp() {
   // Returns the hub's real EnrollResp ({ id, ticket, url, install, expiresAt })
   // so EnrollView renders the real ticket + install command (no fabrication).
   const enrollDevice = async (id: any, group: any) => {
-    // POST creates the 'invited' appliance server-side; it stays 'invited'
+    // POST creates the 'invited' service server-side; it stays 'invited'
     // until the agent joins. refetch surfaces it.
     const resp = await mutate(
       `/api/finch/enroll`,
@@ -107,34 +107,34 @@ export default function DashboardApp() {
   };
 
   const approveDevice = (id: any) =>
-    void mutate(`/api/finch/appliances/${encodeURIComponent(id)}/approve`,
+    void mutate(`/api/finch/services/${encodeURIComponent(id)}/approve`,
       { method: "POST" }, `🐦 ${id} approved — now chirping`, `couldn't approve ${id}`);
 
   const declineDevice = (id: any) => {
-    void mutate(`/api/finch/appliances/${encodeURIComponent(id)}/decline`,
+    void mutate(`/api/finch/services/${encodeURIComponent(id)}/decline`,
       { method: "POST" }, `${id} declined`, `couldn't decline ${id}`);
     if (view === "detail") go("overview");
   };
 
   const setTags = (id: any, tags: any) =>
-    void mutate(`/api/finch/appliances/${encodeURIComponent(id)}/tags`,
+    void mutate(`/api/finch/services/${encodeURIComponent(id)}/tags`,
       { method: "PUT", body: JSON.stringify({ tags }) }, undefined, `couldn't update tags`);
 
-  // Per-machine key chip (appliance detail view): detach a key label from a box.
-  const revokeMachineKey = (appId: any, machineName: any, key: any) =>
+  // Per-box key chip (service detail view): detach a key label from a box.
+  const revokeBoxKey = (appId: any, boxName: any, key: any) =>
     void mutate(`/api/finch/keys/revoke`,
-      { method: "POST", body: JSON.stringify({ machine: machineName, appliance: appId, key }) },
+      { method: "POST", body: JSON.stringify({ box: boxName, service: appId, key }) },
       "🔑 key revoked", "couldn't revoke key");
 
   // --- keys (the tenant-level Keys view) ---------------------------
   // Mint a real finch_ key via the hub; returns the MintKeyResp so KeysView can
   // reveal the plaintext once. Revoke by the key's stable id (not its label).
   //
-  // For a minted key to actually REACH an enrolled appliance it must clear BOTH
+  // For a minted key to actually REACH an enrolled service it must clear BOTH
   // gates in TenantDO.checkKey (worker/src/tenant-do.ts):
   //   Gate 1 (scope): the structured KeyScope must be {all:true} or list the
-  //     appliance. We default to {all:true} so a v1 owner key works fleet-wide.
-  //     (A caller MAY pass an explicit `scope` to narrow it to picked appliances.)
+  //     service. We default to {all:true} so a v1 owner key works fleet-wide.
+  //     (A caller MAY pass an explicit `scope` to narrow it to picked services.)
   //   Gate 2 (ACL, default-deny): some allow rule's src must match the key's
   //     OWNER identity. A fresh tenant ships ONE locked rule: user "you" -> all.
   //     The single-owner common case (no org / sole user) is that "you" owner —
@@ -183,8 +183,8 @@ export default function DashboardApp() {
 
   const onAddDevice = () => go("enroll");
 
-  const current = appliances.find((a: any) => a.id === openId);
-  const online = appliances.filter((a: any) => isOnline(a.state)).length;
+  const current = services.find((a: any) => a.id === openId);
+  const online = services.filter((a: any) => isOnline(a.state)).length;
 
   const nav = [
     ["overview", "Fleet"], ["home", "Observability"], ["keys", "Keys"],
@@ -234,25 +234,25 @@ export default function DashboardApp() {
         {!showLoading && state && (
           <>
             {view === "home" && (
-              <HomeView appliances={appliances} machines={machines} overview={overview} host={host}
+              <HomeView services={services} boxes={boxes} overview={overview} host={host}
                 onOpen={openDevice} onApprove={approveDevice} onAddDevice={onAddDevice} />
             )}
             {view === "overview" && (
-              <FleetView appliances={appliances} machines={machines} overview={overview} host={host}
+              <FleetView services={services} boxes={boxes} overview={overview} host={host}
                 groups={groups} onOpen={openDevice} onRelease={releaseDevice} onAddDevice={onAddDevice}
                 layout={layout} setLayout={setLayout} />
             )}
             {view === "detail" && current && (
               <DetailView app={current} host={host} onBack={() => go("overview")}
                 onRelease={releaseDevice} onTags={setTags} onApprove={approveDevice} onDecline={declineDevice}
-                onRevokeMachineKey={revokeMachineKey} />
+                onRevokeBoxKey={revokeBoxKey} />
             )}
             {view === "detail" && !current && (
               <div className="view"><button className="backlink" onClick={() => go("overview")}>← Fleet</button>
                 <Card><p className="dim" style={{ padding: 20 }}>This service has left the roost.</p></Card></div>
             )}
             {view === "enroll" && (
-              <EnrollView host={host} existingIds={appliances.map((a: any) => a.id)} groups={groups.map((g: any) => g.name)} onEnrolled={enrollDevice} onWatch={() => go("overview")} />
+              <EnrollView host={host} existingIds={services.map((a: any) => a.id)} groups={groups.map((g: any) => g.name)} onEnrolled={enrollDevice} onWatch={() => go("overview")} />
             )}
             {view === "keys" && (
               <KeysView keys={keys} users={users} onMint={mintKey} onRevoke={revokeKey} />
@@ -261,14 +261,14 @@ export default function DashboardApp() {
               <UsersView users={users} onInvite={inviteUser} onRole={setUserRole} onRemove={removeUser} />
             )}
             {view === "access" && (
-              <AccessView appliances={appliances} groups={groups} keys={keys} acl={acl} users={users}
+              <AccessView services={services} groups={groups} keys={keys} acl={acl} users={users}
                 onAdd={addAcl} onRemove={removeAcl} />
             )}
             {view === "logs" && (
               <LogsView logs={logs} />
             )}
             {view === "settings" && (
-              <SettingsView settings={settings} groups={groups} appliances={appliances} onChange={updateSetting} />
+              <SettingsView settings={settings} groups={groups} services={services} onChange={updateSetting} />
             )}
           </>
         )}

@@ -42,17 +42,17 @@ describe("TenantDO.enroll — slug derivation + dedup", () => {
     expect(c.id).toBe("printer-3");
   });
 
-  it("falls back to 'appliance' for an empty/symbol-only name", async () => {
+  it("falls back to 'service' for an empty/symbol-only name", async () => {
     const t = freshTenant();
     const r = await op<{ id: string }>(t, "enroll", { name: "!!!" });
-    expect(r.id).toBe("appliance");
+    expect(r.id).toBe("service");
   });
 
-  it("creates the appliance in 'invited' state with the default group", async () => {
+  it("creates the service in 'invited' state with the default group", async () => {
     const t = freshTenant();
     await op(t, "enroll", { name: "Embeddings" });
     const state = await op<any>(t, "getState");
-    const ap = state.appliances.find((a: any) => a.id === "embeddings");
+    const ap = state.services.find((a: any) => a.id === "embeddings");
     expect(ap).toBeTruthy();
     expect(ap.state).toBe("invited");
     expect(ap.group).toBe("default"); // default group
@@ -66,13 +66,13 @@ describe("TenantDO.enroll — slug derivation + dedup", () => {
   });
 });
 
-describe("TenantDO.registerMachine — machine state", () => {
-  it("registers a new machine as 'pending' when requireApproval (default)", async () => {
+describe("TenantDO.registerBox — box state", () => {
+  it("registers a new box as 'pending' when requireApproval (default)", async () => {
     const t = freshTenant();
     await op(t, "enroll", { name: "Scraper" });
-    const r = await op<{ ok: boolean; state: string }>(t, "registerMachine", {
-      appliance: "scraper",
-      machine: "box-1",
+    const r = await op<{ ok: boolean; state: string }>(t, "registerBox", {
+      service: "scraper",
+      box: "box-1",
       os: "linux",
       version: "1.4.0",
     });
@@ -80,80 +80,80 @@ describe("TenantDO.registerMachine — machine state", () => {
     expect(r.state).toBe("pending");
 
     const state = await op<any>(t, "getState");
-    const ap = state.appliances.find((a: any) => a.id === "scraper");
-    expect(ap.machines).toHaveLength(1);
-    expect(ap.machines[0].name).toBe("box-1");
-    expect(ap.machines[0].os).toBe("linux");
+    const ap = state.services.find((a: any) => a.id === "scraper");
+    expect(ap.boxes).toHaveLength(1);
+    expect(ap.boxes[0].name).toBe("box-1");
+    expect(ap.boxes[0].os).toBe("linux");
   });
 
   it("registers as 'chirping' when approval is not required", async () => {
     const t = freshTenant();
     await op(t, "enroll", { name: "Scraper" });
     await op(t, "updateSetting", { key: "requireApproval", val: false });
-    const r = await op<{ state: string }>(t, "registerMachine", {
-      appliance: "scraper",
-      machine: "box-1",
+    const r = await op<{ state: string }>(t, "registerBox", {
+      service: "scraper",
+      box: "box-1",
       os: "linux",
       version: "1.4.0",
     });
     expect(r.state).toBe("chirping");
   });
 
-  it("auto-creates the appliance if it joins an unknown appliance id", async () => {
+  it("auto-creates the service if it joins an unknown service id", async () => {
     const t = freshTenant();
-    const r = await op<{ ok: boolean }>(t, "registerMachine", {
-      appliance: "ghost",
-      machine: "box-1",
+    const r = await op<{ ok: boolean }>(t, "registerBox", {
+      service: "ghost",
+      box: "box-1",
       os: "darwin",
       version: "1.4.0",
     });
     expect(r.ok).toBe(true);
     const state = await op<any>(t, "getState");
-    expect(state.appliances.some((a: any) => a.id === "ghost")).toBe(true);
+    expect(state.services.some((a: any) => a.id === "ghost")).toBe(true);
   });
 
-  it("refreshes (not duplicates) an existing machine on re-join", async () => {
+  it("refreshes (not duplicates) an existing box on re-join", async () => {
     const t = freshTenant();
     await op(t, "enroll", { name: "Scraper" });
-    await op(t, "registerMachine", {
-      appliance: "scraper",
-      machine: "box-1",
+    await op(t, "registerBox", {
+      service: "scraper",
+      box: "box-1",
       os: "linux",
       version: "1.0.0",
     });
-    await op(t, "registerMachine", {
-      appliance: "scraper",
-      machine: "box-1",
+    await op(t, "registerBox", {
+      service: "scraper",
+      box: "box-1",
       os: "linux",
       version: "1.5.1",
     });
     const state = await op<any>(t, "getState");
-    const ap = state.appliances.find((a: any) => a.id === "scraper");
-    expect(ap.machines).toHaveLength(1);
-    expect(ap.machines[0].version).toBe("1.5.1");
-    expect(ap.machines[0].outdated).toBe(false); // matches LATEST_AGENT
+    const ap = state.services.find((a: any) => a.id === "scraper");
+    expect(ap.boxes).toHaveLength(1);
+    expect(ap.boxes[0].version).toBe("1.5.1");
+    expect(ap.boxes[0].outdated).toBe(false); // matches LATEST_AGENT
   });
 
-  it("marks a machine on an outdated agent version", async () => {
+  it("marks a box on an outdated agent version", async () => {
     const t = freshTenant();
     await op(t, "enroll", { name: "Scraper" });
-    await op(t, "registerMachine", {
-      appliance: "scraper",
-      machine: "old-box",
+    await op(t, "registerBox", {
+      service: "scraper",
+      box: "old-box",
       os: "linux",
       version: "0.9.0",
     });
     const state = await op<any>(t, "getState");
-    const ap = state.appliances.find((a: any) => a.id === "scraper");
-    expect(ap.machines[0].outdated).toBe(true);
+    const ap = state.services.find((a: any) => a.id === "scraper");
+    expect(ap.boxes[0].outdated).toBe(true);
   });
 });
 
 describe("TenantDO.checkKey — scope gate (structured)", () => {
   // The owner rule (user:you -> all) is seeded fresh, and mintKey owner defaults
   // to "you", so a default key passes the ACL gate — letting us isolate scope.
-  // Scope is now STRUCTURED: {all:true} | {appliances:[...]}; magic strings/CSV
-  // are gone (security M2). mintKey validates every listed appliance id exists.
+  // Scope is now STRUCTURED: {all:true} | {services:[...]}; magic strings/CSV
+  // are gone (security M2). mintKey validates every listed service id exists.
   async function mint(
     t: string,
     label: string,
@@ -168,7 +168,7 @@ describe("TenantDO.checkKey — scope gate (structured)", () => {
     await op(t, "enroll", { name: "Scraper" });
     const r = await op<{ allowed: boolean; reason: string }>(t, "checkKey", {
       hash: await hashKey("finch_does_not_exist"),
-      appliance: "scraper",
+      service: "scraper",
     });
     expect(r.allowed).toBe(false);
     expect(r.reason).toBe("no-key");
@@ -180,7 +180,7 @@ describe("TenantDO.checkKey — scope gate (structured)", () => {
     const key = await mint(t, "wide", { all: true });
     const r = await op<{ allowed: boolean }>(t, "checkKey", {
       hash: await hashKey(key),
-      appliance: "scraper",
+      service: "scraper",
     });
     expect(r.allowed).toBe(true);
   });
@@ -191,33 +191,33 @@ describe("TenantDO.checkKey — scope gate (structured)", () => {
     const key = await mint(t, "bare"); // no scope → reaches nothing
     const r = await op<{ allowed: boolean; reason: string }>(t, "checkKey", {
       hash: await hashKey(key),
-      appliance: "scraper",
+      service: "scraper",
     });
     expect(r.allowed).toBe(false);
     expect(r.reason).toBe("scope");
   });
 
-  it("denies with reason 'scope' when the appliance is not in the list", async () => {
+  it("denies with reason 'scope' when the service is not in the list", async () => {
     const t = freshTenant();
     await op(t, "enroll", { name: "Scraper" });
     await op(t, "enroll", { name: "Printer" });
-    const key = await mint(t, "narrow", { appliances: ["printer"] });
+    const key = await mint(t, "narrow", { services: ["printer"] });
     const r = await op<{ allowed: boolean; reason: string }>(t, "checkKey", {
       hash: await hashKey(key),
-      appliance: "scraper",
+      service: "scraper",
     });
     expect(r.allowed).toBe(false);
     expect(r.reason).toBe("scope");
   });
 
-  it("allows an appliance list that includes the target", async () => {
+  it("allows an service list that includes the target", async () => {
     const t = freshTenant();
     await op(t, "enroll", { name: "Scraper" });
     await op(t, "enroll", { name: "Printer" });
-    const key = await mint(t, "list", { appliances: ["printer", "scraper"] });
+    const key = await mint(t, "list", { services: ["printer", "scraper"] });
     const r = await op<{ allowed: boolean }>(t, "checkKey", {
       hash: await hashKey(key),
-      appliance: "scraper",
+      service: "scraper",
     });
     expect(r.allowed).toBe(true);
   });
@@ -227,7 +227,7 @@ describe("TenantDO.checkKey — scope gate (structured)", () => {
     await op(t, "enroll", { name: "Scraper" });
     const r = await op<{ error?: string; plaintext?: string }>(t, "mintKey", {
       label: "bad-scope",
-      scope: { appliances: ["ghost"] },
+      scope: { services: ["ghost"] },
     });
     expect(r.plaintext).toBeUndefined();
     expect(r.error).toMatch(/unknown service/i);
@@ -257,11 +257,11 @@ describe("TenantDO.evalAccess — ACL matrix (default-deny)", () => {
   async function allowed(
     t: string,
     keyPlain: string,
-    appliance = "scraper",
+    service = "scraper",
   ): Promise<boolean> {
     const r = await op<{ allowed: boolean; reason?: string }>(t, "checkKey", {
       hash: await hashKey(keyPlain),
-      appliance,
+      service,
     });
     return r.allowed;
   }
@@ -273,29 +273,29 @@ describe("TenantDO.evalAccess — ACL matrix (default-deny)", () => {
     expect(await allowed(t, key)).toBe(false);
   });
 
-  it("ALLOW via key rule: src key:<label> -> appliance", async () => {
+  it("ALLOW via key rule: src key:<label> -> service", async () => {
     const t = freshTenant();
     await setup(t);
     const key = await mintNonOwner(t, "k-by-label");
     await op(t, "addAcl", {
       src: { type: "key", name: "k-by-label" },
-      dst: [{ type: "appliance", name: "scraper" }],
+      dst: [{ type: "service", name: "scraper" }],
     });
     expect(await allowed(t, key)).toBe(true);
   });
 
-  it("ALLOW via user rule: src user:<owner> -> appliance", async () => {
+  it("ALLOW via user rule: src user:<owner> -> service", async () => {
     const t = freshTenant();
     await setup(t);
     const key = await mintNonOwner(t, "k-user");
     await op(t, "addAcl", {
       src: { type: "user", name: ALICE },
-      dst: [{ type: "appliance", name: "scraper" }],
+      dst: [{ type: "service", name: "scraper" }],
     });
     expect(await allowed(t, key)).toBe(true);
   });
 
-  it("ALLOW via group rule: key is a member of the src group -> appliance", async () => {
+  it("ALLOW via group rule: key is a member of the src group -> service", async () => {
     const t = freshTenant();
     // enroll auto-creates the group "lab" with member ["you"]. keyIdentities
     // adds a group to the key's identities when the key's LABEL is a member of
@@ -306,7 +306,7 @@ describe("TenantDO.evalAccess — ACL matrix (default-deny)", () => {
     const key = await mintNonOwner(t, "you"); // label "you", owner "alice"
     await op(t, "addAcl", {
       src: { type: "group", name: "lab" },
-      dst: [{ type: "appliance", name: "scraper" }],
+      dst: [{ type: "service", name: "scraper" }],
     });
     expect(await allowed(t, key)).toBe(true);
   });
@@ -317,12 +317,12 @@ describe("TenantDO.evalAccess — ACL matrix (default-deny)", () => {
     const key = await mintNonOwner(t, "k-not-in-group"); // not a member of "lab"
     await op(t, "addAcl", {
       src: { type: "group", name: "lab" },
-      dst: [{ type: "appliance", name: "scraper" }],
+      dst: [{ type: "service", name: "scraper" }],
     });
     expect(await allowed(t, key)).toBe(false);
   });
 
-  it("ALLOW via tag rule: src key -> tag matches an appliance tag", async () => {
+  it("ALLOW via tag rule: src key -> tag matches an service tag", async () => {
     const t = freshTenant();
     await setup(t, { tags: ["prod", "scrapers"] });
     const key = await mintNonOwner(t, "k-tag");
@@ -333,7 +333,7 @@ describe("TenantDO.evalAccess — ACL matrix (default-deny)", () => {
     expect(await allowed(t, key)).toBe(true);
   });
 
-  it("ALLOW via appliance-group rule: src key -> group matches", async () => {
+  it("ALLOW via service-group rule: src key -> group matches", async () => {
     const t = freshTenant();
     await setup(t, { group: "homelab" });
     const key = await mintNonOwner(t, "k-applgroup");
@@ -366,14 +366,14 @@ describe("TenantDO.evalAccess — ACL matrix (default-deny)", () => {
     expect(await allowed(t, r.plaintext)).toBe(true);
   });
 
-  it("DENY when the allow rule targets a DIFFERENT appliance", async () => {
+  it("DENY when the allow rule targets a DIFFERENT service", async () => {
     const t = freshTenant();
     await setup(t);
     await op(t, "enroll", { name: "Printer" });
     const key = await mintNonOwner(t, "k-wrong-dst");
     await op(t, "addAcl", {
       src: { type: "key", name: "k-wrong-dst" },
-      dst: [{ type: "appliance", name: "printer" }], // not scraper
+      dst: [{ type: "service", name: "printer" }], // not scraper
     });
     expect(await allowed(t, key, "scraper")).toBe(false);
     expect(await allowed(t, key, "printer")).toBe(true);
@@ -385,12 +385,12 @@ describe("TenantDO.evalAccess — ACL matrix (default-deny)", () => {
     const key = await mintNonOwner(t, "k-real");
     await op(t, "addAcl", {
       src: { type: "key", name: "some-other-key" },
-      dst: [{ type: "appliance", name: "scraper" }],
+      dst: [{ type: "service", name: "scraper" }],
     });
     expect(await allowed(t, key)).toBe(false);
   });
 
-  it("DENY when the appliance does not exist (evalAccess returns false)", async () => {
+  it("DENY when the service does not exist (evalAccess returns false)", async () => {
     const t = freshTenant();
     await setup(t);
     const key = await mintNonOwner(t, "k-ghost-dst");
@@ -398,7 +398,7 @@ describe("TenantDO.evalAccess — ACL matrix (default-deny)", () => {
       src: { type: "key", name: "k-ghost-dst" },
       dst: [{ type: "all" }],
     });
-    // appliance "nope" doesn't exist -> evalAccess findAppliance fails -> deny.
+    // service "nope" doesn't exist -> evalAccess findService fails -> deny.
     expect(await allowed(t, key, "nope")).toBe(false);
   });
 });
@@ -443,7 +443,7 @@ describe("TenantDO.checkKey — expiry gate (#11)", () => {
     });
     const chk = await op<{ allowed: boolean }>(t, "checkKey", {
       hash: await hashKey(r.plaintext),
-      appliance: "scraper",
+      service: "scraper",
     });
     expect(chk.allowed).toBe(true);
   });
@@ -463,7 +463,7 @@ describe("TenantDO.checkKey — expiry gate (#11)", () => {
     });
     const chk = await op<{ allowed: boolean }>(t, "checkKey", {
       hash: await hashKey(r.plaintext),
-      appliance: "scraper",
+      service: "scraper",
     });
     expect(chk.allowed).toBe(true);
   });
@@ -480,7 +480,7 @@ describe("TenantDO.checkKey — expiry gate (#11)", () => {
   });
 });
 
-describe("TenantDO.revokeMachineKey — revoke by id (#10)", () => {
+describe("TenantDO.revokeBoxKey — revoke by id (#10)", () => {
   it("revoking by Key.id makes the hash lookup stop matching", async () => {
     const t = freshTenant();
     await op(t, "enroll", { name: "Scraper" });
@@ -492,98 +492,98 @@ describe("TenantDO.revokeMachineKey — revoke by id (#10)", () => {
     // Sanity: the key authorizes before revoke.
     const before = await op<{ allowed: boolean }>(t, "checkKey", {
       hash: await hashKey(minted.plaintext),
-      appliance: "scraper",
+      service: "scraper",
     });
     expect(before.allowed).toBe(true);
     // Revoke by id.
-    const rev = await op<{ ok: boolean }>(t, "revokeMachineKey", {
-      appliance: "scraper",
-      machine: "—",
+    const rev = await op<{ ok: boolean }>(t, "revokeBoxKey", {
+      service: "scraper",
+      box: "—",
       key: minted.key.id,
     });
     expect(rev.ok).toBe(true);
     const after = await op<{ allowed: boolean; reason?: string }>(t, "checkKey", {
       hash: await hashKey(minted.plaintext),
-      appliance: "scraper",
+      service: "scraper",
     });
     expect(after.allowed).toBe(false);
     expect(after.reason).toBe("no-key");
   });
 
-  it("populates the appliance key display list at mint (scoped)", async () => {
+  it("populates the service key display list at mint (scoped)", async () => {
     const t = freshTenant();
     await op(t, "enroll", { name: "Scraper" });
     const minted = await op<{ key: { id: string } }>(t, "mintKey", {
       label: "scoped",
-      scope: { appliances: ["scraper"] },
+      scope: { services: ["scraper"] },
     });
     const state = await op<any>(t, "getState");
-    const ap = state.appliances.find((a: any) => a.id === "scraper");
+    const ap = state.services.find((a: any) => a.id === "scraper");
     expect(ap.keys).toContain(minted.key.id);
   });
 });
 
-describe("TenantDO.registerMachine — re-join preserves approved state (#5)", () => {
-  it("does NOT demote an approved+connected machine to pending on re-join", async () => {
+describe("TenantDO.registerBox — re-join preserves approved state (#5)", () => {
+  it("does NOT demote an approved+connected box to pending on re-join", async () => {
     const t = freshTenant();
     await op(t, "enroll", { name: "Scraper" });
     // requireApproval default true → first join is pending.
-    await op(t, "registerMachine", {
-      appliance: "scraper",
-      machine: "box-1",
+    await op(t, "registerBox", {
+      service: "scraper",
+      box: "box-1",
       os: "linux",
       version: "1.4.0",
     });
     await op(t, "approve", { id: "scraper" });
-    await op(t, "markMachine", {
-      appliance: "scraper",
-      machine: "box-1",
+    await op(t, "markBox", {
+      service: "scraper",
+      box: "box-1",
       connected: true,
     });
-    // Agent restart re-joins the SAME machine.
-    const rj = await op<{ ok: boolean; state: string }>(t, "registerMachine", {
-      appliance: "scraper",
-      machine: "box-1",
+    // Agent restart re-joins the SAME box.
+    const rj = await op<{ ok: boolean; state: string }>(t, "registerBox", {
+      service: "scraper",
+      box: "box-1",
       os: "linux",
       version: "1.4.0",
     });
     expect(rj.state).not.toBe("pending"); // not demoted
     const state = await op<any>(t, "getState");
-    const m = state.machines.find((mm: any) => mm.name === "box-1");
+    const m = state.boxes.find((mm: any) => mm.name === "box-1");
     expect(m.state).not.toBe("pending");
   });
 });
 
 describe("TenantDO.approve — derives liveness from connected (#12)", () => {
-  it("an approved-but-disconnected machine reads resting, not chirping", async () => {
+  it("an approved-but-disconnected box reads resting, not chirping", async () => {
     const t = freshTenant();
     await op(t, "enroll", { name: "Scraper" });
-    await op(t, "registerMachine", {
-      appliance: "scraper",
-      machine: "box-1",
+    await op(t, "registerBox", {
+      service: "scraper",
+      box: "box-1",
       os: "linux",
       version: "1.4.0",
     });
     // Approve WITHOUT ever connecting.
     await op(t, "approve", { id: "scraper" });
     const state = await op<any>(t, "getState");
-    const m = state.machines.find((mm: any) => mm.name === "box-1");
+    const m = state.boxes.find((mm: any) => mm.name === "box-1");
     expect(m.state).toBe("resting"); // not "chirping"
   });
 });
 
-describe("TenantDO.machineExists — /refresh revocation gate", () => {
-  it("returns true for a registered machine, false otherwise", async () => {
+describe("TenantDO.boxExists — /refresh revocation gate", () => {
+  it("returns true for a registered box, false otherwise", async () => {
     const t = freshTenant();
     await op(t, "enroll", { name: "Scraper" });
-    await op(t, "registerMachine", {
-      appliance: "scraper",
-      machine: "box-1",
+    await op(t, "registerBox", {
+      service: "scraper",
+      box: "box-1",
       os: "linux",
       version: "1.4.0",
     });
-    expect(await op<{ exists: boolean }>(t, "machineExists", { appliance: "scraper", machine: "box-1" })).toEqual({ exists: true });
-    expect(await op<{ exists: boolean }>(t, "machineExists", { appliance: "scraper", machine: "ghost" })).toEqual({ exists: false });
-    expect(await op<{ exists: boolean }>(t, "machineExists", { appliance: "nope", machine: "box-1" })).toEqual({ exists: false });
+    expect(await op<{ exists: boolean }>(t, "boxExists", { service: "scraper", box: "box-1" })).toEqual({ exists: true });
+    expect(await op<{ exists: boolean }>(t, "boxExists", { service: "scraper", box: "ghost" })).toEqual({ exists: false });
+    expect(await op<{ exists: boolean }>(t, "boxExists", { service: "nope", box: "box-1" })).toEqual({ exists: false });
   });
 });

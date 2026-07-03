@@ -1,22 +1,22 @@
 /// <reference types="@cloudflare/workers-types" />
 //
-// ApplianceDO — one Durable Object per finch MACHINE (keyed
-// `${tenant}:${appliance}:${machine}`). It is the rendezvous point: the
-// box-side agent dials OUT to /<appliance>/<machine>/_connect and parks a
+// BoxDO — one Durable Object per finch BOX (keyed
+// `${tenant}:${service}:${box}`). It is the rendezvous point: the
+// box-side agent dials OUT to /<service>/<box>/_connect and parks a
 // WebSocket here; public requests routed to this DO are relayed down that
 // socket and the response is relayed back.
 //
 // Beyond relaying, it reports liveness to the tenant's TenantDO: on WS open it
-// calls markMachine{connected:true}; on close/error markMachine{connected:false}
-// so the appliance's online/offline state stays accurate. It learns its
-// tenant/appliance/machine from query params on the _connect URL and stashes
+// calls markBox{connected:true}; on close/error markBox{connected:false}
+// so the service's online/offline state stays accurate. It learns its
+// tenant/service/box from query params on the _connect URL and stashes
 // them via serializeAttachment so they survive hibernation (the close/error
 // handlers fire on a possibly-evicted-and-revived object).
 //
 // Hibernation: we use the WebSocket Hibernation API (ctx.acceptWebSocket +
 // webSocketMessage handler method, NOT addEventListener). That lets the runtime
 // evict this object from memory while the socket sits idle, so an idle but
-// connected appliance costs ~nothing. NAT keepalive is handled by WS-protocol
+// connected service costs ~nothing. NAT keepalive is handled by WS-protocol
 // pings via setWebSocketAutoResponse — those do NOT wake us (so they're free).
 // Never keep a setInterval running here; it would pin us awake and bill.
 
@@ -34,8 +34,8 @@ import {
  *  close/error handlers can reach the right TenantDO after hibernation. */
 interface SockMeta {
   tenant: string;
-  appliance: string;
-  machine: string;
+  service: string;
+  box: string;
 }
 
 /** One in-flight relayed response, keyed by frame id. Created when the DO sends
@@ -90,14 +90,14 @@ export const RELAY_IDLE_MS = 300_000;
 // once the head lands, rearm() switches to RELAY_IDLE_MS.
 export const RELAY_HEAD_TIMEOUT_MS = 120_000;
 
-// Concurrent in-flight relay streams per machine (S1). Each stream can buffer
+// Concurrent in-flight relay streams per box (S1). Each stream can buffer
 // up to ~RELAY_WINDOW_BYTES (1 MiB HWM) of response body, so 32 bounds queue
 // memory at ~32 MiB against the DO's 128 MB limit while comfortably covering a
 // docs page's subresource burst. Over the cap → 429 (terminal: NO
 // X-Finch-Offline, so index.ts's LB failover does NOT retry a saturated
-// machine on an idle sibling — acceptable for the single-machine deployment,
+// box on an idle sibling — acceptable for the single-box deployment,
 // and a failover here would just spread the flood).
-export const MAX_STREAMS_PER_MACHINE = 32;
+export const MAX_STREAMS_PER_BOX = 32;
 
 // Streaming backpressure high-water-mark (#: no-backpressure OOM). The response
 // ReadableStream uses a ByteLengthQueuingStrategy with this HWM; once the
@@ -134,7 +134,7 @@ const HOP_BY_HOP = new Set([
   "content-encoding",
 ]);
 
-export class ApplianceDO extends DurableObject<Env> {
+export class BoxDO extends DurableObject<Env> {
   // In-flight relayed responses, keyed by frame id. In-memory only — but a
   // request in flight is "pending work" (the streaming Response is the DO's
   // return value and keeps us awake for the round-trip), so this survives the
@@ -144,9 +144,9 @@ export class ApplianceDO extends DurableObject<Env> {
 
   async fetch(req: Request): Promise<Response> {
     const url = new URL(req.url);
-    // This DO is per-MACHINE, so the incoming path is
-    // /<appliance>/<machine>/<rest>. Strip BOTH leading segments so the
-    // upstream agent sees /_connect or /mcp — not /<appliance>/<machine>/mcp.
+    // This DO is per-BOX, so the incoming path is
+    // /<service>/<box>/<rest>. Strip BOTH leading segments so the
+    // upstream agent sees /_connect or /mcp — not /<service>/<box>/mcp.
     const parts = url.pathname.split("/").filter(Boolean);
     const relPath = "/" + parts.slice(2).join("/") + (url.search || "");
 
@@ -155,17 +155,17 @@ export class ApplianceDO extends DurableObject<Env> {
       if (req.headers.get("Upgrade") !== "websocket") {
         return new Response("expected websocket upgrade", { status: 426 });
       }
-      // index.ts stamps tenant/appliance/machine onto the _connect URL.
+      // index.ts stamps tenant/service/box onto the _connect URL.
       const meta: SockMeta = {
         tenant: url.searchParams.get("tenant") ?? "",
-        appliance: url.searchParams.get("appliance") ?? "",
-        machine: url.searchParams.get("machine") ?? "",
+        service: url.searchParams.get("service") ?? "",
+        box: url.searchParams.get("box") ?? "",
       };
-      // SINGLE-AGENT: a machine has exactly one live agent socket. Evict any
+      // SINGLE-AGENT: a box has exactly one live agent socket. Evict any
       // prior "agent" sockets before accepting the new one (last-writer-wins) so
       // a reconnect — or a would-be second claimant — can't leave two sockets
       // racing in getWebSockets("agent")[0]. Close code 1012 ("superseded") is
-      // recognized by webSocketClose, which then skips markMachine(false) so the
+      // recognized by webSocketClose, which then skips markBox(false) so the
       // freshly-accepted socket's liveness doesn't flap offline.
       for (const old of this.ctx.getWebSockets("agent")) {
         try {
@@ -183,19 +183,19 @@ export class ApplianceDO extends DurableObject<Env> {
       this.ctx.setWebSocketAutoResponse(
         new WebSocketRequestResponsePair("ping", "pong"),
       );
-      // Tell the tenant this machine is live (fire-and-forget — don't block the
+      // Tell the tenant this box is live (fire-and-forget — don't block the
       // 101 on the control-plane write).
-      this.ctx.waitUntil(this.markMachine(meta, true));
+      this.ctx.waitUntil(this.markBox(meta, true));
       return new Response(null, { status: 101, webSocket: client });
     }
 
     // ---- Public request: relay it to the connected agent. ----
     const agent = this.ctx.getWebSockets("agent")[0];
     if (!agent) {
-      // No live agent socket for this machine — a stale pick. Tag the 503 with
+      // No live agent socket for this box — a stale pick. Tag the 503 with
       // X-Finch-Offline so the relay (which knows the tenant; the public relay
       // path doesn't carry it down to this DO) can fail over to a sibling AND
-      // mark this machine offline so the next pick excludes it. (code-review #12)
+      // mark this box offline so the next pick excludes it. (code-review #12)
       return json(
         503,
         { error: "service offline", id: parts[0] },
@@ -203,11 +203,11 @@ export class ApplianceDO extends DurableObject<Env> {
       );
     }
 
-    // PER-MACHINE STREAM CAP (S1): bound concurrent in-flight relays BEFORE
+    // PER-BOX STREAM CAP (S1): bound concurrent in-flight relays BEFORE
     // buffering the request body or registering a stream. 429 is terminal —
     // deliberately NO X-Finch-Offline header, so the LB path never "fails over"
-    // a saturated machine's load onto a sibling or marks it offline.
-    if (this.streams.size >= MAX_STREAMS_PER_MACHINE) {
+    // a saturated box's load onto a sibling or marks it offline.
+    if (this.streams.size >= MAX_STREAMS_PER_BOX) {
       return json(
         429,
         { error: "too many concurrent requests for this box" },
@@ -552,9 +552,9 @@ export class ApplianceDO extends DurableObject<Env> {
     this.resetAll("service link closed");
     // Code 1012 means we superseded this socket with a fresh agent connection
     // (single-agent eviction above). The newer socket is the live one, so do NOT
-    // mark the machine offline — that would flap a connected machine to offline.
+    // mark the box offline — that would flap a connected box to offline.
     const meta = ws.deserializeAttachment() as SockMeta | null;
-    if (meta && code !== 1012) await this.markMachine(meta, false);
+    if (meta && code !== 1012) await this.markBox(meta, false);
     try {
       ws.close(code, reason);
     } catch {
@@ -563,11 +563,11 @@ export class ApplianceDO extends DurableObject<Env> {
   }
 
   async webSocketError(ws: WebSocket, _error: unknown) {
-    // Agent link errored — reset all in-flight streams fast and flag the machine
+    // Agent link errored — reset all in-flight streams fast and flag the box
     // offline.
     this.resetAll("service link errored");
     const meta = ws.deserializeAttachment() as SockMeta | null;
-    if (meta) await this.markMachine(meta, false);
+    if (meta) await this.markBox(meta, false);
   }
 
   /** Reset EVERY in-flight stream: error its readable (or resolve its pending
@@ -579,11 +579,11 @@ export class ApplianceDO extends DurableObject<Env> {
     }
   }
 
-  /** Report this machine's connected state to its tenant's TenantDO. Skipped if
+  /** Report this box's connected state to its tenant's TenantDO. Skipped if
    *  we don't have full identity (e.g. an old socket from before this field
    *  existed). Best-effort: never throws into the WS lifecycle. */
-  private async markMachine(meta: SockMeta, connected: boolean): Promise<void> {
-    if (!meta.tenant || !meta.appliance || !meta.machine) return;
+  private async markBox(meta: SockMeta, connected: boolean): Promise<void> {
+    if (!meta.tenant || !meta.service || !meta.box) return;
     try {
       const stub = this.env.TENANT.get(
         this.env.TENANT.idFromName(meta.tenant),
@@ -592,9 +592,9 @@ export class ApplianceDO extends DurableObject<Env> {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          op: "markMachine",
-          appliance: meta.appliance,
-          machine: meta.machine,
+          op: "markBox",
+          service: meta.service,
+          box: meta.box,
           connected,
         }),
       });

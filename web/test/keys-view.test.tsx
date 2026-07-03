@@ -21,7 +21,7 @@ const keys: PublicKey[] = [
     label: "scoped",
     owner: "you",
     created: "2026-06-14",
-    scope: { appliances: ["calendar-sync"] },
+    scope: { services: ["calendar-sync"] },
     last4: "cd34",
   },
 ];

@@ -12,11 +12,11 @@
 #   finch run
 
 hub: https://finchmcp.com        # the finch hub (default; omit for prod)
-machine: mac-mini                # this box's name (default: hostname)
+box: mac-mini                # this box's name (default: hostname)
 credentials-dir: ~/.finch        # where `finch enroll` writes per-app credentials
 
 # Each rule forwards one local service:
-#   app_path    — the public URL segment AND the appliance you enrolled.
+#   app_path    — the public URL segment AND the service you enrolled.
 #                 Public URL: https://<your-slug>.finchmcp.com/<app_path>/…
 #   service     — the local server to forward to. By default finch confines a rule
 #                 to /mcp (it's an MCP tunnel first); add a base path (…:8000/mcp)

@@ -10,12 +10,12 @@ describe("formatScope", () => {
   });
 
   it("renders a service allow-list as a comma-joined id list", () => {
-    const scope: KeyScope = { appliances: ["calendar-sync", "printer"] };
+    const scope: KeyScope = { services: ["calendar-sync", "printer"] };
     expect(formatScope(scope)).toBe("calendar-sync, printer");
   });
 
   it('renders an empty allow-list as "no services"', () => {
-    expect(formatScope({ appliances: [] })).toBe("no services");
+    expect(formatScope({ services: [] })).toBe("no services");
   });
 
   it("never returns the stringified object (the bug it fixes)", () => {

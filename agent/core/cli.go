@@ -1,7 +1,7 @@
 package core
 
 // finch CLI setup commands — `finch login` and `finch add`. Together they let a
-// box enroll appliances and build its finch.yml without ever touching the
+// box enroll services and build its finch.yml without ever touching the
 // dashboard (cloudflared's `tunnel login` + `tunnel create`):
 //
 //	finch login <token>                         # paste the CLI token from the dashboard
@@ -73,7 +73,7 @@ Keep the ticket off the remote argv/shell history: pipe it to stdin with
 
 ## Grant + REVOKE client access
 A caller (another agent/app) reaches your server with a finch_ bearer key:
-  finch keys mint web-client --appliance printer   # prints a finch_ key ONCE
+  finch keys mint web-client --service printer   # prints a finch_ key ONCE
   finch keys list
   finch keys revoke <id>                            # access stops immediately
 The client then calls:
@@ -93,7 +93,7 @@ needed for your FIRST box.
 
 ## finch.yml (what 'finch add' writes — holds NO secrets)
   hub: https://finchmcp.com
-  machine: this-box
+  box: this-box
   ingress:
     - app_path: printer                # becomes <slug>.finchmcp.com/printer/
       service: http://127.0.0.1:8000
@@ -102,7 +102,7 @@ needed for your FIRST box.
 - --json works on add / token / status / fleet / keys / test / call for parsing.
 - The CLI token is a tenant-admin credential (~30 days). Revoke everything with:
     finch revoke-tokens   (or the dashboard -> Settings -> CLI access)
-- 'finch rm <appliance>' removes a service; 'finch approve <app_path>' is only
+- 'finch rm <service>' removes a service; 'finch approve <app_path>' is only
   needed if you are not logged in (otherwise 'finch run' approves automatically).
 - See 'finch help' for the flag-level reference.
 `)
@@ -124,11 +124,11 @@ Usage:
   finch token [--json|--login]         Mint a fresh CLI token (provision a new box, no browser)
   finch status [--json]                Show login + what finch.yml serves
   finch fleet [--json]   (alias: ls)   List this account's services + state
-  finch test <appliance>               List a service's MCP tools (does-it-work check)
-  finch call <appliance> <tool> [--args '{...}']   Invoke one tool through the hub
-  finch keys [list|mint <label> --appliance <id>|revoke <id>]   Manage client finch_ keys
+  finch test <service>               List a service's MCP tools (does-it-work check)
+  finch call <service> <tool> [--args '{...}']   Invoke one tool through the hub
+  finch keys [list|mint <label> --service <id>|revoke <id>]   Manage client finch_ keys
   finch domain [ls|add <hostname>|rm <hostname>]   Manage custom hostnames
-  finch rm <appliance>                 Remove a service
+  finch rm <service>                 Remove a service
   finch revoke-tokens                  De-authorize every CLI login (incl. this box)
   finch join --ticket <t> --upstream <url>   Run one service straight from flags
   finch guide                          Full agent operating manual (point an AI agent at this)
@@ -160,7 +160,7 @@ Automation / driving finch from an agent (after the one-time 'finch login'):
     finch call scraper search --args '{"q":"finch"}'   # invoke one tool
 
   Grant + REVOKE client access (the finch_ keys callers present):
-    finch keys mint web-client --appliance scraper     # prints a finch_ key once
+    finch keys mint web-client --service scraper     # prints a finch_ key once
     finch keys list
     finch keys revoke <id>         # access stops immediately
     finch domain add mcp.example.com
@@ -261,7 +261,7 @@ func loadCliCredQuiet() *cliCred {
 	return c
 }
 
-// cliApprove clears the pending gate for appliance `id` via the CLI token.
+// cliApprove clears the pending gate for service `id` via the CLI token.
 func cliApprove(cred *cliCred, id string) error {
 	_, err := cliRequest("POST", cred.Hub, "/api/cli/approve", cred.Token, map[string]string{"id": id})
 	return err
@@ -287,13 +287,13 @@ func cmdApprove(args []string) {
 	}
 }
 
-// cliSetAuth flips an appliance's public-relay access mode ("key" | "public").
+// cliSetAuth flips a service's public-relay access mode ("key" | "public").
 func cliSetAuth(cred *cliCred, appPath, mode string) error {
-	_, err := cliRequest("POST", cred.Hub, "/api/cli/auth", cred.Token, map[string]string{"appliance": appPath, "mode": mode})
+	_, err := cliRequest("POST", cred.Hub, "/api/cli/auth", cred.Token, map[string]string{"service": appPath, "mode": mode})
 	return err
 }
 
-// cmdAuth: finch auth <app_path> public|key — set whether the appliance's public
+// cmdAuth: finch auth <app_path> public|key — set whether the service's public
 // endpoint requires a finch_ bearer key. "public" makes it an open webpage.
 func cmdAuth(args []string) {
 	if len(args) != 2 || (args[1] != "public" && args[1] != "key") {
@@ -417,22 +417,22 @@ func openBrowser(u string) {
 	_ = exec.Command(name, args...).Start()
 }
 
-// cmdTest: finch test <appliance> — list the service's MCP tools (a quick
+// cmdTest: finch test <service> — list the service's MCP tools (a quick
 // "does my endpoint work" check, relayed through the hub via the CLI token).
 func cmdTest(args []string) {
 	fs := flag.NewFlagSet("test", flag.ExitOnError)
-	asJSON := fs.Bool("json", false, "machine-readable JSON")
+	asJSON := fs.Bool("json", false, "JSON output")
 	app := ""
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		app, args = args[0], args[1:]
 	}
 	_ = fs.Parse(args)
 	if app == "" {
-		fmt.Fprintln(os.Stderr, "usage: finch test <appliance>")
+		fmt.Fprintln(os.Stderr, "usage: finch test <service>")
 		os.Exit(2)
 	}
 	cred := mustCliCred()
-	out, err := cliRequest("POST", cred.Hub, "/api/cli/call", cred.Token, map[string]any{"appliance": app, "method": "tools/list"})
+	out, err := cliRequest("POST", cred.Hub, "/api/cli/call", cred.Token, map[string]any{"service": app, "method": "tools/list"})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
 		os.Exit(1)
@@ -455,7 +455,7 @@ func cmdTest(args []string) {
 	}
 }
 
-// cmdCall: finch call <appliance> <tool> [--args '{...}'] — invoke one tool.
+// cmdCall: finch call <service> <tool> [--args '{...}'] — invoke one tool.
 func cmdCall(args []string) {
 	fs := flag.NewFlagSet("call", flag.ExitOnError)
 	argsJSON := fs.String("args", "{}", "tool arguments as a JSON object")
@@ -467,7 +467,7 @@ func cmdCall(args []string) {
 	}
 	_ = fs.Parse(args)
 	if len(pos) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: finch call <appliance> <tool> [--args '{\"k\":\"v\"}']")
+		fmt.Fprintln(os.Stderr, "usage: finch call <service> <tool> [--args '{\"k\":\"v\"}']")
 		os.Exit(2)
 	}
 	var toolArgs any
@@ -477,9 +477,9 @@ func cmdCall(args []string) {
 	}
 	cred := mustCliCred()
 	out, err := cliRequest("POST", cred.Hub, "/api/cli/call", cred.Token, map[string]any{
-		"appliance": pos[0],
-		"method":    "tools/call",
-		"params":    map[string]any{"name": pos[1], "arguments": toolArgs},
+		"service": pos[0],
+		"method":  "tools/call",
+		"params":  map[string]any{"name": pos[1], "arguments": toolArgs},
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
@@ -538,7 +538,7 @@ func cmdDomain(args []string) {
 	switch sub {
 	case "ls", "list":
 		fs := flag.NewFlagSet("domain ls", flag.ExitOnError)
-		asJSON := fs.Bool("json", false, "machine-readable JSON")
+		asJSON := fs.Bool("json", false, "JSON output")
 		_ = fs.Parse(args)
 		out, err := cliRequest("GET", cred.Hub, "/api/cli/hostnames", cred.Token, nil)
 		if err != nil {
@@ -607,7 +607,7 @@ func cmdKeys(args []string) {
 	switch sub {
 	case "list":
 		fs := flag.NewFlagSet("keys", flag.ExitOnError)
-		asJSON := fs.Bool("json", false, "machine-readable JSON")
+		asJSON := fs.Bool("json", false, "JSON output")
 		_ = fs.Parse(args)
 		st, err := cliRequest("GET", cred.Hub, "/api/cli/state", cred.Token, nil)
 		if err != nil {
@@ -621,7 +621,7 @@ func cmdKeys(args []string) {
 			return
 		}
 		if len(keys) == 0 {
-			fmt.Println("no keys — `finch keys mint <label> --appliance <id>`")
+			fmt.Println("no keys — `finch keys mint <label> --service <id>`")
 			return
 		}
 		for _, k := range keys {
@@ -631,25 +631,25 @@ func cmdKeys(args []string) {
 	case "mint":
 		fs := flag.NewFlagSet("keys mint", flag.ExitOnError)
 		all := fs.Bool("all", false, "key reaches EVERY service (default: none — scope it)")
-		appliance := fs.String("appliance", "", "scope the key to one service id")
-		asJSON := fs.Bool("json", false, "machine-readable JSON")
+		service := fs.String("service", "", "scope the key to one service id")
+		asJSON := fs.Bool("json", false, "JSON output")
 		label := ""
 		if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 			label, args = args[0], args[1:]
 		}
 		_ = fs.Parse(args)
 		if label == "" {
-			fmt.Fprintln(os.Stderr, "usage: finch keys mint <label> (--appliance <id> | --all)")
+			fmt.Fprintln(os.Stderr, "usage: finch keys mint <label> (--service <id> | --all)")
 			os.Exit(2)
 		}
 		var scope any
 		switch {
 		case *all:
 			scope = map[string]bool{"all": true}
-		case *appliance != "":
-			scope = map[string][]string{"appliances": {*appliance}}
+		case *service != "":
+			scope = map[string][]string{"services": {*service}}
 		default:
-			fmt.Fprintln(os.Stderr, "finch: scope the key with --appliance <id> (or --all)")
+			fmt.Fprintln(os.Stderr, "finch: scope the key with --service <id> (or --all)")
 			os.Exit(2)
 		}
 		out, err := cliRequest("POST", cred.Hub, "/api/cli/keys", cred.Token, map[string]any{"label": label, "scope": scope})
@@ -674,7 +674,7 @@ func cmdKeys(args []string) {
 		}
 		fmt.Printf("finch: revoked key %s\n", args[0])
 	default:
-		fmt.Fprintln(os.Stderr, "usage: finch keys [list | mint <label> --appliance <id> | revoke <id>]")
+		fmt.Fprintln(os.Stderr, "usage: finch keys [list | mint <label> --service <id> | revoke <id>]")
 		os.Exit(2)
 	}
 }
@@ -682,7 +682,7 @@ func cmdKeys(args []string) {
 // cmdFleet: finch fleet [--json] — list this tenant's services + state.
 func cmdFleet(args []string) {
 	fs := flag.NewFlagSet("fleet", flag.ExitOnError)
-	asJSON := fs.Bool("json", false, "machine-readable JSON")
+	asJSON := fs.Bool("json", false, "JSON output")
 	_ = fs.Parse(args)
 	cred, err := loadCliCred()
 	if err != nil {
@@ -694,7 +694,7 @@ func cmdFleet(args []string) {
 		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
 		os.Exit(1)
 	}
-	apps, _ := st["appliances"].([]any)
+	apps, _ := st["services"].([]any)
 	if *asJSON {
 		b, _ := json.Marshal(apps)
 		fmt.Println(string(b))
@@ -710,10 +710,10 @@ func cmdFleet(args []string) {
 	}
 }
 
-// cmdRm: finch rm <appliance> — remove a service from the tenant.
+// cmdRm: finch rm <service> — remove a service from the tenant.
 func cmdRm(args []string) {
 	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, "usage: finch rm <appliance>")
+		fmt.Fprintln(os.Stderr, "usage: finch rm <service>")
 		os.Exit(2)
 	}
 	cred, err := loadCliCred()
@@ -721,7 +721,7 @@ func cmdRm(args []string) {
 		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
 		os.Exit(1)
 	}
-	if _, err := cliRequest("POST", cred.Hub, "/api/cli/appliances/release", cred.Token, map[string]string{"id": args[0]}); err != nil {
+	if _, err := cliRequest("POST", cred.Hub, "/api/cli/services/release", cred.Token, map[string]string{"id": args[0]}); err != nil {
 		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
 		os.Exit(1)
 	}
@@ -782,7 +782,7 @@ func cmdToken(args []string) {
 // cmdStatus: finch status [--json] — introspect login + finch.yml (for agents).
 func cmdStatus(args []string) {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
-	asJSON := fs.Bool("json", false, "machine-readable JSON")
+	asJSON := fs.Bool("json", false, "JSON output")
 	configPath := fs.String("config", "finch.yml", "finch.yml to summarize")
 	_ = fs.Parse(args)
 
@@ -843,7 +843,7 @@ func cmdStatus(args []string) {
 
 // cmdAdd: finch add <app_path> --service <url> [--config finch.yml]
 //
-// One-shot convenience for a logged-in box: it enrolls the appliance via the CLI
+// One-shot convenience for a logged-in box: it enrolls the service via the CLI
 // token, saves the box-side refresh credential (so `finch run` resumes without a
 // ticket), and appends a ticketless ingress rule to finch.yml.
 func cmdAdd(args []string) {
@@ -884,8 +884,8 @@ func cmdAdd(args []string) {
 		os.Exit(1)
 	}
 
-	// Enroll the appliance via the CLI token. The hub slugifies the name into the
-	// real appliance id; use THAT as the app_path so the URL matches.
+	// Enroll the service via the CLI token. The hub slugifies the name into the
+	// real service id; use THAT as the app_path so the URL matches.
 	out, err := cliRequest("POST", cred.Hub, "/api/cli/enroll", cred.Token, map[string]string{"name": wantPath})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "finch: enroll failed: %v\n", err)
@@ -903,19 +903,19 @@ func cmdAdd(args []string) {
 	}
 
 	// Honor the finch.yml at --config (best-effort): the box should register under
-	// the manifest's `machine:` (falling back to the hostname), and the credential
+	// the manifest's `box:` (falling back to the hostname), and the credential
 	// MUST land in the manifest's credentials-dir so `finch run` finds it.
 	host, _ := os.Hostname()
-	machine, credDir := addPaths(*configPath, host)
+	box, credDir := addPaths(*configPath, host)
 
 	// Trade the ticket for a saved box-side credential now (so the ticket never
 	// lands in the manifest), then append a ticketless ingress rule.
 	statePath := filepath.Join(credDir, id+".json")
-	if _, _, eerr := enrollToState(cred.Hub, machine, ticket, statePath); eerr != nil {
+	if _, _, eerr := enrollToState(cred.Hub, box, ticket, statePath); eerr != nil {
 		fmt.Fprintf(os.Stderr, "finch: enroll failed: %v\n", eerr)
 		os.Exit(1)
 	}
-	if err := appendIngress(*configPath, cred.Hub, id, *service, machine); err != nil {
+	if err := appendIngress(*configPath, cred.Hub, id, *service, box); err != nil {
 		fmt.Fprintf(os.Stderr, "finch: could not write %s: %v\n", *configPath, err)
 		os.Exit(1)
 	}
@@ -931,7 +931,7 @@ func cmdAdd(args []string) {
 	fmt.Printf("       wrote rule to %s — run `finch run` to serve it\n", *configPath)
 }
 
-// cmdEnroll: finch enroll <app_path> --ticket <t> [--hub …] [--machine …] [--credentials-dir …]
+// cmdEnroll: finch enroll <app_path> --ticket <t> [--hub …] [--box …] [--credentials-dir …]
 //
 // The one-time, imperative enrollment step: it trades a one-shot dashboard ticket
 // for the long-lived box-side refresh credential and writes it to
@@ -964,10 +964,10 @@ func cmdEnroll(args []string) {
 	fs := flag.NewFlagSet("enroll", flag.ExitOnError)
 	ticket := fs.String("ticket", "", "one-shot enrollment ticket from the dashboard (required; '-' reads it from stdin, or set FINCH_TICKET)")
 	hub := fs.String("hub", "https://finchmcp.com", "finch hub base URL")
-	// Default --machine to finch.yml's `machine:` when a manifest is present, so the
+	// Default --box to finch.yml's `box:` when a manifest is present, so the
 	// box registers under the name the manifest declares; else the hostname.
 	host, _ := os.Hostname()
-	machine := fs.String("machine", configMachine("finch.yml", host), "this box's name")
+	box := fs.String("box", configBox("finch.yml", host), "this box's name")
 	credDir := fs.String("credentials-dir", defaultCredentialsDir(), "directory the saved credential is written to")
 
 	appPath := ""
@@ -991,15 +991,15 @@ func cmdEnroll(args []string) {
 		os.Exit(2)
 	}
 
-	// Join FIRST so we can name the credential by the hub's slugified appliance id
-	// (the relay resolves the appliance by THAT id, so `finch enroll Printer` must
+	// Join FIRST so we can name the credential by the hub's slugified service id
+	// (the relay resolves the service by THAT id, so `finch enroll Printer` must
 	// land as "printer", not the raw arg, or its URL/credential never matches).
-	jr, err := join(*hub, ticketVal, *machine)
+	jr, err := join(*hub, ticketVal, *box)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "finch: enroll failed: %v\n", err)
 		os.Exit(1)
 	}
-	id := jr.Appliance
+	id := jr.Service
 	statePath := filepath.Join(expandHome(*credDir), id+".json")
 	if _, err := persistJoin(*hub, jr, statePath); err != nil {
 		fmt.Fprintf(os.Stderr, "finch: enroll failed: %v\n", err)
@@ -1023,53 +1023,53 @@ func defaultCredentialsDir() string {
 	return ".finch"
 }
 
-// configMachine returns the finch.yml `machine:` at configPath, or host when the
-// manifest is absent / sets no machine — so `finch enroll`/`finch add` register
+// configBox returns the finch.yml `box:` at configPath, or host when the
+// manifest is absent / sets no box — so `finch enroll`/`finch add` register
 // the box under the name the manifest declares (matching the run-time log line).
-func configMachine(configPath, host string) string {
-	if c, err := loadConfig(configPath, host); err == nil && c.Machine != "" {
-		return c.Machine
+func configBox(configPath, host string) string {
+	if c, err := loadConfig(configPath, host); err == nil && c.Box != "" {
+		return c.Box
 	}
 	return host
 }
 
-// addPaths resolves the machine name + credentials dir `finch add` should use,
+// addPaths resolves the box name + credentials dir `finch add` should use,
 // honoring an existing finch.yml at configPath (best-effort): the credential must
 // land in the manifest's credentials-dir so `finch run` finds it, and the box
-// should register under the manifest's machine name. Falls back to the hostname +
+// should register under the manifest's box name. Falls back to the hostname +
 // the default ~/.finch when the manifest is absent. loadConfig already expands ~
 // and applies the credentials-dir default, so its values are used as-is.
-func addPaths(configPath, host string) (machine, credDir string) {
-	machine, credDir = host, defaultCredentialsDir()
+func addPaths(configPath, host string) (box, credDir string) {
+	box, credDir = host, defaultCredentialsDir()
 	if c, err := loadConfig(configPath, host); err == nil {
-		if c.Machine != "" {
-			machine = c.Machine
+		if c.Box != "" {
+			box = c.Box
 		}
 		if c.CredentialsDir != "" {
 			credDir = c.CredentialsDir
 		}
 	}
-	return machine, credDir
+	return box, credDir
 }
 
 // appendIngress adds (or updates) one ingress rule in finch.yml WITHOUT clobbering
 // user comments or keys finch doesn't model: it edits an existing file through a
 // yaml.Node (yaml.v3 preserves comments + unknown content across a Node round-trip)
 // rather than unmarshaling into the fixed `config` struct and re-marshaling. An
-// existing rule with the same app_path is updated in place; hub/machine are filled
+// existing rule with the same app_path is updated in place; hub/box are filled
 // only when absent. A missing file is created from the managed header + a minimal
 // struct marshal. No ticket is written — the credential is saved separately by enroll.
-func appendIngress(configPath, hub, appPath, service, machine string) error {
+func appendIngress(configPath, hub, appPath, service, box string) error {
 	b, err := os.ReadFile(configPath)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			return err
 		}
 		// New file: a minimal struct marshal under the managed header is fine.
-		if machine == "" {
-			machine, _ = os.Hostname()
+		if box == "" {
+			box, _ = os.Hostname()
 		}
-		c := config{Hub: hub, Machine: machine, Ingress: []ingress{{AppPath: appPath, Service: service}}}
+		c := config{Hub: hub, Box: box, Ingress: []ingress{{AppPath: appPath, Service: service}}}
 		out, merr := yaml.Marshal(&c)
 		if merr != nil {
 			return merr
@@ -1093,16 +1093,16 @@ func appendIngress(configPath, hub, appPath, service, machine string) error {
 		return fmt.Errorf("%s: top-level YAML is not a mapping", configPath)
 	}
 
-	// Fill hub/machine only when absent (don't overwrite a user's values).
+	// Fill hub/box only when absent (don't overwrite a user's values).
 	if yamlMapValue(root, "hub") == nil && hub != "" {
 		yamlMapSet(root, "hub", yamlScalar(hub))
 	}
-	if yamlMapValue(root, "machine") == nil {
-		if machine == "" {
-			machine, _ = os.Hostname()
+	if yamlMapValue(root, "box") == nil {
+		if box == "" {
+			box, _ = os.Hostname()
 		}
-		if machine != "" {
-			yamlMapSet(root, "machine", yamlScalar(machine))
+		if box != "" {
+			yamlMapSet(root, "box", yamlScalar(box))
 		}
 	}
 

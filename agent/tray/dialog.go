@@ -3,7 +3,7 @@
 package main
 
 // dialog.go — tiny native input/alert dialogs, so the tray can take text (an
-// appliance name + service URL) that a systray menu can't. Uses whatever ships
+// service name + service URL) that a systray menu can't. Uses whatever ships
 // with the OS: osascript on macOS, zenity on Linux, PowerShell on Windows. Every
 // helper degrades to a no-op / (,"",false) if the tool is missing, so a headless
 // box never blocks.

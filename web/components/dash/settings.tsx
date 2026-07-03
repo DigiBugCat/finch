@@ -78,12 +78,12 @@ function HubDomain({ current, onClaim }: { current: string; onClaim: (slug: stri
 // tenant in the hub's host-key index. Adding one returns the CNAME instruction
 // the operator must configure; the hub enforces ownership/vanity gating and
 // (when configured) provisions the Cloudflare-for-SaaS certificate.
-// Concrete URL preview for a hostname: every appliance the tenant runs, as it
+// Concrete URL preview for a hostname: every service the tenant runs, as it
 // would be reached under that domain. The recommended naming is one hostname
-// per machine (box.yourdomain.com) with the service in the path — mirroring
-// the <machine>.aviary.run/<service> scheme.
-function DomainPreview({ hostname, appliances }: { hostname: string; appliances: any[] }) {
-  const shown = (appliances || []).slice(0, 4);
+// per box (box.yourdomain.com) with the service in the path — mirroring
+// the <box>.aviary.run/<service> scheme.
+function DomainPreview({ hostname, services }: { hostname: string; services: any[] }) {
+  const shown = (services || []).slice(0, 4);
   if (!shown.length) {
     return (
       <div className="set-hint dim" style={{ marginTop: 4 }}>
@@ -99,14 +99,14 @@ function DomainPreview({ hostname, appliances }: { hostname: string; appliances:
           https://{hostname}/<span style={{ color: 'var(--amber)' }}>{a.id}</span>/
         </div>
       ))}
-      {(appliances?.length ?? 0) > 4 && (
-        <div className="set-hint dim">…and {appliances.length - 4} more</div>
+      {(services?.length ?? 0) > 4 && (
+        <div className="set-hint dim">…and {services.length - 4} more</div>
       )}
     </div>
   );
 }
 
-function CustomDomains({ appliances }: { appliances: any[] }) {
+function CustomDomains({ services }: { services: any[] }) {
   const [hostnames, setHostnames] = useState<string[]>([]);
   const [draft, setDraft] = useState('');
   const [busy, setBusy] = useState(false);
@@ -187,7 +187,7 @@ function CustomDomains({ appliances }: { appliances: any[] }) {
                 <a href={`https://${h}`} target="_blank" rel="noreferrer">{h}</a>
                 <button type="button" className="btn btn-sm btn-ghost" disabled={busy} onClick={() => remove(h)}>Remove</button>
               </div>
-              <DomainPreview hostname={h} appliances={appliances} />
+              <DomainPreview hostname={h} services={services} />
             </div>
           ))}
         </div>
@@ -206,7 +206,7 @@ function CustomDomains({ appliances }: { appliances: any[] }) {
       </div>
       {plausible && !hostnames.includes(hostname) && (
         <div style={{ marginTop: 8 }}>
-          <DomainPreview hostname={hostname} appliances={appliances} />
+          <DomainPreview hostname={hostname} services={services} />
         </div>
       )}
       {err && <div className="set-hint red" style={{ marginTop: 8 }}>{err}</div>}
@@ -221,7 +221,7 @@ function CustomDomains({ appliances }: { appliances: any[] }) {
   );
 }
 
-// CLI access: mint a token for `finch login`, so a box can enroll appliances
+// CLI access: mint a token for `finch login`, so a box can enroll services
 // and build its finch.toml from the command line (no dashboard round-trips).
 function CliAccess() {
   const [cmd, setCmd] = useState('');
@@ -295,7 +295,7 @@ function CliAccess() {
 
 // Web sessions: sign everyone out of the login-wall. Hits the BFF which bumps
 // the tenant's sessionEpoch on the hub, invalidating every live finch_session
-// cookie so every browser viewing a hosted appliance must sign in again.
+// cookie so every browser viewing a hosted service must sign in again.
 function WebSessions() {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
@@ -348,7 +348,7 @@ function withCurrent(options: string[], current: string | undefined): string[] {
   return current && !options.includes(current) ? [current, ...options] : options;
 }
 
-export function SettingsView({ settings, groups, appliances, onChange }: any) {
+export function SettingsView({ settings, groups, services, onChange }: any) {
   const s = settings;
   // Real groups if the tenant has any, else just the current default — never
   // invent placeholder groups the user never created.
@@ -374,7 +374,7 @@ export function SettingsView({ settings, groups, appliances, onChange }: any) {
 
       <Card className="set-card">
         <SectionLabel>custom domains <span className="beta-badge">free while in beta</span></SectionLabel>
-        <CustomDomains appliances={appliances || []} />
+        <CustomDomains services={services || []} />
       </Card>
 
       <Card className="set-card">

@@ -74,7 +74,7 @@ describe("last4", () => {
 describe("signToken / verifyToken (join + connect tickets)", () => {
   const basePayload = (): TicketPayload => ({
     tenant: "tenant-1",
-    appliance: "web-scraper",
+    service: "web-scraper",
     exp: nowSec() + 3600,
     kind: "join",
   });
@@ -85,23 +85,23 @@ describe("signToken / verifyToken (join + connect tickets)", () => {
     const got = await verifyToken(tok, SECRET);
     expect(got).not.toBeNull();
     expect(got!.tenant).toBe(p.tenant);
-    expect(got!.appliance).toBe(p.appliance);
+    expect(got!.service).toBe(p.service);
     expect(got!.exp).toBe(p.exp);
     expect(got!.kind).toBe("join");
   });
 
-  it("round-trips a connect ticket with a machine field", async () => {
+  it("round-trips a connect ticket with a box field", async () => {
     const p: TicketPayload = {
       tenant: "t",
-      appliance: "a",
-      machine: "m",
+      service: "a",
+      box: "m",
       kind: "connect",
       exp: nowSec() + 120,
     };
     const got = await verifyToken(await signToken(p, SECRET), SECRET);
     expect(got).not.toBeNull();
     expect(got!.kind).toBe("connect");
-    expect(got!.machine).toBe("m");
+    expect(got!.box).toBe("m");
   });
 
   it("rejects a tampered signature", async () => {
@@ -147,7 +147,7 @@ describe("signToken / verifyToken (join + connect tickets)", () => {
   it("rejects a ticket with an invalid kind", async () => {
     // Hand-build a payload with a bogus kind, signed correctly, to prove the
     // shape validation (not just the HMAC) rejects it.
-    const bogus = { tenant: "t", appliance: "a", exp: nowSec() + 60, kind: "x" };
+    const bogus = { tenant: "t", service: "a", exp: nowSec() + 60, kind: "x" };
     const body = btoa(JSON.stringify(bogus))
       .replace(/\+/g, "-")
       .replace(/\//g, "_")

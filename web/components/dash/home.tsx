@@ -21,17 +21,17 @@ function Kpi({ label, value, unit, delta, sub, spark, color, extra }: any) {
   );
 }
 
-export function HomeView({ appliances, machines, overview, host, onOpen, onApprove, onAddDevice }: any) {
+export function HomeView({ services, boxes, overview, host, onOpen, onApprove, onAddDevice }: any) {
   const ov = overview;
-  const online = appliances.filter((a: any) => isOnline(a.state));
-  const resting = appliances.filter((a: any) => a.state === "resting");
-  const invited = appliances.filter((a: any) => a.state === "invited");
-  const pending = appliances.filter((a: any) => a.state === "pending");
+  const online = services.filter((a: any) => isOnline(a.state));
+  const resting = services.filter((a: any) => a.state === "resting");
+  const invited = services.filter((a: any) => a.state === "invited");
+  const pending = services.filter((a: any) => a.state === "pending");
 
   const issues: any[] = [];
   pending.forEach((a: any) => issues.push({ tone: "green", ic: "⏳", title: `${a.id} is waiting for approval`, sub: `Connected from ${a.box}, owned by ${a.owner}. Approve to let traffic through.`, cta: ["Approve", () => onApprove(a.id)] }));
   online.filter((a: any) => a.err >= 1).forEach((a: any) => issues.push({ tone: "red", ic: "⚠", title: `${a.id} · ${a.err}% errors`, sub: `p95 ${a.p95}ms · above your 1% comfort line over the last 24h.`, cta: ["Inspect", () => onOpen(a.id)] }));
-  appliances.filter((a: any) => a.outdated).forEach((a: any) => issues.push({ tone: "amber", ic: "⬆", title: `${a.id} has a box out of date`, sub: `One or more boxes are behind v${ov.latest}. Open it for the update command.`, cta: ["Update", () => onOpen(a.id)] }));
+  services.filter((a: any) => a.outdated).forEach((a: any) => issues.push({ tone: "amber", ic: "⬆", title: `${a.id} has a box out of date`, sub: `One or more boxes are behind v${ov.latest}. Open it for the update command.`, cta: ["Update", () => onOpen(a.id)] }));
   invited.forEach((a: any) => issues.push({ tone: "amber", ic: "🎟", title: `${a.id} hasn't phoned home`, sub: "Ticket is waiting — run the install command on the box.", cta: ["Open", () => onOpen(a.id)] }));
   const hasErr = issues.some((i: any) => i.tone === "red");
 
@@ -48,7 +48,7 @@ export function HomeView({ appliances, machines, overview, host, onOpen, onAppro
         </div>
         <div className="roost-head-right">
           <div className="perch-wrap" title="Perch meter — one bar per service">
-            <PerchMeter items={appliances} big />
+            <PerchMeter items={services} big />
             <span className="perch-cap">perch meter</span>
           </div>
           <Button kind="accent" size="md" onClick={onAddDevice}>＋ Add box</Button>
@@ -58,8 +58,8 @@ export function HomeView({ appliances, machines, overview, host, onOpen, onAppro
       <div className="ov-label">Observability <span className="dim">· last 24 hours</span></div>
       <div className="kpi-row kpi-row-3">
         <Kpi label="Services online" value={ov.activeNow} unit={` / ${ov.total}`}
-          sub={`${machines.filter((m: any) => m.state === "chirping" || m.state === "in_use").length} of ${machines.length} boxes up`}
-          extra={<div className="kpi-states"><PerchMeter items={appliances} /></div>} />
+          sub={`${boxes.filter((m: any) => m.state === "chirping" || m.state === "in_use").length} of ${boxes.length} boxes up`}
+          extra={<div className="kpi-states"><PerchMeter items={services} /></div>} />
         <Kpi label="Latency p50" value={ov.p50} unit="ms" sub={`p95 ${ov.p95}ms`} spark={ov.latency24h} color="#c4a8ef" />
         <Kpi label="Error rate" value={ov.errRate} unit="%" delta={-0.3}
           sub={hasErr ? `${issues.filter((i: any) => i.tone === "red").length} service over target` : "comfortably under 1% target"}

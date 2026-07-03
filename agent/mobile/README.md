@@ -43,7 +43,7 @@ val cfg = Config().apply {
     appPath = "myapp"                       // the service the ticket was minted for
     upstream = "http://127.0.0.1:8080"      // your local server
     credentialPath = "${filesDir}/finch.json"
-    machine = "pixel-" + Build.SERIAL        // a stable box name
+    box = "pixel-" + Build.SERIAL        // a stable box name
     forwardAll = false                       // true to host a website / arbitrary HTTP
 }
 
@@ -77,7 +77,7 @@ saved credential, no ticket needed.
 | `Service.start()` | Begin relaying in the background (non-blocking, auto-reconnect). |
 | `Service.stop()` | Cancel the relay. Idempotent. |
 | `Service.running` | Whether the relay loop is active. |
-| `Config` | `hub, machine, appPath, upstream, credentialPath, forwardAll`. |
+| `Config` | `hub, box, appPath, upstream, credentialPath, forwardAll`. |
 | `Listener.onState(state, detail)` | `connecting / enrolled / live / connected / reconnecting / warn / stopped`. |
 | `Finch.version()` | The agent version this SDK was built from. |
 

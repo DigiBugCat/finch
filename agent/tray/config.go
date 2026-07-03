@@ -10,11 +10,11 @@ import (
 )
 
 // manifest is a read-only view of finch.yml — just enough for the tray to shape
-// its menu (appliance rows + the dashboard link). The relay engine (core) parses
+// its menu (service rows + the dashboard link). The relay engine (core) parses
 // the same file authoritatively; this never writes it.
 type manifest struct {
 	Hub     string `yaml:"hub"`
-	Machine string `yaml:"machine"`
+	Box     string `yaml:"box"`
 	Ingress []struct {
 		AppPath string `yaml:"app_path"`
 	} `yaml:"ingress"`
@@ -43,8 +43,8 @@ func readAppPaths(path string) []string {
 // readHub returns the manifest's hub URL, or "" if unset/unreadable.
 func readHub(path string) string { return loadManifest(path).Hub }
 
-// readMachine returns the manifest's machine name, or "" if unset/unreadable.
-func readMachine(path string) string { return loadManifest(path).Machine }
+// readBox returns the manifest's box name, or "" if unset/unreadable.
+func readBox(path string) string { return loadManifest(path).Box }
 
 // sortedAppPaths returns the keys of set in stable (sorted) order, so the menu
 // rows don't reshuffle between reloads.

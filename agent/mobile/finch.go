@@ -26,18 +26,18 @@ import (
 	"github.com/digibugcat/finch/agent/core"
 )
 
-// Config describes the appliance the app wants to publish. All fields are plain
+// Config describes the service the app wants to publish. All fields are plain
 // values so gomobile binds Config as a simple Kotlin/Java class with getters and
 // setters.
 type Config struct {
 	// Hub is the finch hub base URL. Empty defaults to https://finchmcp.com.
 	Hub string
-	// Machine is this device's name in the dashboard. Empty defaults to the OS
+	// Box is this device's name in the dashboard. Empty defaults to the OS
 	// hostname (often not meaningful on Android — set something stable like an
 	// install id).
-	Machine string
-	// AppPath is the public URL segment / appliance id (the slug host serves it
-	// at https://<slug>.finchmcp.com/<AppPath>/…). Set it to the appliance the
+	Box string
+	// AppPath is the public URL segment / service id (the slug host serves it
+	// at https://<slug>.finchmcp.com/<AppPath>/…). Set it to the service the
 	// enrollment ticket was minted for.
 	AppPath string
 	// Upstream is the LOCAL service to publish, e.g. "http://127.0.0.1:8080".
@@ -86,7 +86,7 @@ func NewService(cfg *Config, listener Listener) *Service {
 func (s *Service) opts() core.EmbedOptions {
 	return core.EmbedOptions{
 		Hub:            s.cfg.Hub,
-		Machine:        s.cfg.Machine,
+		Box:            s.cfg.Box,
 		AppPath:        s.cfg.AppPath,
 		Upstream:       s.cfg.Upstream,
 		CredentialPath: s.cfg.CredentialPath,

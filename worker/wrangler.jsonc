@@ -14,11 +14,11 @@
   // vars into named environments, so each env below repeats durable_objects +
   // migrations. The class definitions are identical, but DO ids are name-scoped
   // per Worker — so finch-dev and finch-prod get fully separate
-  // ApplianceDO/TenantDO/RouterDO namespaces. A dev deploy can never read or
+  // BoxDO/TenantDO/RouterDO namespaces. A dev deploy can never read or
   // mutate prod tenant registries, keys, or ACLs.
   "durable_objects": {
     "bindings": [
-      { "name": "APPLIANCE", "class_name": "ApplianceDO" },
+      { "name": "BOX", "class_name": "BoxDO" },
       { "name": "TENANT", "class_name": "TenantDO" },
       { "name": "ROUTER", "class_name": "RouterDO" }
     ]
@@ -46,6 +46,10 @@
       // RouterDO — singleton slug→tenantId index for the relay plane.
       "tag": "v3",
       "new_sqlite_classes": ["RouterDO"]
+    },
+    {
+      "tag": "v4",
+      "renamed_classes": [{ "from": "ApplianceDO", "to": "BoxDO" }]
     }
   ],
 
@@ -63,7 +67,7 @@
       },
       "durable_objects": {
         "bindings": [
-          { "name": "APPLIANCE", "class_name": "ApplianceDO" },
+          { "name": "BOX", "class_name": "BoxDO" },
           { "name": "TENANT", "class_name": "TenantDO" },
           { "name": "ROUTER", "class_name": "RouterDO" }
         ]
@@ -88,7 +92,8 @@
       "migrations": [
         { "tag": "v1", "new_sqlite_classes": ["ApplianceDO"] },
         { "tag": "v2", "new_sqlite_classes": ["TenantDO"] },
-        { "tag": "v3", "new_sqlite_classes": ["RouterDO"] }
+        { "tag": "v3", "new_sqlite_classes": ["RouterDO"] },
+        { "tag": "v4", "renamed_classes": [{ "from": "ApplianceDO", "to": "BoxDO" }] }
       ]
     },
 
@@ -96,7 +101,7 @@
     // Internet-reachable pre-prod that CI auto-deploys on every push to main.
     // Like dev it carries DEFAULT_TENANT/DEV (so it's usable on a workers.dev
     // origin with no registered <slug>.finchmcp.com), but it is a fully separate
-    // Worker (finch-staging) with its OWN ApplianceDO/TenantDO/RouterDO
+    // Worker (finch-staging) with its OWN BoxDO/TenantDO/RouterDO
     // namespaces and its OWN secrets — it can never read or mutate prod state.
     // True wildcard host routing is exercised only in production (validated by
     // the prod smoke test); to upgrade staging to staging.finchmcp.com later,
@@ -123,12 +128,12 @@
       },
       "ai": { "binding": "AI" },
       // Self service-binding: the /chat tool-runner relays MCP calls back through
-      // our own appliance path. A direct fetch to our workers.dev host is blocked
+      // our own service path. A direct fetch to our workers.dev host is blocked
       // (error 1042); a service binding to ourselves is the supported way.
       "services": [{ "binding": "SELF", "service": "finch-staging" }],
       "durable_objects": {
         "bindings": [
-          { "name": "APPLIANCE", "class_name": "ApplianceDO" },
+          { "name": "BOX", "class_name": "BoxDO" },
           { "name": "TENANT", "class_name": "TenantDO" },
           { "name": "ROUTER", "class_name": "RouterDO" }
         ]
@@ -152,7 +157,8 @@
       "migrations": [
         { "tag": "v1", "new_sqlite_classes": ["ApplianceDO"] },
         { "tag": "v2", "new_sqlite_classes": ["TenantDO"] },
-        { "tag": "v3", "new_sqlite_classes": ["RouterDO"] }
+        { "tag": "v3", "new_sqlite_classes": ["RouterDO"] },
+        { "tag": "v4", "renamed_classes": [{ "from": "ApplianceDO", "to": "BoxDO" }] }
       ]
     },
 
@@ -182,7 +188,7 @@
       ],
       "durable_objects": {
         "bindings": [
-          { "name": "APPLIANCE", "class_name": "ApplianceDO" },
+          { "name": "BOX", "class_name": "BoxDO" },
           { "name": "TENANT", "class_name": "TenantDO" },
           { "name": "ROUTER", "class_name": "RouterDO" }
         ]
@@ -207,7 +213,8 @@
       "migrations": [
         { "tag": "v1", "new_sqlite_classes": ["ApplianceDO"] },
         { "tag": "v2", "new_sqlite_classes": ["TenantDO"] },
-        { "tag": "v3", "new_sqlite_classes": ["RouterDO"] }
+        { "tag": "v3", "new_sqlite_classes": ["RouterDO"] },
+        { "tag": "v4", "renamed_classes": [{ "from": "ApplianceDO", "to": "BoxDO" }] }
       ]
     }
   }

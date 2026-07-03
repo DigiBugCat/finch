@@ -7,7 +7,7 @@
 // (and the Windows/Linux tray). It auto-starts the relays on launch and, like
 // Tailscale, shows the fleet grouped into "This box" (the services this box
 // publishes, with live relay state) and "Other boxes" (every other box in the
-// tenant and what it serves, from the hub). Add/remove appliances and log in/out
+// tenant and what it serves, from the hub). Add/remove services and log in/out
 // via native dialogs. Everything runs on the same agent/core engine as the CLI.
 package main
 
@@ -37,16 +37,16 @@ var iconPNG []byte
 // Fixed pools: systray can't reorder or delete items after creation, so we
 // allocate slots up-front and Show/Hide them as the manifest + fleet change.
 const (
-	maxRows           = 16 // appliances this box publishes
-	maxMachines       = 8  // other boxes shown under "Other boxes"
-	maxAppsPerMachine = 12 // appliances per other box
-	fleetPoll         = 15 * time.Second
+	maxRows       = 16 // services this box publishes
+	maxBoxes      = 8  // other boxes shown under "Other boxes"
+	maxAppsPerBox = 12 // services per other box
+	fleetPoll     = 15 * time.Second
 )
 
 var (
-	configPath   string
-	hubFlag      string
-	localMachine string // this box's name (finch.yml machine: or hostname)
+	configPath string
+	hubFlag    string
+	localBox   string // this box's name (finch.yml box: or hostname)
 
 	mu        sync.Mutex
 	order     []string                     // local app_paths, in manifest order
@@ -59,8 +59,8 @@ var (
 	thisParent  *systray.MenuItem
 	otherParent *systray.MenuItem
 	machParent  []*systray.MenuItem   // "Other boxes" -> per-box submenu parents
-	machRows    [][]*systray.MenuItem // machParent[j] -> its appliance rows
-	machRowApp  [][]string            // machRows[j][k] -> the appliance id it shows
+	machRows    [][]*systray.MenuItem // machParent[j] -> its service rows
+	machRowApp  [][]string            // machRows[j][k] -> the service id it shows
 
 	statusItem    *systray.MenuItem // "Connected" / "Signed out" status line
 	accountParent *systray.MenuItem // account row (submenu with Log out) when signed in
@@ -79,7 +79,7 @@ func main() {
 	}
 	rowByApp = map[string]*systray.MenuItem{}
 	lastState = map[string]string{}
-	localMachine = localMachineName()
+	localBox = localBoxName()
 	systray.Run(onReady, onExit)
 }
 
@@ -93,10 +93,10 @@ func defaultConfigPath() string {
 	return filepath.Join(dir, "finch.yml")
 }
 
-// localMachineName is the manifest's machine:, else the OS hostname — the name
-// this box registers under, so we can tell "this machine" from the others.
-func localMachineName() string {
-	if m := readMachine(configPath); m != "" {
+// localBoxName is the manifest's box:, else the OS hostname — the name
+// this box registers under, so we can tell "this box" from the others.
+func localBoxName() string {
+	if m := readBox(configPath); m != "" {
 		return m
 	}
 	h, _ := os.Hostname()
@@ -129,15 +129,15 @@ func onReady() {
 
 	// "Other boxes" — every other box in the tenant, from the hub (read-only).
 	otherParent = systray.AddMenuItem("Other boxes", "Other boxes in your tenant")
-	machParent = make([]*systray.MenuItem, maxMachines)
-	machRows = make([][]*systray.MenuItem, maxMachines)
-	machRowApp = make([][]string, maxMachines)
+	machParent = make([]*systray.MenuItem, maxBoxes)
+	machRows = make([][]*systray.MenuItem, maxBoxes)
+	machRowApp = make([][]string, maxBoxes)
 	for j := range machParent {
 		p := otherParent.AddSubMenuItem("", "")
 		p.Hide()
 		machParent[j] = p
-		machRows[j] = make([]*systray.MenuItem, maxAppsPerMachine)
-		machRowApp[j] = make([]string, maxAppsPerMachine)
+		machRows[j] = make([]*systray.MenuItem, maxAppsPerBox)
+		machRowApp[j] = make([]string, maxAppsPerBox)
 		for k := range machRows[j] {
 			it := p.AddSubMenuItem("", "Open this service in the dashboard")
 			it.Hide()
@@ -179,7 +179,7 @@ func onReady() {
 		i := i
 		go clickLoop(rmItems[i], func() { onRemoveSlot(i) })
 	}
-	// Clicking an appliance opens its dashboard page.
+	// Clicking a service opens its dashboard page.
 	for i := range rows {
 		i := i
 		go clickLoop(rows[i], func() { onLocalRowClick(i) })
@@ -269,7 +269,7 @@ func reloadRows() {
 }
 
 // refreshFleet repaints "Other boxes" from the hub: every box that isn't this
-// one, each a submenu of the appliances it serves. Best-effort — a login/network
+// one, each a submenu of the services it serves. Best-effort — a login/network
 // error just leaves a hint on the parent.
 func refreshFleet() {
 	nodes, err := core.FleetNodes()
@@ -284,17 +284,17 @@ func refreshFleet() {
 		}
 		return
 	}
-	// Group appliances by machine, excluding this box.
+	// Group services by box, excluding this box.
 	type fleetApp struct{ id, label string }
-	byMachine := map[string][]fleetApp{}
+	byBox := map[string][]fleetApp{}
 	for _, n := range nodes {
-		if n.Machine == localMachine {
+		if n.Box == localBox {
 			continue
 		}
-		byMachine[n.Machine] = append(byMachine[n.Machine], fleetApp{n.Appliance, n.Appliance + " — " + prettyState(n.State)})
+		byBox[n.Box] = append(byBox[n.Box], fleetApp{n.Service, n.Service + " — " + prettyState(n.State)})
 	}
-	names := make([]string, 0, len(byMachine))
-	for name := range byMachine {
+	names := make([]string, 0, len(byBox))
+	for name := range byBox {
 		names = append(names, name)
 	}
 	sort.Strings(names)
@@ -303,7 +303,7 @@ func refreshFleet() {
 	for j, p := range machParent {
 		if j < len(names) {
 			name := names[j]
-			apps := byMachine[name]
+			apps := byBox[name]
 			p.SetTitle(fmt.Sprintf("%s (%d)", name, len(apps)))
 			p.Show()
 			for k, row := range machRows[j] {
@@ -516,7 +516,7 @@ func updateAccount() {
 }
 
 // updateStatus paints the header status line (Tailscale's "Connected"): signed-in
-// state first, then how many local appliances are live. "Connected" whenever you
+// state first, then how many local services are live. "Connected" whenever you
 // hold a credential — 0 local apps is normal, not a disconnection.
 func updateStatus() {
 	if statusItem == nil {
@@ -546,7 +546,7 @@ func updateStatus() {
 	}
 }
 
-// onLogout drops the CLI token (already-enrolled appliances keep working).
+// onLogout drops the CLI token (already-enrolled services keep working).
 func onLogout() {
 	if err := core.Logout(); err != nil {
 		alert("finch — logout failed", err.Error())
@@ -608,9 +608,9 @@ func dashboardURL() string {
 	return strings.TrimRight(base, "/") + "/dashboard"
 }
 
-// dashboardAppURL deep-links to one appliance's detail view in the dashboard.
+// dashboardAppURL deep-links to one service's detail view in the dashboard.
 func dashboardAppURL(id string) string {
-	return dashboardURL() + "?appliance=" + url.QueryEscape(id)
+	return dashboardURL() + "?service=" + url.QueryEscape(id)
 }
 
 func openBrowser(url string) {

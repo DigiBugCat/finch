@@ -492,7 +492,7 @@ body::before{
 .ent-ic{font-size:12px}
 .ent-tag{font-family:var(--mono); font-size:11.5px; color:var(--admin); background:rgba(196,168,239,.1); border-color:rgba(196,168,239,.22)}
 .ent-key{font-family:var(--mono); color:var(--amber); background:var(--amber-soft); border-color:rgba(242,180,67,.2)}
-.ent-appliance{font-family:var(--mono); color:var(--amber)}
+.ent-service{font-family:var(--mono); color:var(--amber)}
 .ent-all{color:var(--green); background:var(--green-soft); border-color:transparent}
 
 .auth-tags{display:flex; align-items:center; gap:9px; flex-wrap:wrap; margin-top:14px; padding-top:14px; border-top:1px solid var(--line)}
@@ -587,7 +587,7 @@ body::before{
   .lrow .l-ip{display:none}
 }
 
-/* ===== fleet header + lens + machines ===== */
+/* ===== fleet header + lens + boxes ===== */
 .fleet-header{display:flex; align-items:flex-start; justify-content:space-between; gap:16px; flex-wrap:wrap}
 .fleet-header .page-title{margin-top:0}
 .lens-bar{display:flex; align-items:center; gap:14px}
@@ -599,16 +599,16 @@ body::before{
 .mrow:hover{background:var(--card2)}
 .mrow-head{cursor:default; font-size:11px; font-weight:800; text-transform:uppercase; letter-spacing:.07em; color:var(--dim)}
 .mrow-head:hover{background:none}
-.m-machine{display:flex; align-items:center; gap:11px; min-width:0}
+.m-box{display:flex; align-items:center; gap:11px; min-width:0}
 .m-id{display:flex; flex-direction:column; min-width:0}
 .m-name{font-size:14px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
 .m-os{font-size:12px}
 .m-addr, .m-seen{font-size:12.5px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
 .m-status{display:flex; justify-content:flex-start}
 
-.machines-card .mach{padding:14px 0; border-bottom:1px solid var(--line)}
-.machines-card .mach:first-of-type{padding-top:6px}
-.machines-card .mach:last-child{border-bottom:none; padding-bottom:2px}
+.boxes-card .mach{padding:14px 0; border-bottom:1px solid var(--line)}
+.boxes-card .mach:first-of-type{padding-top:6px}
+.boxes-card .mach:last-child{border-bottom:none; padding-bottom:2px}
 .mach-head{display:flex; align-items:center; gap:10px; margin-bottom:10px}
 .mach-name{font-size:14px; font-weight:600}
 .mach-os{font-size:12.5px}
@@ -648,7 +648,7 @@ body::before{
   .roost-head-right{width:100%; justify-content:space-between}
 }
 
-/* Test-in-chat — a chat window inside the appliance detail */
+/* Test-in-chat — a chat window inside the service detail */
 .chatd-win{margin-top:6px;border:1px solid var(--line2);border-radius:14px;overflow:hidden;
   background:#1a150d;display:flex;flex-direction:column;height:380px}
 .chatd-winbar{display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid var(--line);background:#1f190f}

@@ -13,14 +13,14 @@ function tokenDst(d: any) {
   if (d.type === "all") return "*";
   if (d.type === "tag") return `tag:${d.name}`;
   if (d.type === "group") return `group:${d.name.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}`;
-  return d.name; // appliance
+  return d.name; // service
 }
 
-export function AccessView({ appliances, groups, keys, acl, users, onAdd, onRemove }: any) {
+export function AccessView({ services, groups, keys, acl, users, onAdd, onRemove }: any) {
   const [mode, setMode] = useState("rules"); // rules | policy
   const [dst, setDst] = useState<any[]>([]);
 
-  const allTags = [...new Set(appliances.flatMap((a: any) => a.tags || []))];
+  const allTags = [...new Set(services.flatMap((a: any) => a.tags || []))];
   // Real Clerk members (from /api/finch/state) — not a hardcoded phantom list.
   const userNames: string[] = (users || []).map((u: any) => u.name).filter(Boolean);
   const keyNames = keys.map((k: any) => k.label);

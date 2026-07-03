@@ -1,5 +1,5 @@
 "use client";
-// Roost — fleet tables (Appliance table/cards/compact + Machines) + detail.
+// Roost — fleet tables (Service table/cards/compact + Boxes) + detail.
 import { useState } from 'react';
 import { Avatar, Button, Card, CopyChip, InlineConfirm, MonoUrl, SectionLabel, StatePill, TagList, isOnline } from '@/components/dash/primitives';
 import { ChatPanel } from '@/components/dash/ChatPanel';
@@ -7,7 +7,7 @@ import { AreaChart } from '@/components/dash/charts';
 import { LATEST_AGENT } from '@/components/dash/data';
 
 function mcpUrl(host: any, id: any) { return `https://${host}/${id}/mcp`; }
-function machineUrl(host: any, id: any, machine: any) { return `https://${host}/${id}/${machine}/mcp`; }
+function boxUrl(host: any, id: any, box: any) { return `https://${host}/${id}/${box}/mcp`; }
 const mdot = (st: any) => isOnline(st) ? "on" : st === "pending" ? "inv" : "off";
 
 // out-of-date / version badge
@@ -17,12 +17,12 @@ function VersionTag({ a }: any) {
     ? <span className="ver-badge out" title={`update available — latest v${LATEST_AGENT}`}>⬆ v{a.version} · update</span>
     : <span className="ver-badge mono">v{a.version}</span>;
 }
-function MachineCount({ a }: any) {
-  if (!a.machineCount) return null;
-  return <span className="m-count">{a.machineCount} box{a.machineCount > 1 ? "es" : ""}</span>;
+function BoxCount({ a }: any) {
+  if (!a.boxCount) return null;
+  return <span className="m-count">{a.boxCount} box{a.boxCount > 1 ? "es" : ""}</span>;
 }
 
-// ---- Appliances · dense table ------------------------------------
+// ---- Services · dense table ------------------------------------
 export function FleetTable({ apps, host, onOpen, onRelease, head = true }: any) {
   return (
     <Card className="table-card">
@@ -43,7 +43,7 @@ export function FleetTable({ apps, host, onOpen, onRelease, head = true }: any) 
               <span className="app-id mono">{a.id}</span>
               <span className="app-sub">
                 <VersionTag a={a} />
-                <MachineCount a={a} />
+                <BoxCount a={a} />
                 <TagList tags={a.tags} />
               </span>
             </span>
@@ -67,7 +67,7 @@ export function FleetTable({ apps, host, onOpen, onRelease, head = true }: any) 
   );
 }
 
-// ---- Appliances · roomy cards ------------------------------------
+// ---- Services · roomy cards ------------------------------------
 export function FleetCards({ apps, host, onOpen, onRelease }: any) {
   return (
     <div className="cardgrid">
@@ -77,7 +77,7 @@ export function FleetCards({ apps, host, onOpen, onRelease }: any) {
             <Avatar state={a.state} size={40} />
             <div className="appcard-id">
               <span className="app-id mono">{a.id}</span>
-              <span className="appcard-box dim">{a.machineCount ? `${a.machineCount} box${a.machineCount > 1 ? "es" : ""}` : "no boxes"}{a.state !== "invited" ? <> · <VersionTag a={a} /></> : null}</span>
+              <span className="appcard-box dim">{a.boxCount ? `${a.boxCount} box${a.boxCount > 1 ? "es" : ""}` : "no boxes"}{a.state !== "invited" ? <> · <VersionTag a={a} /></> : null}</span>
             </div>
             <StatePill state={a.state} />
           </div>
@@ -98,7 +98,7 @@ export function FleetCards({ apps, host, onOpen, onRelease }: any) {
   );
 }
 
-// ---- Appliances · compact ----------------------------------------
+// ---- Services · compact ----------------------------------------
 export function FleetCompact({ apps, host, onOpen, onRelease }: any) {
   return (
     <Card className="compact-card">
@@ -107,7 +107,7 @@ export function FleetCompact({ apps, host, onOpen, onRelease }: any) {
           <span className={`crow-dot crow-${mdot(a.state)}`} />
           <span className="app-id mono crow-id">{a.id}</span>
           <StatePill state={a.state} />
-          {a.machineCount ? <span className="m-count">{a.machineCount}×</span> : null}
+          {a.boxCount ? <span className="m-count">{a.boxCount}×</span> : null}
           {a.outdated && <span className="ver-badge out crow-ver" title={`update to v${LATEST_AGENT}`}>⬆</span>}
           <span className="crow-spacer" />
           {a.state !== "invited" && <CopyChip value={mcpUrl(host, a.id)} label="copy url" />}
@@ -117,9 +117,9 @@ export function FleetCompact({ apps, host, onOpen, onRelease }: any) {
   );
 }
 
-// ---- Machines · flat node list (Tailscale lens) ------------------
-export function MachinesTable({ machines, host, onOpen, query }: any) {
-  if (!machines.length) {
+// ---- Boxes · flat node list (Tailscale lens) ------------------
+export function BoxesTable({ boxes, host, onOpen, query }: any) {
+  if (!boxes.length) {
     return <Card className="group-empty"><div className="dim">{query ? `No boxes match “${query}”.` : "No boxes yet."}</div></Card>;
   }
   return (
@@ -127,13 +127,13 @@ export function MachinesTable({ machines, host, onOpen, query }: any) {
       <div className="mrow mrow-head">
         <span>box</span><span>service</span><span>address</span><span>version</span><span>last seen</span><span>status</span>
       </div>
-      {machines.map((m: any) => (
-        <div key={m.name} className="mrow" onClick={() => onOpen(m.appliance)}>
-          <span className="m-machine">
+      {boxes.map((m: any) => (
+        <div key={m.name} className="mrow" onClick={() => onOpen(m.service)}>
+          <span className="m-box">
             <span className={`crow-dot crow-${mdot(m.state)}`} />
             <span className="m-id"><span className="mono m-name">{m.name}</span><span className="dim m-os">{m.os}</span></span>
           </span>
-          <span className="m-appliance"><span className="ent ent-appliance">{m.appliance}</span></span>
+          <span className="m-service"><span className="ent ent-service">{m.service}</span></span>
           <span className="m-addr mono dim">{m.address}</span>
           <span className="m-ver">{m.outdated ? <span className="ver-badge out">⬆ v{m.version}</span> : <span className="ver-badge mono">v{m.version}</span>}</span>
           <span className="m-seen mono dim">{m.lastSeen}</span>
@@ -144,8 +144,8 @@ export function MachinesTable({ machines, host, onOpen, query }: any) {
   );
 }
 
-// ============ APPLIANCE DETAIL ====================================
-export function DetailView({ app, host, onBack, onRelease, onTags, onApprove, onDecline, onRevokeMachineKey }: any) {
+// ============ BOX DETAIL ====================================
+export function DetailView({ app, host, onBack, onRelease, onTags, onApprove, onDecline, onRevokeBoxKey }: any) {
   const [tab, setTab] = useState("claude");
   const [newTag, setNewTag] = useState("");
   const url = mcpUrl(host, app.id);
@@ -177,7 +177,7 @@ export function DetailView({ app, host, onBack, onRelease, onTags, onApprove, on
             <span className="group-tag">{app.group}</span>
           </div>
           <p className="detail-meta mono dim">
-            {app.machineCount} box{app.machineCount === 1 ? "" : "es"} · owner <span className={app.owner === "you" ? "own-you" : "own-other"}>{app.owner}</span>
+            {app.boxCount} box{app.boxCount === 1 ? "" : "es"} · owner <span className={app.owner === "you" ? "own-you" : "own-other"}>{app.owner}</span>
             {" · "}{online ? `up ${app.uptime}` : `last seen ${app.lastSeen}`}
           </p>
         </div>
@@ -207,7 +207,7 @@ export function DetailView({ app, host, onBack, onRelease, onTags, onApprove, on
 
         {/* Connect */}
         <Card className="connect-card">
-          <SectionLabel hint={app.machineCount > 1 ? "load-balanced across every healthy box" : "paste this URL into any MCP client"}>connect</SectionLabel>
+          <SectionLabel hint={app.boxCount > 1 ? "load-balanced across every healthy box" : "paste this URL into any MCP client"}>connect</SectionLabel>
           {app.state === "invited"
             ? <div className="url-pending mono big-pending">🎟 ticket minted — waiting for the box to phone home…</div>
             : <MonoUrl url={url} hero />}
@@ -223,7 +223,7 @@ export function DetailView({ app, host, onBack, onRelease, onTags, onApprove, on
         </Card>
 
         {/* Test in chat */}
-        <ChatPanel appliance={app.id} online={online} />
+        <ChatPanel service={app.id} online={online} />
 
         {/* Traffic */}
         <Card className="chart-card connect-card">
@@ -247,10 +247,10 @@ export function DetailView({ app, host, onBack, onRelease, onTags, onApprove, on
             : <div className="url-pending mono big-pending">🌙 resting — no live traffic to show.</div>}
         </Card>
 
-        {/* Machines */}
-        <Card className="machines-card connect-card">
+        {/* Boxes */}
+        <Card className="boxes-card connect-card">
           <SectionLabel hint="boxes serving this service · revoke keys here">boxes</SectionLabel>
-          {app.machines.length ? app.machines.map((m: any) => (
+          {app.boxes.length ? app.boxes.map((m: any) => (
             <div key={m.name} className="mach">
               <div className="mach-head">
                 <span className={`crow-dot crow-${mdot(m.state)}`} />
@@ -260,12 +260,12 @@ export function DetailView({ app, host, onBack, onRelease, onTags, onApprove, on
                 <span className="mach-spacer" />
                 <StatePill state={m.state} />
               </div>
-              <MonoUrl url={machineUrl(host, app.id, m.name)} />
+              <MonoUrl url={boxUrl(host, app.id, m.name)} />
               <div className="mach-foot">
                 <span className="mach-keys">
                   <span className="auth-sub dim">keys</span>
                   {m.keys.length ? m.keys.map((k: any) => (
-                    <span key={k} className="kchip mono">🔑 {k}<button className="tag-x" title="revoke" onClick={() => onRevokeMachineKey(app.id, m.name, k)}>×</button></span>
+                    <span key={k} className="kchip mono">🔑 {k}<button className="tag-x" title="revoke" onClick={() => onRevokeBoxKey(app.id, m.name, k)}>×</button></span>
                   )) : <span className="dim">none</span>}
                 </span>
                 {m.outdated && <span className="mach-update mono">finch update <CopyChip value="finch update" /></span>}

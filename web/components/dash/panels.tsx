@@ -20,7 +20,7 @@ const PLATS = [
 // We render that verbatim — no client-side ticket fabrication.
 export function EnrollView({ host, existingIds, groups, onEnrolled, onWatch }: any) {
   // ---- Primary path: ONE command that installs finch + signs the box in via
-  // the browser device-auth flow (no appliance id, no one-shot ticket). The hub
+  // the browser device-auth flow (no service id, no one-shot ticket). The hub
   // origin is fetched from the BFF so the command targets THIS environment
   // (staging vs prod), not a tenant's stored slug host. ----
   const [connect, setConnect] = useState<any>(null);
@@ -38,7 +38,7 @@ export function EnrollView({ host, existingIds, groups, onEnrolled, onWatch }: a
   const exposeCmd = "finch add myapp --service http://127.0.0.1:8000 && finch run";
 
   // ---- Advanced path (headless / no browser): mint a one-shot ticket for a
-  // NAMED appliance — the original flow. Kept for boxes that can't open a
+  // NAMED service — the original flow. Kept for boxes that can't open a
   // browser (CI provisioning, the embeddable SDK). Collapsed by default. ----
   const [advanced, setAdvanced] = useState(false);
   const [id, setId] = useState("");
@@ -61,7 +61,7 @@ export function EnrollView({ host, existingIds, groups, onEnrolled, onWatch }: a
     if (!canMint) return;
     setPhase("minting");
     setMintErr("");
-    // onEnrolled creates the appliance server-side and returns the hub's real
+    // onEnrolled creates the service server-side and returns the hub's real
     // EnrollResp (or null on failure). Render the ticket/install it gives back.
     const resp = await onEnrolled(clean, group);
     if (resp && resp.ticket) {

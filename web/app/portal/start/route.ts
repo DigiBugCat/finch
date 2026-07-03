@@ -1,7 +1,7 @@
 // GET /portal/start?slug=<host-key>&rd=<relpath>
 //
-// The appliance login-wall BOUNCE handler. When an unauthenticated browser
-// hits a gated <slug>.finchmcp.com appliance, the worker's browserGate 302's
+// The service login-wall BOUNCE handler. When an unauthenticated browser
+// hits a gated <slug>.finchmcp.com service, the worker's browserGate 302's
 // it here (see worker/src/index.ts). This route is /portal-protected by
 // middleware.ts, so Clerk has already forced sign-in by the time we run — the
 // session is guaranteed real.
@@ -19,7 +19,7 @@
 //      and 403s otherwise — ownership is enforced hub-side off the SIGNED
 //      assertion, never off the slug we pass. userId rides the body because the
 //      assertion only binds the tenant.
-//   4. On success, 302 the browser to the appliance's reserved callback:
+//   4. On success, 302 the browser to the service's reserved callback:
 //        https://<host>/__finch/cb?g=<grant>&rd=<rd>
 //      where the worker burns the single-use grant and sets the finch_session
 //      cookie host-scoped to that slug.
@@ -29,20 +29,20 @@
 
 import { resolveTenant, hubFetch, HttpError } from "@/lib/hub";
 
-/** The appliance base domain that vanity slugs live under: <slug>.finchmcp.com.
+/** The service base domain that vanity slugs live under: <slug>.finchmcp.com.
  *  Configurable so staging can point elsewhere; defaults to the prod apex. The
  *  worker is the source of truth for host→key (hostKeyFromHost in index.ts); this
  *  only has to AGREE with it for the host we 302 to. */
-async function applianceDomain(): Promise<string> {
+async function serviceDomain(): Promise<string> {
   try {
     const { getCloudflareContext } = await import("@opennextjs/cloudflare");
     const env = getCloudflareContext().env as Record<string, unknown>;
-    const v = env?.APPLIANCE_DOMAIN;
+    const v = env?.BOX_DOMAIN;
     if (typeof v === "string" && v.length) return v;
   } catch {
     // not under the Cloudflare adapter (`next dev`) — fall through
   }
-  const pv = process.env.APPLIANCE_DOMAIN;
+  const pv = process.env.BOX_DOMAIN;
   return typeof pv === "string" && pv.length ? pv : "finchmcp.com";
 }
 
@@ -61,7 +61,7 @@ function isValidHostKey(key: string): boolean {
 }
 
 /** Validate that `rd` is a SITE-RELATIVE path we can safely hand back to the
- *  appliance: it must start with a single "/" and must NOT start with "//" or
+ *  service: it must start with a single "/" and must NOT start with "//" or
  *  "/\" (protocol-relative URLs that browsers treat as cross-host), and must
  *  not contain a scheme. Anything else collapses to "/". Open-redirect guard. */
 function safeRelPath(rd: string | null): string {
@@ -124,7 +124,7 @@ export async function GET(req: Request) {
     });
   }
 
-  // 403 = this tenant does not own this appliance. Surface a clean message
+  // 403 = this tenant does not own this service. Surface a clean message
   // rather than bouncing into a host we have no claim to.
   if (res.status === 403) {
     return new Response(
@@ -158,10 +158,10 @@ export async function GET(req: Request) {
     });
   }
 
-  // Hand the grant to the appliance's reserved callback. The worker there burns
+  // Hand the grant to the service's reserved callback. The worker there burns
   // the single-use jti and sets the host-scoped finch_session cookie, then 302s
   // to `rd`.
-  const domain = await applianceDomain();
+  const domain = await serviceDomain();
   const cbHost = hostKey.includes(".") ? hostKey : `${hostKey}.${domain}`;
   const cb =
     `https://${cbHost}/__finch/cb` +

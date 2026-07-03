@@ -1,4 +1,4 @@
-// BFF route-handler test: GET /portal/start is the appliance login-wall bounce.
+// BFF route-handler test: GET /portal/start is the service login-wall bounce.
 // The worker 302's an unauthenticated browser here; middleware has already
 // forced Clerk sign-in. The handler resolves the tenant, asks the hub for a
 // single-use portal grant (POST /api/portal-grant {slug,userId}), and 302's the
@@ -115,7 +115,7 @@ describe("GET /portal/start", () => {
     expect(fetchSpy).not.toHaveBeenCalled();
   });
 
-  it("surfaces a clean 403 when the tenant doesn't own the appliance", async () => {
+  it("surfaces a clean 403 when the tenant doesn't own the service", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ error: "not owner" }), {
         status: 403,

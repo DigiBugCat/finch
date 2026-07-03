@@ -55,65 +55,65 @@ async function router(body: Record<string, unknown>): Promise<any> {
   return res.json();
 }
 
-async function freshApplianceOnHost(host: string, tenant: string) {
+async function freshServiceOnHost(host: string, tenant: string) {
   expect((await router({ op: "register", slug: host, tenant })).ok).toBe(true);
   const enroll = (await (
     await api(tenant, "POST", "/api/enroll", { name: `Host Box ${seq++}` })
   ).json()) as { id: string; ticket: string };
   const base = `https://${host}`;
-  const machine = `box-${Date.now()}-${seq++}`;
+  const box = `box-${Date.now()}-${seq++}`;
   const join = (await (
     await call(
       new Request(`${base}/join`, {
         method: "POST",
         headers: { "content-type": "application/json", host },
-        body: JSON.stringify({ ticket: enroll.ticket, machine }),
+        body: JSON.stringify({ ticket: enroll.ticket, box }),
       }),
     )
   ).json()) as { connectToken: string };
   const connectRes = await call(
     new Request(
-      `${base}/${enroll.id}/${encodeURIComponent(machine)}/_connect?ct=${encodeURIComponent(join.connectToken)}`,
+      `${base}/${enroll.id}/${encodeURIComponent(box)}/_connect?ct=${encodeURIComponent(join.connectToken)}`,
       { headers: { Upgrade: "websocket", host } },
     ),
   );
   expect(connectRes.status).toBe(101);
   const agent = connectRes.webSocket!;
   agent.accept();
-  await waitForMachine(tenant, enroll.id, machine, (m) => m.connected);
+  await waitForBox(tenant, enroll.id, box, (m) => m.connected);
   await api(
     tenant,
     "POST",
-    `/api/appliances/${encodeURIComponent(enroll.id)}/approve`,
+    `/api/services/${encodeURIComponent(enroll.id)}/approve`,
   );
-  await api(tenant, "PUT", `/api/appliances/${encodeURIComponent(enroll.id)}/auth`, {
+  await api(tenant, "PUT", `/api/services/${encodeURIComponent(enroll.id)}/auth`, {
     mode: "public",
   });
-  await waitForMachine(
+  await waitForBox(
     tenant,
     enroll.id,
-    machine,
+    box,
     (m) => m.connected && m.state !== "pending",
   );
-  return { base, host, tenant, appliance: enroll.id, agent };
+  return { base, host, tenant, service: enroll.id, agent };
 }
 
-async function waitForMachine(
+async function waitForBox(
   tenant: string,
-  appliance: string,
-  machine: string,
+  service: string,
+  box: string,
   pred: (m: any) => boolean,
   tries = 50,
 ): Promise<void> {
   for (let i = 0; i < tries; i++) {
     const res = await api(tenant, "GET", "/api/state");
     const state = (await res.json()) as any;
-    const ap = (state.appliances ?? []).find((a: any) => a.id === appliance);
-    const m = ap?.machines?.find((x: any) => x.name === machine);
+    const ap = (state.services ?? []).find((a: any) => a.id === service);
+    const m = ap?.boxes?.find((x: any) => x.name === box);
     if (m && pred(m)) return;
     await new Promise((r) => setTimeout(r, 0));
   }
-  throw new Error(`machine ${appliance}/${machine} never satisfied predicate`);
+  throw new Error(`box ${service}/${box} never satisfied predicate`);
 }
 
 function nextFrame(ws: WebSocket): Promise<any> {
@@ -211,13 +211,13 @@ describe("custom hostname API", () => {
 
 describe("relay and login wall on custom hostnames", () => {
   it("resolves a registered custom hostname end to end", async () => {
-    const ctx = await freshApplianceOnHost(
+    const ctx = await freshServiceOnHost(
       `relay-${Date.now()}-${seq++}.acme.com`,
       `tenant_relay_${Date.now()}_${seq++}`,
     );
     const seen = nextFrame(ctx.agent);
     const relay = call(
-      new Request(`${ctx.base}/${ctx.appliance}/mcp`, {
+      new Request(`${ctx.base}/${ctx.service}/mcp`, {
         headers: { host: ctx.host },
       }),
     );
@@ -230,8 +230,8 @@ describe("relay and login wall on custom hostnames", () => {
 
   it("binds login-wall sessions to the full custom-host host key", async () => {
     const host = `wall-${Date.now()}-${seq++}.acme.com`;
-    const ctx = await freshApplianceOnHost(host, `tenant_wall_custom_${Date.now()}_${seq++}`);
-    await api(ctx.tenant, "PUT", `/api/appliances/${encodeURIComponent(ctx.appliance)}/auth`, {
+    const ctx = await freshServiceOnHost(host, `tenant_wall_custom_${Date.now()}_${seq++}`);
+    await api(ctx.tenant, "PUT", `/api/services/${encodeURIComponent(ctx.service)}/auth`, {
       mode: "key",
     });
     const cookie = await signSession(
@@ -247,7 +247,7 @@ describe("relay and login wall on custom hostnames", () => {
     );
     const goodSeen = nextFrame(ctx.agent);
     const good = call(
-      new Request(`${ctx.base}/${ctx.appliance}/index.html`, {
+      new Request(`${ctx.base}/${ctx.service}/index.html`, {
         headers: { host, cookie: `finch_session=${cookie}` },
       }),
     );
@@ -257,7 +257,7 @@ describe("relay and login wall on custom hostnames", () => {
     const otherHost = `other-${Date.now()}-${seq++}.acme.com`;
     expect((await router({ op: "register", slug: otherHost, tenant: ctx.tenant })).ok).toBe(true);
     const bad = await call(
-      new Request(`https://${otherHost}/${ctx.appliance}/index.html`, {
+      new Request(`https://${otherHost}/${ctx.service}/index.html`, {
         headers: { host: otherHost, cookie: `finch_session=${cookie}` },
         redirect: "manual",
       }),

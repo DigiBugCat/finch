@@ -68,7 +68,7 @@ export function Avatar({ state, size = 36 }: any) {
 }
 
 // ---- PerchMeter --------------------------------------------------
-// One bar per appliance; lit green online, amber invited, dim resting.
+// One bar per service; lit green online, amber invited, dim resting.
 export function PerchMeter({ items, big = false }: any) {
   return (
     <div className={`perch ${big ? "perch-big" : ""}`}>
@@ -165,7 +165,7 @@ export function TagList({ tags, onRemove }: any) {
 export function EntityChip({ ent }: any) {
   const map: any = {
     user: ["👤", ent.name], group: ["👥", ent.name], key: ["🔑", ent.name],
-    tag: ["", "tag:" + ent.name], appliance: ["🐦", ent.name], all: ["🌐", "all services"],
+    tag: ["", "tag:" + ent.name], service: ["🐦", ent.name], all: ["🌐", "all services"],
   };
   const [ic, label] = map[ent.type] || ["", ent.name];
   return (

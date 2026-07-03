@@ -14,10 +14,10 @@ type DashUser = {
   email: string;
   role: "Owner" | "Admin" | "Member";
   // STUB: per-user box count + last-active are not derivable yet. The hub
-  // hardcodes appliance.owner to the literal "you" (worker tenant-do.ts
-  // newAppliance) and enroll never captures a real owner id, so there's nothing
+  // hardcodes service.owner to the literal "you" (worker tenant-do.ts
+  // newService) and enroll never captures a real owner id, so there's nothing
   // to join boxes on. These stay 0 / "—" until enroll records a per-user
-  // owner id and appliances expose it; the Users view renders them as-is.
+  // owner id and services expose it; the Users view renders them as-is.
   devices: number;
   lastActive: string;
   status: string;

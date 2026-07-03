@@ -1,4 +1,4 @@
-// POST /api/finch/appliances/:id/:action -> hub POST /api/appliances/:id/:action
+// POST /api/finch/services/:id/:action -> hub POST /api/services/:id/:action
 // action ∈ { release, approve, decline }
 import { errorResponse, hubProxy, HttpError, requireAdmin } from "@/lib/hub";
 
@@ -15,7 +15,7 @@ export async function POST(
       throw new HttpError(404, `unknown service action: ${action}`);
     }
     return await hubProxy(
-      `/api/appliances/${encodeURIComponent(id)}/${action}`,
+      `/api/services/${encodeURIComponent(id)}/${action}`,
       { method: "POST" },
     );
   } catch (err) {

@@ -1,10 +1,10 @@
 /// <reference types="@cloudflare/workers-types" />
 //
 // TenantDO — one Durable Object per tenant (a Clerk org id, or a user id).
-// It owns the tenant's entire control-plane state: appliances, the machines
+// It owns the tenant's entire control-plane state: services, the boxes
 // that run them, finch_ keys, ACL rules, groups, settings, and the activity
 // log. The dashboard's GET /api/state returns exactly the projection this DO
-// computes; the agent join flow, the relay (ApplianceDO), and the MCP router
+// computes; the agent join flow, the relay (BoxDO), and the MCP router
 // all reach in here via internal RPC.
 //
 // RPC shape: POST a JSON body { op, ...args } to this DO's fetch(); it returns
@@ -13,7 +13,7 @@
 // Storage model: we keep a single STORED record in this.ctx.storage under the
 // key "state". That record is the source of truth and holds the full Key
 // objects (hash + last4). getState() derives the public TenantState from it —
-// flattening machines, deriving each appliance.state from its machines,
+// flattening boxes, deriving each service.state from its boxes,
 // recomputing `outdated`, building the overview, and stripping key hashes — so
 // derived fields are never persisted stale. Every mutation persists the stored
 // record and appends a LogEvent.
@@ -24,8 +24,8 @@ import { genFinchKey, hashKey, last4 } from "./auth";
 import { routerRegister } from "./router-do";
 import {
   type TenantState,
-  type Appliance,
-  type Machine,
+  type Service,
+  type Box,
   type Key,
   type KeyScope,
   type PublicKey,
@@ -36,22 +36,22 @@ import {
   type Overview,
   type Group,
   type RecentCall,
-  type ApplianceState,
+  type ServiceState,
   isOnline,
   LATEST_AGENT,
 } from "./types";
 
 // ---- stored shape ---------------------------------------------------------
 // What actually lives in this.ctx.storage. It mirrors TenantState but holds
-// full Key objects (with hash), and stores appliances WITHOUT the derived
-// fields that getState() recomputes (state/machines/outdated/metrics live on
-// the appliance, but `machines` flatten + overview are computed on read).
+// full Key objects (with hash), and stores services WITHOUT the derived
+// fields that getState() recomputes (state/boxes/outdated/metrics live on
+// the service, but `boxes` flatten + overview are computed on read).
 
-interface StoredAppliance extends Appliance {}
+interface StoredService extends Service {}
 
 interface StoredState {
   host: string;
-  appliances: StoredAppliance[];
+  services: StoredService[];
   keys: Key[]; // full keys incl. hash — never leaves the DO as-is
   groups: Group[];
   acl: AclRule[];
@@ -77,21 +77,21 @@ const ROLL_WINDOW = 50; // calls kept for the rolling p50/p95/err estimate
 
 // Growth caps (M5 / M1): bound state so a flood of joins can't grow a DO
 // unbounded.
-const MAX_APPLIANCES_PER_TENANT = 200;
-const MAX_MACHINES_PER_APPLIANCE = 100;
+const MAX_SERVICES_PER_TENANT = 200;
+const MAX_BOXES_PER_SERVICE = 100;
 
-// Machine-name validation (M1): the box picks its own name, so clamp it to a
+// Box-name validation (M1): the box picks its own name, so clamp it to a
 // sane length + charset before it pollutes the registry / squats a slot.
-const MAX_MACHINE_NAME = 64;
-const MACHINE_NAME_RE = /^[A-Za-z0-9 ._\-]+$/;
+const MAX_BOX_NAME = 64;
+const BOX_NAME_RE = /^[A-Za-z0-9 ._\-]+$/;
 
-/** Validate + normalize an agent-supplied machine name. Returns the trimmed
+/** Validate + normalize an agent-supplied box name. Returns the trimmed
  *  name, or null if it's empty, too long, or carries disallowed characters. */
-function cleanMachineName(raw: unknown): string | null {
+function cleanBoxName(raw: unknown): string | null {
   if (typeof raw !== "string") return null;
   const name = raw.trim();
-  if (!name || name.length > MAX_MACHINE_NAME) return null;
-  if (!MACHINE_NAME_RE.test(name)) return null;
+  if (!name || name.length > MAX_BOX_NAME) return null;
+  if (!BOX_NAME_RE.test(name)) return null;
   return name;
 }
 
@@ -120,12 +120,12 @@ function timeAgo(ts?: number, now = Date.now()): string {
   return `${day}d ago`;
 }
 
-/** UNIFIED liveness for a machine: online iff it holds a live relay socket AND
+/** UNIFIED liveness for a box: online iff it holds a live relay socket AND
  *  has been approved (state !== "pending"). The two former read paths
- *  (getState's isOnline(state) and pickHealthyMachine's connected||chirping)
+ *  (getState's isOnline(state) and pickHealthyBox's connected||chirping)
  *  now share this one rule, so the dashboard and the LB picker can't disagree
- *  about which machines are reachable. */
-function machineOnline(m: { connected?: boolean; state: ApplianceState }): boolean {
+ *  about which boxes are reachable. */
+function boxOnline(m: { connected?: boolean; state: ServiceState }): boolean {
   return !!m.connected && m.state !== "pending";
 }
 
@@ -170,7 +170,7 @@ const bad = (status: number, error: string): Response =>
   });
 
 export class TenantDO extends DurableObject<Env> {
-  // In-memory rolling latency samples per "appliance:machine", used to recompute
+  // In-memory rolling latency samples per "service:box", used to recompute
   // p50/p95/err on recordCall. Lost on eviction — that only blurs the rolling
   // window briefly, the durable counters (calls, recentCalls) survive.
   private samples = new Map<string, { ms: number; ok: boolean }[]>();
@@ -212,15 +212,15 @@ export class TenantDO extends DurableObject<Env> {
         case "setGroup":
           return ok(await this.setGroup(a.id, a.group));
         case "setAuth":
-          return ok(await this.setAuth(a.appliance ?? a.id, a.mode));
+          return ok(await this.setAuth(a.service ?? a.id, a.mode));
         case "mintKey": {
           const r = await this.mintKey(a.label, a.scope, a.owner);
           if ("error" in r) return bad(400, r.error);
           return ok(r);
         }
-        case "revokeMachineKey":
+        case "revokeBoxKey":
           return ok(
-            await this.revokeMachineKey(a.appliance, a.machine, a.key),
+            await this.revokeBoxKey(a.service, a.box, a.key),
           );
         case "addAcl":
           return ok(await this.addAcl(a.src, a.dst));
@@ -228,29 +228,29 @@ export class TenantDO extends DurableObject<Env> {
           return ok(await this.removeAcl(a.id));
         case "updateSetting":
           return ok(await this.updateSetting(a.key, a.val));
-        case "registerMachine": {
-          const r = await this.registerMachine(
-            a.appliance,
-            a.machine,
+        case "registerBox": {
+          const r = await this.registerBox(
+            a.service,
+            a.box,
             a.os,
             a.version,
           );
           if (r.error) return bad(409, r.error);
           return ok(r);
         }
-        case "markMachine":
+        case "markBox":
           return ok(
-            await this.markMachine(a.appliance, a.machine, a.connected),
+            await this.markBox(a.service, a.box, a.connected),
           );
         case "claimTicket":
           return ok(await this.claimTicket(a.jti, a.exp));
-        case "machineExists":
-          return ok(await this.machineExists(a.appliance, a.machine));
+        case "boxExists":
+          return ok(await this.boxExists(a.service, a.box));
         case "recordCall":
           return ok(
             await this.recordCall(
-              a.appliance,
-              a.machine,
+              a.service,
+              a.box,
               a.status,
               a.ms,
               a.caller,
@@ -258,7 +258,7 @@ export class TenantDO extends DurableObject<Env> {
             ),
           );
         case "checkKey":
-          return ok(await this.checkKey(a.hash, a.appliance));
+          return ok(await this.checkKey(a.hash, a.service));
         default:
           return bad(400, `unknown op: ${op}`);
       }
@@ -270,9 +270,30 @@ export class TenantDO extends DurableObject<Env> {
   // ---- stored-state lifecycle --------------------------------------------
 
   private async load(): Promise<StoredState> {
-    const stored = await this.ctx.storage.get<StoredState>("state");
-    if (stored) return stored;
-    return this.fresh();
+    const stored = await this.ctx.storage.get<any>("state");
+    const base = this.fresh();
+    if (!stored || typeof stored !== "object") return base;
+    return {
+      ...base,
+      ...stored,
+      services: Array.isArray(stored.services) ? stored.services : [],
+      keys: Array.isArray(stored.keys) ? stored.keys : [],
+      groups: Array.isArray(stored.groups) ? stored.groups : [],
+      acl: Array.isArray(stored.acl) ? stored.acl : base.acl,
+      logs: Array.isArray(stored.logs) ? stored.logs : [],
+      settings:
+        stored.settings && typeof stored.settings === "object"
+          ? { ...base.settings, ...stored.settings }
+          : base.settings,
+      usedTickets:
+        stored.usedTickets && typeof stored.usedTickets === "object"
+          ? stored.usedTickets
+          : {},
+      cliTokenEpoch:
+        typeof stored.cliTokenEpoch === "number" ? stored.cliTokenEpoch : 0,
+      sessionEpoch:
+        typeof stored.sessionEpoch === "number" ? stored.sessionEpoch : 0,
+    };
   }
 
   /** A brand-new tenant: empty roost, default settings, no mock seed data.
@@ -284,7 +305,7 @@ export class TenantDO extends DurableObject<Env> {
     const id = this.ctx.id.name ?? "";
     return {
       host: "", // set on first enroll/getState if we learn the subdomain
-      appliances: [],
+      services: [],
       keys: [],
       groups: [],
       acl: [
@@ -326,49 +347,49 @@ export class TenantDO extends DurableObject<Env> {
 
   // ---- derivation (read-side) --------------------------------------------
 
-  /** Build the public TenantState: flatten machines, derive appliance.state
-   *  from machines, recompute `outdated`, compute the overview, strip key
+  /** Build the public TenantState: flatten boxes, derive service.state
+   *  from boxes, recompute `outdated`, compute the overview, strip key
    *  hashes. Never persisted — always recomputed from the stored record. */
   private async getState(): Promise<TenantState> {
     const s = await this.load();
     const now = Date.now();
 
-    const appliances: Appliance[] = s.appliances.map((a) => {
-      const machines = (a.machines ?? []).map((m) => ({
+    const services: Service[] = s.services.map((a) => {
+      const boxes = (a.boxes ?? []).map((m) => ({
         ...m,
-        appliance: a.id,
-        applianceLabel: a.label,
+        service: a.id,
+        serviceLabel: a.label,
         outdated: m.version !== LATEST_AGENT,
         // Derive the relative-time display strings on read from stored epoch-ms.
         lastSeen: timeAgo(m.lastSeenAt, now),
         handshake: timeAgo(m.handshakeAt, now),
       }));
-      // appliance.state derives from its machines: online if any machine is
-      // online. Liveness is UNIFIED across read paths: a machine is online iff
+      // service.state derives from its boxes: online if any box is
+      // online. Liveness is UNIFIED across read paths: a box is online iff
       // it holds a live relay socket AND has been approved (state !== pending) —
-      // the same rule pickHealthyMachine uses. With no machines we keep the
-      // appliance's own lifecycle state (invited/pending/resting) untouched.
-      let state: ApplianceState = a.state;
-      if (machines.length) {
-        const anyOnline = machines.some((m) => machineOnline(m));
-        const anyPending = machines.some((m) => m.state === "pending");
+      // the same rule pickHealthyBox uses. With no boxes we keep the
+      // service's own lifecycle state (invited/pending/resting) untouched.
+      let state: ServiceState = a.state;
+      if (boxes.length) {
+        const anyOnline = boxes.some((m) => boxOnline(m));
+        const anyPending = boxes.some((m) => m.state === "pending");
         state = anyOnline ? "chirping" : anyPending ? "pending" : "resting";
       }
-      const version = machines.length ? machines[0].version : a.version;
+      const version = boxes.length ? boxes[0].version : a.version;
       const outdated =
         state !== "invited" &&
-        (machines.length
-          ? machines.some((m) => m.outdated)
+        (boxes.length
+          ? boxes.some((m) => m.outdated)
           : version !== LATEST_AGENT);
       // Roll the 24h buckets to a trailing window with index 23 = current hour.
       const traffic24h = rollBuckets(a.traffic24h, a.lastBucketHour, now);
       const latency24h = rollBuckets(a.lat24h, a.lastBucketHour, now);
       return {
         ...a,
-        auth: a.auth ?? "key", // legacy appliances predate this field → key-gated
+        auth: a.auth ?? "key", // legacy services predate this field → key-gated
         state,
-        machines,
-        machineCount: machines.length,
+        boxes,
+        boxCount: boxes.length,
         version,
         outdated,
         lastSeen: timeAgo(a.lastSeenAt, now),
@@ -381,17 +402,17 @@ export class TenantDO extends DurableObject<Env> {
       };
     });
 
-    // Flattened machines lens, annotated with the appliance's group/tags/owner
-    // (the dashboard's Machines view consumes this exact shape).
-    const machines: Machine[] = [];
-    for (const a of appliances) {
-      for (const m of a.machines) {
-        machines.push({
+    // Flattened boxes lens, annotated with the service's group/tags/owner
+    // (the dashboard's Boxes view consumes this exact shape).
+    const boxes: Box[] = [];
+    for (const a of services) {
+      for (const m of a.boxes) {
+        boxes.push({
           ...m,
           group: a.group,
           tags: a.tags,
           owner: a.owner,
-        } as Machine & { group: string; tags: string[]; owner: string });
+        } as Box & { group: string; tags: string[]; owner: string });
       }
     }
 
@@ -404,15 +425,15 @@ export class TenantDO extends DurableObject<Env> {
 
     return {
       host: s.host,
-      appliances,
-      machines,
+      services,
+      boxes,
       keys: publicKeys,
       groups: s.groups,
       acl: s.acl,
       logs,
       settings: s.settings,
       overview: this.overview(
-        appliances,
+        services,
         s.keys,
         now,
         !!s.settings.enforceExpiry,
@@ -422,20 +443,20 @@ export class TenantDO extends DurableObject<Env> {
   }
 
   private overview(
-    appliances: Appliance[],
+    services: Service[],
     keys: Key[],
     now: number,
     enforceExpiry: boolean,
   ): Overview {
-    // The fleet's 24h HISTORY is built over ALL appliances (the buckets here are
+    // The fleet's 24h HISTORY is built over ALL services (the buckets here are
     // already rolled to a trailing window, index 23 = now). Building it only over
-    // currently-online appliances made a resting box's stored history vanish the
+    // currently-online services made a resting box's stored history vanish the
     // moment it idled — the chart must still show the traffic it served.
     const traffic24h = Array.from({ length: 24 }, (_, h) =>
-      appliances.reduce((sum, a) => sum + (a.traffic24h[h] || 0), 0),
+      services.reduce((sum, a) => sum + (a.traffic24h[h] || 0), 0),
     );
     const latency24h = Array.from({ length: 24 }, (_, h) => {
-      const vals = appliances
+      const vals = services
         .map((a) => a.lat24h[h])
         .filter((v): v is number => typeof v === "number" && v > 0);
       return vals.length
@@ -447,7 +468,7 @@ export class TenantDO extends DurableObject<Env> {
     // activeNow / total reflect the LIVE fleet; p50/p95/err are quality-of-
     // service numbers for the boxes currently serving (an idle box's stale
     // rolling window shouldn't drag the live SLO).
-    const on = appliances.filter((a) => isOnline(a.state));
+    const on = services.filter((a) => isOnline(a.state));
 
     // Active keys = not-yet-expired keys (expiry only enforced if the tenant
     // turned it on; here we just don't count an over-expiry key as active).
@@ -459,7 +480,7 @@ export class TenantDO extends DurableObject<Env> {
       callsToday,
       callsDelta: 0,
       activeNow: on.length,
-      total: appliances.length,
+      total: services.length,
       p50: on.length
         ? Math.round(on.reduce((s, a) => s + a.p50, 0) / on.length)
         : 0,
@@ -476,15 +497,15 @@ export class TenantDO extends DurableObject<Env> {
 
   // ---- helpers ------------------------------------------------------------
 
-  private findAppliance(
+  private findService(
     s: StoredState,
     id: string,
-  ): StoredAppliance | undefined {
-    return s.appliances.find((a) => a.id === id);
+  ): StoredService | undefined {
+    return s.services.find((a) => a.id === id);
   }
 
   /** Lowercase a string into a host-safe slug; `fallback` if it reduces empty.
-   *  Used for both appliance ids (from name) and the default subdomain (from id). */
+   *  Used for both service ids (from name) and the default subdomain (from id). */
   private slugify(raw: string, fallback: string): string {
     return (
       raw
@@ -521,17 +542,17 @@ export class TenantDO extends DurableObject<Env> {
       relay: "—",
       version: "",
       address: "",
-      handshake: "never", // display-only; machine.handshake is timestamp-derived
+      handshake: "never", // display-only; box.handshake is timestamp-derived
       protocol: "offline",
     };
   }
 
-  /** A skeleton appliance — no machines yet (invited, ticket just minted). */
-  private newAppliance(
+  /** A skeleton service — no boxes yet (invited, ticket just minted). */
+  private newService(
     id: string,
     label: string,
     group: string,
-  ): StoredAppliance {
+  ): StoredService {
     const now = new Date().toISOString().slice(0, 10);
     return {
       id,
@@ -552,8 +573,8 @@ export class TenantDO extends DurableObject<Env> {
       routes: [],
       keys: [],
       components: [],
-      machines: [],
-      machineCount: 0,
+      boxes: [],
+      boxCount: 0,
       calls: 0,
       p50: 0,
       p95: 0,
@@ -600,20 +621,20 @@ export class TenantDO extends DurableObject<Env> {
     return { ok: true, epoch: s.sessionEpoch };
   }
 
-  // ---- mutations: appliances ---------------------------------------------
+  // ---- mutations: services ---------------------------------------------
 
-  /** Move an appliance to a group (creating it if new; pruning a now-empty old
+  /** Move a service to a group (creating it if new; pruning a now-empty old
    *  group). Empty string clears the group. */
   private async setGroup(id: string, group: string): Promise<{ ok: boolean }> {
     const s = await this.load();
-    const ap = this.findAppliance(s, id);
+    const ap = this.findService(s, id);
     if (!ap) return { ok: false };
     const old = ap.group;
     ap.group = group || "";
     if (group && !s.groups.some((g) => g.name === group)) {
       s.groups.push({ name: group, members: ["you"] });
     }
-    if (old && old !== group && !s.appliances.some((a) => a.group === old)) {
+    if (old && old !== group && !s.services.some((a) => a.group === old)) {
       s.groups = s.groups.filter((g) => g.name !== old);
     }
     this.log(s, { cat: "admin", actor: "you", action: "moved to group", target: `${id} → ${group || "—"}`, ip: "" });
@@ -626,15 +647,15 @@ export class TenantDO extends DurableObject<Env> {
     group?: string,
   ): Promise<{ id: string }> {
     const s = await this.load();
-    let id = this.slugify(name, "appliance");
+    let id = this.slugify(name, "service");
     // de-dupe id within the tenant
-    if (this.findAppliance(s, id)) {
+    if (this.findService(s, id)) {
       let n = 2;
-      while (this.findAppliance(s, `${id}-${n}`)) n++;
+      while (this.findService(s, `${id}-${n}`)) n++;
       id = `${id}-${n}`;
     }
     const g = group || s.settings.defaultGroup;
-    s.appliances.push(this.newAppliance(id, name, g));
+    s.services.push(this.newService(id, name, g));
     if (g && !s.groups.some((gr) => gr.name === g)) {
       s.groups.push({ name: g, members: ["you"] });
     }
@@ -669,9 +690,9 @@ export class TenantDO extends DurableObject<Env> {
 
   private async release(id: string): Promise<{ ok: boolean }> {
     const s = await this.load();
-    const before = s.appliances.length;
-    s.appliances = s.appliances.filter((a) => a.id !== id);
-    if (s.appliances.length === before) return { ok: false };
+    const before = s.services.length;
+    s.services = s.services.filter((a) => a.id !== id);
+    if (s.services.length === before) return { ok: false };
     this.log(s, {
       cat: "device",
       actor: "you",
@@ -685,16 +706,16 @@ export class TenantDO extends DurableObject<Env> {
 
   private async approve(id: string): Promise<{ ok: boolean }> {
     const s = await this.load();
-    const ap = this.findAppliance(s, id);
+    const ap = this.findService(s, id);
     if (!ap) return { ok: false };
-    // Approve = clear the pending gate. Liveness is then owned by markMachine: an
-    // approved-but-disconnected machine must read "resting", not "chirping". So
+    // Approve = clear the pending gate. Liveness is then owned by markBox: an
+    // approved-but-disconnected box must read "resting", not "chirping". So
     // derive from m.connected rather than flipping straight to chirping.
-    for (const m of ap.machines) {
+    for (const m of ap.boxes) {
       if (m.state === "pending") m.state = m.connected ? "chirping" : "resting";
     }
     if (ap.state === "pending") {
-      const anyConnected = ap.machines.some((mm) => mm.connected);
+      const anyConnected = ap.boxes.some((mm) => mm.connected);
       ap.state = anyConnected ? "chirping" : "resting";
     }
     this.log(s, {
@@ -710,10 +731,10 @@ export class TenantDO extends DurableObject<Env> {
 
   private async decline(id: string): Promise<{ ok: boolean }> {
     const s = await this.load();
-    const ap = this.findAppliance(s, id);
+    const ap = this.findService(s, id);
     if (!ap) return { ok: false };
-    // Declining a pending appliance removes it (it never became real).
-    s.appliances = s.appliances.filter((a) => a.id !== id);
+    // Declining a pending service removes it (it never became real).
+    s.services = s.services.filter((a) => a.id !== id);
     this.log(s, {
       cat: "device",
       actor: "you",
@@ -725,7 +746,7 @@ export class TenantDO extends DurableObject<Env> {
     return { ok: true };
   }
 
-  /** Flip an appliance's public-relay access mode between "key" (require a
+  /** Flip a service's public-relay access mode between "key" (require a
    *  finch_ bearer) and "public" (open webpage). The control-plane half of the
    *  generic-HTTP-hosting feature; the relay reads it via checkKey. */
   private async setAuth(
@@ -736,7 +757,7 @@ export class TenantDO extends DurableObject<Env> {
       return { ok: false, error: 'mode must be "key" or "public"' };
     }
     const s = await this.load();
-    const ap = this.findAppliance(s, id);
+    const ap = this.findService(s, id);
     if (!ap) return { ok: false, error: "unknown service" };
     ap.auth = mode;
     this.log(s, {
@@ -755,7 +776,7 @@ export class TenantDO extends DurableObject<Env> {
     tags: string[],
   ): Promise<{ ok: boolean }> {
     const s = await this.load();
-    const ap = this.findAppliance(s, id);
+    const ap = this.findService(s, id);
     if (!ap) return { ok: false };
     ap.tags = Array.isArray(tags) ? tags.map(String) : [];
     this.log(s, {
@@ -781,9 +802,9 @@ export class TenantDO extends DurableObject<Env> {
     const s = await this.load();
 
     // Validate + normalize the structured scope. Default is LEAST-PRIVILEGE:
-    // no scope (or an empty appliance list) mints a key that reaches nothing
+    // no scope (or an empty service list) mints a key that reaches nothing
     // until the operator scopes it — never a fleet-wide key by accident. Every
-    // listed appliance id MUST exist (400 on an unknown id) so a key can't carry
+    // listed service id MUST exist (400 on an unknown id) so a key can't carry
     // dangling free-text that silently grants or denies.
     const normScope = this.normalizeScope(s, scope);
     if ("error" in normScope) return { error: normScope.error };
@@ -806,21 +827,21 @@ export class TenantDO extends DurableObject<Env> {
     };
     s.keys.push(key);
 
-    // Populate the display lists (#10): attach the key's ID to every appliance
-    // it can reach (and that appliance's machines), so the per-machine /
-    // per-appliance key chips actually render — and revokeMachineKey (which now
-    // works by id) has lists to prune. {all:true} reaches every appliance.
-    const reach: StoredAppliance[] =
+    // Populate the display lists (#10): attach the key's ID to every service
+    // it can reach (and that service's boxes), so the per-box /
+    // per-service key chips actually render — and revokeBoxKey (which now
+    // works by id) has lists to prune. {all:true} reaches every service.
+    const reach: StoredService[] =
       "all" in normScope.scope && normScope.scope.all === true
-        ? s.appliances
-        : s.appliances.filter((a) =>
-            (normScope.scope as { appliances: string[] }).appliances.includes(
+        ? s.services
+        : s.services.filter((a) =>
+            (normScope.scope as { services: string[] }).services.includes(
               a.id,
             ),
           );
     for (const a of reach) {
       if (!a.keys.includes(key.id)) a.keys.push(key.id);
-      for (const m of a.machines) {
+      for (const m of a.boxes) {
         if (!m.keys.includes(key.id)) m.keys.push(key.id);
       }
     }
@@ -838,7 +859,7 @@ export class TenantDO extends DurableObject<Env> {
   }
 
   /** Validate + normalize an incoming KeyScope. {all:true} passes through; an
-   *  appliance list is filtered to existing ids (unknown id → 400). A missing or
+   *  service list is filtered to existing ids (unknown id → 400). A missing or
    *  empty scope defaults to an explicit empty allow-list (least privilege). */
   private normalizeScope(
     s: StoredState,
@@ -847,15 +868,15 @@ export class TenantDO extends DurableObject<Env> {
     if (scope && "all" in scope && scope.all === true) {
       return { scope: { all: true } };
     }
-    const ids = Array.isArray((scope as any)?.appliances)
-      ? ((scope as any).appliances as unknown[]).map(String)
+    const ids = Array.isArray((scope as any)?.services)
+      ? ((scope as any).services as unknown[]).map(String)
       : [];
-    const unknown = ids.filter((id) => !this.findAppliance(s, id));
+    const unknown = ids.filter((id) => !this.findService(s, id));
     if (unknown.length) {
       return { error: `unknown service id(s): ${unknown.join(", ")}` };
     }
     // De-dupe; least-privilege default is the explicit empty list.
-    return { scope: { appliances: Array.from(new Set(ids)) } };
+    return { scope: { services: Array.from(new Set(ids)) } };
   }
 
   /** Absolute expiry (epoch ms) for a key, from settings.keyExpiry. "never" (or
@@ -870,9 +891,9 @@ export class TenantDO extends DurableObject<Env> {
     return now + days * 24 * MS_PER_HOUR;
   }
 
-  private async revokeMachineKey(
-    appliance: string,
-    machine: string,
+  private async revokeBoxKey(
+    service: string,
+    box: string,
     key: string,
   ): Promise<{ ok: boolean }> {
     const s = await this.load();
@@ -886,14 +907,14 @@ export class TenantDO extends DurableObject<Env> {
     s.keys = s.keys.filter((k) => k.id !== key);
     let touched = s.keys.length !== before;
 
-    // Drop the id from the display lists everywhere it appears so the per-machine
-    // / per-appliance key chips stop rendering a now-dead key.
-    for (const a of s.appliances) {
+    // Drop the id from the display lists everywhere it appears so the per-box
+    // / per-service key chips stop rendering a now-dead key.
+    for (const a of s.services) {
       if (a.keys.includes(key)) {
         a.keys = a.keys.filter((k) => k !== key);
         touched = true;
       }
-      for (const m of a.machines) {
+      for (const m of a.boxes) {
         if (m.keys.includes(key)) {
           m.keys = m.keys.filter((k) => k !== key);
           touched = true;
@@ -905,7 +926,7 @@ export class TenantDO extends DurableObject<Env> {
       cat: "key",
       actor: "you",
       action: "revoked key",
-      target: `${target?.label ?? key} @ ${appliance}/${machine}`,
+      target: `${target?.label ?? key} @ ${service}/${box}`,
       ip: "",
     });
     await this.save(s);
@@ -1039,79 +1060,79 @@ export class TenantDO extends DurableObject<Env> {
     return { ok: true };
   }
 
-  /** True iff `machine` is currently registered under `appliance`. Used by the
-   *  /refresh endpoint so a machine removed from the dashboard can no longer mint
+  /** True iff `box` is currently registered under `service`. Used by the
+   *  /refresh endpoint so a box removed from the dashboard can no longer mint
    *  fresh connect-tokens — revocation takes effect within one connect-token TTL. */
-  private async machineExists(
-    appliance: unknown,
-    machine: unknown,
+  private async boxExists(
+    service: unknown,
+    box: unknown,
   ): Promise<{ exists: boolean }> {
-    if (typeof appliance !== "string" || typeof machine !== "string") {
+    if (typeof service !== "string" || typeof box !== "string") {
       return { exists: false };
     }
     const s = await this.load();
-    const ap = this.findAppliance(s, appliance);
+    const ap = this.findService(s, service);
     if (!ap) return { exists: false };
-    return { exists: ap.machines.some((m) => m.name === machine) };
+    return { exists: ap.boxes.some((m) => m.name === box) };
   }
 
-  /** Agent join: register (or refresh) a machine under an appliance. Sets the
-   *  appliance pending|chirping per settings.requireApproval. */
-  private async registerMachine(
-    appliance: string,
-    machine: string,
+  /** Agent join: register (or refresh) a box under a service. Sets the
+   *  service pending|chirping per settings.requireApproval. */
+  private async registerBox(
+    service: string,
+    box: string,
     os: string,
     version: string,
-  ): Promise<{ ok: boolean; state?: ApplianceState; error?: string }> {
-    // Validate/clamp the machine name at the DATA layer too (defense-in-depth;
+  ): Promise<{ ok: boolean; state?: ServiceState; error?: string }> {
+    // Validate/clamp the box name at the DATA layer too (defense-in-depth;
     // api.ts also clamps at the /join door). (security M1)
-    const cleaned = cleanMachineName(machine);
+    const cleaned = cleanBoxName(box);
     if (!cleaned) return { ok: false, error: "invalid box name" };
-    machine = cleaned;
+    box = cleaned;
 
     const s = await this.load();
-    let ap = this.findAppliance(s, appliance);
+    let ap = this.findService(s, service);
     if (!ap) {
-      // Join for an appliance we don't know (e.g. enrolled then evicted) —
-      // create it on the fly so the machine has a home. Cap appliances-per-tenant
+      // Join for a service we don't know (e.g. enrolled then evicted) —
+      // create it on the fly so the box has a home. Cap services-per-tenant
       // so a flood of joins to unknown ids can't grow the DO unbounded (M5).
-      if (s.appliances.length >= MAX_APPLIANCES_PER_TENANT) {
+      if (s.services.length >= MAX_SERVICES_PER_TENANT) {
         return { ok: false, error: "service limit reached for tenant" };
       }
-      ap = this.newAppliance(appliance, appliance, s.settings.defaultGroup);
-      s.appliances.push(ap);
+      ap = this.newService(service, service, s.settings.defaultGroup);
+      s.services.push(ap);
     }
     const requireApproval = s.settings.requireApproval;
-    // The state a GENUINELY NEW machine starts in.
-    const newState: ApplianceState = requireApproval ? "pending" : "chirping";
+    // The state a GENUINELY NEW box starts in.
+    const newState: ServiceState = requireApproval ? "pending" : "chirping";
     const now = Date.now();
 
-    let m = ap.machines.find((mm) => mm.name === machine);
+    let m = ap.boxes.find((mm) => mm.name === box);
     if (m) {
-      // RE-JOIN of a known machine (agent restart): refresh os/version/lastSeen
+      // RE-JOIN of a known box (agent restart): refresh os/version/lastSeen
       // but DO NOT clobber its lifecycle state. Re-stamping pending|chirping here
       // would demote an already-approved, live box back to pending on every agent
-      // restart. The only legitimate demotion is leaving "invited"; markMachine
+      // restart. The only legitimate demotion is leaving "invited"; markBox
       // owns connected↔chirping/resting transitions from here on. A still-pending
-      // machine stays pending (re-approval not retriggered).
+      // box stays pending (re-approval not retriggered).
       m.os = os;
       m.version = version;
       m.lastSeenAt = now;
       m.outdated = version !== LATEST_AGENT;
       if (m.state === "invited") m.state = newState;
     } else {
-      // Genuinely new machine. Cap machines-per-appliance (M1/M5): bound name
+      // Genuinely new box. Cap boxes-per-service (M1/M5): bound name
       // squatting + unbounded DO creation behind a single ticket.
-      if (ap.machines.length >= MAX_MACHINES_PER_APPLIANCE) {
+      if (ap.boxes.length >= MAX_BOXES_PER_SERVICE) {
         return { ok: false, error: "box limit reached for service" };
       }
       m = {
-        name: machine,
+        name: box,
         os,
         version,
         state: newState,
-        appliance: ap.id,
-        applianceLabel: ap.label,
+        service: ap.id,
+        serviceLabel: ap.label,
         keys: [],
         address: "",
         outdated: version !== LATEST_AGENT,
@@ -1122,42 +1143,42 @@ export class TenantDO extends DurableObject<Env> {
         handshakeAt: 0,
         connected: false,
       };
-      ap.machines.push(m);
+      ap.boxes.push(m);
     }
-    ap.machineCount = ap.machines.length;
-    ap.box = ap.box === "—" ? machine : ap.box;
+    ap.boxCount = ap.boxes.length;
+    ap.box = ap.box === "—" ? box : ap.box;
     ap.lastSeenAt = now;
-    // Promote the appliance out of "invited" on first real join; never demote an
-    // approved appliance back to pending on a re-join.
+    // Promote the service out of "invited" on first real join; never demote an
+    // approved service back to pending on a re-join.
     if (ap.state === "invited") ap.state = newState;
 
     this.log(s, {
       cat: "device",
-      actor: appliance,
+      actor: service,
       action: requireApproval ? "requested approval" : "joined",
-      target: machine,
+      target: box,
       ip: "",
     });
     await this.save(s);
     return { ok: true, state: m.state };
   }
 
-  /** Relay callback on WS open/close: mark a machine connected/disconnected and
-   *  recompute the appliance.state (online if any machine is connected). */
-  private async markMachine(
-    appliance: string,
-    machine: string,
+  /** Relay callback on WS open/close: mark a box connected/disconnected and
+   *  recompute the service.state (online if any box is connected). */
+  private async markBox(
+    service: string,
+    box: string,
     connected: boolean,
   ): Promise<{ ok: boolean }> {
     const s = await this.load();
-    const ap = this.findAppliance(s, appliance);
+    const ap = this.findService(s, service);
     if (!ap) return { ok: false };
-    const m = ap.machines.find((mm) => mm.name === machine);
+    const m = ap.boxes.find((mm) => mm.name === box);
     if (!m) return { ok: false };
     const now = Date.now();
     m.connected = connected;
-    // markMachine is the SOLE authority for connected↔chirping/resting. Don't
-    // override a pending (unapproved) machine's lifecycle state.
+    // markBox is the SOLE authority for connected↔chirping/resting. Don't
+    // override a pending (unapproved) box's lifecycle state.
     if (m.state !== "pending") {
       m.state = connected ? "chirping" : "resting";
     }
@@ -1166,7 +1187,7 @@ export class TenantDO extends DurableObject<Env> {
       m.handshakeAt = now;
     }
 
-    const anyConnected = ap.machines.some((mm) => mm.connected);
+    const anyConnected = ap.boxes.some((mm) => mm.connected);
     if (ap.state !== "pending" && ap.state !== "invited") {
       ap.state = anyConnected ? "chirping" : "resting";
     }
@@ -1174,9 +1195,9 @@ export class TenantDO extends DurableObject<Env> {
 
     this.log(s, {
       cat: "device",
-      actor: appliance,
+      actor: service,
       action: connected ? "started chirping" : "went resting",
-      target: machine,
+      target: box,
       ip: "",
     });
     await this.save(s);
@@ -1186,21 +1207,21 @@ export class TenantDO extends DurableObject<Env> {
   /** Relay callback per proxied request: bump counters, roll p50/p95/err, push
    *  a capped recentCall, bump the current traffic24h bucket, append a log. */
   private async recordCall(
-    appliance: string,
-    machine: string,
+    service: string,
+    box: string,
     status: number,
     ms: number,
     caller: string,
     route: string,
   ): Promise<{ ok: boolean }> {
     const s = await this.load();
-    const ap = this.findAppliance(s, appliance);
+    const ap = this.findService(s, service);
     if (!ap) return { ok: false };
 
     ap.calls += 1;
 
     // Rolling latency/error window (in-memory samples, durable counters).
-    const skey = `${appliance}:${machine}`;
+    const skey = `${service}:${box}`;
     const arr = this.samples.get(skey) ?? [];
     arr.push({ ms, ok: status < 400 });
     if (arr.length > ROLL_WINDOW) arr.shift();
@@ -1221,8 +1242,8 @@ export class TenantDO extends DurableObject<Env> {
 
     const now = Date.now();
 
-    // Per-route metric also reflected on the machine, if present.
-    const m = ap.machines.find((mm) => mm.name === machine);
+    // Per-route metric also reflected on the box, if present.
+    const m = ap.boxes.find((mm) => mm.name === box);
     if (m) m.lastSeenAt = now;
 
     const call: RecentCall = {
@@ -1263,7 +1284,7 @@ export class TenantDO extends DurableObject<Env> {
       cat: "request",
       actor: caller,
       action: "called",
-      target: `${appliance} ${route}`,
+      target: `${service} ${route}`,
       ip: "",
       result: status,
     });
@@ -1273,15 +1294,15 @@ export class TenantDO extends DurableObject<Env> {
 
   // ---- key check + ACL evaluation (MCP router) ---------------------------
 
-  /** Given the sha-256 hash of a presented finch_ key and the target appliance,
+  /** Given the sha-256 hash of a presented finch_ key and the target service,
    *  decide if the call is allowed. TWO gates, BOTH must pass (default-deny):
    *
-   *   1. KEY SCOPE — the key's scope must be "all appliances"/"*" or list the
-   *      appliance id (the existing per-key coarse gate, kept as a floor).
+   *   1. KEY SCOPE — the key's scope must be "all services"/"*" or list the
+   *      service id (the existing per-key coarse gate, kept as a floor).
    *   2. ACL — the tenant's acl rules must contain at least one `allow` rule
    *      whose src matches this key's identity (key label/id, the key owner as a
    *      user, or a group the owner/key belongs to) AND whose dst matches the
-   *      target appliance (by appliance id, one of its tags, its group, or
+   *      target service (by service id, one of its tags, its group, or
    *      `all`). An owner/admin "allow all" rule is honored. No matching allow
    *      rule → denied. This is the "enforced at the door" promise made real.
    *
@@ -1289,7 +1310,7 @@ export class TenantDO extends DurableObject<Env> {
    *  denial (so the relay can return a precise 403). */
   private async checkKey(
     hash: string,
-    appliance: string,
+    service: string,
   ): Promise<{
     allowed: boolean;
     keyLabel: string;
@@ -1298,12 +1319,12 @@ export class TenantDO extends DurableObject<Env> {
   }> {
     const s = await this.load();
 
-    // Gate −1: PUBLIC appliance. A public appliance (an ngrok-style open webpage)
+    // Gate −1: PUBLIC service. A public service (an ngrok-style open webpage)
     // needs no finch_ key — allow regardless of what (if anything) was presented,
     // BEFORE the key lookup so a missing/empty hash still passes. `public:true`
     // tells the relay to label the caller "public" and skip the bearer 401.
     // (auth defaults to "key" when the field is absent → fail-closed.)
-    const ap = this.findAppliance(s, appliance);
+    const ap = this.findService(s, service);
     if (ap && ap.auth === "public") {
       return { allowed: true, keyLabel: "public", public: true };
     }
@@ -1322,20 +1343,20 @@ export class TenantDO extends DurableObject<Env> {
       return { allowed: false, keyLabel: key.label, reason: "expired" };
     }
 
-    // Gate 1: key scope (structured — {all:true} or an explicit appliance list).
+    // Gate 1: key scope (structured — {all:true} or an explicit service list).
     const scope = key.scope;
     const scopeOk =
       !!scope &&
       ("all" in scope && scope.all === true
         ? true
-        : Array.isArray((scope as any).appliances) &&
-          (scope as any).appliances.includes(appliance));
+        : Array.isArray((scope as any).services) &&
+          (scope as any).services.includes(service));
     if (!scopeOk) {
       return { allowed: false, keyLabel: key.label, reason: "scope" };
     }
 
     // Gate 2: ACL evaluation (default-deny).
-    const aclOk = this.evalAccess(s, key, appliance);
+    const aclOk = this.evalAccess(s, key, service);
     if (!aclOk) {
       return { allowed: false, keyLabel: key.label, reason: "acl" };
     }
@@ -1343,17 +1364,17 @@ export class TenantDO extends DurableObject<Env> {
     return { allowed: true, keyLabel: key.label };
   }
 
-  /** Evaluate the tenant's ACL rules for a key reaching an appliance.
+  /** Evaluate the tenant's ACL rules for a key reaching a service.
    *  Default-deny: returns true iff at least one `allow` rule's src matches the
-   *  key's identity AND its dst matches the target appliance. */
-  private evalAccess(s: StoredState, key: Key, appliance: string): boolean {
-    const ap = this.findAppliance(s, appliance);
+   *  key's identity AND its dst matches the target service. */
+  private evalAccess(s: StoredState, key: Key, service: string): boolean {
+    const ap = this.findService(s, service);
     if (!ap) return false;
 
     // The identities this key presents as a rule SOURCE.
     const ident = this.keyIdentities(s, key);
 
-    // The descriptors this appliance matches as a rule DESTINATION.
+    // The descriptors this service matches as a rule DESTINATION.
     const apTags = new Set((ap.tags || []).map((t) => t.toLowerCase()));
     const apGroup = (ap.group || "").toLowerCase();
     const apId = (ap.id || "").toLowerCase();
@@ -1365,7 +1386,7 @@ export class TenantDO extends DurableObject<Env> {
       for (const d of dsts) {
         if (d.type === "all") return true;
         const dn = (d.name || "").toLowerCase();
-        if (d.type === "appliance" && dn === apId) return true;
+        if (d.type === "service" && dn === apId) return true;
         if (d.type === "tag" && apTags.has(dn)) return true;
         if (d.type === "group" && dn === apGroup) return true;
       }

@@ -1,7 +1,7 @@
 /// <reference types="@cloudflare/workers-types" />
 //
 // RELAY v2 FRAME CONTRACT (FROZEN) — the TypeScript side of the wire shapes the
-// ApplianceDO (WS server) and the Go agent (WS client) exchange over the single
+// BoxDO (WS server) and the Go agent (WS client) exchange over the single
 // hibernatable WebSocket. One WS message = one frame = one JSON object, UTF-8.
 //
 // The canonical fixture is worker/test/relay-vectors.json; both this codec and

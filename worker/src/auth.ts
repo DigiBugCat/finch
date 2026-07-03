@@ -73,26 +73,26 @@ export function last4(plaintext: string): string {
 
 export interface TicketPayload {
   tenant: string;
-  // `appliance` is required for the agent-channel grants (join/connect/refresh)
+  // `service` is required for the agent-channel grants (join/connect/refresh)
   // but ABSENT on the browser login-wall grants (portal/session), which are
-  // scoped to a slug-host, not a single appliance. Optional at the type level;
+  // scoped to a slug-host, not a single service. Optional at the type level;
   // verifyToken still requires it for the agent kinds via its shape validator.
-  appliance?: string;
+  service?: string;
   exp: number; // epoch SECONDS; verifyToken rejects once Date.now()/1000 > exp
   // `kind` distinguishes the HMAC grants that share this signer:
   //   - "join"    (or absent) — the short, single-use enroll ticket presented at
   //                 POST /join. Burned (jti) on first use.
-  //   - "refresh" — the long-lived (~30d) per-machine credential handed back at
+  //   - "refresh" — the long-lived (~30d) per-box credential handed back at
   //                 /join. The agent persists it in memory and presents it at
   //                 POST /refresh to mint fresh connect-tokens, so steady-state
   //                 reconnection never re-uses the one-shot join ticket.
-  //   - "connect" — the short-lived (~120s) per-machine grant the agent presents
-  //                 on the /_connect WS dial (?ct=…). Bound to a single machine.
+  //   - "connect" — the short-lived (~120s) per-box grant the agent presents
+  //                 on the /_connect WS dial (?ct=…). Bound to a single box.
   //   - "portal"  — the short-lived (~60s), SINGLE-USE (jti) hand-off the hub
   //                 mints (POST /api/portal-grant) for a Clerk-authed browser. The
   //                 browser carries it to GET /__finch/cb on the slug host, which
   //                 burns the jti and sets the long-lived session cookie. Scoped
-  //                 to {tenant,slug,userId}, NOT an appliance.
+  //                 to {tenant,slug,userId}, NOT a service.
   //   - "session" — the long-lived (~12h) browser login-wall cookie minted at
   //                 /__finch/cb. Signed with the SEPARATE SESSION_SECRET (see
   //                 signSession/verifySession) so a leaked session signer can't
@@ -100,12 +100,12 @@ export interface TicketPayload {
   //                 epoch}; browserGate checks epoch === the tenant's current
   //                 sessionEpoch so "sign everyone out" invalidates live cookies.
   kind?: "join" | "connect" | "refresh" | "portal" | "session";
-  machine?: string; // present (and verified) for kind:"connect"|"refresh" tokens
+  box?: string; // present (and verified) for kind:"connect"|"refresh" tokens
   // The routing host key a portal/session grant is bound to. For legacy
   // <slug>.finchmcp.com hosts this is the bare slug; for custom hostnames it is
   // the full lowercase hostname. The field stays named `slug` for wire compat.
   // Present (and verified) ONLY for kind:"portal"|"session"; the agent kinds
-  // bind an appliance instead. Ties the browser grant to a single host.
+  // bind a service instead. Ties the browser grant to a single host.
   slug?: string;
   // The Clerk user id the portal/session grant was minted for (login-wall audit /
   // identity). Present for kind:"portal"|"session".
@@ -119,7 +119,7 @@ export interface TicketPayload {
   // be reused for its whole TTL. Also carried on a kind:"portal" grant: the slug
   // host's /__finch/cb burns it (claimTicket) so a captured portal grant can't be
   // replayed to mint a second session. Connect tokens don't carry one (they're
-  // already bound to a single machine + a ~120s window and are dialed repeatedly).
+  // already bound to a single box + a ~120s window and are dialed repeatedly).
   jti?: string;
 }
 
@@ -207,8 +207,8 @@ export function signToken(
  *  (TICKET_SECRET grants: join/connect/refresh/portal) and verifySession
  *  (SESSION_SECRET grants: session) — they ride the same envelope and payload
  *  shape, differing only in the SECRET they were signed with. The browser kinds
- *  (portal/session) carry {slug,userId} and NO appliance; the agent kinds carry
- *  an appliance and NO slug. We enforce kind ∈ the known set, require `appliance`
+ *  (portal/session) carry {slug,userId} and NO service; the agent kinds carry
+ *  a service and NO slug. We enforce kind ∈ the known set, require `service`
  *  for the agent kinds, and type-check the optional fields; the per-callsite
  *  predicate (e.g. _connect's kind==="connect" check) does the rest. */
 function validateTicket(p: any): TicketPayload | null {
@@ -223,12 +223,12 @@ function validateTicket(p: any): TicketPayload | null {
     kind === "session";
   if (!knownKind) return null;
   // The agent-channel grants (join/connect/refresh, and the legacy undefined
-  // kind) are appliance-scoped — `appliance` MUST be a string. The browser grants
-  // (portal/session) are slug-scoped and carry no appliance.
+  // kind) are service-scoped — `service` MUST be a string. The browser grants
+  // (portal/session) are slug-scoped and carry no service.
   const isBrowserKind = kind === "portal" || kind === "session";
-  if (!isBrowserKind && typeof p.appliance !== "string") return null;
-  if (p.appliance !== undefined && typeof p.appliance !== "string") return null;
-  if (p.machine !== undefined && typeof p.machine !== "string") return null;
+  if (!isBrowserKind && typeof p.service !== "string") return null;
+  if (p.service !== undefined && typeof p.service !== "string") return null;
+  if (p.box !== undefined && typeof p.box !== "string") return null;
   if (p.slug !== undefined && typeof p.slug !== "string") return null;
   if (p.userId !== undefined && typeof p.userId !== "string") return null;
   if (p.epoch !== undefined && typeof p.epoch !== "number") return null;
