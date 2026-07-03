@@ -640,14 +640,20 @@ export class TenantDO extends DurableObject<Env> {
     }
     // First enroll for a tenant that hasn't chosen a subdomain: claim a default
     // slug (derived from the tenant id) and register it in the RouterDO so the
-    // public relay URL resolves. Best-effort; if the default slug collides with
-    // another tenant we leave the subdomain blank (the tenant can pick one).
+    // public relay URL resolves. If the base slug collides (two tenant ids that
+    // slugify identically — e.g. differing only in punctuation/case), retry with
+    // a numeric suffix so every tenant still gets a working default host rather
+    // than being silently left with no public URL. Bounded so a pathological
+    // collision run can't loop forever; if even that fails the tenant picks one.
     if (!s.settings.subdomain) {
-      const slug = this.slugify(this.tenantId(), "tenant");
-      const claimed = await this.registerSlug(slug);
-      if (claimed) {
-        s.settings.subdomain = slug;
-        s.host = `${slug}.finchmcp.com`;
+      const base = this.slugify(this.tenantId(), "tenant");
+      for (let n = 0; n < 20; n++) {
+        const slug = n === 0 ? base : `${base}-${n + 1}`;
+        if (await this.registerSlug(slug)) {
+          s.settings.subdomain = slug;
+          s.host = `${slug}.finchmcp.com`;
+          break;
+        }
       }
     }
     this.log(s, {
