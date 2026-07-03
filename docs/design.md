@@ -2,7 +2,10 @@
 
 > Spun out of the `cassandra-tits` appliance kit (2026-06-13). Finch is the
 > standalone, self-ownable productization: an opinionated, batteries-included
-> way to host MCP appliances on infrastructure you own.
+> way to host MCP services on infrastructure you own.
+
+User-facing terms map to the protocol names this repo still uses on the wire:
+**service** = `appliance`, and **box** = `machine`.
 
 ## Thesis
 
@@ -10,7 +13,7 @@ The components of "host an MCP server on a box you own, behind auth" are all
 commodities. The **opinions** are the product. Nobody has made an opinionated,
 batteries-included way to ship an MCP capability — write the tool logic in a
 folder, run it, and it's authed, public, identity-aware, supervised, and
-discoverable for free. "Rails/Vercel for MCP appliances."
+discoverable for free. "Rails/Vercel for MCP services."
 
 This is not a new category — it's porting a proven category (sovereign app
 bundles + an auth proxy: Sandstorm, YunoHost, Nabu Casa, Balena) to the
@@ -24,7 +27,7 @@ surface.
 | Transport (outbound agent + DO/WS + hibernation) | Wormhole, WorksLocal, cloudflared, ngrok | Commodity. Our relay is small and ours, but the idea is borrowed, not invented. |
 | MCP-over-tunnel (vendor) | OpenAI Secure MCP Tunnels, Anthropic MCP Tunnels | Don't adopt: vendor-locked (consumable only by that one model) **and still make you do your own MCP auth.** |
 | Auth + appliance bundles | Sandstorm (grains behind an auth proxy), YunoHost (manifest declares SSO), Nabu Casa (open appliance + paid cloud), Balena | Steal the patterns — proven and mature. |
-| **MCP-native + agent-auth + vendor-neutral hub + appliance fleet** | — | **The open slice. This is finch.** |
+| **MCP-native + agent-auth + vendor-neutral hub + service fleet** | — | **The open slice. This is finch.** |
 
 Lineage note: Sandstorm's "auth proxy in front of capability bundles" was built
 by Kenton Varda, who then built Cloudflare Workers + Durable Objects. The modern
@@ -38,7 +41,7 @@ MCP client ──HTTPS (streamable-http)──▶ Worker (finchmcp.com/<id>/mcp)
                                           │ Clerk auth + finch_ key + ACL
                                           │ inject X-Finch-User; route by <id>
                                           ▼
-                                        Durable Object (one per appliance)
+                                        Durable Object (one per service)
                                           ▲ hibernatable outbound WS
                                    ───────┘ (agent dialed OUT)
                                           │
@@ -60,15 +63,15 @@ Clerk fits a self-serve indie developer product better than WorkOS
 (enterprise-SSO-first): better DX, generous free tier, drop-in OAuth + UI, and
 MCP/OAuth support. Two credential types:
 - **Clerk** — owner/human identity, dashboard login, OAuth for agent clients.
-- **`finch_` keys** — agent/tool-call auth minted per appliance (hashed at rest).
+- **`finch_` keys** — agent/tool-call auth minted per service (hashed at rest).
 
-The Worker terminates both at the edge and injects `X-Finch-User`. The appliance
+The Worker terminates both at the edge and injects `X-Finch-User`. The service
 app authenticates nothing — it reads the header (Sandstorm's "auth at the
 proxy" lesson).
 
 ## Cost model (Cloudflare, with hibernation)
 
-- **Idle fleet** (appliances connected, no clients): DOs hibernate → ~$0, just
+- **Idle fleet** (services connected, no clients): DOs hibernate → ~$0, just
   the $5/mo Workers Paid floor.
 - **Per request/response tool call**: sub-microcent; millions/month fit inside
   free tiers (10M Worker req, 1M DO req, 400k GB-s).
@@ -92,14 +95,14 @@ proxy" lesson).
 ## Roadmap
 
 1. ✅ Request/response relay end-to-end (Worker DO ↔ agent ↔ local server), hibernation-correct, **streaming**.
-2. ✅ Appliance registry (TenantDO): id → owner, `finch_` key hashes, online state.
+2. ✅ Service registry (TenantDO): id → owner, `finch_` key hashes, online state.
 3. ✅ Clerk auth + `finch_` key check at the edge. (Edge `X-Finch-User` injection: still planned.)
-4. ✅ `finch` CLI: `login` (browser device-auth) / `add` / `run` / `approve`; CLI tokens; one-paste install.
-5. ✅ Manifest runtime (`finch.toml` — one process fronts many local servers as separate appliances, cloudflared-style ingress).
+4. ✅ `finch` CLI: `login` (browser approval) / `add` / `run` / `approve`; CLI tokens; one-paste install.
+5. ✅ Manifest runtime (`finch.toml` — one process fronts many local servers as separate services, cloudflared-style ingress).
 6. ✅ Dashboard (fleet, keys, settings, audit log, "test in chat").
 7. Bind `finchmcp.com` zone + production deploy.
 
 **Optional / later (not blocking):** a stdio↔Streamable-HTTP bridge (host
 stdio MCP servers; today `service` is an HTTP URL). **Out of scope by choice:**
-load balancing / multi-machine session affinity — an appliance is served by one
+load balancing / multi-box session affinity — a service is served by one
 box; finch is not a load-balancer.

@@ -249,7 +249,7 @@ export default function DashboardApp() {
             )}
             {view === "detail" && !current && (
               <div className="view"><button className="backlink" onClick={() => go("overview")}>← Fleet</button>
-                <Card><p className="dim" style={{ padding: 20 }}>This appliance has left the roost.</p></Card></div>
+                <Card><p className="dim" style={{ padding: 20 }}>This service has left the roost.</p></Card></div>
             )}
             {view === "enroll" && (
               <EnrollView host={host} existingIds={appliances.map((a: any) => a.id)} groups={groups.map((g: any) => g.name)} onEnrolled={enrollDevice} onWatch={() => go("overview")} />

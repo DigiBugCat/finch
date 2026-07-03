@@ -22,7 +22,7 @@ export function UsersView({ users, onInvite, onRole, onRemove }: any) {
   return (
     <div className="view">
       <h1 className="page-title">Users <span className="admin-badge">admin</span></h1>
-      <p className="page-lede">Everyone in your tenant. Roles decide who can approve devices, edit access rules, and manage keys.</p>
+      <p className="page-lede">Everyone in your tenant. Roles decide who can approve boxes, edit access rules, and manage keys.</p>
 
       <Card className="invite-card">
         <SectionLabel hint="they'll get an email to join this tenant">invite a teammate</SectionLabel>
@@ -40,7 +40,7 @@ export function UsersView({ users, onInvite, onRole, onRemove }: any) {
 
       <Card className="table-card">
         <div className="urow urow-head">
-          <span>user</span><span>role</span><span>devices</span><span>last active</span><span></span>
+          <span>user</span><span>role</span><span>boxes</span><span>last active</span><span></span>
         </div>
         {users.map((u: any) => (
           <div key={u.id} className="urow">

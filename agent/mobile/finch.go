@@ -101,8 +101,8 @@ func (s *Service) emit(state, detail string) {
 }
 
 // Enroll trades a one-shot dashboard ticket for a saved refresh credential at
-// CredentialPath. Call it once per device (the ticket is minted in the dashboard
-// under "Add device"). Synchronous — returns a non-nil error for a bad/expired
+// CredentialPath. Call it once per box (the ticket is minted in the dashboard
+// under "Add box"). Synchronous — returns a non-nil error for a bad/expired
 // ticket or an unwritable CredentialPath, so the app can show it immediately.
 func (s *Service) Enroll(ticket string) error {
 	o := s.opts()

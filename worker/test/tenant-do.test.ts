@@ -222,7 +222,7 @@ describe("TenantDO.checkKey — scope gate (structured)", () => {
     expect(r.allowed).toBe(true);
   });
 
-  it("rejects minting a key scoped to an UNKNOWN appliance id (400)", async () => {
+  it("rejects minting a key scoped to an UNKNOWN service id (400)", async () => {
     const t = freshTenant();
     await op(t, "enroll", { name: "Scraper" });
     const r = await op<{ error?: string; plaintext?: string }>(t, "mintKey", {
@@ -230,12 +230,12 @@ describe("TenantDO.checkKey — scope gate (structured)", () => {
       scope: { appliances: ["ghost"] },
     });
     expect(r.plaintext).toBeUndefined();
-    expect(r.error).toMatch(/unknown appliance/i);
+    expect(r.error).toMatch(/unknown service/i);
   });
 });
 
 describe("TenantDO.evalAccess — ACL matrix (default-deny)", () => {
-  // To isolate the ACL gate we always mint with scope "all appliances" (scope
+  // To isolate the ACL gate we always mint with scope "all services" (scope
   // passes) and a non-owner owner so the seeded owner rule (user:you) does NOT
   // auto-allow. Then we add specific allow rules and assert allow/deny.
   const ALICE = "alice";

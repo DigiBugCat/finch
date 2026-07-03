@@ -165,7 +165,7 @@ export function TagList({ tags, onRemove }: any) {
 export function EntityChip({ ent }: any) {
   const map: any = {
     user: ["👤", ent.name], group: ["👥", ent.name], key: ["🔑", ent.name],
-    tag: ["", "tag:" + ent.name], appliance: ["🐦", ent.name], all: ["🌐", "all appliances"],
+    tag: ["", "tag:" + ent.name], appliance: ["🐦", ent.name], all: ["🌐", "all services"],
   };
   const [ic, label] = map[ent.type] || ["", ent.name];
   return (

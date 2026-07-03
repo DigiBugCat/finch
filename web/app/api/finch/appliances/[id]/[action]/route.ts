@@ -12,7 +12,7 @@ export async function POST(
     await requireAdmin();
     const { id, action } = await params;
     if (!ACTIONS.has(action)) {
-      throw new HttpError(404, `unknown appliance action: ${action}`);
+      throw new HttpError(404, `unknown service action: ${action}`);
     }
     return await hubProxy(
       `/api/appliances/${encodeURIComponent(id)}/${action}`,

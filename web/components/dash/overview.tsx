@@ -72,20 +72,20 @@ export function FleetView({ appliances, machines, overview, host, groups, onOpen
       <div className="fleet-header">
         <div>
           <h1 className="page-title">Fleet</h1>
-          <p className="page-lede">All your appliances, organized into groups. Switch to <b>Machines</b> for the box-level view.</p>
+          <p className="page-lede">All your services, organized into groups. Switch to <b>Boxes</b> for the box-level view.</p>
         </div>
-        <Button kind="accent" onClick={onAddDevice}>＋ Add device</Button>
+        <Button kind="accent" onClick={onAddDevice}>＋ Add box</Button>
       </div>
 
       {/* lens toggle */}
       <div className="lens-bar">
         <div className="seg lens-seg">
-          {[["appliances", "Appliances"], ["machines", "Machines"]].map(([k, l]) => (
+          {[["appliances", "Services"], ["machines", "Boxes"]].map(([k, l]) => (
             <button key={k} className={`seg-btn ${lens === k ? "seg-on" : ""}`} onClick={() => setLens(k)}>{l}</button>
           ))}
         </div>
         <span className="lens-count dim">
-          {lens === "appliances" ? `${appliances.length} appliances` : `${machines.length} machines`}
+          {lens === "appliances" ? `${appliances.length} services` : `${machines.length} boxes`}
         </span>
       </div>
 
@@ -93,7 +93,7 @@ export function FleetView({ appliances, machines, overview, host, groups, onOpen
       <div className="fleet-search">
         <span className="si">🔍</span>
         <input value={search} onChange={(e) => setSearch(e.target.value)}
-          placeholder={lens === "appliances" ? "Search by name, owner, group, tag…" : "Search by machine, OS, appliance, address…"}
+          placeholder={lens === "appliances" ? "Search by name, owner, group, tag…" : "Search by box, OS, service, address…"}
           spellCheck={false} autoCapitalize="off" autoCorrect="off" />
         {search && <button className="clr" onClick={() => setSearch("")} title="Clear">✕</button>}
       </div>
@@ -121,7 +121,7 @@ export function FleetView({ appliances, machines, overview, host, groups, onOpen
           </div>
 
           <div className="fleet-toolbar">
-            <span className="fleet-count">{shownA} {shownA === 1 ? "appliance" : "appliances"}{q ? <> matching “<b>{search}</b>”</> : null}</span>
+            <span className="fleet-count">{shownA} {shownA === 1 ? "service" : "services"}{q ? <> matching “<b>{search}</b>”</> : null}</span>
             <div className="seg">
               {["table", "cards", "compact"].map((l) => (
                 <button key={l} className={`seg-btn ${layout === l ? "seg-on" : ""}`} onClick={() => setLayout(l)}>{l}</button>
@@ -139,7 +139,7 @@ export function FleetView({ appliances, machines, overview, host, groups, onOpen
                   {list.length
                     ? renderRows(list)
                     : <Card className="group-empty">
-                        <div className="dim">{q ? "No matches in this group." : "No appliances in this group yet."}</div>
+                        <div className="dim">{q ? "No matches in this group." : "No services in this group yet."}</div>
                         {!q && <Button kind="ghost" size="md" onClick={onAddDevice}>＋ Add one</Button>}
                       </Card>}
                 </div>

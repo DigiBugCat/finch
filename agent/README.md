@@ -1,6 +1,6 @@
 # finch agent (`agent/`)
 
-The box-side daemon. It runs on any always-on machine (Mac mini, Raspberry Pi,
+The box-side daemon. It runs on any always-on box (Mac mini, Raspberry Pi,
 old laptop), **dials out** to the finch hub over a single WebSocket, and relays
 each request the hub sends down to your local service(s). finch is a
 protocol-agnostic tunnel — the service can be an MCP server, a website, or any
@@ -10,18 +10,18 @@ A single Go binary with a few subcommands:
 
 | Command | What it does |
 |---|---|
-| `finch login` | Log in to your tenant via the browser (device-auth, like `gh auth login`). |
-| `finch add <app_path> --service <url>` | Enroll an appliance and append an `ingress` rule to `finch.yml`. |
+| `finch login` | Log in to your tenant via the browser (like `gh auth login`). |
+| `finch add <app_path> --service <url>` | Enroll a service and append an `ingress` rule to `finch.yml`. |
 | `finch enroll <app_path> --ticket <t>` | Save a box-side credential from a dashboard ticket (one time; no CLI login needed). |
 | `finch run` | Serve every rule in `finch.yml` — dials out, auto-approves, holds the relay open. |
 | `finch status` | Am I logged in (which tenant)? What does `finch.yml` serve? |
-| `finch fleet` (alias `ls`) | List this account's appliances + state. |
-| `finch test <appliance>` | List an appliance's MCP tools (does-it-work check). |
+| `finch fleet` (alias `ls`) | List this account's services + state. |
+| `finch test <appliance>` | List a service's MCP tools (does-it-work check). |
 | `finch call <appliance> <tool> [--args '{…}']` | Invoke one tool through the hub. |
 | `finch keys [list \| mint <label> --appliance <id> \| revoke <id>]` | Manage the client `finch_` keys callers present (grant + revoke access). |
 | `finch token` | Mint a fresh CLI token — provision a new box with no browser. |
-| `finch approve <path>` | Approve an appliance (clear the pending gate). Usually automatic. |
-| `finch rm <appliance>` | Remove an appliance. |
+| `finch approve <path>` | Approve a service (clear the pending gate). Usually automatic. |
+| `finch rm <appliance>` | Remove a service. |
 | `finch revoke-tokens` | De-authorize every CLI login (including this box). |
 | `finch join --ticket … --upstream …` | Legacy single-service mode straight from flags (no config file). |
 | `finch help` | Command overview, first-time setup, and the **agent/automation** guide. |
@@ -41,7 +41,7 @@ ssh user@newbox "finch add api --service http://127.0.0.1:9000 && finch run"
 
 `finch token` mints a fresh, epoch-bound CLI token (revocable via `finch
 revoke-tokens` or the dashboard). The human approval only exists for your very
-first box; after that every device is a scripted one-liner.
+first box; after that every box is a scripted one-liner.
 
 ## Quick start (the modern flow)
 
@@ -53,7 +53,7 @@ go build -o finch .
 ./finch login --hub https://finchmcp.com
 #   → opens https://<hub>/cli?code=WXYZ-1234 ; click "Approve" ; done.
 
-# 3. expose a local service (running on :8000) as the appliance "printer"
+# 3. expose a local service (running on :8000) as the service "printer"
 ./finch add printer --service http://127.0.0.1:8000
 
 # 4. serve it — prints the public URL, e.g. https://<slug>.finchmcp.com/printer/
@@ -65,7 +65,7 @@ services with more `finch add` calls — one process fronts them all.
 
 ## `finch.yml` — the manifest (cloudflared-style)
 
-One `finch run` serves many local services, each as its own appliance, over one
+One `finch run` serves many local services, each as its own service, over one
 outbound link. The manifest holds **no secrets** — it's a pure wiring table of
 `app_path → service`. See [`finch.example.yml`](finch.example.yml).
 
@@ -76,7 +76,7 @@ credentials-dir: ~/.finch        # where `finch enroll` writes per-app credentia
 
 # Each rule forwards one local service.
 #   app_path → the public URL segment: https://<your-slug>.finchmcp.com/<app_path>/
-#              (and the appliance name in the dashboard). By default finch forwards
+#              (and the service name in the dashboard). By default finch forwards
 #              only …/<app_path>/mcp (it's an MCP tunnel first). Set forward_all: true
 #              (or point service at a base path) to forward the whole subtree — for a
 #              website or any non-MCP HTTP app.
@@ -102,13 +102,13 @@ ticket is ever needed again.
   days) to `~/.finch/cli.json` (`0600`). You can also paste one directly:
   `finch login --hub <hub> <token>` (mint it in the dashboard → **Settings →
   CLI access → Generate**). The browser flow is the easy path.
-- **`finch add`** uses that token to enroll appliances — no dashboard tickets to
+- **`finch add`** uses that token to enroll services — no dashboard tickets to
   copy.
-- **`finch run`** holds the relay open and **auto-approves** the appliances it
+- **`finch run`** holds the relay open and **auto-approves** the services it
   serves when you're logged in (the CLI-token holder is the tenant admin), so
   there's no separate dashboard approval step. If you're not logged in (e.g. a
   ticket-only box), approve in the dashboard or with `finch approve <app_path>`.
-- Per-appliance **refresh credentials** live under `credentials-dir/` and survive
+- Per-service **refresh credentials** live under `credentials-dir/` and survive
   restarts/reboots — "authenticate once", like ngrok's authtoken.
 
 ## Legacy single-service mode
@@ -119,7 +119,7 @@ For one server straight from flags, without a config file:
 finch join --hub https://finchmcp.com --ticket <ticket> --upstream http://127.0.0.1:8000
 ```
 
-`--ticket` is a one-shot enrollment ticket from the dashboard ("Add device").
+`--ticket` is a one-shot enrollment ticket from the dashboard ("Add box").
 After first join, the agent resumes from `--state` (default `~/.finch/agent.json`)
 ticketless.
 
@@ -132,7 +132,7 @@ ticketless.
 | `--ticket` | — | one-shot enrollment ticket (first run, single-service mode) |
 | `--machine` | hostname | this box's name |
 | `--upstream` | `http://127.0.0.1:8000` | local service (single-service mode) |
-| `--state` | `~/.finch/agent.json` | persisted per-machine refresh credential |
+| `--state` | `~/.finch/agent.json` | persisted per-box refresh credential |
 | `--forward-all` | off | forward the whole loopback host, not just `/mcp` (single-service mode) |
 
 ## How it relays

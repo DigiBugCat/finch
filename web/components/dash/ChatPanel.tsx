@@ -51,7 +51,7 @@ export function ChatPanel({ appliance, online }: { appliance: string; online: bo
 
   return (
     <Card className="connect-card chatd-card">
-      <SectionLabel hint="ask an LLM to use this appliance's tools — a live check it works">test in chat</SectionLabel>
+      <SectionLabel hint="ask an LLM to use this service's tools — a live check it works">test in chat</SectionLabel>
 
       {!online ? (
         <div className="url-pending mono big-pending">🌙 resting — start the box to chat with its tools.</div>

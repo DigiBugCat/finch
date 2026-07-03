@@ -198,7 +198,7 @@ export class ApplianceDO extends DurableObject<Env> {
       // mark this machine offline so the next pick excludes it. (code-review #12)
       return json(
         503,
-        { error: "appliance offline", id: parts[0] },
+        { error: "service offline", id: parts[0] },
         { "X-Finch-Offline": "1" },
       );
     }
@@ -210,7 +210,7 @@ export class ApplianceDO extends DurableObject<Env> {
     if (this.streams.size >= MAX_STREAMS_PER_MACHINE) {
       return json(
         429,
-        { error: "too many concurrent requests for this machine" },
+        { error: "too many concurrent requests for this box" },
         { "retry-after": "1" },
       );
     }
@@ -549,7 +549,7 @@ export class ApplianceDO extends DurableObject<Env> {
     // A dead link must NOT leave in-flight callers hanging — reset ALL in-flight
     // streams now (error their readables / resolve pending heads 502) so they
     // unblock immediately.
-    this.resetAll("appliance link closed");
+    this.resetAll("service link closed");
     // Code 1012 means we superseded this socket with a fresh agent connection
     // (single-agent eviction above). The newer socket is the live one, so do NOT
     // mark the machine offline — that would flap a connected machine to offline.
@@ -565,7 +565,7 @@ export class ApplianceDO extends DurableObject<Env> {
   async webSocketError(ws: WebSocket, _error: unknown) {
     // Agent link errored — reset all in-flight streams fast and flag the machine
     // offline.
-    this.resetAll("appliance link errored");
+    this.resetAll("service link errored");
     const meta = ws.deserializeAttachment() as SockMeta | null;
     if (meta) await this.markMachine(meta, false);
   }

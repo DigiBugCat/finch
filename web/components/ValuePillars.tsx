@@ -11,7 +11,7 @@ export default function ValuePillars() {
           <div className="pillar">
             <div className="pillar-ic">🐦</div>
             <h3>Wake a box, keep it perched</h3>
-            <p>Point Finch at any always-on machine. It installs as a service, survives reboots, and re-homes itself on its own — so the perch is there whenever an agent calls.</p>
+            <p>Point Finch at any always-on box. It installs as a service, survives reboots, and re-homes itself on its own — so the perch is there whenever an agent calls.</p>
           </div>
           <div className="pillar">
             <div className="pillar-ic">🔗</div>

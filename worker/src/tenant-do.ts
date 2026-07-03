@@ -737,7 +737,7 @@ export class TenantDO extends DurableObject<Env> {
     }
     const s = await this.load();
     const ap = this.findAppliance(s, id);
-    if (!ap) return { ok: false, error: "unknown appliance" };
+    if (!ap) return { ok: false, error: "unknown service" };
     ap.auth = mode;
     this.log(s, {
       cat: "device",
@@ -852,7 +852,7 @@ export class TenantDO extends DurableObject<Env> {
       : [];
     const unknown = ids.filter((id) => !this.findAppliance(s, id));
     if (unknown.length) {
-      return { error: `unknown appliance id(s): ${unknown.join(", ")}` };
+      return { error: `unknown service id(s): ${unknown.join(", ")}` };
     }
     // De-dupe; least-privilege default is the explicit empty list.
     return { scope: { appliances: Array.from(new Set(ids)) } };
@@ -1066,7 +1066,7 @@ export class TenantDO extends DurableObject<Env> {
     // Validate/clamp the machine name at the DATA layer too (defense-in-depth;
     // api.ts also clamps at the /join door). (security M1)
     const cleaned = cleanMachineName(machine);
-    if (!cleaned) return { ok: false, error: "invalid machine name" };
+    if (!cleaned) return { ok: false, error: "invalid box name" };
     machine = cleaned;
 
     const s = await this.load();
@@ -1076,7 +1076,7 @@ export class TenantDO extends DurableObject<Env> {
       // create it on the fly so the machine has a home. Cap appliances-per-tenant
       // so a flood of joins to unknown ids can't grow the DO unbounded (M5).
       if (s.appliances.length >= MAX_APPLIANCES_PER_TENANT) {
-        return { ok: false, error: "appliance limit reached for tenant" };
+        return { ok: false, error: "service limit reached for tenant" };
       }
       ap = this.newAppliance(appliance, appliance, s.settings.defaultGroup);
       s.appliances.push(ap);
@@ -1103,7 +1103,7 @@ export class TenantDO extends DurableObject<Env> {
       // Genuinely new machine. Cap machines-per-appliance (M1/M5): bound name
       // squatting + unbounded DO creation behind a single ticket.
       if (ap.machines.length >= MAX_MACHINES_PER_APPLIANCE) {
-        return { ok: false, error: "machine limit reached for appliance" };
+        return { ok: false, error: "box limit reached for service" };
       }
       m = {
         name: machine,
@@ -1423,6 +1423,6 @@ export class TenantDO extends DurableObject<Env> {
 
 // ---- ACL label helper (for log targets) -----------------------------------
 function aclLabel(e: AclEntity): string {
-  if (e.type === "all") return "all appliances";
+  if (e.type === "all") return "all services";
   return e.name ? `${e.type}:${e.name}` : e.type;
 }

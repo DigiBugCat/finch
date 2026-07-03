@@ -95,7 +95,7 @@ export async function GET(req: Request) {
   // Host-key guard FIRST — without a valid key we can neither ask the hub about
   // ownership nor build a safe redirect host.
   if (!isValidHostKey(hostKey)) {
-    return new Response("invalid appliance host", {
+    return new Response("invalid service host", {
       status: 400,
       headers: { "content-type": "text/plain; charset=utf-8" },
     });
@@ -128,13 +128,13 @@ export async function GET(req: Request) {
   // rather than bouncing into a host we have no claim to.
   if (res.status === 403) {
     return new Response(
-      "This appliance isn't registered to your account. " +
+      "This service isn't registered to your account. " +
         "Sign in with the account that owns it, or check the link.",
       { status: 403, headers: { "content-type": "text/plain; charset=utf-8" } },
     );
   }
   if (!res.ok) {
-    return new Response("Could not start the appliance session. Try again.", {
+    return new Response("Could not start the service session. Try again.", {
       status: 502,
       headers: { "content-type": "text/plain; charset=utf-8" },
     });
@@ -152,7 +152,7 @@ export async function GET(req: Request) {
     grant = undefined;
   }
   if (!grant) {
-    return new Response("Could not start the appliance session. Try again.", {
+    return new Response("Could not start the service session. Try again.", {
       status: 502,
       headers: { "content-type": "text/plain; charset=utf-8" },
     });

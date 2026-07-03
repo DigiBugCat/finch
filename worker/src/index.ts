@@ -644,7 +644,7 @@ export default {
             route: path,
           }).catch(() => {}),
         );
-        return json(503, { error: "appliance offline", appliance });
+        return json(503, { error: "service offline", appliance });
       }
       return relayMcp(req, env, ctx, tenant, appliance, pool, path, upstream, browserAuthed);
     }
@@ -776,12 +776,12 @@ async function relayMcp(
       }
       const error =
         check.reason === "acl"
-          ? "no ACL rule grants this key access to this appliance"
+          ? "no ACL rule grants this key access to this service"
           : check.reason === "scope"
-            ? "key scope does not include this appliance"
+            ? "key scope does not include this service"
             : check.reason === "expired"
               ? "key has expired"
-              : "key not allowed for this appliance";
+              : "key not allowed for this service";
       return json(403, { error });
     }
     caller = check.public ? "public" : check.keyLabel || "finch_key";
@@ -827,7 +827,7 @@ async function relayMcp(
   }
 
   const start = Date.now();
-  let res = json(503, { error: "appliance offline", appliance });
+  let res = json(503, { error: "service offline", appliance });
   let usedMachine = pool[0];
   for (const machine of pool) {
     usedMachine = machine;
@@ -851,7 +851,7 @@ async function relayMcp(
     } catch (e) {
       res = json(502, { error: `relay failed: ${e}` });
     }
-    // FAIL OVER only on the DO's own "appliance offline" signal (no agent socket
+    // FAIL OVER only on the DO's own "service offline" signal (no agent socket
     // for this machine) — a stale pick. Any other status (including an upstream
     // 503) is the box's real answer and is returned as-is. The DO tags its
     // offline 503 with X-Finch-Offline so we don't have to read the body.

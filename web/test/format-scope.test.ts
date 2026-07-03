@@ -5,17 +5,17 @@ import { describe, it, expect } from "vitest";
 import { formatScope, type KeyScope } from "@/components/dash/data";
 
 describe("formatScope", () => {
-  it('renders {all:true} as "all appliances"', () => {
-    expect(formatScope({ all: true })).toBe("all appliances");
+  it('renders {all:true} as "all services"', () => {
+    expect(formatScope({ all: true })).toBe("all services");
   });
 
-  it("renders an appliance allow-list as a comma-joined id list", () => {
+  it("renders a service allow-list as a comma-joined id list", () => {
     const scope: KeyScope = { appliances: ["calendar-sync", "printer"] };
     expect(formatScope(scope)).toBe("calendar-sync, printer");
   });
 
-  it('renders an empty allow-list as "no appliances"', () => {
-    expect(formatScope({ appliances: [] })).toBe("no appliances");
+  it('renders an empty allow-list as "no services"', () => {
+    expect(formatScope({ appliances: [] })).toBe("no services");
   });
 
   it("never returns the stringified object (the bug it fixes)", () => {
@@ -27,6 +27,6 @@ describe("formatScope", () => {
     expect(formatScope(null)).toBe("—");
     expect(formatScope(undefined)).toBe("—");
     // A legacy/garbage value with no `all` and no array falls back safely.
-    expect(formatScope({} as unknown as KeyScope)).toBe("no appliances");
+    expect(formatScope({} as unknown as KeyScope)).toBe("no services");
   });
 });

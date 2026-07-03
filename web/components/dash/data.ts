@@ -91,15 +91,15 @@ export type KeyScope = { all: true } | { all?: false; appliances: string[] };
 
 /** Render a KeyScope as a human label for the dashboard (panels.tsx). The hub
  *  returns a KeyScope OBJECT, so rendering it raw yields "[object Object]";
- *  this collapses it to "all appliances" or a comma-joined id list. Tolerant of
+ *  this collapses it to "all services" or a comma-joined id list. Tolerant of
  *  a malformed/legacy value so the Keys table never renders garbage. */
 export function formatScope(scope: KeyScope | null | undefined): string {
   if (!scope) return "—";
-  if ("all" in scope && scope.all === true) return "all appliances";
+  if ("all" in scope && scope.all === true) return "all services";
   const ids = Array.isArray((scope as { appliances?: unknown }).appliances)
     ? (scope as { appliances: string[] }).appliances
     : [];
-  return ids.length ? ids.join(", ") : "no appliances";
+  return ids.length ? ids.join(", ") : "no services";
 }
 
 export interface AclEntity {

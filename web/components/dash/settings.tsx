@@ -87,7 +87,7 @@ function DomainPreview({ hostname, appliances }: { hostname: string; appliances:
   if (!shown.length) {
     return (
       <div className="set-hint dim" style={{ marginTop: 4 }}>
-        Services would live at <code className="mono">https://{hostname}/&lt;service&gt;/</code> — enroll a device to see real URLs here.
+        Services would live at <code className="mono">https://{hostname}/&lt;service&gt;/</code> — add a box to see real URLs here.
       </div>
     );
   }
@@ -302,7 +302,7 @@ function WebSessions() {
   const [done, setDone] = useState(false);
 
   async function signOutAll() {
-    if (!confirm('Sign out ALL web sessions for this account? Everyone viewing one of your hosted appliances will have to sign in again.')) return;
+    if (!confirm('Sign out ALL web sessions for this account? Everyone viewing one of your hosted services will have to sign in again.')) return;
     setBusy(true); setErr(''); setDone(false);
     try {
       const r = await fetch('/api/finch/sessions/revoke', { method: 'POST' });
@@ -318,13 +318,13 @@ function WebSessions() {
   return (
     <div className="web-sessions">
       <p className="set-hint dim" style={{ marginBottom: 12 }}>
-        Force a fresh sign-in on every browser currently viewing one of your hosted appliances. Use this if a teammate left or a session may be compromised.
+        Force a fresh sign-in on every browser currently viewing one of your hosted services. Use this if a teammate left or a session may be compromised.
       </p>
       <button type="button" className="btn btn-sm btn-ghost" onClick={signOutAll} disabled={busy}>
         {busy ? 'signing out…' : 'Sign out all web sessions'}
       </button>
       {err && <div className="set-hint red" style={{ marginTop: 8 }}>{err}</div>}
-      {done && <div className="set-hint green" style={{ marginTop: 8 }}>✓ All web sessions signed out — viewers must sign in again at the appliance gate.</div>}
+      {done && <div className="set-hint green" style={{ marginTop: 8 }}>✓ All web sessions signed out — viewers must sign in again at the service gate.</div>}
     </div>
   );
 }
@@ -360,7 +360,7 @@ export function SettingsView({ settings, groups, appliances, onChange }: any) {
   return (
     <div className="view view-narrow">
       <h1 className="page-title">Settings <span className="admin-badge">admin</span></h1>
-      <p className="page-lede">Tenant-wide defaults. Changes apply across every device and teammate.</p>
+      <p className="page-lede">Tenant-wide defaults. Changes apply across every box and teammate.</p>
 
       <Card className="set-card">
         <SectionLabel>organization</SectionLabel>
@@ -388,11 +388,11 @@ export function SettingsView({ settings, groups, appliances, onChange }: any) {
       </Card>
 
       <Card className="set-card">
-        <SectionLabel>devices &amp; access</SectionLabel>
-        <SetRow label="Require approval for new devices" hint="new devices wait for an admin before they can serve">
+        <SectionLabel>boxes &amp; access</SectionLabel>
+        <SetRow label="Require approval for new boxes" hint="new boxes wait for an admin before they can serve">
           <Toggle on={s.requireApproval} onChange={(v: any) => onChange("requireApproval", v)} />
         </SetRow>
-        <SetRow label="Default group" hint="where newly enrolled devices land">
+        <SetRow label="Default group" hint="where newly enrolled boxes land">
           <select className="acl-select" value={s.defaultGroup} onChange={(e) => onChange("defaultGroup", e.target.value)}>
             {groupOptions.map((g) => <option key={g}>{g}</option>)}
           </select>

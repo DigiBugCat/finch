@@ -36,7 +36,7 @@ describe("KeysView scope column", () => {
         onRevoke={() => {}}
       />,
     );
-    expect(screen.getByText("all appliances")).toBeInTheDocument();
+    expect(screen.getByText("all services")).toBeInTheDocument();
     expect(screen.getByText("calendar-sync")).toBeInTheDocument();
     expect(screen.queryByText(/\[object Object\]/)).toBeNull();
   });

@@ -56,7 +56,7 @@ export function AccessView({ appliances, groups, keys, acl, users, onAdd, onRemo
   return (
     <div className="view view-narrow">
       <h1 className="page-title">Access <span className="admin-badge">admin</span></h1>
-      <p className="page-lede">Who can reach what. Every rule is enforced at the door — before a request ever touches a device. Tag your devices, then grant access by tag, group, or key.</p>
+      <p className="page-lede">Who can reach what. Every rule is enforced at the door — before a request ever touches a box. Tag your services, then grant access by tag, group, or key.</p>
 
       <div className="client-tabs" style={{ margin: "4px 0 0" }}>
         {[["rules", "Rules"], ["policy", "Raw policy"]].map(([k, l]) => (

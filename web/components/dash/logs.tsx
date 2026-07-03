@@ -3,7 +3,7 @@
 import { useState } from 'react';
 import { Card } from '@/components/dash/primitives';
 
-const L_CATS = [["all", "All"], ["request", "Requests"], ["device", "Devices"], ["key", "Keys"], ["access", "Access"], ["admin", "Admin"]];
+const L_CATS = [["all", "All"], ["request", "Requests"], ["device", "Boxes"], ["key", "Keys"], ["access", "Access"], ["admin", "Admin"]];
 
 export function LogsView({ logs }: any) {
   const [cat, setCat] = useState("all");

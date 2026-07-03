@@ -144,7 +144,7 @@ describe("GET /portal/start", () => {
     const res = await GET(startReq("?slug=printer&rd=%2F"));
 
     expect(res.status).toBe(502);
-    expect(await res.text()).toMatch(/could not start the appliance session/i);
+    expect(await res.text()).toMatch(/could not start the service session/i);
   });
 
   it("returns a clean 502 when the hub's 200 body omits the grant", async () => {
@@ -158,7 +158,7 @@ describe("GET /portal/start", () => {
     const res = await GET(startReq("?slug=printer&rd=%2F"));
 
     expect(res.status).toBe(502);
-    expect(await res.text()).toMatch(/could not start the appliance session/i);
+    expect(await res.text()).toMatch(/could not start the service session/i);
   });
 
   it("redirects to /sign-in when unauthenticated", async () => {

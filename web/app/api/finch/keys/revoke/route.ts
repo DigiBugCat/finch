@@ -36,7 +36,7 @@ export async function POST(req: Request) {
 
     // Machine-scoped revoke from the appliance detail view.
     if (!machine || !appliance || !key) {
-      throw new HttpError(400, "machine, appliance and key required");
+      throw new HttpError(400, "box, service and key required");
     }
     return await hubProxy(
       `/api/machines/${encodeURIComponent(machine)}/keys/revoke`,

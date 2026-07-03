@@ -5,8 +5,8 @@
 // It's the desktop sibling of `finch run`: one binary that reads a finch.yml
 // manifest and supervises a relay per ingress rule, living in the macOS menubar
 // (and the Windows/Linux tray). It auto-starts the relays on launch and, like
-// Tailscale, shows the fleet grouped into "This machine" (the appliances this box
-// publishes, with live relay state) and "Other machines" (every other box in the
+// Tailscale, shows the fleet grouped into "This box" (the services this box
+// publishes, with live relay state) and "Other boxes" (every other box in the
 // tenant and what it serves, from the hub). Add/remove appliances and log in/out
 // via native dialogs. Everything runs on the same agent/core engine as the CLI.
 package main
@@ -38,7 +38,7 @@ var iconPNG []byte
 // allocate slots up-front and Show/Hide them as the manifest + fleet change.
 const (
 	maxRows           = 16 // appliances this box publishes
-	maxMachines       = 8  // other boxes shown under "Other machines"
+	maxMachines       = 8  // other boxes shown under "Other boxes"
 	maxAppsPerMachine = 12 // appliances per other box
 	fleetPoll         = 15 * time.Second
 )
@@ -50,15 +50,15 @@ var (
 
 	mu        sync.Mutex
 	order     []string                     // local app_paths, in manifest order
-	rowByApp  map[string]*systray.MenuItem // local app_path -> its "This machine" row
+	rowByApp  map[string]*systray.MenuItem // local app_path -> its "This box" row
 	lastState map[string]string            // local app_path -> last relay state
-	rows      []*systray.MenuItem          // "This machine" row pool
+	rows      []*systray.MenuItem          // "This box" row pool
 	rmItems   []*systray.MenuItem          // Remove-submenu pool
 	rmApp     []string                     // rmItems[i] removes rmApp[i]
 
 	thisParent  *systray.MenuItem
 	otherParent *systray.MenuItem
-	machParent  []*systray.MenuItem   // "Other machines" -> per-machine submenu parents
+	machParent  []*systray.MenuItem   // "Other boxes" -> per-box submenu parents
 	machRows    [][]*systray.MenuItem // machParent[j] -> its appliance rows
 	machRowApp  [][]string            // machRows[j][k] -> the appliance id it shows
 
@@ -118,17 +118,17 @@ func onReady() {
 	loginItem = systray.AddMenuItem("Log in…", "Sign in to your finch tenant")
 	systray.AddSeparator()
 
-	// "This machine" — the appliances this box publishes, with live relay state.
-	thisParent = systray.AddMenuItem("This machine", "Appliances this box publishes")
+	// "This box" — the services this box publishes, with live relay state.
+	thisParent = systray.AddMenuItem("This box", "Services this box publishes")
 	rows = make([]*systray.MenuItem, maxRows)
 	for i := range rows {
-		it := thisParent.AddSubMenuItem("", "Open this appliance in the dashboard")
+		it := thisParent.AddSubMenuItem("", "Open this service in the dashboard")
 		it.Hide()
 		rows[i] = it
 	}
 
-	// "Other machines" — every other box in the tenant, from the hub (read-only).
-	otherParent = systray.AddMenuItem("Other machines", "Other boxes in your tenant")
+	// "Other boxes" — every other box in the tenant, from the hub (read-only).
+	otherParent = systray.AddMenuItem("Other boxes", "Other boxes in your tenant")
 	machParent = make([]*systray.MenuItem, maxMachines)
 	machRows = make([][]*systray.MenuItem, maxMachines)
 	machRowApp = make([][]string, maxMachines)
@@ -139,7 +139,7 @@ func onReady() {
 		machRows[j] = make([]*systray.MenuItem, maxAppsPerMachine)
 		machRowApp[j] = make([]string, maxAppsPerMachine)
 		for k := range machRows[j] {
-			it := p.AddSubMenuItem("", "Open this appliance in the dashboard")
+			it := p.AddSubMenuItem("", "Open this service in the dashboard")
 			it.Hide()
 			machRows[j][k] = it
 		}
@@ -147,7 +147,7 @@ func onReady() {
 	systray.AddSeparator()
 
 	addItem := systray.AddMenuItem("Add application…", "Enroll a local service and publish it")
-	rmParent := systray.AddMenuItem("Remove application", "Remove a published appliance")
+	rmParent := systray.AddMenuItem("Remove application", "Remove a published service")
 	rmItems = make([]*systray.MenuItem, maxRows)
 	rmApp = make([]string, maxRows)
 	for i := range rmItems {
@@ -165,7 +165,7 @@ func onReady() {
 	reloadRows()
 	startRelays()
 	updateStatus()
-	go refreshFleet() // first paint of "Other machines"
+	go refreshFleet() // first paint of "Other boxes"
 	go fleetTicker()  // keep it fresh
 
 	go clickLoop(accountParent, func() {}) // parent is just a container for Log out
@@ -193,7 +193,7 @@ func onReady() {
 	}
 }
 
-// onLocalRowClick opens the dashboard for the appliance in "This machine" slot i.
+// onLocalRowClick opens the dashboard for the service in "This box" slot i.
 func onLocalRowClick(i int) {
 	mu.Lock()
 	app := ""
@@ -206,7 +206,7 @@ func onLocalRowClick(i int) {
 	}
 }
 
-// onOtherRowClick opens the dashboard for the appliance in "Other machines" slot.
+// onOtherRowClick opens the dashboard for the service in "Other boxes" slot.
 func onOtherRowClick(j, k int) {
 	mu.Lock()
 	app := ""
@@ -234,7 +234,7 @@ func fleetTicker() {
 	}
 }
 
-// reloadRows repaints the "This machine" pool from the manifest.
+// reloadRows repaints the "This box" pool from the manifest.
 func reloadRows() {
 	apps := readAppPaths(configPath)
 	mu.Lock()
@@ -263,19 +263,19 @@ func reloadRows() {
 	n := len(apps)
 	mu.Unlock()
 	if thisParent != nil {
-		thisParent.SetTitle(fmt.Sprintf("This machine (%d)", n))
+		thisParent.SetTitle(fmt.Sprintf("This box (%d)", n))
 	}
 	refreshTooltip()
 }
 
-// refreshFleet repaints "Other machines" from the hub: every box that isn't this
+// refreshFleet repaints "Other boxes" from the hub: every box that isn't this
 // one, each a submenu of the appliances it serves. Best-effort — a login/network
 // error just leaves a hint on the parent.
 func refreshFleet() {
 	nodes, err := core.FleetNodes()
 	if err != nil {
 		if otherParent != nil {
-			otherParent.SetTitle("Other machines — (log in)")
+			otherParent.SetTitle("Other boxes — (log in)")
 			mu.Lock()
 			for _, p := range machParent {
 				p.Hide()
@@ -326,7 +326,7 @@ func refreshFleet() {
 	count := len(names)
 	mu.Unlock()
 	if otherParent != nil {
-		otherParent.SetTitle(fmt.Sprintf("Other machines (%d)", count))
+		otherParent.SetTitle(fmt.Sprintf("Other boxes (%d)", count))
 	}
 }
 
@@ -445,11 +445,11 @@ func refreshTooltip() {
 	mu.Unlock()
 	switch {
 	case total == 0:
-		systray.SetTooltip("finch — no appliances (Add application…)")
+		systray.SetTooltip("finch — no services (Add application…)")
 	case !running:
 		systray.SetTooltip("finch — stopped")
 	default:
-		systray.SetTooltip(fmt.Sprintf("finch — %d/%d live on this machine", live, total))
+		systray.SetTooltip(fmt.Sprintf("finch — %d/%d live on this box", live, total))
 	}
 	updateStatus()
 }

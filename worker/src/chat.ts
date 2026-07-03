@@ -68,7 +68,7 @@ async function chatCompletion(req: Request, env: Env, origin: string): Promise<R
       content: String((m && m.content) || "").slice(0, MAX_MSG_CHARS),
     }));
   if (!appliance || !userMessages.length) {
-    return json(400, { error: "appliance and messages are required" });
+    return json(400, { error: "service and messages are required" });
   }
 
   // Two ways to authorize the relay this chat performs:
@@ -102,7 +102,7 @@ async function chatCompletion(req: Request, env: Env, origin: string): Promise<R
   const sys: Msg = {
     role: "system",
     content:
-      `You are a concise assistant connected to the user's finch appliance "${appliance}". ` +
+      `You are a concise assistant connected to the user's finch service "${appliance}". ` +
       `You can call these tools:\n` +
       tools.map((t) => `- ${t.name}: ${t.description || ""}  schema=${JSON.stringify(t.inputSchema || {})}`).join("\n") +
       `\n\nTo call a tool, reply with ONE line of JSON and nothing else: {"tool":"<name>","args":{...}}. ` +
@@ -155,7 +155,7 @@ async function mcp(env: Env, origin: string, appliance: string, authHeaders: Rec
   try {
     j = JSON.parse(text);
   } catch {
-    throw new Error(`non-JSON from appliance: ${text.slice(0, 120)}`);
+    throw new Error(`non-JSON from service: ${text.slice(0, 120)}`);
   }
   if (j.error) throw new Error(j.error.message || JSON.stringify(j.error));
   return j.result;
@@ -285,15 +285,15 @@ a{color:var(--amber);text-decoration:none}
   <span class="avatar">🐦</span>
   <div class="head-mid">
     <div class="head-id"><h1 id="hId">chat</h1><span class="pill pill-off" id="hPill">not connected</span></div>
-    <div class="head-sub">Chat with an LLM that calls your appliance's MCP tools — a quick "does my endpoint work" check.</div>
+    <div class="head-sub">Chat with an LLM that calls your service's MCP tools — a quick "does my endpoint work" check.</div>
   </div>
 </div>
 
 <div class="card">
   <div class="body">
-    <div class="seclabel">connect <small>your appliance + a finch_ key (stored in this browser only)</small></div>
+    <div class="seclabel">connect <small>your service + a finch_ key (stored in this browser only)</small></div>
     <div class="fields">
-      <input class="field" id="app" placeholder="appliance — e.g. hello" style="max-width:200px"/>
+      <input class="field" id="app" placeholder="service — e.g. hello" style="max-width:200px"/>
       <input class="field" id="key" placeholder="finch_… key" type="password"/>
     </div>
     <div class="hint">Mint a key in the dashboard → <b>Keys</b>. The model runs on Cloudflare Workers AI.</div>
@@ -328,7 +328,7 @@ function escapeHtml(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&
 async function send(){
   const app=$('#app').value.trim(), key=$('#key').value.trim(), text=$('#msg').value.trim();
   if(!text)return;
-  if(!app||!key){add('a err','Enter your appliance and a finch_ key above first.');return;}
+  if(!app||!key){add('a err','Enter your service and a finch_ key above first.');return;}
   localStorage.fchApp=app; localStorage.fchKey=key;
   $('#msg').value=''; add('u',text); hist.push({role:'user',content:text});
   $('#send').disabled=true; const thinking=add('a','');thinking.innerHTML='<span class=dots></span>';

@@ -59,7 +59,7 @@ more services with more 'finch add' calls — one process fronts them all, and i
 auto-approves while you are logged in).
 
 ## Enroll on another box (no CLI login there)
-Mint a ticket in the dashboard (Add device), then on the box:
+Mint a ticket in the dashboard (Add box), then on the box:
   finch enroll printer --ticket <ticket>     # writes the credential, one time
   finch run                                  # resumes ticketless thereafter
 Tickets are one-shot credentials — they live on disk via enroll, NEVER in finch.yml.
@@ -68,7 +68,7 @@ Keep the ticket off the remote argv/shell history: pipe it to stdin with
   echo <ticket> | ssh newbox "finch enroll printer --ticket -"
 
 ## Test an endpoint
-  finch test printer                          # list the appliance's MCP tools
+  finch test printer                          # list the service's MCP tools
   finch call printer echo --args '{"text":"hi"}'   # invoke one tool
 
 ## Grant + REVOKE client access
@@ -88,7 +88,7 @@ needed for your FIRST box.
 
 ## Inspect state
   finch status --json     # am I logged in (which tenant)? what does finch.yml serve?
-  finch fleet --json      # every appliance + its state (chirping/resting/pending)
+  finch fleet --json      # every service + its state (chirping/resting/pending)
   finch domain ls         # custom hostnames mapped to this account
 
 ## finch.yml (what 'finch add' writes — holds NO secrets)
@@ -102,7 +102,7 @@ needed for your FIRST box.
 - --json works on add / token / status / fleet / keys / test / call for parsing.
 - The CLI token is a tenant-admin credential (~30 days). Revoke everything with:
     finch revoke-tokens   (or the dashboard -> Settings -> CLI access)
-- 'finch rm <appliance>' removes an appliance; 'finch approve <app_path>' is only
+- 'finch rm <appliance>' removes a service; 'finch approve <app_path>' is only
   needed if you are not logged in (otherwise 'finch run' approves automatically).
 - See 'finch help' for the flag-level reference.
 `)
@@ -116,21 +116,21 @@ finch hub. Your box dials OUT, so nothing listens and no ports are opened.
 
 Usage:
   finch login [--hub URL]              Log in (opens the browser to approve a code)
-  finch add <app_path> --service <url> Enroll an appliance and append it to finch.yml
+  finch add <app_path> --service <url> Enroll a service and append it to finch.yml
                                           <app_path> becomes the URL: <slug>.finchmcp.com/<app_path>/
   finch enroll <app_path> --ticket <t> Save a box-side credential from a dashboard ticket (one time)
   finch run [--config finch.yml]       Serve every ingress rule (auto-approves when logged in)
-  finch approve <app_path>             Approve an appliance (clear the pending gate)
+  finch approve <app_path>             Approve a service (clear the pending gate)
   finch token [--json|--login]         Mint a fresh CLI token (provision a new box, no browser)
   finch status [--json]                Show login + what finch.yml serves
-  finch fleet [--json]   (alias: ls)   List this account's appliances + state
-  finch test <appliance>               List an appliance's MCP tools (does-it-work check)
+  finch fleet [--json]   (alias: ls)   List this account's services + state
+  finch test <appliance>               List a service's MCP tools (does-it-work check)
   finch call <appliance> <tool> [--args '{...}']   Invoke one tool through the hub
   finch keys [list|mint <label> --appliance <id>|revoke <id>]   Manage client finch_ keys
   finch domain [ls|add <hostname>|rm <hostname>]   Manage custom hostnames
-  finch rm <appliance>                 Remove an appliance
+  finch rm <appliance>                 Remove a service
   finch revoke-tokens                  De-authorize every CLI login (incl. this box)
-  finch join --ticket <t> --upstream <url>   Run one appliance straight from flags
+  finch join --ticket <t> --upstream <url>   Run one service straight from flags
   finch guide                          Full agent operating manual (point an AI agent at this)
   finch help                           Show this help
 
@@ -149,7 +149,7 @@ Automation / driving finch from an agent (after the one-time 'finch login'):
 
   Introspect:
     finch status --json            # am I logged in? what does finch.yml serve?
-    finch fleet --json             # every appliance + its state
+    finch fleet --json             # every service + its state
 
   Serve a local service:
     finch add scraper --service http://127.0.0.1:8001 --json
@@ -417,7 +417,7 @@ func openBrowser(u string) {
 	_ = exec.Command(name, args...).Start()
 }
 
-// cmdTest: finch test <appliance> — list the appliance's MCP tools (a quick
+// cmdTest: finch test <appliance> — list the service's MCP tools (a quick
 // "does my endpoint work" check, relayed through the hub via the CLI token).
 func cmdTest(args []string) {
 	fs := flag.NewFlagSet("test", flag.ExitOnError)
@@ -592,7 +592,7 @@ func cmdDomain(args []string) {
 }
 
 // cmdKeys: finch keys [list|mint|revoke] — manage the client finch_ keys that
-// callers present to reach your appliances. The control plane an agent uses to
+// callers present to reach your services. The control plane an agent uses to
 // grant + REVOKE access without the dashboard.
 func cmdKeys(args []string) {
 	sub := "list"
@@ -630,8 +630,8 @@ func cmdKeys(args []string) {
 		}
 	case "mint":
 		fs := flag.NewFlagSet("keys mint", flag.ExitOnError)
-		all := fs.Bool("all", false, "key reaches EVERY appliance (default: none — scope it)")
-		appliance := fs.String("appliance", "", "scope the key to one appliance id")
+		all := fs.Bool("all", false, "key reaches EVERY service (default: none — scope it)")
+		appliance := fs.String("appliance", "", "scope the key to one service id")
 		asJSON := fs.Bool("json", false, "machine-readable JSON")
 		label := ""
 		if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
@@ -679,7 +679,7 @@ func cmdKeys(args []string) {
 	}
 }
 
-// cmdFleet: finch fleet [--json] — list this tenant's appliances + state.
+// cmdFleet: finch fleet [--json] — list this tenant's services + state.
 func cmdFleet(args []string) {
 	fs := flag.NewFlagSet("fleet", flag.ExitOnError)
 	asJSON := fs.Bool("json", false, "machine-readable JSON")
@@ -701,7 +701,7 @@ func cmdFleet(args []string) {
 		return
 	}
 	if len(apps) == 0 {
-		fmt.Println("no appliances — `finch add <path> --service <url>`")
+		fmt.Println("no services — `finch add <path> --service <url>`")
 		return
 	}
 	for _, a := range apps {
@@ -710,7 +710,7 @@ func cmdFleet(args []string) {
 	}
 }
 
-// cmdRm: finch rm <appliance> — remove an appliance from the tenant.
+// cmdRm: finch rm <appliance> — remove a service from the tenant.
 func cmdRm(args []string) {
 	if len(args) < 1 {
 		fmt.Fprintln(os.Stderr, "usage: finch rm <appliance>")
@@ -982,7 +982,7 @@ func cmdEnroll(args []string) {
 	ticketVal := resolveTicket(*ticket)
 	if appPath == "" || ticketVal == "" {
 		fmt.Fprintln(os.Stderr, "usage: finch enroll <app_path> --ticket <t>")
-		fmt.Fprintln(os.Stderr, "  mint the ticket in the dashboard (Add device); <app_path> is the appliance/URL segment")
+		fmt.Fprintln(os.Stderr, "  mint the ticket in the dashboard (Add box); <app_path> is the service/URL segment")
 		fmt.Fprintln(os.Stderr, "  keep it off argv/history: 'echo <t> | finch enroll <app_path> --ticket -' or set FINCH_TICKET")
 		os.Exit(2)
 	}

@@ -40,10 +40,10 @@ import com.finchmcp.finch.Service
 // 2. Configure finch. CredentialPath must be writable (use filesDir).
 val cfg = Config().apply {
     hub = "https://finchmcp.com"
-    appPath = "myapp"                       // the appliance the ticket was minted for
+    appPath = "myapp"                       // the service the ticket was minted for
     upstream = "http://127.0.0.1:8080"      // your local server
     credentialPath = "${filesDir}/finch.json"
-    machine = "pixel-" + Build.SERIAL        // a stable device name
+    machine = "pixel-" + Build.SERIAL        // a stable box name
     forwardAll = false                       // true to host a website / arbitrary HTTP
 }
 
@@ -54,7 +54,7 @@ val svc: Service = Finch.newService(cfg, object : Listener {
     }
 })
 
-// 3. ONCE per device: trade a dashboard ticket ("Add device") for a saved
+// 3. ONCE per box: trade a dashboard ticket ("Add box") for a saved
 //    credential. Do this off the main thread (it does network I/O).
 svc.enroll(ticketFromDashboard)   // throws on a bad/expired ticket
 

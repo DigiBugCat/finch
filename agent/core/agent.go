@@ -275,8 +275,8 @@ func Main() {
 	ticket := flag.String("ticket", "", "one-shot enrollment ticket from the dashboard (first run only; '-' reads it from stdin, or set FINCH_TICKET; later runs resume from --state)")
 	machine := flag.String("machine", hostName, "this box's name")
 	upstream := flag.String("upstream", "http://127.0.0.1:8000", "local MCP server base URL")
-	statePath := flag.String("state", defaultStatePath(), "file that persists the per-machine refresh credential so a restart needs no new ticket")
-	configPath := flag.String("config", "", "path to a finch.yml manifest; serves every ingress rule (one local service per appliance) over one process")
+	statePath := flag.String("state", defaultStatePath(), "file that persists the per-box refresh credential so a restart needs no new ticket")
+	configPath := flag.String("config", "", "path to a finch.yml manifest; serves every ingress rule (one local service per app_path) over one process")
 	forwardAll := flag.Bool("forward-all", false, "forward the WHOLE loopback host (every path), not just /mcp — for a website or any non-MCP HTTP app (single-service mode)")
 
 	// The install one-liners are `finch join …` (single service) and `finch run`
@@ -411,7 +411,7 @@ func runConfig(cfg *config) {
 	if started == 0 {
 		log.Fatal("finch: no valid ingress rules to serve")
 	}
-	log.Printf("finch: serving %d ingress rule(s) from finch.yml as machine %q", started, cfg.Machine)
+	log.Printf("finch: serving %d ingress rule(s) from finch.yml as box %q", started, cfg.Machine)
 	wg.Wait()
 }
 
@@ -490,7 +490,7 @@ func runAppliance(o applianceOpts) {
 	if endpoint == "" { // older hub without host/url in the join response
 		endpoint = relayURL(hub, jr.Appliance, jr.Machine)
 	}
-	log.Printf("%s: %q live at %s  →  %s  (machine %q, tenant %s)",
+	log.Printf("%s: %q live at %s  →  %s  (box %q, tenant %s)",
 		lp, name, endpoint, upstreamURL, jr.Machine, jr.Tenant)
 
 	// Self-approve via the saved CLI token (best-effort): the machine just

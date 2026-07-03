@@ -331,7 +331,7 @@ export async function handleApi(
     // access mode ("key" requires a finch_ bearer; "public" is an open webpage).
     if (path === "/api/cli/auth" && method === "POST") {
       const body = await readJson(req);
-      if (!body.appliance) return json(400, { error: "appliance required" });
+      if (!body.appliance) return json(400, { error: "service required" });
       const out = await tenantOp<{ ok: boolean; error?: string }>(
         env,
         cliTenant,
@@ -339,7 +339,7 @@ export async function handleApi(
         { appliance: body.appliance, mode: body.mode },
       );
       if (out?.ok === false) {
-        return json(out.error === "unknown appliance" ? 404 : 400, out);
+        return json(out.error === "unknown service" ? 404 : 400, out);
       }
       return json(200, out);
     }
@@ -389,7 +389,7 @@ export async function handleApi(
       const b = await readJson(req);
       const appliance = String(b.appliance || "").trim();
       const rpcMethod = String(b.method || "").trim();
-      if (!appliance || !rpcMethod) return json(400, { error: "appliance and method required" });
+      if (!appliance || !rpcMethod) return json(400, { error: "service and method required" });
       const exp = Math.floor(Date.now() / 1000) + 120;
       const assertion = await signAssertion({ tenant: cliTenant, exp }, env.FINCH_SERVICE_SECRET);
       const scheme = host.startsWith("localhost") || host.startsWith("127.") ? "http" : "https";
@@ -559,7 +559,7 @@ export async function handleApi(
       const out = await tenantOp(env, tenant, action, { id });
       return json(out?.ok === false ? 404 : 200, out);
     }
-    return json(404, { error: "unknown appliance action", action });
+    return json(404, { error: "unknown service action", action });
   }
 
   // PUT /api/appliances/:id/auth {mode} — set the public-relay access mode
@@ -580,7 +580,7 @@ export async function handleApi(
       { appliance: id, mode: body.mode },
     );
     if (out?.ok === false) {
-      return json(out.error === "unknown appliance" ? 404 : 400, out);
+      return json(out.error === "unknown service" ? 404 : 400, out);
     }
     return json(200, out);
   }
@@ -651,7 +651,7 @@ export async function handleApi(
     const machine = safeDecode(seg[1]);
     const body = await readJson(req);
     if (!body.appliance || !body.key) {
-      return json(400, { error: "appliance and key required" });
+      return json(400, { error: "service and key required" });
     }
     const out = await tenantOp(env, tenant, "revokeMachineKey", {
       appliance: body.appliance,
@@ -850,14 +850,14 @@ async function handleJoin(
 
   const body = await readJson(req);
   if (!body.ticket || !body.machine) {
-    return json(400, { error: "ticket and machine required" });
+    return json(400, { error: "ticket and box required" });
   }
   // Validate + clamp the attacker-chosen machine name (length + charset) before
   // it can pollute the registry / squat a name. (security M1)
   const machine = cleanMachine(body.machine);
   if (!machine) {
     return json(400, {
-      error: "invalid machine name (1-64 chars, [A-Za-z0-9 ._-] only)",
+      error: "invalid box name (1-64 chars, [A-Za-z0-9 ._-] only)",
     });
   }
   const payload = await verifyToken(body.ticket, env.TICKET_SECRET);
@@ -986,7 +986,7 @@ async function handleRefresh(
     machine,
   });
   if (!reg.exists) {
-    return json(403, { error: "machine no longer registered" });
+    return json(403, { error: "box no longer registered" });
   }
 
   const connectExp =
