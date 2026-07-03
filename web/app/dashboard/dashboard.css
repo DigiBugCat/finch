@@ -73,9 +73,33 @@ body::before{
 .seclabel-hint{text-transform:none; letter-spacing:0; font-weight:600; color:var(--dim); opacity:.7; font-size:12px}
 
 /* ---------- buttons ---------- */
-.btn{font-family:inherit; font-weight:800; cursor:pointer; border-radius:999px;
+/* Pin the body font explicitly (NOT inherit): buttons often sit inside .mono
+   rows (domain pickers, CLI commands) and must never pick up monospace. */
+.btn{font-family:"Nunito",system-ui,sans-serif; font-weight:700; letter-spacing:0;
+  font-size:14px; cursor:pointer; border-radius:999px;
   border:1px solid transparent; transition:.15s; white-space:nowrap}
+.btn-sm{padding:6px 14px; font-size:13px}
 .btn-md{padding:9px 16px; font-size:14px}
+/* The marketing pages' amber hover lifts (translateY) — inside dashboard form
+   rows that reads as jitter; keep dashboard buttons put. */
+.set-card .btn-amber:hover, .view .btn-amber:hover{transform:none;
+  box-shadow:0 6px 20px -6px rgba(242,180,67,.5)}
+.btn-amber:disabled{background:var(--amber-soft); color:var(--dim);
+  cursor:not-allowed; box-shadow:none; transform:none}
+/* Small amber "beta" chip, sibling of .admin-badge. */
+.beta-badge{background:rgba(242,180,67,0.12); color:var(--amber);
+  border:1px solid rgba(242,180,67,0.35); border-radius:999px;
+  font-size:10.5px; font-weight:800; letter-spacing:.08em; text-transform:uppercase;
+  padding:2px 8px; vertical-align:1px}
+/* Numbered setup steps (Custom domains card). */
+.setup-steps{margin:0 0 14px; padding-left:0; list-style:none; counter-reset:step;
+  display:flex; flex-direction:column; gap:8px}
+.setup-steps li{counter-increment:step; display:flex; gap:10px; align-items:baseline;
+  color:var(--dim); font-size:13.5px}
+.setup-steps li::before{content:counter(step); flex:none; width:20px; height:20px;
+  border-radius:50%; background:var(--card2); border:1px solid var(--line);
+  color:var(--amber); font-weight:800; font-size:11px; display:inline-flex;
+  align-items:center; justify-content:center; transform:translateY(3px)}
 .btn-accent{background:var(--amber); color:#2a200c; box-shadow:0 0 0 0 rgba(242,180,67,.4)}
 .btn-accent:hover{background:#f6c25f; box-shadow:0 6px 20px -6px rgba(242,180,67,.5)}
 .btn-accent:disabled{background:var(--amber-soft); color:var(--dim); cursor:not-allowed; box-shadow:none}

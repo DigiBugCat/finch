@@ -142,9 +142,13 @@ function CustomDomains() {
   return (
     <div className="custom-domains">
       <p className="set-hint dim" style={{ marginBottom: 12 }}>
-        Serve your boxes on your own domain. Add a hostname here, then point a CNAME at finch —
-        certificates are issued automatically once DNS resolves.
+        Serve your boxes on your own domain instead of <code className="mono">.finchmcp.com</code>. Three steps:
       </p>
+      <ol className="setup-steps">
+        <li>Add your hostname below (e.g. <code className="mono">mcp.yourdomain.com</code>).</li>
+        <li>At your DNS provider, create the CNAME record we show you — it points your hostname at finch.</li>
+        <li>Wait for DNS to resolve; the certificate is issued automatically and your boxes go live on the new name.</li>
+      </ol>
       {hostnames.length > 0 && (
         <div style={{ marginBottom: 12 }}>
           {hostnames.map((h) => (
@@ -331,7 +335,7 @@ export function SettingsView({ settings, groups, onChange }: any) {
       </Card>
 
       <Card className="set-card">
-        <SectionLabel>custom domains</SectionLabel>
+        <SectionLabel>custom domains <span className="beta-badge">beta</span></SectionLabel>
         <CustomDomains />
       </Card>
 
