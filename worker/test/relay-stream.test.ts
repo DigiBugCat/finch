@@ -5,6 +5,7 @@ import {
   MAX_STREAMS_PER_MACHINE,
   RELAY_HEAD_TIMEOUT_MS,
   RELAY_IDLE_MS,
+  RELAY_STREAM_HARD_CAP_BYTES,
 } from "../src/appliance-do";
 
 // The APPLIANCE binding's stub type (DurableObjectStub<undefined> in this
@@ -677,4 +678,75 @@ describe("ApplianceDO streaming relay — backpressure (window frames)", () => {
     // No backpressure ever needed -> no window frames at all.
     expect(windows).toEqual([]);
   });
+
+  it("hard-resets a stream when a non-cooperating agent floods past the hard cap (S2 OOM backstop)", async () => {
+    const m = freshMachine();
+    const stub = stubFor(m);
+    const agent = await connectAgent(stub, m);
+
+    const reqSeen = nextFrame(agent);
+    const resPromise = stub.fetch(
+      new Request(relayUrl(m), { method: "POST", body: "x" }),
+    );
+    const { id } = await reqSeen;
+
+    agent.send(
+      JSON.stringify({
+        id,
+        type: "head",
+        status: 200,
+        headers: [["content-type", "application/octet-stream"]],
+      }),
+    );
+
+    const res = await resPromise;
+    expect(res.status).toBe(200);
+
+    // Arm watchers for the advisory PAUSE and the terminal reset BEFORE
+    // flooding so neither can be missed.
+    const pauseSeen = waitForFrame(
+      agent,
+      (f) => f.type === "window" && f.id === id && f.credits === 0,
+    );
+    const resetSeen = waitForFrame(
+      agent,
+      (f) => f.type === "reset" && f.id === id,
+    );
+    // NOTE: we deliberately do NOT read res.body during the flood — reading
+    // would relieve the very buffering pressure this test exercises. The
+    // errored state is observed after the reset (workerd only surfaces a
+    // controller.error() to the reader once a read is attempted).
+
+    // A MALICIOUS agent: never reads window frames, keeps flooding chunks well
+    // past the 8 MiB hard cap. One 256 KiB frame reused for speed.
+    const floodChunk = chunkFrame(id, 256 * 1024, 0x42);
+    const frames = Math.ceil(RELAY_STREAM_HARD_CAP_BYTES / (256 * 1024)) + 4;
+    for (let i = 0; i < frames; i++) agent.send(floodChunk);
+
+    // The advisory pause fired first (at the 1 MiB HWM) and was ignored…
+    const pause = await pauseSeen;
+    expect(pause).toMatchObject({ type: "window", id, credits: 0 });
+
+    // …so crossing the hard cap must RESET the stream: a `reset` frame goes
+    // down to the agent and the buffered readable errors out.
+    const reset = await resetSeen;
+    expect(reset).toMatchObject({ type: "reset", id });
+    expect(reset.message).toBe("stream buffer overflow");
+    expect(await drainExpectingError(res)).toBeInstanceOf(Error);
+
+    // The slot is freed: the stream map no longer holds this id, so further
+    // chunk frames for it are ignored (no throw) and a new relay is admitted.
+    agent.send(floodChunk); // late flood frame against a dead id — must be inert
+    const req2Seen = nextFrame(agent);
+    const res2Promise = stub.fetch(
+      new Request(relayUrl(m), { method: "POST", body: "x" }),
+    );
+    const req2 = await req2Seen;
+    expect(req2.type).toBe("req");
+    agent.send(
+      JSON.stringify({ id: req2.id, type: "err", status: 502, message: "ok" }),
+    );
+    expect((await res2Promise).status).toBe(502);
+  }, 15_000);
 });
+

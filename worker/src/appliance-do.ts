@@ -64,6 +64,10 @@ interface Stream {
    *  (a race the WS input gate normally prevents). start() flushes them, so a
    *  future regression can't silently truncate the body. */
   pending?: Uint8Array[];
+  /** Total bytes sitting in `pending`, counted against the hard cap while the
+   *  controller isn't captured yet (start() resets it to 0 on flush — the
+   *  flushed bytes then count via the controller's desiredSize instead). */
+  pendingBytes?: number;
   /** `end` won the same race — start() closes after flushing `pending`. */
   ended?: boolean;
   /** Flow-control state: true once we've sent the agent a {credits:0} PAUSE for
@@ -103,6 +107,16 @@ export const MAX_STREAMS_PER_MACHINE = 32;
 // the DO's buffered body to ~HWM + whatever chunks are already in flight on the
 // wire when the pause is sent.
 const RELAY_WINDOW_BYTES = 1 * 1024 * 1024; // 1 MiB
+
+// HARD per-stream buffered-byte cap (S2: OOM backstop). The {credits:0} pause
+// above is ADVISORY — a malicious, stale, or non-cooperating agent can ignore
+// it and keep sending `chunk` frames, which would otherwise buffer without
+// bound in the response queue (or the pre-controller `pending` array) until the
+// DO hits its 128 MB limit. Once a stream's buffered-but-unread bytes exceed
+// this cap we stop trusting the peer: reset the stream (error the readable,
+// notify the agent). 8 MiB = 8× the advisory HWM, so a well-behaved agent that
+// pauses promptly (≤ HWM + in-flight wire chunks) never comes near it.
+export const RELAY_STREAM_HARD_CAP_BYTES = 8 * 1024 * 1024; // 8 MiB
 
 // Max relay body we'll buffer (#16 / L9). Mirrors index.ts's pre-stub cap; we
 // enforce by STRING LENGTH after req.text() because content-length is
@@ -287,6 +301,7 @@ export class ApplianceDO extends DurableObject<Env> {
               }
             }
             s.pending = undefined;
+            s.pendingBytes = 0;
           }
           // The flushed pending bytes may already have pushed the queue past the
           // HWM; apply backpressure now so a slow consumer can't be outrun before
@@ -373,10 +388,28 @@ export class ApplianceDO extends DurableObject<Env> {
           // Post-enqueue backpressure: if this chunk pushed the in-memory queue
           // to/over the HWM and we haven't already paused, tell the agent to stop.
           this.maybePause(frame.id);
+          // HARD CAP (S2): the pause above is advisory. desiredSize is
+          // HWM - buffered, so buffered = HWM - desiredSize; a peer that keeps
+          // flooding past the cap gets reset instead of OOMing the DO.
+          const desired = s.controller.desiredSize;
+          if (
+            desired !== null &&
+            RELAY_WINDOW_BYTES - desired > RELAY_STREAM_HARD_CAP_BYTES
+          ) {
+            this.resetStream(frame.id, "stream buffer overflow", true);
+            return;
+          }
         } else {
           // head settled but start() hasn't captured the controller yet — buffer
           // (the input gate normally prevents this; flushed in start()).
           (s.pending ??= []).push(bytes);
+          // HARD CAP (S2) also guards this pre-controller path — a flood that
+          // races start() must not accumulate unbounded in `pending` either.
+          s.pendingBytes = (s.pendingBytes ?? 0) + bytes.byteLength;
+          if (s.pendingBytes > RELAY_STREAM_HARD_CAP_BYTES) {
+            this.resetStream(frame.id, "stream buffer overflow", true);
+            return;
+          }
         }
         return;
       }
