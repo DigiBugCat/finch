@@ -113,7 +113,13 @@
         // (Prod has none of this — it fails closed and routes by slug subdomain.)
         "DEFAULT_TENANT": "user_3F74fiQzwjM6UPfl9axNpA1jgyQ",
         "DEV": "1",
-        "WEB_URL": "https://finch-web-staging.pantainos.workers.dev"
+        "WEB_URL": "https://finch-web-staging.pantainos.workers.dev",
+        // Custom-hostname tiers, demoable on staging: the operator tenant may
+        // claim *.aviary.run; BYO adds register (no CF-for-SaaS call — no
+        // CF_API_TOKEN/CF_SAAS_ZONE_ID here) and return the CNAME instruction.
+        "VANITY_SUFFIXES": "aviary.run",
+        "VANITY_TENANT": "user_3F74fiQzwjM6UPfl9axNpA1jgyQ",
+        "BYO_CNAME_TARGET": "finchmcp.com"
       },
       "ai": { "binding": "AI" },
       // Self service-binding: the /chat tool-runner relays MCP calls back through

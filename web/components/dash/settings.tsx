@@ -74,6 +74,111 @@ function HubDomain({ current, onClaim }: { current: string; onClaim: (slug: stri
   );
 }
 
+// Custom domains: bring-your-own hostnames (and our vanity tier) mapped to this
+// tenant in the hub's host-key index. Adding one returns the CNAME instruction
+// the operator must configure; the hub enforces ownership/vanity gating and
+// (when configured) provisions the Cloudflare-for-SaaS certificate.
+function CustomDomains() {
+  const [hostnames, setHostnames] = useState<string[]>([]);
+  const [draft, setDraft] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const [added, setAdded] = useState<{ hostname: string; instructions?: string; ssl?: string } | null>(null);
+
+  async function refresh() {
+    try {
+      const r = await fetch('/api/finch/hostnames');
+      const j = await r.json();
+      if (r.ok) setHostnames(j.hostnames || []);
+    } catch { /* leave the list as-is */ }
+  }
+  useEffect(() => { refresh(); }, []);
+
+  // Mirror the hub's host-key shape loosely at the input: lowercase, host chars
+  // only, must contain a dot. The hub is the real validator (400s otherwise).
+  const clean = (v: string) => v.toLowerCase().replace(/[^a-z0-9.-]/g, '').slice(0, 253);
+  const hostname = clean(draft);
+  const plausible = hostname.includes('.') && !hostname.startsWith('.') && !hostname.endsWith('.');
+
+  async function add() {
+    setBusy(true); setErr(''); setAdded(null);
+    try {
+      const r = await fetch('/api/finch/hostnames', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ hostname }),
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || 'could not add hostname');
+      setAdded({ hostname: j.hostname, instructions: j.instructions, ssl: j.ssl ? String(j.ssl) : undefined });
+      setDraft('');
+      refresh();
+    } catch (e: any) {
+      setErr(e.message || 'failed');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function remove(h: string) {
+    if (!confirm(`Remove ${h}? Traffic on it stops resolving immediately.`)) return;
+    setBusy(true); setErr('');
+    try {
+      const r = await fetch('/api/finch/hostnames', {
+        method: 'DELETE',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ hostname: h }),
+      });
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || 'could not remove hostname');
+      if (added?.hostname === h) setAdded(null);
+      refresh();
+    } catch (e: any) {
+      setErr(e.message || 'failed');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="custom-domains">
+      <p className="set-hint dim" style={{ marginBottom: 12 }}>
+        Serve your boxes on your own domain. Add a hostname here, then point a CNAME at finch —
+        certificates are issued automatically once DNS resolves.
+      </p>
+      {hostnames.length > 0 && (
+        <div style={{ marginBottom: 12 }}>
+          {hostnames.map((h) => (
+            <div key={h} className="set-domain mono" style={{ alignItems: 'center', gap: 8, marginBottom: 4 }}>
+              <a href={`https://${h}`} target="_blank" rel="noreferrer">{h}</a>
+              <button type="button" className="btn btn-sm btn-ghost" disabled={busy} onClick={() => remove(h)}>Remove</button>
+            </div>
+          ))}
+        </div>
+      )}
+      <div className="set-domain mono" style={{ alignItems: 'center', gap: 8 }}>
+        <input
+          className="set-input"
+          value={draft}
+          placeholder="mcp.yourdomain.com"
+          onChange={(e) => setDraft(clean(e.target.value))}
+          style={{ width: 220 }}
+        />
+        <button type="button" className="btn btn-sm btn-amber" disabled={!plausible || busy} onClick={add}>
+          {busy ? 'adding…' : 'Add domain'}
+        </button>
+      </div>
+      {err && <div className="set-hint red" style={{ marginTop: 8 }}>{err}</div>}
+      {added && (
+        <div className="set-hint" style={{ marginTop: 8 }}>
+          <span className="green">✓ {added.hostname} added.</span>{' '}
+          {added.instructions && <>Now create this DNS record: <code className="mono">{added.instructions}</code>.</>}
+          {added.ssl && <> Certificate: <code className="mono">{added.ssl}</code>.</>}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // CLI access: mint a token for `finch login`, so a box can enroll appliances
 // and build its finch.toml from the command line (no dashboard round-trips).
 function CliAccess() {
@@ -223,6 +328,11 @@ export function SettingsView({ settings, groups, onChange }: any) {
         <SetRow label="Hub domain" hint="the name clients use to reach your boxes">
           <HubDomain current={s.subdomain || ''} onClaim={(slug) => onChange('subdomain', slug)} />
         </SetRow>
+      </Card>
+
+      <Card className="set-card">
+        <SectionLabel>custom domains</SectionLabel>
+        <CustomDomains />
       </Card>
 
       <Card className="set-card">
