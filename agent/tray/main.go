@@ -1,3 +1,5 @@
+//go:build tray
+
 // Command finch-tray is a menubar / system-tray front-end for the finch relay.
 //
 // It's the desktop sibling of `finch run`: one binary that reads a finch.yml

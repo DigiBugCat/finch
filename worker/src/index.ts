@@ -214,8 +214,16 @@ async function maybeBrowserGate(
   //    empty hash: a public appliance returns {public:true} regardless of key.
   //    (A slug host with no usable slug — dev fallback — also has none to bind a
   //    cookie to; skip the wall there too rather than bounce to a dead slug. The
-  //    relay's own checkKey then enforces the key gate as before.)
-  if (!slug) return { browserAuthed: false };
+  //    relay's own checkKey then enforces the key gate as before.) Gate this on
+  //    env.DEV: an empty slug only ever arises via the DEV DEFAULT_TENANT
+  //    fallback (resolveTenant fails closed in prod), so a prod build must never
+  //    take this wall-skip even if misconfigured — fall through to browserGate.
+  if (!slug) {
+    if (env.DEV === "1") return { browserAuthed: false };
+    // No slug in a non-dev build should be unreachable (resolveTenant 404s), but
+    // if it happens, fail CLOSED: treat as a private appliance needing the wall.
+    return browserGate(req, env, tenant, slug, originalPathAndQuery);
+  }
   const probe = await tenantOp<{ public?: boolean }>(env, tenant, "checkKey", {
     hash: "",
     appliance,

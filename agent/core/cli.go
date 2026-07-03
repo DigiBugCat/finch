@@ -63,6 +63,9 @@ Mint a ticket in the dashboard (Add device), then on the box:
   finch enroll printer --ticket <ticket>     # writes the credential, one time
   finch run                                  # resumes ticketless thereafter
 Tickets are one-shot credentials — they live on disk via enroll, NEVER in finch.yml.
+Keep the ticket off the remote argv/shell history: pipe it to stdin with
+'--ticket -' (or set FINCH_TICKET), e.g.
+  echo <ticket> | ssh newbox "finch enroll printer --ticket -"
 
 ## Test an endpoint
   finch test printer                          # list the appliance's MCP tools
@@ -862,9 +865,32 @@ func cmdAdd(args []string) {
 // for the long-lived box-side refresh credential and writes it to
 // <credentials-dir>/<app_path>.json. After this, `finch run` resumes ticketless.
 // Tickets are a credential, so they live here / on disk — never in finch.yml.
+// resolveTicket applies argv-free intake for an enrollment ticket: "-" reads it
+// from stdin and FINCH_TICKET from the env — so a one-shot ticket (which mints
+// the long-lived refresh token) need not land on the remote process table /
+// shell history. A literal value passes through unchanged.
+func resolveTicket(ticket string) string {
+	if ticket == "-" {
+		b, err := io.ReadAll(io.LimitReader(os.Stdin, 4096))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "finch: could not read ticket from stdin: %v\n", err)
+			os.Exit(1)
+		}
+		ticket = strings.TrimSpace(string(b))
+		if ticket == "" {
+			fmt.Fprintln(os.Stderr, "finch: --ticket - given but stdin was empty")
+			os.Exit(1)
+		}
+	}
+	if ticket == "" {
+		ticket = strings.TrimSpace(os.Getenv("FINCH_TICKET"))
+	}
+	return ticket
+}
+
 func cmdEnroll(args []string) {
 	fs := flag.NewFlagSet("enroll", flag.ExitOnError)
-	ticket := fs.String("ticket", "", "one-shot enrollment ticket from the dashboard (required)")
+	ticket := fs.String("ticket", "", "one-shot enrollment ticket from the dashboard (required; '-' reads it from stdin, or set FINCH_TICKET)")
 	hub := fs.String("hub", "https://finchmcp.com", "finch hub base URL")
 	// Default --machine to finch.yml's `machine:` when a manifest is present, so the
 	// box registers under the name the manifest declares; else the hostname.
@@ -881,9 +907,11 @@ func cmdEnroll(args []string) {
 	if appPath == "" && fs.NArg() > 0 {
 		appPath = fs.Arg(0)
 	}
-	if appPath == "" || *ticket == "" {
+	ticketVal := resolveTicket(*ticket)
+	if appPath == "" || ticketVal == "" {
 		fmt.Fprintln(os.Stderr, "usage: finch enroll <app_path> --ticket <t>")
 		fmt.Fprintln(os.Stderr, "  mint the ticket in the dashboard (Add device); <app_path> is the appliance/URL segment")
+		fmt.Fprintln(os.Stderr, "  keep it off argv/history: 'echo <t> | finch enroll <app_path> --ticket -' or set FINCH_TICKET")
 		os.Exit(2)
 	}
 	if strings.ContainsAny(appPath, "/ ") {
@@ -894,7 +922,7 @@ func cmdEnroll(args []string) {
 	// Join FIRST so we can name the credential by the hub's slugified appliance id
 	// (the relay resolves the appliance by THAT id, so `finch enroll Printer` must
 	// land as "printer", not the raw arg, or its URL/credential never matches).
-	jr, err := join(*hub, *ticket, *machine)
+	jr, err := join(*hub, ticketVal, *machine)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "finch: enroll failed: %v\n", err)
 		os.Exit(1)

@@ -1,3 +1,5 @@
+//go:build tray
+
 package main
 
 // dialog.go — tiny native input/alert dialogs, so the tray can take text (an
