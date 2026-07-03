@@ -78,7 +78,35 @@ function HubDomain({ current, onClaim }: { current: string; onClaim: (slug: stri
 // tenant in the hub's host-key index. Adding one returns the CNAME instruction
 // the operator must configure; the hub enforces ownership/vanity gating and
 // (when configured) provisions the Cloudflare-for-SaaS certificate.
-function CustomDomains() {
+// Concrete URL preview for a hostname: every appliance the tenant runs, as it
+// would be reached under that domain. The recommended naming is one hostname
+// per machine (box.yourdomain.com) with the service in the path — mirroring
+// the <machine>.aviary.run/<service> scheme.
+function DomainPreview({ hostname, appliances }: { hostname: string; appliances: any[] }) {
+  const shown = (appliances || []).slice(0, 4);
+  if (!shown.length) {
+    return (
+      <div className="set-hint dim" style={{ marginTop: 4 }}>
+        Services would live at <code className="mono">https://{hostname}/&lt;service&gt;/</code> — enroll a device to see real URLs here.
+      </div>
+    );
+  }
+  return (
+    <div style={{ marginTop: 4 }}>
+      <div className="set-hint dim" style={{ marginBottom: 4 }}>Your services on this domain:</div>
+      {shown.map((a) => (
+        <div key={a.id} className="mono set-hint" style={{ marginBottom: 2 }}>
+          https://{hostname}/<span style={{ color: 'var(--amber)' }}>{a.id}</span>/
+        </div>
+      ))}
+      {(appliances?.length ?? 0) > 4 && (
+        <div className="set-hint dim">…and {appliances.length - 4} more</div>
+      )}
+    </div>
+  );
+}
+
+function CustomDomains({ appliances }: { appliances: any[] }) {
   const [hostnames, setHostnames] = useState<string[]>([]);
   const [draft, setDraft] = useState('');
   const [busy, setBusy] = useState(false);
@@ -142,19 +170,24 @@ function CustomDomains() {
   return (
     <div className="custom-domains">
       <p className="set-hint dim" style={{ marginBottom: 12 }}>
-        Serve your boxes on your own domain instead of <code className="mono">.finchmcp.com</code>. Three steps:
+        Serve your boxes on your own domain instead of <code className="mono">.finchmcp.com</code>.
+        Name one hostname per box — services live under it as paths:{' '}
+        <code className="mono">&lt;box&gt;.yourdomain.com/&lt;service&gt;/</code>. Three steps:
       </p>
       <ol className="setup-steps">
-        <li>Add your hostname below (e.g. <code className="mono">mcp.yourdomain.com</code>).</li>
+        <li>Add a hostname below, named after the box it reaches (e.g. <code className="mono">pelican.yourdomain.com</code>).</li>
         <li>At your DNS provider, create the CNAME record we show you — it points your hostname at finch.</li>
-        <li>Wait for DNS to resolve; the certificate is issued automatically and your boxes go live on the new name.</li>
+        <li>Wait for DNS to resolve; the certificate is issued automatically and your services go live on the new name.</li>
       </ol>
       {hostnames.length > 0 && (
         <div style={{ marginBottom: 12 }}>
           {hostnames.map((h) => (
-            <div key={h} className="set-domain mono" style={{ alignItems: 'center', gap: 8, marginBottom: 4 }}>
-              <a href={`https://${h}`} target="_blank" rel="noreferrer">{h}</a>
-              <button type="button" className="btn btn-sm btn-ghost" disabled={busy} onClick={() => remove(h)}>Remove</button>
+            <div key={h} style={{ marginBottom: 10 }}>
+              <div className="set-domain mono" style={{ alignItems: 'center', gap: 8, marginBottom: 4 }}>
+                <a href={`https://${h}`} target="_blank" rel="noreferrer">{h}</a>
+                <button type="button" className="btn btn-sm btn-ghost" disabled={busy} onClick={() => remove(h)}>Remove</button>
+              </div>
+              <DomainPreview hostname={h} appliances={appliances} />
             </div>
           ))}
         </div>
@@ -171,6 +204,11 @@ function CustomDomains() {
           {busy ? 'adding…' : 'Add domain'}
         </button>
       </div>
+      {plausible && !hostnames.includes(hostname) && (
+        <div style={{ marginTop: 8 }}>
+          <DomainPreview hostname={hostname} appliances={appliances} />
+        </div>
+      )}
       {err && <div className="set-hint red" style={{ marginTop: 8 }}>{err}</div>}
       {added && (
         <div className="set-hint" style={{ marginTop: 8 }}>
@@ -310,7 +348,7 @@ function withCurrent(options: string[], current: string | undefined): string[] {
   return current && !options.includes(current) ? [current, ...options] : options;
 }
 
-export function SettingsView({ settings, groups, onChange }: any) {
+export function SettingsView({ settings, groups, appliances, onChange }: any) {
   const s = settings;
   // Real groups if the tenant has any, else just the current default — never
   // invent placeholder groups the user never created.
@@ -336,7 +374,7 @@ export function SettingsView({ settings, groups, onChange }: any) {
 
       <Card className="set-card">
         <SectionLabel>custom domains <span className="beta-badge">free while in beta</span></SectionLabel>
-        <CustomDomains />
+        <CustomDomains appliances={appliances || []} />
       </Card>
 
       <Card className="set-card">

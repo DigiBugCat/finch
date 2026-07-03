@@ -268,7 +268,7 @@ export default function DashboardApp() {
               <LogsView logs={logs} />
             )}
             {view === "settings" && (
-              <SettingsView settings={settings} groups={groups} onChange={updateSetting} />
+              <SettingsView settings={settings} groups={groups} appliances={appliances} onChange={updateSetting} />
             )}
           </>
         )}
