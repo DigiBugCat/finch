@@ -77,7 +77,23 @@ interface Stream {
 // readable + send `reset` to the agent. This REPLACES the old 30s total cap —
 // a long-running ("thinking") tool that keeps streaming never trips it; only a
 // genuinely stalled link does.
-const RELAY_IDLE_MS = 300_000;
+export const RELAY_IDLE_MS = 300_000;
+
+// PRE-HEAD timeout (S1): the initial timer armed at `req` send, before any
+// frame has come back. Tighter than the post-head idle (300s) so slowloris
+// slots — requests parked awaiting a head that never comes — recycle in ≤2min
+// instead of 5. Only affects upstreams silent >120s before emitting HEADERS;
+// once the head lands, rearm() switches to RELAY_IDLE_MS.
+export const RELAY_HEAD_TIMEOUT_MS = 120_000;
+
+// Concurrent in-flight relay streams per machine (S1). Each stream can buffer
+// up to ~RELAY_WINDOW_BYTES (1 MiB HWM) of response body, so 32 bounds queue
+// memory at ~32 MiB against the DO's 128 MB limit while comfortably covering a
+// docs page's subresource burst. Over the cap → 429 (terminal: NO
+// X-Finch-Offline, so index.ts's LB failover does NOT retry a saturated
+// machine on an idle sibling — acceptable for the single-machine deployment,
+// and a failover here would just spread the flood).
+export const MAX_STREAMS_PER_MACHINE = 32;
 
 // Streaming backpressure high-water-mark (#: no-backpressure OOM). The response
 // ReadableStream uses a ByteLengthQueuingStrategy with this HWM; once the
@@ -173,6 +189,18 @@ export class ApplianceDO extends DurableObject<Env> {
       );
     }
 
+    // PER-MACHINE STREAM CAP (S1): bound concurrent in-flight relays BEFORE
+    // buffering the request body or registering a stream. 429 is terminal —
+    // deliberately NO X-Finch-Offline header, so the LB path never "fails over"
+    // a saturated machine's load onto a sibling or marks it offline.
+    if (this.streams.size >= MAX_STREAMS_PER_MACHINE) {
+      return json(
+        429,
+        { error: "too many concurrent requests for this machine" },
+        { "retry-after": "1" },
+      );
+    }
+
     const body = await req.text();
     if (body.length > MAX_RELAY_BODY_BYTES) {
       return json(413, { error: "request body too large" });
@@ -193,7 +221,9 @@ export class ApplianceDO extends DurableObject<Env> {
     // FIRST frame for this id: `head` -> a streaming Response; `err` -> a plain
     // error Response; idle timeout with no head -> 504.
     const first = await new Promise<AgentFrame>((resolve) => {
-      const timer = setTimeout(() => this.onIdle(id), RELAY_IDLE_MS);
+      // Initial (pre-head) timer is the TIGHTER RELAY_HEAD_TIMEOUT_MS; rearm()
+      // switches to the longer RELAY_IDLE_MS once frames start flowing. (S1)
+      const timer = setTimeout(() => this.onIdle(id), RELAY_HEAD_TIMEOUT_MS);
       this.streams.set(id, { resolveHead: resolve, timer, headSettled: false });
       try {
         agent.send(JSON.stringify(frame));

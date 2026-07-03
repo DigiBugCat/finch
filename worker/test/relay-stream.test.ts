@@ -1,6 +1,11 @@
 import { describe, it, expect } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
 import vectors from "./relay-vectors.json";
+import {
+  MAX_STREAMS_PER_MACHINE,
+  RELAY_HEAD_TIMEOUT_MS,
+  RELAY_IDLE_MS,
+} from "../src/appliance-do";
 
 // The APPLIANCE binding's stub type (DurableObjectStub<undefined> in this
 // config). runInDurableObject hands the callback the real ApplianceDO instance;
@@ -433,6 +438,80 @@ describe("ApplianceDO streaming relay — reset / offline", () => {
     // Agent link drops -> webSocketClose -> resetAll errors the in-flight body.
     agent.close(1011, "link gone");
     expect(await bodyErr).toBeInstanceOf(Error);
+  });
+});
+
+describe("ApplianceDO streaming relay — per-machine stream cap (S1)", () => {
+  it("pins the slowloris constants: pre-head 120s, post-head idle 300s, cap 32", () => {
+    // The pre-head timer must be TIGHTER than the streaming idle so head-less
+    // (slowloris) slots recycle fast; the cap bounds concurrent DO memory.
+    expect(RELAY_HEAD_TIMEOUT_MS).toBe(120_000);
+    expect(RELAY_IDLE_MS).toBe(300_000);
+    expect(MAX_STREAMS_PER_MACHINE).toBe(32);
+  });
+
+  it("429s the request over the cap; a freed slot admits the next request", async () => {
+    const m = freshMachine();
+    const stub = stubFor(m);
+    const agent = await connectAgent(stub, m);
+
+    // Collect every relayed req frame (to learn the live ids).
+    const reqIds: string[] = [];
+    agent.addEventListener("message", ((ev: MessageEvent) => {
+      const f = JSON.parse(ev.data as string);
+      if (f.type === "req") reqIds.push(f.id);
+    }) as EventListener);
+    const waitForReqs = async (n: number) => {
+      for (let i = 0; i < 500 && reqIds.length < n; i++) {
+        await new Promise((r) => setTimeout(r, 0));
+      }
+      expect(reqIds.length).toBeGreaterThanOrEqual(n);
+    };
+
+    // Fill EVERY slot: the fetches park awaiting head (a slow/silent upstream).
+    const parked: Promise<Response>[] = [];
+    for (let i = 0; i < MAX_STREAMS_PER_MACHINE; i++) {
+      parked.push(
+        stub.fetch(new Request(relayUrl(m), { method: "POST", body: "x" })),
+      );
+    }
+    await waitForReqs(MAX_STREAMS_PER_MACHINE);
+
+    // One more is over the cap → 429, terminal (no X-Finch-Offline: the LB
+    // must NOT treat a saturated machine as offline / fail its load over).
+    const over = await stub.fetch(
+      new Request(relayUrl(m), { method: "POST", body: "x" }),
+    );
+    expect(over.status).toBe(429);
+    expect(over.headers.get("X-Finch-Offline")).toBeNull();
+    expect(over.headers.get("retry-after")).toBe("1");
+
+    // Complete ONE stream (err before head → its parked fetch resolves and the
+    // slot frees)…
+    agent.send(
+      JSON.stringify({
+        id: reqIds[0],
+        type: "err",
+        status: 502,
+        message: "done",
+      }),
+    );
+    const freed = await parked[0];
+    expect(freed.status).toBe(502);
+
+    // …and the SAME request that was just refused now gets through (its req
+    // frame reaches the agent instead of a 429).
+    const before = reqIds.length;
+    const admitted = stub.fetch(
+      new Request(relayUrl(m), { method: "POST", body: "x" }),
+    );
+    await waitForReqs(before + 1);
+
+    // Teardown: close the agent socket → resetAll resolves every parked fetch
+    // (502) so nothing dangles past the test.
+    agent.close(1011, "cap test done");
+    const rest = await Promise.all([...parked.slice(1), admitted]);
+    for (const r of rest) expect(r.status).toBe(502);
   });
 });
 
