@@ -21,6 +21,10 @@ import {
 } from "./auth";
 import {
   routerLookup,
+  routerRegister,
+  routerUnregister,
+  routerListForTenant,
+  isValidHostKey,
   routerDeviceStart,
   routerDevicePoll,
   routerDeviceApprove,
@@ -88,6 +92,7 @@ const REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60; // 30d
 // portal page → /__finch/cb hand-off while sharply bounding the replay window of
 // a captured grant (which is also burned on first use). (login-wall contract)
 const PORTAL_GRANT_TTL_SECONDS = 60;
+const DEFAULT_BYO_CNAME_TARGET = "finchmcp.com";
 
 // Machine-name clamp at the door (M1): bound length + charset before the name
 // ever reaches the registry. Mirrors tenant-do's cleanMachineName.
@@ -99,6 +104,81 @@ function cleanMachine(raw: unknown): string | null {
   if (!name || name.length > MAX_MACHINE_NAME) return null;
   if (!MACHINE_NAME_RE.test(name)) return null;
   return name;
+}
+
+function normalizeHostname(raw: unknown): string {
+  return typeof raw === "string" ? raw.trim().toLowerCase() : "";
+}
+
+function vanitySuffixes(env: Env): string[] {
+  return (env.VANITY_SUFFIXES || "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function underSuffix(hostname: string, suffix: string): boolean {
+  return hostname === suffix || hostname.endsWith(`.${suffix}`);
+}
+
+function vanityTier(env: Env, hostname: string): boolean {
+  return vanitySuffixes(env).some((suffix) => underSuffix(hostname, suffix));
+}
+
+function validateCustomHostname(hostname: string): boolean {
+  return hostname.includes(".") && isValidHostKey(hostname);
+}
+
+function cfHeaders(env: Env): HeadersInit {
+  return {
+    authorization: `Bearer ${env.CF_API_TOKEN || ""}`,
+    "content-type": "application/json",
+  };
+}
+
+async function provisionCfHostname(
+  env: Env,
+  hostname: string,
+): Promise<{ ok: boolean; ssl?: unknown; error?: unknown }> {
+  if (!env.CF_API_TOKEN || !env.CF_SAAS_ZONE_ID) return { ok: true };
+  const res = await fetch(
+    `https://api.cloudflare.com/client/v4/zones/${env.CF_SAAS_ZONE_ID}/custom_hostnames`,
+    {
+      method: "POST",
+      headers: cfHeaders(env),
+      body: JSON.stringify({ hostname, ssl: { method: "http", type: "dv" } }),
+    },
+  );
+  let data: any = null;
+  try {
+    data = await res.json();
+  } catch {
+    data = { error: await res.text().catch(() => "") };
+  }
+  if (!res.ok || data?.success === false) {
+    return { ok: false, error: data };
+  }
+  return { ok: true, ssl: data?.result?.ssl?.status };
+}
+
+async function bestEffortDeleteCfHostname(env: Env, hostname: string): Promise<void> {
+  if (!env.CF_API_TOKEN || !env.CF_SAAS_ZONE_ID) return;
+  try {
+    const qs = new URLSearchParams({ hostname });
+    const list = await fetch(
+      `https://api.cloudflare.com/client/v4/zones/${env.CF_SAAS_ZONE_ID}/custom_hostnames?${qs}`,
+      { method: "GET", headers: cfHeaders(env) },
+    );
+    const data: any = await list.json().catch(() => null);
+    const id = data?.result?.[0]?.id;
+    if (!list.ok || !id) return;
+    await fetch(
+      `https://api.cloudflare.com/client/v4/zones/${env.CF_SAAS_ZONE_ID}/custom_hostnames/${encodeURIComponent(id)}`,
+      { method: "DELETE", headers: cfHeaders(env) },
+    ).catch(() => {});
+  } catch {
+    // Best-effort cleanup only. Never log the CF token.
+  }
 }
 
 /** True if this path is handled by the control API (vs the MCP/relay plane). */
@@ -218,6 +298,9 @@ export async function handleApi(
     const { epoch: curEpoch } = await tenantOp<{ epoch: number }>(env, cliTenant, "cliEpoch");
     if ((payload!.epoch ?? -1) !== (curEpoch ?? 0)) {
       return json(401, { error: "CLI token revoked — run `finch login` again" });
+    }
+    if (path === "/api/cli/hostnames") {
+      return handleHostnames(req, env, cliTenant, method);
     }
     // GET /api/cli/whoami — validate a token + report the tenant it acts as.
     if (path === "/api/cli/whoami" && method === "GET") {
@@ -349,6 +432,10 @@ export async function handleApi(
 
   const parts = path.split("/").filter(Boolean); // ["api", ...]
   const seg = parts.slice(1); // strip "api"
+
+  if (seg.length === 1 && seg[0] === "hostnames") {
+    return handleHostnames(req, env, tenant, method);
+  }
 
   // GET /api/state
   if (method === "GET" && seg.length === 1 && seg[0] === "state") {
@@ -608,9 +695,84 @@ export async function handleApi(
   return json(404, { error: "no such control route", path, method });
 }
 
+async function handleHostnames(
+  req: Request,
+  env: Env,
+  tenant: string,
+  method: string,
+): Promise<Response> {
+  if (method === "GET") {
+    const keys = await routerListForTenant(env, tenant);
+    return json(200, { hostnames: keys.filter((key) => key.includes(".")) });
+  }
+
+  if (method !== "POST" && method !== "DELETE") {
+    return json(405, { error: "GET, POST, or DELETE only" });
+  }
+  if (!(await rateLimitOk(env.JOIN_LIMIT, `hostnames:${tenant}`))) {
+    return json(429, { error: "rate limited" });
+  }
+
+  const body = await readJson(req);
+  const hostname = normalizeHostname(body.hostname);
+  if (!validateCustomHostname(hostname)) {
+    return json(400, { error: "invalid hostname" });
+  }
+  // Registration is inert until the domain owner points DNS at us and, for BYO
+  // hostnames, Cloudflare validates + issues the cert. Collisions are first-come.
+  if (
+    hostname === "finchmcp.com" ||
+    hostname.endsWith(".finchmcp.com") ||
+    hostname === "workers.dev" ||
+    hostname.endsWith(".workers.dev")
+  ) {
+    return json(400, { error: "reserved hostname family" });
+  }
+
+  const vanity = vanityTier(env, hostname);
+  if (vanity && env.VANITY_TENANT !== tenant) {
+    return json(403, { error: "tenant is not allowed to claim vanity hostnames" });
+  }
+
+  if (method === "POST") {
+    const reg = await routerRegister(env, hostname, tenant);
+    if (!reg.ok) {
+      if (reg.reason === "collision") return json(409, { error: "hostname already registered" });
+      return json(400, { error: "invalid hostname" });
+    }
+    let ssl: unknown = undefined;
+    if (!vanity) {
+      const cf = await provisionCfHostname(env, hostname);
+      if (!cf.ok) {
+        await routerUnregister(env, hostname, tenant);
+        return json(502, { error: "cloudflare custom hostname provisioning failed", cloudflare: cf.error });
+      }
+      ssl = cf.ssl;
+    }
+    const target = env.BYO_CNAME_TARGET || DEFAULT_BYO_CNAME_TARGET;
+    return json(200, {
+      ok: true,
+      hostname,
+      tier: vanity ? "vanity" : "byo",
+      target,
+      ...(ssl !== undefined ? { ssl } : {}),
+      instructions: `CNAME ${hostname} -> ${target}`,
+    });
+  }
+
+  const owner = await routerLookup(env, hostname);
+  if (owner !== tenant) {
+    return json(404, { error: "hostname not found" });
+  }
+  const out = await routerUnregister(env, hostname, tenant);
+  if (!out.ok) return json(404, { error: "hostname not found" });
+  if (!vanity) await bestEffortDeleteCfHostname(env, hostname);
+  return json(200, { ok: true });
+}
+
 // Build operator-facing URLs from the tenant's RESOLVABLE host
 // (<slug>.finchmcp.com, registered in RouterDO) — NOT the inbound apex host,
-// which fails closed at the relay (slugFromHost("finchmcp.com") === ""). Local
+// which fails closed at the relay (hostKeyFromHost("finchmcp.com") === ""). Local
 // dev keeps the reachable inbound host (localhost:8787) for convenience.
 async function tenantHostBase(
   env: Env,

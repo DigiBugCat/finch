@@ -50,6 +50,11 @@ export interface Env {
   DEFAULT_TENANT?: string; // DEV-ONLY tenant fallback when no slug resolves
   DEV?: string; // "1" in the dev env; gates the DEFAULT_TENANT fallback
   WEB_URL?: string; // dashboard base URL — the `finch login` device page lives at <WEB_URL>/cli
+  VANITY_SUFFIXES?: string; // comma-separated first-party custom-hostname suffixes, e.g. "aviary.run"
+  VANITY_TENANT?: string; // only this tenant may claim VANITY_SUFFIXES hostnames
+  CF_API_TOKEN?: string; // secret: Cloudflare for SaaS API token (never log)
+  CF_SAAS_ZONE_ID?: string; // finchmcp.com zone id for SaaS custom-hostname provisioning
+  BYO_CNAME_TARGET?: string; // CNAME target shown to BYO-domain customers
   AI: Ai; // Workers AI binding — powers the /chat test interface
   SELF: Fetcher; // self service-binding — /chat relays MCP back through our own appliance path
 
@@ -109,8 +114,9 @@ const MAX_RELAY_BODY_BYTES = 4 * 1024 * 1024; // 4 MiB
 const SESSION_TTL_SECONDS = 12 * 60 * 60;
 
 // The login-wall cookie name. HttpOnly + Secure + SameSite=Lax + Path=/, and
-// HOST-scoped (no Domain attribute) so a cookie minted for <slug>.finchmcp.com
-// can't be replayed against a sibling tenant's slug host.
+// HOST-scoped (no Domain attribute) so a cookie minted for one host key
+// (<slug>.finchmcp.com, <machine>.aviary.run, or a BYO hostname) can't be
+// replayed against a sibling tenant's host.
 const SESSION_COOKIE = "finch_session";
 
 /** Parse a single cookie value out of a Cookie header. Returns "" if absent.
@@ -187,7 +193,7 @@ async function maybeBrowserGate(
   req: Request,
   env: Env,
   tenant: string,
-  slug: string,
+  hostKey: string,
   appliance: string,
   originalPathAndQuery: string,
 ): Promise<GateDecision> {
@@ -212,17 +218,17 @@ async function maybeBrowserGate(
 
   // 3. Public appliance → no wall (the explicit opt-out). We ask checkKey with an
   //    empty hash: a public appliance returns {public:true} regardless of key.
-  //    (A slug host with no usable slug — dev fallback — also has none to bind a
+  //    (A dev-fallback host with no usable host key also has none to bind a
   //    cookie to; skip the wall there too rather than bounce to a dead slug. The
   //    relay's own checkKey then enforces the key gate as before.) Gate this on
-  //    env.DEV: an empty slug only ever arises via the DEV DEFAULT_TENANT
+  //    env.DEV: an empty host key only ever arises via the DEV DEFAULT_TENANT
   //    fallback (resolveTenant fails closed in prod), so a prod build must never
   //    take this wall-skip even if misconfigured — fall through to browserGate.
-  if (!slug) {
+  if (!hostKey) {
     if (env.DEV === "1") return { browserAuthed: false };
-    // No slug in a non-dev build should be unreachable (resolveTenant 404s), but
+    // No host key in a non-dev build should be unreachable (resolveTenant 404s), but
     // if it happens, fail CLOSED: treat as a private appliance needing the wall.
-    return browserGate(req, env, tenant, slug, originalPathAndQuery);
+    return browserGate(req, env, tenant, hostKey, originalPathAndQuery);
   }
   const probe = await tenantOp<{ public?: boolean }>(env, tenant, "checkKey", {
     hash: "",
@@ -231,7 +237,7 @@ async function maybeBrowserGate(
   if (probe?.public) return { browserAuthed: false };
 
   // 4. A browser on a private appliance → require the session cookie.
-  return browserGate(req, env, tenant, slug, originalPathAndQuery);
+  return browserGate(req, env, tenant, hostKey, originalPathAndQuery);
 }
 
 /** browserGate — the login-wall decision for a relay request that is NOT a
@@ -246,7 +252,7 @@ async function browserGate(
   req: Request,
   env: Env,
   tenant: string,
-  slug: string,
+  hostKey: string,
   originalPathAndQuery: string,
 ): Promise<GateDecision> {
   const cookie = readCookie(req, SESSION_COOKIE);
@@ -256,7 +262,7 @@ async function browserGate(
       sess &&
       sess.kind === "session" &&
       sess.tenant === tenant &&
-      sess.slug === slug
+      sess.slug === hostKey
     ) {
       // Stale-cookie check: the tenant can "sign everyone out" by bumping its
       // sessionEpoch; a cookie minted under an older epoch is treated as logged
@@ -272,12 +278,12 @@ async function browserGate(
     }
   }
   // No valid session → bounce to the Clerk-gated portal start page. WEB_URL is
-  // the dashboard origin; the portal page re-mints a portal grant for this slug
+  // the dashboard origin; the portal page re-mints a portal grant for this host key
   // and hands the browser back to /__finch/cb here. `rd` carries the original
   // path+query so the user lands where they meant to after login.
   const webBase = (env.WEB_URL || "https://finchmcp.com").replace(/\/+$/, "");
   const target =
-    `${webBase}/portal/start?slug=${encodeURIComponent(slug)}` +
+    `${webBase}/portal/start?slug=${encodeURIComponent(hostKey)}` +
     `&rd=${encodeURIComponent(safeRelPath(originalPathAndQuery))}`;
   return { wall: Response.redirect(target, 302) };
 }
@@ -303,34 +309,63 @@ function safeDecode(seg: string): string {
   }
 }
 
-/** Extract the vanity host slug for an MCP/relay request.
- *  `<slug>.finchmcp.com` -> `<slug>`. Returns "" for the apex, `www`,
- *  `*.workers.dev`, localhost, or anything without a usable subdomain. */
-function slugFromHost(host: string): string {
-  const h = (host || "").split(":")[0].toLowerCase();
-  const labels = h.split(".").filter(Boolean);
-  // <slug>.finchmcp.com -> ["<slug>", "finchmcp", "com"]
-  if (labels.length >= 3 && labels[labels.length - 2] === "finchmcp") {
+/** Extract the routing host key for an MCP/relay request.
+ *  `<slug>.finchmcp.com` -> `<slug>` (legacy bare-slug key).
+ *  Any other multi-label hostname -> the full lowercase hostname (custom host).
+ *  Returns "" for apex/www finchmcp.com, workers.dev, localhost/IP literals,
+ *  single-label hosts, and anything without a usable public hostname. */
+export function hostKeyFromHost(host: string): string {
+  let h = (host || "").trim().toLowerCase();
+  if (h.startsWith("[")) {
+    const end = h.indexOf("]");
+    if (end >= 0) h = h.slice(1, end);
+  } else {
+    h = h.split(":")[0];
+  }
+  if (!h || h === "localhost" || h.includes(":")) return "";
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(h) || h.startsWith("127.")) return "";
+  const labels = h.split(".");
+  if (labels.length < 2 || labels.some((label) => !label)) return "";
+  if (h === "finchmcp.com" || h === "www.finchmcp.com") return "";
+  if (h === "workers.dev" || h.endsWith(".workers.dev")) return "";
+  if (
+    labels.length === 3 &&
+    labels[1] === "finchmcp" &&
+    labels[2] === "com"
+  ) {
     const sub = labels[0];
     if (sub && sub !== "www") return sub;
+    return "";
   }
-  return "";
+  return h;
 }
 
-/** Resolve the tenant id for an MCP/relay request from the host slug.
- *  slug -> RouterDO.lookup -> tenant id. FAILS CLOSED: an unknown slug returns
- *  null (the caller turns that into a 404). The DEFAULT_TENANT fallback is
- *  consulted ONLY in dev (env.DEV === "1") so prod never silently falls back. */
-async function resolveTenant(host: string, env: Env): Promise<string | null> {
-  const slug = slugFromHost(host);
-  if (slug) {
-    const tenant = await routerLookup(env, slug);
-    if (tenant) return tenant;
+/** Back-compat alias for tests / older local imports; prefer hostKeyFromHost. */
+export const slugFromHost = hostKeyFromHost;
+
+/** Resolve the tenant id for an MCP/relay request from the host key.
+ *  host key -> RouterDO.lookup -> tenant id. FAILS CLOSED: an unknown key returns
+ *  a null tenant (the caller turns that into a 404). The DEFAULT_TENANT fallback
+ *  is consulted ONLY in dev (env.DEV === "1") so prod never silently falls back.
+ *  Returns the RESOLVED host key alongside the tenant: hostKey is "" when the
+ *  dev fallback supplied the tenant (the inbound host never resolved), so the
+ *  login wall / cookie binding only ever operate on a key RouterDO vouched for —
+ *  never on a merely-parsed hostname. */
+async function resolveTenant(
+  host: string,
+  env: Env,
+): Promise<{ tenant: string | null; hostKey: string }> {
+  const key = hostKeyFromHost(host);
+  if (key) {
+    const tenant = await routerLookup(env, key);
+    if (tenant) return { tenant, hostKey: key };
   }
-  // No usable/registered slug (unregistered slug, apex, www, workers.dev,
+  // No usable/registered host key (unregistered slug/custom host, apex, www, workers.dev,
   // localhost): fail closed in prod; dev-only DEFAULT_TENANT fallback otherwise.
-  if (env.DEV === "1" && env.DEFAULT_TENANT) return env.DEFAULT_TENANT;
-  return null;
+  if (env.DEV === "1" && env.DEFAULT_TENANT) {
+    return { tenant: env.DEFAULT_TENANT, hostKey: "" };
+  }
+  return { tenant: null, hostKey: "" };
 }
 
 /** Tenant DO stub for a tenant id. */
@@ -442,7 +477,7 @@ export default {
 
     // ---- MCP / relay plane. Tenant id resolves from the host slug via the
     //      singleton RouterDO (slug→tenantId). FAIL CLOSED on an unknown slug. ----
-    const tenant = await resolveTenant(host, env);
+    const { tenant, hostKey } = await resolveTenant(host, env);
     if (!tenant) {
       return json(404, {
         error: "tenant could not be resolved from host",
@@ -455,7 +490,7 @@ export default {
     //      (mirrors how _connect/releases are reserved). Both run on the slug
     //      host (<slug>.finchmcp.com), where the tenant is already resolved. ----
     if (path === "/__finch/cb" && req.method === "GET") {
-      return handleFinchCb(req, env, url, host, tenant);
+      return handleFinchCb(req, env, url, hostKey, tenant);
     }
     if (path === "/__finch/logout" && req.method === "GET") {
       // Clear the session cookie (Max-Age=0) and 302 to a validated relative rd
@@ -543,14 +578,15 @@ export default {
       // unless a valid finch_session cookie is present. finch_ key calls, the
       // dashboard's service-authed test-in-chat, and PUBLIC appliances all pass
       // through untouched. Computed once here; covers BOTH the pinned-machine and
-      // the load-balanced branch below.
-      const slug = slugFromHost(host);
+      // the load-balanced branch below. hostKey comes from resolveTenant above —
+      // it is the key RouterDO actually resolved ("" under the dev fallback), so
+      // the wall never binds a cookie to an unregistered hostname.
       const originalPathAndQuery = path + (url.search || "");
       const gate = await maybeBrowserGate(
         req,
         env,
         tenant,
-        slug,
+        hostKey,
         appliance,
         originalPathAndQuery,
       );
@@ -854,14 +890,14 @@ async function relayMcp(
   return res;
 }
 
-/** GET /__finch/cb?g=<grant>&rd=<relpath> — the login-wall callback on the slug
+/** GET /__finch/cb?g=<grant>&rd=<relpath> — the login-wall callback on the host
  *  host. The Clerk-authed portal page (web) mints a short single-use PORTAL grant
  *  and hands the browser here. We:
  *    1. verifyToken(g, TICKET_SECRET) and assert kind==="portal".
- *    2. Bind it to THIS host: grant.tenant === resolved tenant AND grant.slug ===
- *       slugFromHost(host). A grant for another tenant/slug is refused (the slug
- *       host is the security boundary — a grant minted for X can't set a cookie
- *       on Y).
+ *    2. Bind it to THIS host: grant.tenant === resolved tenant AND grant.slug
+ *       carries the resolved host key. A grant for another tenant/host key is
+ *       refused (the host is the security boundary — a grant minted for X can't
+ *       set a cookie on Y). The signed field remains named `slug` for wire compat.
  *    3. Burn the jti (claimTicket) so a captured grant can't mint a second
  *       session — refuse on {ok:false} (replay).
  *    4. Mint a kind:"session" cookie (SESSION_SECRET) stamped with the tenant's
@@ -872,29 +908,30 @@ async function handleFinchCb(
   req: Request,
   env: Env,
   url: URL,
-  host: string,
+  // The RESOLVED host key from resolveTenant ("" under the dev fallback) — the
+  // grant/cookie binding below must only ever see a RouterDO-vouched key.
+  hostKey: string,
   tenant: string,
 ): Promise<Response> {
-  const slug = slugFromHost(host);
   const rd = safeRelPath(url.searchParams.get("rd"));
 
   // Re-bounce target if anything is wrong: back through the Clerk-gated portal.
   const webBase = (env.WEB_URL || "https://finchmcp.com").replace(/\/+$/, "");
   const reBounce = () =>
     Response.redirect(
-      `${webBase}/portal/start?slug=${encodeURIComponent(slug)}&rd=${encodeURIComponent(rd)}`,
+      `${webBase}/portal/start?slug=${encodeURIComponent(hostKey)}&rd=${encodeURIComponent(rd)}`,
       302,
     );
 
   const grantTok = url.searchParams.get("g") || "";
-  if (!grantTok || !slug) return reBounce();
+  if (!grantTok || !hostKey) return reBounce();
 
   const grant = await verifyToken(grantTok, env.TICKET_SECRET);
   if (
     !grant ||
     grant.kind !== "portal" ||
     grant.tenant !== tenant ||
-    grant.slug !== slug ||
+    grant.slug !== hostKey ||
     !grant.userId
   ) {
     return reBounce();
@@ -922,7 +959,7 @@ async function handleFinchCb(
     {
       kind: "session",
       tenant,
-      slug,
+      slug: hostKey,
       userId: grant.userId,
       epoch: epoch ?? 0,
       exp,

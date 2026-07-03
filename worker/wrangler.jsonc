@@ -156,15 +156,23 @@
       "workers_dev": false,
       "observability": { "enabled": true },
       // NO DEFAULT_TENANT and NO DEV — resolveTenant fails closed (404) for any
-      // host without a registered <slug>.finchmcp.com subdomain.
+      // host without a registered host key.
       "vars": {
-        "WEB_URL": "https://finchmcp.com"
+        "WEB_URL": "https://finchmcp.com",
+        "VANITY_SUFFIXES": "aviary.run"
+        // Set VANITY_TENANT to the single tenant allowed to claim *.aviary.run.
+        // Set CF_SAAS_ZONE_ID to enable Cloudflare-for-SaaS BYO provisioning.
+        // Optional BYO_CNAME_TARGET defaults to "finchmcp.com".
+        // CF_API_TOKEN is a secret:
+        //   wrangler secret put CF_API_TOKEN --env production
       },
       "ai": { "binding": "AI" },
       "services": [{ "binding": "SELF", "service": "finch-prod" }],
       "routes": [
         { "pattern": "finchmcp.com/*", "zone_name": "finchmcp.com" },
-        { "pattern": "*.finchmcp.com/*", "zone_name": "finchmcp.com" }
+        { "pattern": "*.finchmcp.com/*", "zone_name": "finchmcp.com" },
+        { "pattern": "*.aviary.run/*", "zone_name": "aviary.run" },
+        { "pattern": "*/*", "zone_name": "finchmcp.com" }
       ],
       "durable_objects": {
         "bindings": [

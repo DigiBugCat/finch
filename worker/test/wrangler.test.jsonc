@@ -19,7 +19,10 @@
     "DEV": "1",
     // The login wall 302s here; a stable test value lets the e2e assert the
     // Location host without depending on prod config.
-    "WEB_URL": "https://web.test"
+    "WEB_URL": "https://web.test",
+    "VANITY_SUFFIXES": "aviary.run",
+    "VANITY_TENANT": "tenant_vanity",
+    "BYO_CNAME_TARGET": "finchmcp.com"
   },
   "durable_objects": {
     "bindings": [

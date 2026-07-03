@@ -89,6 +89,7 @@ needed for your FIRST box.
 ## Inspect state
   finch status --json     # am I logged in (which tenant)? what does finch.yml serve?
   finch fleet --json      # every appliance + its state (chirping/resting/pending)
+  finch domain ls         # custom hostnames mapped to this account
 
 ## finch.yml (what 'finch add' writes — holds NO secrets)
   hub: https://finchmcp.com
@@ -126,6 +127,7 @@ Usage:
   finch test <appliance>               List an appliance's MCP tools (does-it-work check)
   finch call <appliance> <tool> [--args '{...}']   Invoke one tool through the hub
   finch keys [list|mint <label> --appliance <id>|revoke <id>]   Manage client finch_ keys
+  finch domain [ls|add <hostname>|rm <hostname>]   Manage custom hostnames
   finch rm <appliance>                 Remove an appliance
   finch revoke-tokens                  De-authorize every CLI login (incl. this box)
   finch join --ticket <t> --upstream <url>   Run one appliance straight from flags
@@ -161,6 +163,7 @@ Automation / driving finch from an agent (after the one-time 'finch login'):
     finch keys mint web-client --appliance scraper     # prints a finch_ key once
     finch keys list
     finch keys revoke <id>         # access stops immediately
+    finch domain add mcp.example.com
     finch revoke-tokens            # de-authorize every CLI login at once
 
   Provision a NEW box from this already-authed one, zero human in the loop:
@@ -517,6 +520,75 @@ func mustCliCred() *cliCred {
 		os.Exit(1)
 	}
 	return cred
+}
+
+// cmdDomain: finch domain [ls|add|rm] — manage custom hostnames mapped to this
+// tenant. The hub enforces ownership and, for BYO domains, returns the DNS CNAME
+// instruction the operator must configure before traffic becomes live.
+func cmdDomain(args []string) {
+	sub := "ls"
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		sub, args = args[0], args[1:]
+	}
+	cred, err := loadCliCred()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
+		os.Exit(1)
+	}
+	switch sub {
+	case "ls", "list":
+		fs := flag.NewFlagSet("domain ls", flag.ExitOnError)
+		asJSON := fs.Bool("json", false, "machine-readable JSON")
+		_ = fs.Parse(args)
+		out, err := cliRequest("GET", cred.Hub, "/api/cli/hostnames", cred.Token, nil)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "finch: %v\n", err)
+			os.Exit(1)
+		}
+		hostnames, _ := out["hostnames"].([]any)
+		if *asJSON {
+			b, _ := json.Marshal(hostnames)
+			fmt.Println(string(b))
+			return
+		}
+		if len(hostnames) == 0 {
+			fmt.Println("no custom hostnames — `finch domain add <hostname>`")
+			return
+		}
+		for _, h := range hostnames {
+			fmt.Printf("  %v\n", h)
+		}
+	case "add":
+		if len(args) < 1 {
+			fmt.Fprintln(os.Stderr, "usage: finch domain add <hostname>")
+			os.Exit(2)
+		}
+		out, err := cliRequest("POST", cred.Hub, "/api/cli/hostnames", cred.Token, map[string]string{"hostname": args[0]})
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "finch: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("finch: added %v hostname %v\n", out["tier"], out["hostname"])
+		if instr, _ := out["instructions"].(string); instr != "" {
+			fmt.Println(instr)
+		}
+		if ssl, ok := out["ssl"]; ok && ssl != nil {
+			fmt.Printf("ssl: %v\n", ssl)
+		}
+	case "rm", "remove", "delete":
+		if len(args) < 1 {
+			fmt.Fprintln(os.Stderr, "usage: finch domain rm <hostname>")
+			os.Exit(2)
+		}
+		if _, err := cliRequest("DELETE", cred.Hub, "/api/cli/hostnames", cred.Token, map[string]string{"hostname": args[0]}); err != nil {
+			fmt.Fprintf(os.Stderr, "finch: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("finch: removed hostname %s\n", args[0])
+	default:
+		fmt.Fprintln(os.Stderr, "usage: finch domain [ls | add <hostname> | rm <hostname>]")
+		os.Exit(2)
+	}
 }
 
 // cmdKeys: finch keys [list|mint|revoke] — manage the client finch_ keys that

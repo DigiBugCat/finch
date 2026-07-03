@@ -243,6 +243,9 @@ func Main() {
 		case "keys":
 			cmdKeys(os.Args[2:])
 			return
+		case "domain":
+			cmdDomain(os.Args[2:])
+			return
 		case "fleet", "ls":
 			cmdFleet(os.Args[2:])
 			return

@@ -101,9 +101,11 @@ export interface TicketPayload {
   //                 sessionEpoch so "sign everyone out" invalidates live cookies.
   kind?: "join" | "connect" | "refresh" | "portal" | "session";
   machine?: string; // present (and verified) for kind:"connect"|"refresh" tokens
-  // The vanity host slug (<slug>.finchmcp.com) a portal/session grant is bound to.
-  // Present (and verified) ONLY for kind:"portal"|"session"; the agent kinds bind
-  // an appliance instead. Ties the browser grant to a single slug-host.
+  // The routing host key a portal/session grant is bound to. For legacy
+  // <slug>.finchmcp.com hosts this is the bare slug; for custom hostnames it is
+  // the full lowercase hostname. The field stays named `slug` for wire compat.
+  // Present (and verified) ONLY for kind:"portal"|"session"; the agent kinds
+  // bind an appliance instead. Ties the browser grant to a single host.
   slug?: string;
   // The Clerk user id the portal/session grant was minted for (login-wall audit /
   // identity). Present for kind:"portal"|"session".
