@@ -96,14 +96,14 @@ matrix in `.goreleaser.yaml`).
 
 ```sh
 # macOS (needs Xcode command-line tools)
-go build -o finch-tray ./tray
+go build -tags tray -o finch-tray ./tray
 
 # Linux (needs gtk3 + libayatana-appindicator)
 #   Debian/Ubuntu: sudo apt install gcc libgtk-3-dev libayatana-appindicator3-dev
-CGO_ENABLED=1 go build -o finch-tray ./tray
+CGO_ENABLED=1 go build -tags tray -o finch-tray ./tray
 
 # Windows (from a Windows host; CGo via mingw, or plain — systray uses win32)
-go build -o finch-tray.exe ./tray
+go build -tags tray -o finch-tray.exe ./tray
 ```
 
 ### macOS `.app`

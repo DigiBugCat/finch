@@ -457,14 +457,27 @@ describe("ApplianceDO streaming relay — per-machine stream cap (S1)", () => {
 
     // Collect every relayed req frame (to learn the live ids).
     const reqIds: string[] = [];
+    let wakeReqWaiter: (() => void) | undefined;
     agent.addEventListener("message", ((ev: MessageEvent) => {
       const f = JSON.parse(ev.data as string);
-      if (f.type === "req") reqIds.push(f.id);
+      if (f.type === "req") {
+        reqIds.push(f.id);
+        wakeReqWaiter?.();
+      }
     }) as EventListener);
     const waitForReqs = async (n: number) => {
-      for (let i = 0; i < 500 && reqIds.length < n; i++) {
-        await new Promise((r) => setTimeout(r, 0));
+      const deadline = Date.now() + 5_000;
+      while (reqIds.length < n && Date.now() < deadline) {
+        await new Promise<void>((resolve) => {
+          const t = setTimeout(resolve, 50);
+          wakeReqWaiter = () => {
+            clearTimeout(t);
+            wakeReqWaiter = undefined;
+            resolve();
+          };
+        });
       }
+      wakeReqWaiter = undefined;
       expect(reqIds.length).toBeGreaterThanOrEqual(n);
     };
 
@@ -507,12 +520,22 @@ describe("ApplianceDO streaming relay — per-machine stream cap (S1)", () => {
     );
     await waitForReqs(before + 1);
 
-    // Teardown: close the agent socket → resetAll resolves every parked fetch
-    // (502) so nothing dangles past the test.
-    agent.close(1011, "cap test done");
+    // Teardown: terminate the parked pre-head requests explicitly. Relying on a
+    // WebSocket close event here is racy in workerd and can leave promises
+    // parked until Vitest's per-test timeout.
+    for (const id of reqIds.slice(1)) {
+      agent.send(
+        JSON.stringify({
+          id,
+          type: "err",
+          status: 502,
+          message: "cap test done",
+        }),
+      );
+    }
     const rest = await Promise.all([...parked.slice(1), admitted]);
     for (const r of rest) expect(r.status).toBe(502);
-  });
+  }, 10_000);
 });
 
 describe("ApplianceDO streaming relay — backpressure (window frames)", () => {
