@@ -195,8 +195,14 @@
         { "pattern": "finchmcp.com/api/cli/*", "zone_name": "finchmcp.com" },
         { "pattern": "finchmcp.com/install*", "zone_name": "finchmcp.com" },
         { "pattern": "finchmcp.com/releases/*", "zone_name": "finchmcp.com" },
-        { "pattern": "*.finchmcp.com/*", "zone_name": "finchmcp.com" },
-        { "pattern": "*.aviary.run/*", "zone_name": "aviary.run" }
+        { "pattern": "*.finchmcp.com/*", "zone_name": "finchmcp.com" }
+        // First-party vanity subdomains (<slug>.aviary.run, operator-tenant only).
+        // PARKED: the CI/deploy CLOUDFLARE_API_TOKEN has Workers Routes: Edit on
+        // finchmcp.com but NOT on the aviary.run zone, so registering this route
+        // 401s (code 10000) and fails the whole prod deploy. Core product runs on
+        // <slug>.finchmcp.com without it. Re-add once the token gains an
+        // aviary.run → Workers Routes → Edit policy:
+        //   { "pattern": "*.aviary.run/*", "zone_name": "aviary.run" }
         // BYO custom hostnames also need the catch-all route below, which
         // Cloudflare only accepts once Cloudflare-for-SaaS is enabled on the
         // finchmcp.com zone (dashboard: SSL/TLS → Custom Hostnames → Enable;
