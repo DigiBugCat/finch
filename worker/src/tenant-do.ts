@@ -352,6 +352,20 @@ export class TenantDO extends DurableObject<Env> {
    *  hashes. Never persisted — always recomputed from the stored record. */
   private async getState(): Promise<TenantState> {
     const s = await this.load();
+    // First dashboard load for a fresh tenant: hand out a default hub domain
+    // so people start with a working <slug>.finchmcp.com instead of a claim
+    // flow. Persist only when something was actually claimed — getState stays
+    // a pure read otherwise.
+    if (await this.ensureDefaultSlug(s)) {
+      this.log(s, {
+        cat: "admin",
+        actor: "you",
+        action: "claimed default hub domain",
+        target: s.settings.subdomain,
+        ip: "",
+      });
+      await this.save(s);
+    }
     const now = Date.now();
 
     const services: Service[] = s.services.map((a) => {
@@ -515,6 +529,40 @@ export class TenantDO extends DurableObject<Env> {
     );
   }
 
+  /** Every tenant gets a hub domain BY DEFAULT — no claim step. Called from
+   *  getState (first dashboard load) and enroll (first box join), whichever
+   *  comes first. Tries friendly pet-name slugs (adjective-bird-NN, mirroring
+   *  the web picker's suggestions), then falls back to a tenant-id-derived
+   *  slug so even a pathological collision run leaves the tenant with a
+   *  working public host. Mutates `s` but does NOT save — callers save.
+   *  Returns whether a slug was newly claimed. */
+  private async ensureDefaultSlug(s: StoredState): Promise<boolean> {
+    if (s.settings.subdomain) return false;
+    const ADJ = ["sunny", "amber", "dusk", "quiet", "brave", "lucky", "misty", "cozy", "swift", "fern", "maple", "ember", "cedar", "pebble", "noble", "tidal"];
+    const BIRD = ["finch", "wren", "robin", "sparrow", "lark", "swift", "martin", "thrush", "siskin", "tanager", "plover", "kestrel"];
+    for (let n = 0; n < 8; n++) {
+      const slug =
+        `${ADJ[Math.floor(Math.random() * ADJ.length)]}-` +
+        `${BIRD[Math.floor(Math.random() * BIRD.length)]}-` +
+        `${Math.floor(Math.random() * 90) + 10}`;
+      if (await this.registerSlug(slug)) {
+        s.settings.subdomain = slug;
+        s.host = `${slug}.finchmcp.com`;
+        return true;
+      }
+    }
+    const base = this.slugify(this.tenantId(), "tenant");
+    for (let n = 0; n < 20; n++) {
+      const slug = n === 0 ? base : `${base}-${n + 1}`;
+      if (await this.registerSlug(slug)) {
+        s.settings.subdomain = slug;
+        s.host = `${slug}.finchmcp.com`;
+        return true;
+      }
+    }
+    return false;
+  }
+
   /** This DO is keyed by the REAL tenant id (Clerk org/user id). */
   private tenantId(): string {
     return this.ctx.id.name ?? "";
@@ -659,24 +707,10 @@ export class TenantDO extends DurableObject<Env> {
     if (g && !s.groups.some((gr) => gr.name === g)) {
       s.groups.push({ name: g, members: ["you"] });
     }
-    // First enroll for a tenant that hasn't chosen a subdomain: claim a default
-    // slug (derived from the tenant id) and register it in the RouterDO so the
-    // public relay URL resolves. If the base slug collides (two tenant ids that
-    // slugify identically — e.g. differing only in punctuation/case), retry with
-    // a numeric suffix so every tenant still gets a working default host rather
-    // than being silently left with no public URL. Bounded so a pathological
-    // collision run can't loop forever; if even that fails the tenant picks one.
-    if (!s.settings.subdomain) {
-      const base = this.slugify(this.tenantId(), "tenant");
-      for (let n = 0; n < 20; n++) {
-        const slug = n === 0 ? base : `${base}-${n + 1}`;
-        if (await this.registerSlug(slug)) {
-          s.settings.subdomain = slug;
-          s.host = `${slug}.finchmcp.com`;
-          break;
-        }
-      }
-    }
+    // First enroll for a tenant whose dashboard never loaded (getState also
+    // does this): make sure a default hub domain exists so the public relay
+    // URL resolves.
+    await this.ensureDefaultSlug(s);
     this.log(s, {
       cat: "device",
       actor: "you",
