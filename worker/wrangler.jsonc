@@ -176,9 +176,10 @@
         // Production Clerk instance (pk_live/sk_live) — enables the MCP OAuth plane.
         "CLERK_ISSUER": "https://clerk.finchmcp.com",
         // Cloudflare-for-SaaS BYO provisioning: finchmcp.com zone.
-        "CF_SAAS_ZONE_ID": "90ca5aa137cd55b8b174763a50641c00"
-        // Set VANITY_TENANT to the single tenant allowed to claim *.aviary.run
-        // (operator's user id on the PROD Clerk instance — set after first sign-up).
+        "CF_SAAS_ZONE_ID": "90ca5aa137cd55b8b174763a50641c00",
+        // Operator tenant (Andrew on the prod Clerk instance) — the single
+        // tenant allowed to claim *.aviary.run vanity hostnames.
+        "VANITY_TENANT": "user_3GCB66okiVwngWoDmDcHdARcpkl"
         // Optional BYO_CNAME_TARGET defaults to "finchmcp.com".
         // CF_API_TOKEN is a secret:
         //   wrangler secret put CF_API_TOKEN --env production

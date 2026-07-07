@@ -57,10 +57,13 @@
         { "binding": "WORKER_SELF_REFERENCE", "service": "finch-web-prod" },
         { "binding": "FINCH_HUB", "service": "finch-prod" }
       ],
-      // HUB_URL is the public-fetch fallback; unused once the FINCH_HUB service
-      // binding is the path web→hub takes.
+      // HUB_URL must be a host the HUB owns. NOT the bare apex: web itself owns
+      // finchmcp.com/* (the hub only has /join, /refresh, /api/cli/*, /install,
+      // /releases there), so apex /api/state would loop back into web and 404.
+      // hub.finchmcp.com resolves to the hub via the *.finchmcp.com/* route;
+      // /api/* is handled before tenant resolution, so no registration needed.
       "vars": {
-        "HUB_URL": "https://finchmcp.com",
+        "HUB_URL": "https://hub.finchmcp.com",
         // Production Clerk instance (clerk.finchmcp.com). Publishable key is
         // PUBLIC; the secret half (CLERK_SECRET_KEY) is a wrangler secret.
         "NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY": "pk_live_Y2xlcmsuZmluY2htY3AuY29tJA",

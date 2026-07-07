@@ -24,6 +24,14 @@ function HubDomain({ current, onClaim }: { current: string; onClaim: (slug: stri
   // Normalize to a host-safe single label as the user types.
   const clean = (v: string) => v.toLowerCase().replace(/[^a-z0-9-]/g, '').replace(/^-+/, '').slice(0, 40);
 
+  // No domain yet → start with a suggestion instead of an empty box (the
+  // availability check below kicks in automatically). In an effect, not
+  // initial state: petSlug() is random and would mismatch on hydration.
+  useEffect(() => {
+    if (!current && !draft) setDraft(petSlug());
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- mount-only prefill
+  }, []);
+
   useEffect(() => {
     const slug = clean(draft);
     if (!slug) { setStatus('idle'); return; }
