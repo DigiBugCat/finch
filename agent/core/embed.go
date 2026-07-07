@@ -188,7 +188,7 @@ func Embed(ctx context.Context, o EmbedOptions, status func(state, detail string
 		return fmt.Errorf("not enrolled: pass a Ticket on first run")
 	}
 
-	wsBase := relayURL(hub, jr.Service, jr.Box)
+	wsBase := relayDialURL(jr, hub)
 	connectToken := jr.ConnectToken
 	connectExp := tokenExp(connectToken)
 	status("live", jr.URL)
@@ -223,7 +223,7 @@ func Embed(ctx context.Context, o EmbedOptions, status func(state, detail string
 			}
 			connectToken = fresh.ConnectToken
 			connectExp = tokenExp(connectToken)
-			wsBase = relayURL(hub, fresh.Service, fresh.Box)
+			wsBase = relayDialURL(fresh, hub)
 		}
 
 		wsURL := wsBase + "?ct=" + url.QueryEscape(connectToken)

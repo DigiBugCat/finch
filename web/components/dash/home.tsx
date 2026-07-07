@@ -41,7 +41,7 @@ export function HomeView({ services, boxes, overview, host, onOpen, onApprove, o
         <div className="roost-head-left">
           <h1 className="roost-title">Your flock, this evening <span className="moon">🌙</span></h1>
           <p className="roost-sub">
-            <b className="n-on">{online.length} chirping</b> · {resting.length} resting
+            <b className="n-on">{online.length} online</b> · {resting.length} offline
             {invited.length ? <> · <b className="n-inv">{invited.length} invited</b></> : null}
             {pending.length ? <> · <b className="n-inv">{pending.length} pending</b></> : null}
           </p>

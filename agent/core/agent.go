@@ -54,7 +54,7 @@ import (
 // `-ldflags "-X main.agentVersion=<v>"`; the literal here is the source of
 // truth that CI (scripts/check-versions.mjs) asserts matches the worker's
 // LATEST_AGENT and the web dashboard constant. Keep all three in sync.
-var agentVersion = "1.5.1"
+var agentVersion = "1.5.2"
 
 // connectSkew is how long before a connect-token's exp we treat it as already
 // expired and force a fresh /join, so we never dial with a token that lapses
@@ -202,6 +202,14 @@ type joinResp struct {
 	Box     string `json:"box"`
 	Host    string `json:"host"` // public host, e.g. <slug>.finchmcp.com
 	URL     string `json:"url"`  // public MCP endpoint for this service
+	// Fully-formed relay dial URL (wss://<slug-host>/<service>/<box>/_connect),
+	// computed hub-side from the tenant's real host — correct in every env
+	// (staging → inbound workers.dev host; prod → <slug>.finchmcp.com). We PREFER
+	// this over rebuilding from the local `hub` config, which only knows the host
+	// the operator typed at login (the apex on prod, which the relay plane does
+	// NOT serve — that path is owned by the web worker and 404s the WS upgrade).
+	// Empty only on a legacy hub, where we fall back to relayURL(hub,…).
+	ConnectURL string `json:"connectUrl"`
 	// Short-lived (~120s) per-box HMAC grant. We present it on the _connect
 	// dial as ?ct=<connectToken>; the hub verifies it BEFORE accepting the relay
 	// socket. (FLEET_SECRET is gone — this token is the whole proof.)
@@ -301,15 +309,18 @@ func Main() {
 		fatalLegacyTOML(*configPath, hostName)
 	}
 
-	// Config-driven (cloudflared-style) when --config is given, or a finch.yml
-	// sits in the working dir and no single-service flags were overridden.
+	// Config-driven (cloudflared-style) when --config is given, or a finch.yml is
+	// found in the search path and no single-service flags were overridden. The
+	// search prefers the working dir (project-local manifests keep working) then
+	// falls back to the dotfile home (~/.finch/finch.yml, ~/.config/finch/finch.yml)
+	// so a box with a home-dir manifest serves from anywhere, not just when cwd
+	// happens to be home. A legacy finch.toml in cwd still fails loudly.
 	cfgPath := *configPath
 	if cfgPath == "" && *ticket == "" {
-		if _, err := os.Stat("finch.yml"); err == nil {
-			cfgPath = "finch.yml"
-		} else if _, terr := os.Stat("finch.toml"); terr == nil {
+		if _, terr := os.Stat("finch.toml"); terr == nil {
 			fatalLegacyTOML("finch.toml", hostName)
 		}
+		cfgPath = findManifest()
 	}
 	if cfgPath != "" {
 		cfg, err := loadConfig(cfgPath, hostName)
@@ -506,9 +517,7 @@ func runService(o serviceOpts) {
 		}
 	}
 
-	// Build the relay WS URL from the hub base + service/box so scheme/host
-	// always match the hub we were given (the hub's connectUrl may assume prod).
-	wsBase := relayURL(hub, jr.Service, jr.Box)
+	wsBase := relayDialURL(jr, hub)
 	connectToken := jr.ConnectToken
 	connectExp := tokenExp(connectToken)
 
@@ -532,7 +541,9 @@ func runService(o serviceOpts) {
 			}
 			connectToken = fresh.ConnectToken
 			connectExp = tokenExp(connectToken)
-			wsBase = relayURL(hub, fresh.Service, fresh.Box)
+			// Re-read each refresh so a host change is picked up, not pinned to the
+			// first value.
+			wsBase = relayDialURL(fresh, hub)
 			log.Printf("%s: refreshed connect-token (valid until %s)", lp, connectExp.Format(time.RFC3339))
 		}
 
@@ -639,6 +650,19 @@ func tokenExp(token string) time.Time {
 		return time.Time{}
 	}
 	return time.Unix(p.Exp, 0)
+}
+
+// relayDialURL is the relay WS base every dial site must use: PREFER the
+// hub-supplied jr.ConnectURL (computed server-side from the tenant's real host —
+// correct in staging AND prod), falling back to a local rebuild from `hub` only
+// for a legacy hub that predates connectUrl. Rebuilding from `hub` alone is wrong
+// on prod, where `hub` is the login apex but the relay plane lives on the tenant
+// slug subdomain (the apex WS path is the web worker's and 404s the upgrade).
+func relayDialURL(jr *joinResp, hub string) string {
+	if jr.ConnectURL != "" {
+		return jr.ConnectURL
+	}
+	return relayURL(hub, jr.Service, jr.Box)
 }
 
 // relayURL builds ws(s)://<host>/<service>/<box>/_connect from the hub
@@ -1112,6 +1136,26 @@ func fatalLegacyTOML(path, hostName string) {
 
 // loadConfig reads + validates a finch.yml, applying defaults (prod hub, this
 // box's hostname, ~/.finch credentials dir).
+// findManifest locates the finch.yml to serve when no --config was given. Search
+// order: the working dir first (project-local manifests, cloudflared-style), then
+// the dotfile home so a box with a home-dir manifest serves from any cwd. Returns
+// "" when none exists (the caller then falls through to single-service mode).
+func findManifest() string {
+	candidates := []string{"finch.yml"}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		candidates = append(candidates,
+			filepath.Join(home, ".finch", "finch.yml"),
+			filepath.Join(home, ".config", "finch", "finch.yml"),
+		)
+	}
+	for _, p := range candidates {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
 func loadConfig(path, hostName string) (*config, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {

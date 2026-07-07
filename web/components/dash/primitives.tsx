@@ -38,8 +38,8 @@ export function CopyChip({ value, label = "Copy", className = "" }: any) {
 export function StatePill({ state }: any) {
   const map: any = {
     in_use: { cls: "pill-live", dot: true, text: "in use" },
-    chirping: { cls: "pill-live", dot: true, text: "chirping" },
-    resting: { cls: "pill-rest", dot: false, text: "resting" },
+    chirping: { cls: "pill-live", dot: true, text: "online" },
+    resting: { cls: "pill-rest", dot: false, text: "offline" },
     invited: { cls: "pill-invited", dot: false, text: "invited" },
     pending: { cls: "pill-invited", dot: false, text: "pending" },
   };
@@ -110,7 +110,7 @@ export function MaskedSecret({ value, prefix = "", note }: any) {
 }
 
 // ---- InlineConfirm — arm/disarm destructive action ---------------
-export function InlineConfirm({ prompt = "set free?", onConfirm, trigger = "release" }: any) {
+export function InlineConfirm({ prompt = "set free?", onConfirm, trigger = "delete" }: any) {
   const [armed, setArmed] = useState(false);
   if (!armed) {
     return (
