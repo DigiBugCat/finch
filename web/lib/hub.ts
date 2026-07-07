@@ -155,7 +155,7 @@ export async function revokeCliTokens(): Promise<Response> {
 /** Sign out every live login-wall web session across the admin's tenant — the
  *  hub bumps the tenant's sessionEpoch, invalidating all outstanding
  *  finch_session cookies so every browser must re-authenticate at the
- *  appliance gate. Admin-only, mirroring revokeCliTokens. */
+ *  service gate. Admin-only, mirroring revokeCliTokens. */
 export async function revokeSessions(): Promise<Response> {
   await requireAdmin();
   return hubProxy("/api/sessions-revoke", { method: "POST", body: "{}" });

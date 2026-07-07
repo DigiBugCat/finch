@@ -3,25 +3,25 @@
 // dashboard's view components consume this exact shape (it matches the former
 // mock ROOST_DATA so the UI renders unchanged).
 
-export type ApplianceState =
+export type ServiceState =
   | "in_use"
   | "chirping"
   | "resting"
   | "invited"
   | "pending";
 
-export const isOnline = (s: ApplianceState): boolean =>
+export const isOnline = (s: ServiceState): boolean =>
   s === "chirping" || s === "in_use";
 
-/** A box that runs an appliance type. Path: /<appliance>/<machine>/mcp */
-export interface Machine {
+/** A box that runs a service. Path: /<service>/<box>/mcp */
+export interface Box {
   name: string;
   os: string;
   version: string;
-  state: ApplianceState;
-  appliance: string; // appliance id
-  applianceLabel: string;
-  keys: string[]; // finch_ key labels scoped to this machine
+  state: ServiceState;
+  service: string; // service id
+  serviceLabel: string;
+  keys: string[]; // finch_ key labels scoped to this box
   address: string; // tailnet-style display address
   outdated: boolean;
   lastSeen: string; // formatted relative string, derived from lastSeenAt on read
@@ -33,11 +33,11 @@ export interface Machine {
   connected?: boolean;
 }
 
-/** An appliance = a capability TYPE (web-scraper, printer, embeddings…). */
-export interface Appliance {
+/** A service = a capability TYPE (web-scraper, printer, embeddings…). */
+export interface Service {
   id: string;
   label: string;
-  state: ApplianceState; // derived from its machines (online if any machine online)
+  state: ServiceState; // derived from its boxes (online if any box online)
   owner: string;
   box: string;
   created: string;
@@ -53,14 +53,14 @@ export interface Appliance {
   //   "key"    — callers must present a valid finch_ bearer (the default; MCP).
   //   "public" — open, no key required (an ngrok-style public webpage). The
   //              key-strip still runs, so a finch_ key is never forwarded to the
-  //              box even on a public appliance. Defaults to "key" on read for
-  //              legacy stored appliances that predate this field (fail-closed).
+  //              box even on a public service. Defaults to "key" on read for
+  //              legacy stored services that predate this field (fail-closed).
   auth: "key" | "public";
   routes: string[];
   keys: string[];
   components: { name: string; state: "online" | "offline"; log: string }[];
-  machines: Machine[];
-  machineCount: number;
+  boxes: Box[];
+  boxCount: number;
   // metrics (real, from the relay's rolling counters; zero until traffic flows)
   calls: number;
   p50: number;
@@ -95,10 +95,10 @@ export interface Connection {
 }
 
 /** A key's reach, in STRUCTURED form (no magic strings). Either every
- *  appliance ({all:true}) or an explicit allow-list of appliance ids. The
+ *  service ({all:true}) or an explicit allow-list of service ids. The
  *  allow-list is validated at mint (every id must exist) so a key can never
  *  carry free-text that silently grants nothing or everything. */
-export type KeyScope = { all: true } | { all?: false; appliances: string[] };
+export type KeyScope = { all: true } | { all?: false; services: string[] };
 
 export interface Key {
   id: string;
@@ -114,7 +114,7 @@ export interface Key {
 }
 
 export interface AclEntity {
-  type: "user" | "group" | "key" | "tag" | "appliance" | "all";
+  type: "user" | "group" | "key" | "tag" | "service" | "all";
   name?: string;
 }
 export interface AclRule {
@@ -170,8 +170,8 @@ export interface Overview {
  *  the dashboard renders. Users are NOT stored here; they come from Clerk org. */
 export interface TenantState {
   host: string; // <subdomain>.finchmcp.com
-  appliances: Appliance[];
-  machines: Machine[]; // flattened across appliances (the Machines lens)
+  services: Service[];
+  boxes: Box[]; // flattened across services (the Boxes lens)
   keys: PublicKey[]; // hash/last4 only — never plaintext over the wire
   groups: Group[];
   acl: AclRule[];
@@ -189,7 +189,7 @@ export type PublicKey = Omit<Key, "hash"> & { hash?: undefined };
 export interface EnrollResp {
   id: string;
   ticket: string; // one-shot signed join ticket (shown once)
-  url: string; // load-balanced appliance URL
+  url: string; // load-balanced service URL
   install: string; // one-paste command for the box
   expiresAt: number;
 }
@@ -197,16 +197,16 @@ export interface EnrollResp {
 export interface JoinResp {
   ok: boolean;
   tenant: string;
-  appliance: string;
-  machine: string;
+  service: string;
+  box: string;
   host: string; // public host, e.g. <slug>.finchmcp.com — lets the agent print the full URL
-  url: string; // public MCP endpoint, e.g. https://<slug>.finchmcp.com/<appliance>/mcp
+  url: string; // public MCP endpoint, e.g. https://<slug>.finchmcp.com/<service>/mcp
   connectUrl: string; // wss URL to open the relay WebSocket
-  // Short-lived (~120s) per-machine HMAC grant the agent MUST present on the
+  // Short-lived (~120s) per-box HMAC grant the agent MUST present on the
   // _connect dial as ?ct=<connectToken>. The hub verifies it (kind+tenant+
-  // appliance+machine match, not expired) BEFORE forwarding the WS upgrade.
+  // service+box match, not expired) BEFORE forwarding the WS upgrade.
   connectToken: string;
-  // Long-lived (~30d) per-machine credential. The agent keeps this and presents
+  // Long-lived (~30d) per-box credential. The agent keeps this and presents
   // it at POST /refresh to mint fresh connect-tokens, so steady-state reconnects
   // never re-use the one-shot join ticket (which is burned on first /join).
   refreshToken: string;
@@ -217,8 +217,8 @@ export interface JoinResp {
 export interface RefreshResp {
   ok: boolean;
   tenant: string;
-  appliance: string;
-  machine: string;
+  service: string;
+  box: string;
   host: string;
   url: string;
   connectUrl: string;

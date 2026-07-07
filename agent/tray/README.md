@@ -8,24 +8,24 @@ auth, `finch.yml` semantics, and dial-out behaviour — via `core.RunConfig`.
 
 Menu (Tailscale-style fleet view):
 
-- **This machine — `<name>` (N) ▸** — the appliances this box publishes (from
+- **This box — `<name>` (N) ▸** — the services this box publishes (from
   `finch.yml`) with live relay state (`connecting…` / `live` / `reconnecting…` /
   `error`),
-- **Other machines (M) ▸** — every other box in your tenant (from the hub), each a
-  submenu of the appliances it serves + their state (read-only),
+- **Other boxes (M) ▸** — every other box in your tenant (from the hub), each a
+  submenu of the services it serves + their state (read-only),
 - **Add application… ▸** — native dialog (name + port) → enrolls and publishes it
   (`core.Add`), then reloads and reconnects,
-- **Remove application ▸** — submenu of this box's appliances; pick one to release
+- **Remove application ▸** — submenu of this box's services; pick one to release
   it (`core.Remove`) and drop its ingress rule,
 - **Open manifest** — opens `finch.yml` in your editor,
 - **Open dashboard** — opens the `/dashboard` route in your browser,
 - **Reconnect all** — stop and restart every relay,
-- **Log in… / Log out** — browser device-auth (`core.Login`, code shown in a
+- **Log in… / Log out** — browser approval (`core.Login`, code shown in a
   dialog) / drop the CLI token (`core.Logout`),
 - **Quit**.
 
-Relays **auto-start on launch**, and "Other machines" refreshes every 15s. When the
-box is logged in (`finch login`), the tray best-effort self-approves each appliance,
+Relays **auto-start on launch**, and "Other boxes" refreshes every 15s. When the
+box is logged in (`finch login`), the tray best-effort self-approves each service,
 so nothing gets stuck `pending` — same as `finch run`. It reads `~/.finch/finch.yml`
 by default.
 
@@ -37,7 +37,7 @@ finch-tray -config /path/finch.yml
 finch-tray -hub https://finch-staging.pantainos.workers.dev   # dashboard link + approve host
 ```
 
-Prereq: log in and declare at least one appliance first —
+Prereq: log in and declare at least one service first —
 
 ```sh
 finch login --hub <hub>

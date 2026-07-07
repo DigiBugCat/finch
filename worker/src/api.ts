@@ -21,6 +21,10 @@ import {
 } from "./auth";
 import {
   routerLookup,
+  routerRegister,
+  routerUnregister,
+  routerListForTenant,
+  isValidHostKey,
   routerDeviceStart,
   routerDevicePoll,
   routerDeviceApprove,
@@ -77,28 +81,104 @@ import type {
 // a 15-minute window is ample for the enroll → install → join flow while sharply
 // bounding the replay surface a captured ticket exposes. (security M1)
 const TICKET_TTL_SECONDS = 15 * 60; // join tickets live 15m
-const CONNECT_TOKEN_TTL_SECONDS = 120; // per-machine _connect grants live 120s
+const CONNECT_TOKEN_TTL_SECONDS = 120; // per-box _connect grants live 120s
 // The agent keeps its refresh token across the whole enrollment lifetime and
 // trades it for fresh connect-tokens at /refresh, so it never re-uses the
 // one-shot join ticket. 30 days bounds the credential while comfortably covering
-// any realistic always-on uptime; a machine removed from the dashboard is
-// rejected at /refresh (machineExists) well before this elapses.
+// any realistic always-on uptime; a box removed from the dashboard is
+// rejected at /refresh (boxExists) well before this elapses.
 const REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60; // 30d
 // Browser login-wall portal grant: short + single-use (jti). 60s is ample for the
 // portal page → /__finch/cb hand-off while sharply bounding the replay window of
 // a captured grant (which is also burned on first use). (login-wall contract)
 const PORTAL_GRANT_TTL_SECONDS = 60;
+const DEFAULT_BYO_CNAME_TARGET = "finchmcp.com";
 
-// Machine-name clamp at the door (M1): bound length + charset before the name
-// ever reaches the registry. Mirrors tenant-do's cleanMachineName.
-const MAX_MACHINE_NAME = 64;
-const MACHINE_NAME_RE = /^[A-Za-z0-9 ._\-]+$/;
-function cleanMachine(raw: unknown): string | null {
+// Box-name clamp at the door (M1): bound length + charset before the name
+// ever reaches the registry. Mirrors tenant-do's cleanBoxName.
+const MAX_BOX_NAME = 64;
+const BOX_NAME_RE = /^[A-Za-z0-9 ._\-]+$/;
+function cleanBox(raw: unknown): string | null {
   if (typeof raw !== "string") return null;
   const name = raw.trim();
-  if (!name || name.length > MAX_MACHINE_NAME) return null;
-  if (!MACHINE_NAME_RE.test(name)) return null;
+  if (!name || name.length > MAX_BOX_NAME) return null;
+  if (!BOX_NAME_RE.test(name)) return null;
   return name;
+}
+
+function normalizeHostname(raw: unknown): string {
+  return typeof raw === "string" ? raw.trim().toLowerCase() : "";
+}
+
+function vanitySuffixes(env: Env): string[] {
+  return (env.VANITY_SUFFIXES || "")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+}
+
+function underSuffix(hostname: string, suffix: string): boolean {
+  return hostname === suffix || hostname.endsWith(`.${suffix}`);
+}
+
+function vanityTier(env: Env, hostname: string): boolean {
+  return vanitySuffixes(env).some((suffix) => underSuffix(hostname, suffix));
+}
+
+function validateCustomHostname(hostname: string): boolean {
+  return hostname.includes(".") && isValidHostKey(hostname);
+}
+
+function cfHeaders(env: Env): HeadersInit {
+  return {
+    authorization: `Bearer ${env.CF_API_TOKEN || ""}`,
+    "content-type": "application/json",
+  };
+}
+
+async function provisionCfHostname(
+  env: Env,
+  hostname: string,
+): Promise<{ ok: boolean; ssl?: unknown; error?: unknown }> {
+  if (!env.CF_API_TOKEN || !env.CF_SAAS_ZONE_ID) return { ok: true };
+  const res = await fetch(
+    `https://api.cloudflare.com/client/v4/zones/${env.CF_SAAS_ZONE_ID}/custom_hostnames`,
+    {
+      method: "POST",
+      headers: cfHeaders(env),
+      body: JSON.stringify({ hostname, ssl: { method: "http", type: "dv" } }),
+    },
+  );
+  let data: any = null;
+  try {
+    data = await res.json();
+  } catch {
+    data = { error: await res.text().catch(() => "") };
+  }
+  if (!res.ok || data?.success === false) {
+    return { ok: false, error: data };
+  }
+  return { ok: true, ssl: data?.result?.ssl?.status };
+}
+
+async function bestEffortDeleteCfHostname(env: Env, hostname: string): Promise<void> {
+  if (!env.CF_API_TOKEN || !env.CF_SAAS_ZONE_ID) return;
+  try {
+    const qs = new URLSearchParams({ hostname });
+    const list = await fetch(
+      `https://api.cloudflare.com/client/v4/zones/${env.CF_SAAS_ZONE_ID}/custom_hostnames?${qs}`,
+      { method: "GET", headers: cfHeaders(env) },
+    );
+    const data: any = await list.json().catch(() => null);
+    const id = data?.result?.[0]?.id;
+    if (!list.ok || !id) return;
+    await fetch(
+      `https://api.cloudflare.com/client/v4/zones/${env.CF_SAAS_ZONE_ID}/custom_hostnames/${encodeURIComponent(id)}`,
+      { method: "DELETE", headers: cfHeaders(env) },
+    ).catch(() => {});
+  } catch {
+    // Best-effort cleanup only. Never log the CF token.
+  }
 }
 
 /** True if this path is handled by the control API (vs the MCP/relay plane). */
@@ -147,7 +227,7 @@ export async function handleApi(
   }
 
   // ---- /refresh — refresh-token-authed (NOT service-authed). The box trades
-  //      its long-lived per-machine refresh token for a fresh connect-token,
+  //      its long-lived per-box refresh token for a fresh connect-token,
   //      so steady-state reconnection never re-uses the one-shot join ticket. ----
   if (path === "/refresh") {
     if (method !== "POST") return json(405, { error: "POST only" });
@@ -159,7 +239,7 @@ export async function handleApi(
   //      service-secret-authed: the assertion is itself HMAC-signed with
   //      FINCH_SERVICE_SECRET, so a valid one already proves tenant authorization
   //      (same trust as X-Finch-Auth). This lets the `finch` CLI enroll
-  //      appliances from the box without the dashboard. ----
+  //      services from the box without the dashboard. ----
   if (path.startsWith("/api/cli/")) {
     // ---- Public device-authorization flow (`finch login`): the CLI has no
     //      credentials yet, so start/poll are unauthenticated. The browser
@@ -219,6 +299,9 @@ export async function handleApi(
     if ((payload!.epoch ?? -1) !== (curEpoch ?? 0)) {
       return json(401, { error: "CLI token revoked — run `finch login` again" });
     }
+    if (path === "/api/cli/hostnames") {
+      return handleHostnames(req, env, cliTenant, method);
+    }
     // GET /api/cli/whoami — validate a token + report the tenant it acts as.
     if (path === "/api/cli/whoami" && method === "GET") {
       return json(200, { ok: true, tenant: cliTenant });
@@ -231,7 +314,7 @@ export async function handleApi(
     if (path === "/api/cli/token" && method === "POST") {
       return json(200, await mintCliToken(env, cliTenant, host));
     }
-    // POST /api/cli/enroll {name,group} — enroll an appliance, return its ticket.
+    // POST /api/cli/enroll {name,group} — enroll a service, return its ticket.
     if (path === "/api/cli/enroll" && method === "POST") {
       return handleEnroll(req, env, cliTenant, host);
     }
@@ -244,19 +327,19 @@ export async function handleApi(
       return json(out?.ok === false ? 404 : 200, out);
     }
 
-    // POST /api/cli/auth {appliance, mode} — set an appliance's public-relay
+    // POST /api/cli/auth {service, mode} — set a service's public-relay
     // access mode ("key" requires a finch_ bearer; "public" is an open webpage).
     if (path === "/api/cli/auth" && method === "POST") {
       const body = await readJson(req);
-      if (!body.appliance) return json(400, { error: "appliance required" });
+      if (!body.service) return json(400, { error: "service required" });
       const out = await tenantOp<{ ok: boolean; error?: string }>(
         env,
         cliTenant,
         "setAuth",
-        { appliance: body.appliance, mode: body.mode },
+        { service: body.service, mode: body.mode },
       );
       if (out?.ok === false) {
-        return json(out.error === "unknown appliance" ? 404 : 400, out);
+        return json(out.error === "unknown service" ? 404 : 400, out);
       }
       return json(200, out);
     }
@@ -283,11 +366,11 @@ export async function handleApi(
     if (path === "/api/cli/keys/revoke" && method === "POST") {
       const b = await readJson(req);
       if (!b.id) return json(400, { error: "id required" });
-      const out = await tenantOp(env, cliTenant, "revokeMachineKey", { appliance: "", machine: "", key: String(b.id) });
+      const out = await tenantOp(env, cliTenant, "revokeBoxKey", { service: "", box: "", key: String(b.id) });
       return json(out?.ok === false ? 404 : 200, out);
     }
-    // POST /api/cli/appliances/release {id} — remove an appliance.
-    if (path === "/api/cli/appliances/release" && method === "POST") {
+    // POST /api/cli/services/release {id} — remove a service.
+    if (path === "/api/cli/services/release" && method === "POST") {
       const b = await readJson(req);
       if (!b.id) return json(400, { error: "id required" });
       const out = await tenantOp(env, cliTenant, "release", { id: String(b.id) });
@@ -298,19 +381,19 @@ export async function handleApi(
       return json(200, await tenantOp(env, cliTenant, "revokeCliTokens"));
     }
 
-    // POST /api/cli/call {appliance, method, params} — relay an MCP call to the
-    // tenant's own appliance, so an agent can test it from the CLI (no throwaway
+    // POST /api/cli/call {service, method, params} — relay an MCP call to the
+    // tenant's own service, so an agent can test it from the CLI (no throwaway
     // finch_ key). Relays via the SELF binding using a first-party service
     // assertion for cliTenant (the same trusted internal path the chat uses).
     if (path === "/api/cli/call" && method === "POST") {
       const b = await readJson(req);
-      const appliance = String(b.appliance || "").trim();
+      const service = String(b.service || "").trim();
       const rpcMethod = String(b.method || "").trim();
-      if (!appliance || !rpcMethod) return json(400, { error: "appliance and method required" });
+      if (!service || !rpcMethod) return json(400, { error: "service and method required" });
       const exp = Math.floor(Date.now() / 1000) + 120;
       const assertion = await signAssertion({ tenant: cliTenant, exp }, env.FINCH_SERVICE_SECRET);
       const scheme = host.startsWith("localhost") || host.startsWith("127.") ? "http" : "https";
-      const res = await env.SELF.fetch(`${scheme}://${host}/${encodeURIComponent(appliance)}/mcp`, {
+      const res = await env.SELF.fetch(`${scheme}://${host}/${encodeURIComponent(service)}/mcp`, {
         method: "POST",
         headers: {
           "X-Finch-Service": env.FINCH_SERVICE_SECRET,
@@ -349,6 +432,10 @@ export async function handleApi(
 
   const parts = path.split("/").filter(Boolean); // ["api", ...]
   const seg = parts.slice(1); // strip "api"
+
+  if (seg.length === 1 && seg[0] === "hostnames") {
+    return handleHostnames(req, env, tenant, method);
+  }
 
   // GET /api/state
   if (method === "GET" && seg.length === 1 && seg[0] === "state") {
@@ -422,7 +509,7 @@ export async function handleApi(
   }
 
   // POST /api/portal-grant {slug,userId} — the login-wall hand-off. The Clerk-
-  // gated portal page (web) calls this for a browser that hit a private appliance
+  // gated portal page (web) calls this for a browser that hit a private service
   // with no session cookie. The TENANT is the security-critical part and comes
   // from the verified assertion (NOT the body); userId is carried for the cookie's
   // identity/audit. We VERIFY OWNERSHIP — routerLookup(slug) MUST resolve to this
@@ -464,23 +551,23 @@ export async function handleApi(
     return handleEnroll(req, env, tenant, host);
   }
 
-  // POST /api/appliances/:id/release|approve|decline
-  if (method === "POST" && seg[0] === "appliances" && seg.length === 3) {
+  // POST /api/services/:id/release|approve|decline
+  if (method === "POST" && seg[0] === "services" && seg.length === 3) {
     const id = safeDecode(seg[1]);
     const action = seg[2];
     if (action === "release" || action === "approve" || action === "decline") {
       const out = await tenantOp(env, tenant, action, { id });
       return json(out?.ok === false ? 404 : 200, out);
     }
-    return json(404, { error: "unknown appliance action", action });
+    return json(404, { error: "unknown service action", action });
   }
 
-  // PUT /api/appliances/:id/auth {mode} — set the public-relay access mode
+  // PUT /api/services/:id/auth {mode} — set the public-relay access mode
   // ("key" requires a finch_ bearer; "public" is an open webpage). The dashboard
   // BFF half of the generic-HTTP-hosting feature (same op as `finch auth`).
   if (
     method === "PUT" &&
-    seg[0] === "appliances" &&
+    seg[0] === "services" &&
     seg.length === 3 &&
     seg[2] === "auth"
   ) {
@@ -490,18 +577,18 @@ export async function handleApi(
       env,
       tenant,
       "setAuth",
-      { appliance: id, mode: body.mode },
+      { service: id, mode: body.mode },
     );
     if (out?.ok === false) {
-      return json(out.error === "unknown appliance" ? 404 : 400, out);
+      return json(out.error === "unknown service" ? 404 : 400, out);
     }
     return json(200, out);
   }
 
-  // PUT /api/appliances/:id/tags {tags}
+  // PUT /api/services/:id/tags {tags}
   if (
     method === "PUT" &&
-    seg[0] === "appliances" &&
+    seg[0] === "services" &&
     seg.length === 3 &&
     seg[2] === "tags"
   ) {
@@ -514,10 +601,10 @@ export async function handleApi(
     return json(out?.ok === false ? 404 : 200, out);
   }
 
-  // PUT /api/appliances/:id/group {group}
+  // PUT /api/services/:id/group {group}
   if (
     method === "PUT" &&
-    seg[0] === "appliances" &&
+    seg[0] === "services" &&
     seg.length === 3 &&
     seg[2] === "group"
   ) {
@@ -531,8 +618,8 @@ export async function handleApi(
   }
 
   // POST /api/keys {label,scope,owner}. scope is the STRUCTURED KeyScope
-  // ({all:true} | {appliances:[...]}); TenantDO.mintKey validates every listed
-  // appliance id exists and 400s on an unknown id. We pass it through and
+  // ({all:true} | {services:[...]}); TenantDO.mintKey validates every listed
+  // service id exists and 400s on an unknown id. We pass it through and
   // surface the DO's error verbatim (no validation duplicated here).
   if (method === "POST" && seg.length === 1 && seg[0] === "keys") {
     const body = await readJson(req);
@@ -553,22 +640,22 @@ export async function handleApi(
     return json(200, resp);
   }
 
-  // POST /api/machines/:machine/keys/revoke {appliance,key}
+  // POST /api/boxes/:box/keys/revoke {service,key}
   if (
     method === "POST" &&
-    seg[0] === "machines" &&
+    seg[0] === "boxes" &&
     seg.length === 4 &&
     seg[2] === "keys" &&
     seg[3] === "revoke"
   ) {
-    const machine = safeDecode(seg[1]);
+    const box = safeDecode(seg[1]);
     const body = await readJson(req);
-    if (!body.appliance || !body.key) {
-      return json(400, { error: "appliance and key required" });
+    if (!body.service || !body.key) {
+      return json(400, { error: "service and key required" });
     }
-    const out = await tenantOp(env, tenant, "revokeMachineKey", {
-      appliance: body.appliance,
-      machine,
+    const out = await tenantOp(env, tenant, "revokeBoxKey", {
+      service: body.service,
+      box,
       key: body.key,
     });
     return json(out?.ok === false ? 404 : 200, out);
@@ -608,9 +695,84 @@ export async function handleApi(
   return json(404, { error: "no such control route", path, method });
 }
 
+async function handleHostnames(
+  req: Request,
+  env: Env,
+  tenant: string,
+  method: string,
+): Promise<Response> {
+  if (method === "GET") {
+    const keys = await routerListForTenant(env, tenant);
+    return json(200, { hostnames: keys.filter((key) => key.includes(".")) });
+  }
+
+  if (method !== "POST" && method !== "DELETE") {
+    return json(405, { error: "GET, POST, or DELETE only" });
+  }
+  if (!(await rateLimitOk(env.JOIN_LIMIT, `hostnames:${tenant}`))) {
+    return json(429, { error: "rate limited" });
+  }
+
+  const body = await readJson(req);
+  const hostname = normalizeHostname(body.hostname);
+  if (!validateCustomHostname(hostname)) {
+    return json(400, { error: "invalid hostname" });
+  }
+  // Registration is inert until the domain owner points DNS at us and, for BYO
+  // hostnames, Cloudflare validates + issues the cert. Collisions are first-come.
+  if (
+    hostname === "finchmcp.com" ||
+    hostname.endsWith(".finchmcp.com") ||
+    hostname === "workers.dev" ||
+    hostname.endsWith(".workers.dev")
+  ) {
+    return json(400, { error: "reserved hostname family" });
+  }
+
+  const vanity = vanityTier(env, hostname);
+  if (vanity && env.VANITY_TENANT !== tenant) {
+    return json(403, { error: "tenant is not allowed to claim vanity hostnames" });
+  }
+
+  if (method === "POST") {
+    const reg = await routerRegister(env, hostname, tenant);
+    if (!reg.ok) {
+      if (reg.reason === "collision") return json(409, { error: "hostname already registered" });
+      return json(400, { error: "invalid hostname" });
+    }
+    let ssl: unknown = undefined;
+    if (!vanity) {
+      const cf = await provisionCfHostname(env, hostname);
+      if (!cf.ok) {
+        await routerUnregister(env, hostname, tenant);
+        return json(502, { error: "cloudflare custom hostname provisioning failed", cloudflare: cf.error });
+      }
+      ssl = cf.ssl;
+    }
+    const target = env.BYO_CNAME_TARGET || DEFAULT_BYO_CNAME_TARGET;
+    return json(200, {
+      ok: true,
+      hostname,
+      tier: vanity ? "vanity" : "byo",
+      target,
+      ...(ssl !== undefined ? { ssl } : {}),
+      instructions: `CNAME ${hostname} -> ${target}`,
+    });
+  }
+
+  const owner = await routerLookup(env, hostname);
+  if (owner !== tenant) {
+    return json(404, { error: "hostname not found" });
+  }
+  const out = await routerUnregister(env, hostname, tenant);
+  if (!out.ok) return json(404, { error: "hostname not found" });
+  if (!vanity) await bestEffortDeleteCfHostname(env, hostname);
+  return json(200, { ok: true });
+}
+
 // Build operator-facing URLs from the tenant's RESOLVABLE host
 // (<slug>.finchmcp.com, registered in RouterDO) — NOT the inbound apex host,
-// which fails closed at the relay (slugFromHost("finchmcp.com") === ""). Local
+// which fails closed at the relay (hostKeyFromHost("finchmcp.com") === ""). Local
 // dev keeps the reachable inbound host (localhost:8787) for convenience.
 async function tenantHostBase(
   env: Env,
@@ -654,7 +816,7 @@ async function handleEnroll(
   // jti makes the ticket SINGLE-USE: the hub records it at first /join and
   // rejects replays for the rest of its TTL. (security M1)
   const ticket = await signToken(
-    { tenant, appliance: id, exp, kind: "join", jti: genJti() },
+    { tenant, service: id, exp, kind: "join", jti: genJti() },
     env.TICKET_SECRET,
   );
 
@@ -687,29 +849,29 @@ async function handleJoin(
   }
 
   const body = await readJson(req);
-  if (!body.ticket || !body.machine) {
-    return json(400, { error: "ticket and machine required" });
+  if (!body.ticket || !body.box) {
+    return json(400, { error: "ticket and box required" });
   }
-  // Validate + clamp the attacker-chosen machine name (length + charset) before
+  // Validate + clamp the attacker-chosen box name (length + charset) before
   // it can pollute the registry / squat a name. (security M1)
-  const machine = cleanMachine(body.machine);
-  if (!machine) {
+  const box = cleanBox(body.box);
+  if (!box) {
     return json(400, {
-      error: "invalid machine name (1-64 chars, [A-Za-z0-9 ._-] only)",
+      error: "invalid box name (1-64 chars, [A-Za-z0-9 ._-] only)",
     });
   }
   const payload = await verifyToken(body.ticket, env.TICKET_SECRET);
-  // A join ticket is appliance-scoped — validateTicket already requires
-  // `appliance` for non-browser kinds, but narrow it here for the type checker
-  // (TicketPayload.appliance is optional for the browser portal/session kinds).
+  // A join ticket is service-scoped — validateTicket already requires
+  // `service` for non-browser kinds, but narrow it here for the type checker
+  // (TicketPayload.service is optional for the browser portal/session kinds).
   if (
     !payload ||
     (payload.kind !== undefined && payload.kind !== "join") ||
-    !payload.appliance
+    !payload.service
   ) {
     return json(401, { error: "invalid or expired ticket" });
   }
-  const { tenant, appliance } = payload;
+  const { tenant, service } = payload;
 
   // SINGLE-USE: atomically burn the ticket's jti before doing any registration
   // work, so a captured ticket can't be replayed for its TTL. (security M1)
@@ -727,20 +889,20 @@ async function handleJoin(
   const reg = await tenantOp<{ ok: boolean; error?: string }>(
     env,
     tenant,
-    "registerMachine",
-    { appliance, machine, os, version },
+    "registerBox",
+    { service, box, os, version },
   );
   if (reg.error) {
     return json(409, { error: reg.error });
   }
 
   const base = await tenantHostBase(env, tenant, host);
-  const connectUrl = `${base.ws}/${appliance}/${encodeURIComponent(
-    machine,
+  const connectUrl = `${base.ws}/${service}/${encodeURIComponent(
+    box,
   )}/_connect`;
 
-  // Mint the short-lived per-machine connect-token. The agent presents it on the
-  // _connect dial as ?ct=<token>; index.ts verifies kind+tenant+appliance+machine
+  // Mint the short-lived per-box connect-token. The agent presents it on the
+  // _connect dial as ?ct=<token>; index.ts verifies kind+tenant+service+box
   // and expiry BEFORE forwarding the WS upgrade to the relay DO. This is the sole
   // proof that authenticates the box-side agent channel (FLEET_SECRET removed).
   const connectExp =
@@ -748,15 +910,15 @@ async function handleJoin(
   const connectToken = await signToken(
     {
       tenant,
-      appliance,
-      machine,
+      service,
+      box,
       kind: "connect",
       exp: connectExp,
     },
     env.TICKET_SECRET,
   );
 
-  // Long-lived per-machine refresh token. The agent keeps this and trades it at
+  // Long-lived per-box refresh token. The agent keeps this and trades it at
   // /refresh for fresh connect-tokens — so the one-shot join ticket is never
   // re-used (it's already burned above by claimTicket). (reconnect fix)
   const refreshExp =
@@ -764,8 +926,8 @@ async function handleJoin(
   const refreshToken = await signToken(
     {
       tenant,
-      appliance,
-      machine,
+      service,
+      box,
       kind: "refresh",
       exp: refreshExp,
     },
@@ -775,10 +937,10 @@ async function handleJoin(
   const resp: JoinResp = {
     ok: true,
     tenant,
-    appliance,
-    machine,
+    service,
+    box,
     host: base.host,
-    url: `${base.http}/${appliance}/mcp`,
+    url: `${base.http}/${service}/mcp`,
     connectUrl,
     connectToken,
     refreshToken,
@@ -804,48 +966,48 @@ async function handleRefresh(
   if (!body.refreshToken) return json(400, { error: "refreshToken required" });
 
   const payload = await verifyToken(body.refreshToken, env.TICKET_SECRET);
-  // A refresh token is appliance- AND machine-scoped (browser kinds carry
-  // neither); narrow `appliance` for the type checker as well.
+  // A refresh token is service- AND box-scoped (browser kinds carry
+  // neither); narrow `service` for the type checker as well.
   if (
     !payload ||
     payload.kind !== "refresh" ||
-    !payload.machine ||
-    !payload.appliance
+    !payload.box ||
+    !payload.service
   ) {
     return json(401, { error: "invalid or expired refresh token" });
   }
-  const { tenant, appliance } = payload;
-  const machine = payload.machine;
+  const { tenant, service } = payload;
+  const box = payload.box;
 
-  // Revocation: a machine removed from the dashboard can no longer refresh, so a
+  // Revocation: a box removed from the dashboard can no longer refresh, so a
   // leaked refresh token stops working within one connect-token TTL of removal.
-  const reg = await tenantOp<{ exists: boolean }>(env, tenant, "machineExists", {
-    appliance,
-    machine,
+  const reg = await tenantOp<{ exists: boolean }>(env, tenant, "boxExists", {
+    service,
+    box,
   });
   if (!reg.exists) {
-    return json(403, { error: "machine no longer registered" });
+    return json(403, { error: "box no longer registered" });
   }
 
   const connectExp =
     Math.floor(Date.now() / 1000) + CONNECT_TOKEN_TTL_SECONDS;
   const connectToken = await signToken(
-    { tenant, appliance, machine, kind: "connect", exp: connectExp },
+    { tenant, service, box, kind: "connect", exp: connectExp },
     env.TICKET_SECRET,
   );
 
   const base = await tenantHostBase(env, tenant, host);
-  const connectUrl = `${base.ws}/${appliance}/${encodeURIComponent(
-    machine,
+  const connectUrl = `${base.ws}/${service}/${encodeURIComponent(
+    box,
   )}/_connect`;
 
   const resp: RefreshResp = {
     ok: true,
     tenant,
-    appliance,
-    machine,
+    service,
+    box,
     host: base.host,
-    url: `${base.http}/${appliance}/mcp`,
+    url: `${base.http}/${service}/mcp`,
     connectUrl,
     connectToken,
   };

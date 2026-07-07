@@ -9,9 +9,9 @@ import { signAssertion, signToken, signSession, genJti } from "../src/auth";
 
 // LOGIN-WALL E2E — drives the REAL worker (worker.fetch) through the browser
 // login wall in front of the relay plane. The wall is the new DEFAULT for a
-// keyless BROWSER hit on a PRIVATE appliance: no finch_ bearer, not service-
-// authed, appliance.auth==="key" → 302 to /portal/start. The four bypasses
-// (finch_ bearer / svc-auth / public appliance) and the /__finch/cb cookie
+// keyless BROWSER hit on a PRIVATE service: no finch_ bearer, not service-
+// authed, service.auth==="key" → 302 to /portal/start. The four bypasses
+// (finch_ bearer / svc-auth / public service) and the /__finch/cb cookie
 // hand-off are all exercised here against the genuine RouterDO + TenantDO.
 //
 // Tenancy: unlike e2e.test.ts (which leans on the DEV DEFAULT_TENANT fallback on
@@ -87,38 +87,38 @@ async function api(
   );
 }
 
-async function waitForMachine(
+async function waitForBox(
   tenant: string,
   host: string,
-  appliance: string,
-  machine: string,
+  service: string,
+  box: string,
   pred: (m: any) => boolean,
   tries = 50,
 ): Promise<void> {
   for (let i = 0; i < tries; i++) {
     const res = await api(tenant, host, "GET", "/api/state");
     const state = (await res.json()) as any;
-    const ap = (state.appliances ?? []).find((a: any) => a.id === appliance);
-    const m = ap?.machines?.find((x: any) => x.name === machine);
+    const ap = (state.services ?? []).find((a: any) => a.id === service);
+    const m = ap?.boxes?.find((x: any) => x.name === box);
     if (m && pred(m)) return;
     await new Promise((r) => setTimeout(r, 0));
   }
-  throw new Error(`machine ${appliance}/${machine} never satisfied predicate`);
+  throw new Error(`box ${service}/${box} never satisfied predicate`);
 }
 
-/** Stand up an approved, connected appliance under a fresh tenant/slug. Returns
+/** Stand up an approved, connected service under a fresh tenant/slug. Returns
  *  everything the wall tests need. The agent socket is left open (the caller
- *  closes it). The appliance is KEY-gated by default. */
-async function standUpAppliance() {
+ *  closes it). The service is KEY-gated by default. */
+async function standUpService() {
   const ctx = await freshTenantSlug();
   const { tenant, slug, host, base } = ctx;
 
   const enroll = (await (
     await api(tenant, host, "POST", "/api/enroll", { name: "Wall Box" })
   ).json()) as { id: string; ticket: string };
-  const appliance = enroll.id;
+  const service = enroll.id;
 
-  const machine = `box-${Date.now()}-${seq++}`;
+  const box = `box-${Date.now()}-${seq++}`;
   const join = (await (
     await call(
       new Request(`${base}/join`, {
@@ -126,7 +126,7 @@ async function standUpAppliance() {
         headers: { "content-type": "application/json", host },
         body: JSON.stringify({
           ticket: enroll.ticket,
-          machine,
+          box,
           os: "linux",
           version: "1.4.0",
         }),
@@ -136,7 +136,7 @@ async function standUpAppliance() {
 
   const connectRes = await call(
     new Request(
-      `${base}/${appliance}/${encodeURIComponent(machine)}/_connect` +
+      `${base}/${service}/${encodeURIComponent(box)}/_connect` +
         `?ct=${encodeURIComponent(join.connectToken)}`,
       { headers: { Upgrade: "websocket", host } },
     ),
@@ -144,22 +144,22 @@ async function standUpAppliance() {
   expect(connectRes.status).toBe(101);
   const agent = connectRes.webSocket!;
   agent.accept();
-  await waitForMachine(tenant, host, appliance, machine, (m) => m.connected);
+  await waitForBox(tenant, host, service, box, (m) => m.connected);
   await api(
     tenant,
     host,
     "POST",
-    `/api/appliances/${encodeURIComponent(appliance)}/approve`,
+    `/api/services/${encodeURIComponent(service)}/approve`,
   );
-  await waitForMachine(
+  await waitForBox(
     tenant,
     host,
-    appliance,
-    machine,
+    service,
+    box,
     (m) => m.connected && m.state !== "pending",
   );
 
-  return { ...ctx, appliance, machine, agent };
+  return { ...ctx, service, box, agent };
 }
 
 /** Read the next relayed `req` frame off the agent socket. */
@@ -233,12 +233,12 @@ function mintPortal(
   );
 }
 
-describe("login wall — keyless browser hit on a private appliance", () => {
+describe("login wall — keyless browser hit on a private service", () => {
   it("302s a keyless browser to /portal/start with slug + rd", async () => {
-    const { host, base, slug, appliance, agent } = await standUpAppliance();
+    const { host, base, slug, service, agent } = await standUpService();
 
     const res = await call(
-      new Request(`${base}/${appliance}/index.html?x=1`, {
+      new Request(`${base}/${service}/index.html?x=1`, {
         method: "GET",
         headers: { host },
         redirect: "manual",
@@ -250,17 +250,17 @@ describe("login wall — keyless browser hit on a private appliance", () => {
     expect(loc.pathname).toBe("/portal/start");
     expect(loc.searchParams.get("slug")).toBe(slug);
     // rd carries the ORIGINAL path+query so the user lands where they meant to.
-    expect(loc.searchParams.get("rd")).toBe(`/${appliance}/index.html?x=1`);
+    expect(loc.searchParams.get("rd")).toBe(`/${service}/index.html?x=1`);
 
     agent.close(1000, "done");
   });
 
   it("walls a keyless non-bearer call (the new default replaces the bare 401)", async () => {
-    const { host, base, appliance, agent } = await standUpAppliance();
+    const { host, base, service, agent } = await standUpService();
     // A keyless POST /mcp with NO finch_ bearer is a browser-shaped request: under
     // the new contract it 302s to the wall (it used to be a bare 401).
     const res = await call(
-      new Request(`${base}/${appliance}/mcp`, {
+      new Request(`${base}/${service}/mcp`, {
         method: "POST",
         headers: { host, "content-type": "application/json" },
         body: "{}",
@@ -275,13 +275,13 @@ describe("login wall — keyless browser hit on a private appliance", () => {
   });
 
   it("relays (no wall) when a valid finch_session cookie is present", async () => {
-    const { host, base, slug, tenant, appliance, agent } =
-      await standUpAppliance();
+    const { host, base, slug, tenant, service, agent } =
+      await standUpService();
     const cookie = await mintSession({ tenant, slug });
 
     const reqSeen = nextFrame(agent);
     const relayP = call(
-      new Request(`${base}/${appliance}/index.html`, {
+      new Request(`${base}/${service}/index.html`, {
         method: "GET",
         headers: { host, cookie: `finch_session=${cookie}` },
         redirect: "manual",
@@ -299,13 +299,13 @@ describe("login wall — keyless browser hit on a private appliance", () => {
   });
 
   it("strips ONLY finch_session from the Cookie header — the app's own cookies survive (#1)", async () => {
-    const { host, base, slug, tenant, appliance, agent } =
-      await standUpAppliance();
+    const { host, base, slug, tenant, service, agent } =
+      await standUpService();
     const cookie = await mintSession({ tenant, slug });
 
     const reqSeen = nextFrame(agent);
     const relayP = call(
-      new Request(`${base}/${appliance}/index.html`, {
+      new Request(`${base}/${service}/index.html`, {
         method: "GET",
         headers: {
           host,
@@ -332,13 +332,13 @@ describe("login wall — keyless browser hit on a private appliance", () => {
   });
 
   it("deletes the Cookie header entirely when finch_session is the only cookie (#1)", async () => {
-    const { host, base, slug, tenant, appliance, agent } =
-      await standUpAppliance();
+    const { host, base, slug, tenant, service, agent } =
+      await standUpService();
     const cookie = await mintSession({ tenant, slug });
 
     const reqSeen = nextFrame(agent);
     const relayP = call(
-      new Request(`${base}/${appliance}/index.html`, {
+      new Request(`${base}/${service}/index.html`, {
         method: "GET",
         headers: { host, cookie: `finch_session=${cookie}` },
         redirect: "manual",
@@ -355,14 +355,14 @@ describe("login wall — keyless browser hit on a private appliance", () => {
   });
 
   it("does NOT wall a finch_ bearer call (key plane unchanged: 403 bad-key / relay good-key)", async () => {
-    const { host, base, tenant, appliance, agent } = await standUpAppliance();
+    const { host, base, tenant, service, agent } = await standUpService();
 
     // A WELL-FORMED finch_ bearer is the MCP/key plane — the wall is bypassed and
     // relayMcp's checkKey is the authority. A wrong key → 403 (NOT a 302 wall).
     // (A keyless, NON-bearer browser hit is the wall's job — covered separately;
     // here we prove the bearer path is unchanged.)
     const wrongKey = await call(
-      new Request(`${base}/${appliance}/mcp`, {
+      new Request(`${base}/${service}/mcp`, {
         method: "POST",
         headers: {
           host,
@@ -385,7 +385,7 @@ describe("login wall — keyless browser hit on a private appliance", () => {
     ).json()) as { key: string };
     const reqSeen = nextFrame(agent);
     const relayP = call(
-      new Request(`${base}/${appliance}/mcp`, {
+      new Request(`${base}/${service}/mcp`, {
         method: "POST",
         headers: {
           host,
@@ -404,20 +404,20 @@ describe("login wall — keyless browser hit on a private appliance", () => {
     agent.close(1000, "done");
   });
 
-  it("does NOT wall a PUBLIC appliance (open webpage, no cookie)", async () => {
-    const { host, base, tenant, appliance, agent } = await standUpAppliance();
+  it("does NOT wall a PUBLIC service (open webpage, no cookie)", async () => {
+    const { host, base, tenant, service, agent } = await standUpService();
     // Flip to public.
     await api(
       tenant,
       host,
       "PUT",
-      `/api/appliances/${encodeURIComponent(appliance)}/auth`,
+      `/api/services/${encodeURIComponent(service)}/auth`,
       { mode: "public" },
     );
 
     const reqSeen = nextFrame(agent);
     const relayP = call(
-      new Request(`${base}/${appliance}/index.html`, {
+      new Request(`${base}/${service}/index.html`, {
         method: "GET",
         headers: { host },
         redirect: "manual",
@@ -436,11 +436,11 @@ describe("login wall — keyless browser hit on a private appliance", () => {
 
 describe("login wall — session cookie validity", () => {
   it("ignores a cookie bound to a DIFFERENT slug (walls anyway)", async () => {
-    const { host, base, tenant, appliance, agent } = await standUpAppliance();
+    const { host, base, tenant, service, agent } = await standUpService();
     // A cookie for the right tenant but the WRONG slug must not authorize.
     const cookie = await mintSession({ tenant, slug: "someotherlabel" });
     const res = await call(
-      new Request(`${base}/${appliance}/index.html`, {
+      new Request(`${base}/${service}/index.html`, {
         method: "GET",
         headers: { host, cookie: `finch_session=${cookie}` },
         redirect: "manual",
@@ -451,8 +451,8 @@ describe("login wall — session cookie validity", () => {
   });
 
   it("ignores a tampered/forged-secret session cookie (walls anyway)", async () => {
-    const { host, base, slug, tenant, appliance, agent } =
-      await standUpAppliance();
+    const { host, base, slug, tenant, service, agent } =
+      await standUpService();
     // Signed with the WRONG secret → HMAC fails → no session → wall.
     const forged = await signSession(
       {
@@ -466,7 +466,7 @@ describe("login wall — session cookie validity", () => {
       "attacker-secret",
     );
     const res = await call(
-      new Request(`${base}/${appliance}/index.html`, {
+      new Request(`${base}/${service}/index.html`, {
         method: "GET",
         headers: { host, cookie: `finch_session=${forged}` },
         redirect: "manual",
@@ -477,15 +477,15 @@ describe("login wall — session cookie validity", () => {
   });
 
   it("ignores an EXPIRED session cookie (walls anyway)", async () => {
-    const { host, base, slug, tenant, appliance, agent } =
-      await standUpAppliance();
+    const { host, base, slug, tenant, service, agent } =
+      await standUpService();
     const expired = await mintSession({
       tenant,
       slug,
       exp: nowSec() - 1,
     });
     const res = await call(
-      new Request(`${base}/${appliance}/index.html`, {
+      new Request(`${base}/${service}/index.html`, {
         method: "GET",
         headers: { host, cookie: `finch_session=${expired}` },
         redirect: "manual",
@@ -496,13 +496,13 @@ describe("login wall — session cookie validity", () => {
   });
 
   it("invalidates a live cookie after bumpSessionEpoch (sign everyone out)", async () => {
-    const { host, base, slug, tenant, appliance, agent } =
-      await standUpAppliance();
+    const { host, base, slug, tenant, service, agent } =
+      await standUpService();
     // A cookie at epoch 0 works...
     const cookie = await mintSession({ tenant, slug, epoch: 0 });
     const reqSeen = nextFrame(agent);
     const relayP = call(
-      new Request(`${base}/${appliance}/index.html`, {
+      new Request(`${base}/${service}/index.html`, {
         method: "GET",
         headers: { host, cookie: `finch_session=${cookie}` },
         redirect: "manual",
@@ -525,7 +525,7 @@ describe("login wall — session cookie validity", () => {
 
     // ...and the SAME epoch-0 cookie is now treated as logged out → wall.
     const res = await call(
-      new Request(`${base}/${appliance}/index.html`, {
+      new Request(`${base}/${service}/index.html`, {
         method: "GET",
         headers: { host, cookie: `finch_session=${cookie}` },
         redirect: "manual",
@@ -536,13 +536,13 @@ describe("login wall — session cookie validity", () => {
   });
 
   it("POST /api/sessions-revoke bumps the epoch; an old-epoch cookie is then walled (#7)", async () => {
-    const { host, base, slug, tenant, appliance, agent } =
-      await standUpAppliance();
+    const { host, base, slug, tenant, service, agent } =
+      await standUpService();
     // A cookie minted under the CURRENT (epoch 0) session works...
     const cookie = await mintSession({ tenant, slug, epoch: 0 });
     const reqSeen = nextFrame(agent);
     const relayP = call(
-      new Request(`${base}/${appliance}/index.html`, {
+      new Request(`${base}/${service}/index.html`, {
         method: "GET",
         headers: { host, cookie: `finch_session=${cookie}` },
         redirect: "manual",
@@ -560,7 +560,7 @@ describe("login wall — session cookie validity", () => {
 
     // ...and the SAME epoch-0 cookie is now rejected by the relay gate → wall.
     const res = await call(
-      new Request(`${base}/${appliance}/index.html`, {
+      new Request(`${base}/${service}/index.html`, {
         method: "GET",
         headers: { host, cookie: `finch_session=${cookie}` },
         redirect: "manual",
@@ -684,12 +684,12 @@ describe("/__finch/cb — portal grant → session cookie hand-off", () => {
 });
 
 describe("control-plane id decode — malformed percent-encoding (#15)", () => {
-  it("degrades a malformed %-encoded appliance id to a clean 4xx, not a 500", async () => {
+  it("degrades a malformed %-encoded service id to a clean 4xx, not a 500", async () => {
     const { host, tenant } = await freshTenantSlug();
     // A lone/partial %-escape (%zz) makes decodeURIComponent throw a URIError;
     // safeDecode must catch it so the route resolves the (now unknown) id to a
     // clean 404 instead of bubbling the throw into an unhandled 500.
-    const res = await api(tenant, host, "PUT", "/api/appliances/%zz/auth", {
+    const res = await api(tenant, host, "PUT", "/api/services/%zz/auth", {
       mode: "public",
     });
     expect(res.status).not.toBe(500);

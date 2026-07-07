@@ -1,7 +1,7 @@
-// GET /portal/start?slug=<label>&rd=<relpath>
+// GET /portal/start?slug=<host-key>&rd=<relpath>
 //
-// The appliance login-wall BOUNCE handler. When an unauthenticated browser
-// hits a gated <slug>.finchmcp.com appliance, the worker's browserGate 302's
+// The service login-wall BOUNCE handler. When an unauthenticated browser
+// hits a gated <slug>.finchmcp.com service, the worker's browserGate 302's
 // it here (see worker/src/index.ts). This route is /portal-protected by
 // middleware.ts, so Clerk has already forced sign-in by the time we run — the
 // session is guaranteed real.
@@ -10,9 +10,8 @@
 //   1. resolveTenant() — the signed-in Clerk user + their hub tenant. This is
 //      the SECURITY-CRITICAL identity; everything below is bound to it.
 //   2. Read + harden the inputs:
-//        - slug MUST be a single DNS label ([a-z0-9-], no dots) so we can't be
-//          tricked into 302'ing to an attacker-controlled host
-//          (e.g. slug="evil.com" → https://evil.com.finchmcp.com or worse).
+//        - slug is the worker host key: either a single DNS label for
+//          <slug>.finchmcp.com or a validated full hostname for custom domains.
 //        - rd MUST be a site-relative path (leading "/", no scheme/host/"//")
 //          so the eventual landing redirect can't be an open redirect.
 //   3. POST /api/portal-grant {slug,userId} to the hub via hubFetch. The hub
@@ -20,8 +19,8 @@
 //      and 403s otherwise — ownership is enforced hub-side off the SIGNED
 //      assertion, never off the slug we pass. userId rides the body because the
 //      assertion only binds the tenant.
-//   4. On success, 302 the browser to the appliance's reserved callback:
-//        https://<slug>.finchmcp.com/__finch/cb?g=<grant>&rd=<rd>
+//   4. On success, 302 the browser to the service's reserved callback:
+//        https://<host>/__finch/cb?g=<grant>&rd=<rd>
 //      where the worker burns the single-use grant and sets the finch_session
 //      cookie host-scoped to that slug.
 //
@@ -30,33 +29,39 @@
 
 import { resolveTenant, hubFetch, HttpError } from "@/lib/hub";
 
-/** The appliance base domain that vanity slugs live under: <slug>.finchmcp.com.
+/** The service base domain that vanity slugs live under: <slug>.finchmcp.com.
  *  Configurable so staging can point elsewhere; defaults to the prod apex. The
- *  worker is the source of truth for slug→host (slugFromHost in index.ts); this
+ *  worker is the source of truth for host→key (hostKeyFromHost in index.ts); this
  *  only has to AGREE with it for the host we 302 to. */
-async function applianceDomain(): Promise<string> {
+async function serviceDomain(): Promise<string> {
   try {
     const { getCloudflareContext } = await import("@opennextjs/cloudflare");
     const env = getCloudflareContext().env as Record<string, unknown>;
-    const v = env?.APPLIANCE_DOMAIN;
+    const v = env?.BOX_DOMAIN;
     if (typeof v === "string" && v.length) return v;
   } catch {
     // not under the Cloudflare adapter (`next dev`) — fall through
   }
-  const pv = process.env.APPLIANCE_DOMAIN;
+  const pv = process.env.BOX_DOMAIN;
   return typeof pv === "string" && pv.length ? pv : "finchmcp.com";
 }
 
-/** A slug must be exactly one DNS label: lowercase alphanumerics and hyphens,
- *  no dots, no leading/trailing hyphen, 1–63 chars (DNS label limit). This is
- *  the open-redirect guard for the HOST we build — reject anything that could
- *  smuggle a second host component. */
-function isValidSlug(slug: string): boolean {
-  return /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(slug);
+const DNS_LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+
+/** A portal host key is either a legacy single-label slug or a full hostname.
+ *  This remains the open-redirect guard: full hostnames are safe to redirect to
+ *  only because /api/portal-grant verifies routerLookup(key) === this tenant
+ *  before issuing a grant. */
+function isValidHostKey(key: string): boolean {
+  if (!key || key !== key.toLowerCase()) return false;
+  if (!key.includes(".")) return DNS_LABEL_RE.test(key);
+  if (key.length > 253) return false;
+  const labels = key.split(".");
+  return labels.length >= 2 && labels.every((label) => DNS_LABEL_RE.test(label));
 }
 
 /** Validate that `rd` is a SITE-RELATIVE path we can safely hand back to the
- *  appliance: it must start with a single "/" and must NOT start with "//" or
+ *  service: it must start with a single "/" and must NOT start with "//" or
  *  "/\" (protocol-relative URLs that browsers treat as cross-host), and must
  *  not contain a scheme. Anything else collapses to "/". Open-redirect guard. */
 function safeRelPath(rd: string | null): string {
@@ -84,13 +89,13 @@ export async function GET(req: Request) {
   }
 
   const url = new URL(req.url);
-  const slug = (url.searchParams.get("slug") || "").trim().toLowerCase();
+  const hostKey = (url.searchParams.get("slug") || "").trim().toLowerCase();
   const rd = safeRelPath(url.searchParams.get("rd"));
 
-  // Slug guard FIRST — without a valid single-label slug we can neither ask the
-  // hub about ownership nor build a safe redirect host.
-  if (!isValidSlug(slug)) {
-    return new Response("invalid appliance slug", {
+  // Host-key guard FIRST — without a valid key we can neither ask the hub about
+  // ownership nor build a safe redirect host.
+  if (!isValidHostKey(hostKey)) {
+    return new Response("invalid service host", {
       status: 400,
       headers: { "content-type": "text/plain; charset=utf-8" },
     });
@@ -104,7 +109,7 @@ export async function GET(req: Request) {
   try {
     res = await hubFetch("/api/portal-grant", {
       method: "POST",
-      body: JSON.stringify({ slug, userId }),
+      body: JSON.stringify({ slug: hostKey, userId }),
     });
   } catch (err) {
     if (err instanceof HttpError) {
@@ -119,17 +124,17 @@ export async function GET(req: Request) {
     });
   }
 
-  // 403 = this tenant does not own this appliance. Surface a clean message
+  // 403 = this tenant does not own this service. Surface a clean message
   // rather than bouncing into a host we have no claim to.
   if (res.status === 403) {
     return new Response(
-      "This appliance isn't registered to your account. " +
+      "This service isn't registered to your account. " +
         "Sign in with the account that owns it, or check the link.",
       { status: 403, headers: { "content-type": "text/plain; charset=utf-8" } },
     );
   }
   if (!res.ok) {
-    return new Response("Could not start the appliance session. Try again.", {
+    return new Response("Could not start the service session. Try again.", {
       status: 502,
       headers: { "content-type": "text/plain; charset=utf-8" },
     });
@@ -147,19 +152,19 @@ export async function GET(req: Request) {
     grant = undefined;
   }
   if (!grant) {
-    return new Response("Could not start the appliance session. Try again.", {
+    return new Response("Could not start the service session. Try again.", {
       status: 502,
       headers: { "content-type": "text/plain; charset=utf-8" },
     });
   }
 
-  // Hand the grant to the appliance's reserved callback. The worker there burns
+  // Hand the grant to the service's reserved callback. The worker there burns
   // the single-use jti and sets the host-scoped finch_session cookie, then 302s
-  // to `rd`. Host is built from the GUARDED slug + the configured base domain,
-  // so it can only ever be <single-label>.finchmcp.com.
-  const domain = await applianceDomain();
+  // to `rd`.
+  const domain = await serviceDomain();
+  const cbHost = hostKey.includes(".") ? hostKey : `${hostKey}.${domain}`;
   const cb =
-    `https://${slug}.${domain}/__finch/cb` +
+    `https://${cbHost}/__finch/cb` +
     `?g=${encodeURIComponent(grant)}&rd=${encodeURIComponent(rd)}`;
 
   return Response.redirect(cb, 302);

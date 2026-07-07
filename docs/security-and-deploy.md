@@ -159,6 +159,34 @@ What actually ships, with the exact secrets/vars/routes per worker.
 - Zone `finchmcp.com` must be on Cloudflare (orange-cloud) so Worker routes + WAF apply.
 - After H6/H7: `workers_dev:false` and the only reachable hostnames are the bound routes.
 
+### 3.4.1 Custom hostnames
+
+Relay routing uses a single **host key** namespace in RouterDO: `<slug>.finchmcp.com` stores the
+bare slug (`pelican`), while vanity and BYO domains store the full lowercase hostname
+(`pelican.aviary.run`, `mcp.acme.com`). Unknown host keys fail closed with 404, and the browser
+login-wall cookie remains host-scoped with no `Domain` attribute.
+
+Vanity hostnames are gated by `VANITY_SUFFIXES` and `VANITY_TENANT`: production sets
+`VANITY_SUFFIXES="aviary.run"`, and `VANITY_TENANT` must be set to the only tenant allowed to
+claim names below that suffix. Without a matching `VANITY_TENANT`, vanity registration returns
+403 so tenants cannot squat first-party names.
+
+BYO domains use Cloudflare for SaaS when `CF_API_TOKEN` and `CF_SAAS_ZONE_ID` are configured.
+Set the token with `wrangler secret put CF_API_TOKEN --env production`; never place it in vars or
+logs. `BYO_CNAME_TARGET` controls the customer-facing CNAME target and defaults to
+`finchmcp.com`.
+
+Ops setup:
+- `aviary.run`: create a proxied wildcard DNS record and bind the Worker route
+  `*.aviary.run/*`.
+- `finchmcp.com`: configure Cloudflare for SaaS with the Worker as fallback origin and keep the
+  catch-all route for custom-hostname requests.
+- Customers add the CNAME returned by `finch domain add <hostname>`; traffic is inert until DNS
+  points at Finch and, for BYO domains, Cloudflare DCV issues the cert.
+
+Collisions are first-come in RouterDO. A tenant can register a BYO name before the DNS owner has
+completed DCV, so operationally treat stale or disputed registrations as an admin support path.
+
 ### 3.5 Clerk
 
 - A **production Clerk instance** (separate from dev). `pk_live`/`sk_live`. Organizations enabled (`resolveTenant` needs `orgId`). Authorized parties / allowed origins locked to `finchmcp.com`.

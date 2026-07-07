@@ -14,11 +14,11 @@
   // vars into named environments, so each env below repeats durable_objects +
   // migrations. The class definitions are identical, but DO ids are name-scoped
   // per Worker — so finch-dev and finch-prod get fully separate
-  // ApplianceDO/TenantDO/RouterDO namespaces. A dev deploy can never read or
+  // BoxDO/TenantDO/RouterDO namespaces. A dev deploy can never read or
   // mutate prod tenant registries, keys, or ACLs.
   "durable_objects": {
     "bindings": [
-      { "name": "APPLIANCE", "class_name": "ApplianceDO" },
+      { "name": "BOX", "class_name": "BoxDO" },
       { "name": "TENANT", "class_name": "TenantDO" },
       { "name": "ROUTER", "class_name": "RouterDO" }
     ]
@@ -46,6 +46,10 @@
       // RouterDO — singleton slug→tenantId index for the relay plane.
       "tag": "v3",
       "new_sqlite_classes": ["RouterDO"]
+    },
+    {
+      "tag": "v4",
+      "renamed_classes": [{ "from": "ApplianceDO", "to": "BoxDO" }]
     }
   ],
 
@@ -63,7 +67,7 @@
       },
       "durable_objects": {
         "bindings": [
-          { "name": "APPLIANCE", "class_name": "ApplianceDO" },
+          { "name": "BOX", "class_name": "BoxDO" },
           { "name": "TENANT", "class_name": "TenantDO" },
           { "name": "ROUTER", "class_name": "RouterDO" }
         ]
@@ -88,7 +92,8 @@
       "migrations": [
         { "tag": "v1", "new_sqlite_classes": ["ApplianceDO"] },
         { "tag": "v2", "new_sqlite_classes": ["TenantDO"] },
-        { "tag": "v3", "new_sqlite_classes": ["RouterDO"] }
+        { "tag": "v3", "new_sqlite_classes": ["RouterDO"] },
+        { "tag": "v4", "renamed_classes": [{ "from": "ApplianceDO", "to": "BoxDO" }] }
       ]
     },
 
@@ -96,7 +101,7 @@
     // Internet-reachable pre-prod that CI auto-deploys on every push to main.
     // Like dev it carries DEFAULT_TENANT/DEV (so it's usable on a workers.dev
     // origin with no registered <slug>.finchmcp.com), but it is a fully separate
-    // Worker (finch-staging) with its OWN ApplianceDO/TenantDO/RouterDO
+    // Worker (finch-staging) with its OWN BoxDO/TenantDO/RouterDO
     // namespaces and its OWN secrets — it can never read or mutate prod state.
     // True wildcard host routing is exercised only in production (validated by
     // the prod smoke test); to upgrade staging to staging.finchmcp.com later,
@@ -112,17 +117,24 @@
         // actually relays + shows up chirping in their dashboard on staging.
         // (Prod has none of this — it fails closed and routes by slug subdomain.)
         "DEFAULT_TENANT": "user_3F74fiQzwjM6UPfl9axNpA1jgyQ",
+        "CLERK_ISSUER": "https://strong-terrier-95.clerk.accounts.dev",
         "DEV": "1",
-        "WEB_URL": "https://finch-web-staging.pantainos.workers.dev"
+        "WEB_URL": "https://finch-web-staging.pantainos.workers.dev",
+        // Custom-hostname tiers, demoable on staging: the operator tenant may
+        // claim *.aviary.run; BYO adds register (no CF-for-SaaS call — no
+        // CF_API_TOKEN/CF_SAAS_ZONE_ID here) and return the CNAME instruction.
+        "VANITY_SUFFIXES": "aviary.run",
+        "VANITY_TENANT": "user_3F74fiQzwjM6UPfl9axNpA1jgyQ",
+        "BYO_CNAME_TARGET": "finchmcp.com"
       },
       "ai": { "binding": "AI" },
       // Self service-binding: the /chat tool-runner relays MCP calls back through
-      // our own appliance path. A direct fetch to our workers.dev host is blocked
+      // our own service path. A direct fetch to our workers.dev host is blocked
       // (error 1042); a service binding to ourselves is the supported way.
       "services": [{ "binding": "SELF", "service": "finch-staging" }],
       "durable_objects": {
         "bindings": [
-          { "name": "APPLIANCE", "class_name": "ApplianceDO" },
+          { "name": "BOX", "class_name": "BoxDO" },
           { "name": "TENANT", "class_name": "TenantDO" },
           { "name": "ROUTER", "class_name": "RouterDO" }
         ]
@@ -146,7 +158,8 @@
       "migrations": [
         { "tag": "v1", "new_sqlite_classes": ["ApplianceDO"] },
         { "tag": "v2", "new_sqlite_classes": ["TenantDO"] },
-        { "tag": "v3", "new_sqlite_classes": ["RouterDO"] }
+        { "tag": "v3", "new_sqlite_classes": ["RouterDO"] },
+        { "tag": "v4", "renamed_classes": [{ "from": "ApplianceDO", "to": "BoxDO" }] }
       ]
     },
 
@@ -156,19 +169,31 @@
       "workers_dev": false,
       "observability": { "enabled": true },
       // NO DEFAULT_TENANT and NO DEV — resolveTenant fails closed (404) for any
-      // host without a registered <slug>.finchmcp.com subdomain.
+      // host without a registered host key.
       "vars": {
-        "WEB_URL": "https://finchmcp.com"
+        "WEB_URL": "https://finchmcp.com",
+        "VANITY_SUFFIXES": "aviary.run",
+        // Production Clerk instance (pk_live/sk_live) — enables the MCP OAuth plane.
+        "CLERK_ISSUER": "https://clerk.finchmcp.com",
+        // Cloudflare-for-SaaS BYO provisioning: finchmcp.com zone.
+        "CF_SAAS_ZONE_ID": "90ca5aa137cd55b8b174763a50641c00"
+        // Set VANITY_TENANT to the single tenant allowed to claim *.aviary.run
+        // (operator's user id on the PROD Clerk instance — set after first sign-up).
+        // Optional BYO_CNAME_TARGET defaults to "finchmcp.com".
+        // CF_API_TOKEN is a secret:
+        //   wrangler secret put CF_API_TOKEN --env production
       },
       "ai": { "binding": "AI" },
       "services": [{ "binding": "SELF", "service": "finch-prod" }],
       "routes": [
         { "pattern": "finchmcp.com/*", "zone_name": "finchmcp.com" },
-        { "pattern": "*.finchmcp.com/*", "zone_name": "finchmcp.com" }
+        { "pattern": "*.finchmcp.com/*", "zone_name": "finchmcp.com" },
+        { "pattern": "*.aviary.run/*", "zone_name": "aviary.run" },
+        { "pattern": "*/*", "zone_name": "finchmcp.com" }
       ],
       "durable_objects": {
         "bindings": [
-          { "name": "APPLIANCE", "class_name": "ApplianceDO" },
+          { "name": "BOX", "class_name": "BoxDO" },
           { "name": "TENANT", "class_name": "TenantDO" },
           { "name": "ROUTER", "class_name": "RouterDO" }
         ]
@@ -193,7 +218,8 @@
       "migrations": [
         { "tag": "v1", "new_sqlite_classes": ["ApplianceDO"] },
         { "tag": "v2", "new_sqlite_classes": ["TenantDO"] },
-        { "tag": "v3", "new_sqlite_classes": ["RouterDO"] }
+        { "tag": "v3", "new_sqlite_classes": ["RouterDO"] },
+        { "tag": "v4", "renamed_classes": [{ "from": "ApplianceDO", "to": "BoxDO" }] }
       ]
     }
   }

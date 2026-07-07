@@ -74,7 +74,154 @@ function HubDomain({ current, onClaim }: { current: string; onClaim: (slug: stri
   );
 }
 
-// CLI access: mint a token for `finch login`, so a box can enroll appliances
+// Custom domains: bring-your-own hostnames (and our vanity tier) mapped to this
+// tenant in the hub's host-key index. Adding one returns the CNAME instruction
+// the operator must configure; the hub enforces ownership/vanity gating and
+// (when configured) provisions the Cloudflare-for-SaaS certificate.
+// Concrete URL preview for a hostname: every service the tenant runs, as it
+// would be reached under that domain. The recommended naming is one hostname
+// per box (box.yourdomain.com) with the service in the path — mirroring
+// the <box>.aviary.run/<service> scheme.
+function DomainPreview({ hostname, services }: { hostname: string; services: any[] }) {
+  const shown = (services || []).slice(0, 4);
+  if (!shown.length) {
+    return (
+      <div className="set-hint dim" style={{ marginTop: 4 }}>
+        Services would live at <code className="mono">https://{hostname}/&lt;service&gt;/</code> — add a box to see real URLs here.
+      </div>
+    );
+  }
+  return (
+    <div style={{ marginTop: 4 }}>
+      <div className="set-hint dim" style={{ marginBottom: 4 }}>Your services on this domain:</div>
+      {shown.map((a) => (
+        <div key={a.id} className="mono set-hint" style={{ marginBottom: 2 }}>
+          https://{hostname}/<span style={{ color: 'var(--amber)' }}>{a.id}</span>/
+        </div>
+      ))}
+      {(services?.length ?? 0) > 4 && (
+        <div className="set-hint dim">…and {services.length - 4} more</div>
+      )}
+    </div>
+  );
+}
+
+function CustomDomains({ services }: { services: any[] }) {
+  const [hostnames, setHostnames] = useState<string[]>([]);
+  const [draft, setDraft] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+  const [added, setAdded] = useState<{ hostname: string; instructions?: string; ssl?: string } | null>(null);
+
+  async function refresh() {
+    try {
+      const r = await fetch('/api/finch/hostnames');
+      const j = await r.json();
+      if (r.ok) setHostnames(j.hostnames || []);
+    } catch { /* leave the list as-is */ }
+  }
+  useEffect(() => { refresh(); }, []);
+
+  // Mirror the hub's host-key shape loosely at the input: lowercase, host chars
+  // only, must contain a dot. The hub is the real validator (400s otherwise).
+  const clean = (v: string) => v.toLowerCase().replace(/[^a-z0-9.-]/g, '').slice(0, 253);
+  const hostname = clean(draft);
+  const plausible = hostname.includes('.') && !hostname.startsWith('.') && !hostname.endsWith('.');
+
+  async function add() {
+    setBusy(true); setErr(''); setAdded(null);
+    try {
+      const r = await fetch('/api/finch/hostnames', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ hostname }),
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || 'could not add hostname');
+      setAdded({ hostname: j.hostname, instructions: j.instructions, ssl: j.ssl ? String(j.ssl) : undefined });
+      setDraft('');
+      refresh();
+    } catch (e: any) {
+      setErr(e.message || 'failed');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function remove(h: string) {
+    if (!confirm(`Remove ${h}? Traffic on it stops resolving immediately.`)) return;
+    setBusy(true); setErr('');
+    try {
+      const r = await fetch('/api/finch/hostnames', {
+        method: 'DELETE',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ hostname: h }),
+      });
+      if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || 'could not remove hostname');
+      if (added?.hostname === h) setAdded(null);
+      refresh();
+    } catch (e: any) {
+      setErr(e.message || 'failed');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="custom-domains">
+      <p className="set-hint dim" style={{ marginBottom: 12 }}>
+        Serve your boxes on your own domain instead of <code className="mono">.finchmcp.com</code>.
+        Name one hostname per box — services live under it as paths:{' '}
+        <code className="mono">&lt;box&gt;.yourdomain.com/&lt;service&gt;/</code>. Three steps:
+      </p>
+      <ol className="setup-steps">
+        <li>Add a hostname below, named after the box it reaches (e.g. <code className="mono">pelican.yourdomain.com</code>).</li>
+        <li>At your DNS provider, create the CNAME record we show you — it points your hostname at finch.</li>
+        <li>Wait for DNS to resolve; the certificate is issued automatically and your services go live on the new name.</li>
+      </ol>
+      {hostnames.length > 0 && (
+        <div style={{ marginBottom: 12 }}>
+          {hostnames.map((h) => (
+            <div key={h} style={{ marginBottom: 10 }}>
+              <div className="set-domain mono" style={{ alignItems: 'center', gap: 8, marginBottom: 4 }}>
+                <a href={`https://${h}`} target="_blank" rel="noreferrer">{h}</a>
+                <button type="button" className="btn btn-sm btn-ghost" disabled={busy} onClick={() => remove(h)}>Remove</button>
+              </div>
+              <DomainPreview hostname={h} services={services} />
+            </div>
+          ))}
+        </div>
+      )}
+      <div className="set-domain mono" style={{ alignItems: 'center', gap: 8 }}>
+        <input
+          className="set-input"
+          value={draft}
+          placeholder="mcp.yourdomain.com"
+          onChange={(e) => setDraft(clean(e.target.value))}
+          style={{ width: 220 }}
+        />
+        <button type="button" className="btn btn-sm btn-amber" disabled={!plausible || busy} onClick={add}>
+          {busy ? 'adding…' : 'Add domain'}
+        </button>
+      </div>
+      {plausible && !hostnames.includes(hostname) && (
+        <div style={{ marginTop: 8 }}>
+          <DomainPreview hostname={hostname} services={services} />
+        </div>
+      )}
+      {err && <div className="set-hint red" style={{ marginTop: 8 }}>{err}</div>}
+      {added && (
+        <div className="set-hint" style={{ marginTop: 8 }}>
+          <span className="green">✓ {added.hostname} added.</span>{' '}
+          {added.instructions && <>Now create this DNS record: <code className="mono">{added.instructions}</code>.</>}
+          {added.ssl && <> Certificate: <code className="mono">{added.ssl}</code>.</>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// CLI access: mint a token for `finch login`, so a box can enroll services
 // and build its finch.toml from the command line (no dashboard round-trips).
 function CliAccess() {
   const [cmd, setCmd] = useState('');
@@ -148,14 +295,14 @@ function CliAccess() {
 
 // Web sessions: sign everyone out of the login-wall. Hits the BFF which bumps
 // the tenant's sessionEpoch on the hub, invalidating every live finch_session
-// cookie so every browser viewing a hosted appliance must sign in again.
+// cookie so every browser viewing a hosted service must sign in again.
 function WebSessions() {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
   const [done, setDone] = useState(false);
 
   async function signOutAll() {
-    if (!confirm('Sign out ALL web sessions for this account? Everyone viewing one of your hosted appliances will have to sign in again.')) return;
+    if (!confirm('Sign out ALL web sessions for this account? Everyone viewing one of your hosted services will have to sign in again.')) return;
     setBusy(true); setErr(''); setDone(false);
     try {
       const r = await fetch('/api/finch/sessions/revoke', { method: 'POST' });
@@ -171,13 +318,13 @@ function WebSessions() {
   return (
     <div className="web-sessions">
       <p className="set-hint dim" style={{ marginBottom: 12 }}>
-        Force a fresh sign-in on every browser currently viewing one of your hosted appliances. Use this if a teammate left or a session may be compromised.
+        Force a fresh sign-in on every browser currently viewing one of your hosted services. Use this if a teammate left or a session may be compromised.
       </p>
       <button type="button" className="btn btn-sm btn-ghost" onClick={signOutAll} disabled={busy}>
         {busy ? 'signing out…' : 'Sign out all web sessions'}
       </button>
       {err && <div className="set-hint red" style={{ marginTop: 8 }}>{err}</div>}
-      {done && <div className="set-hint green" style={{ marginTop: 8 }}>✓ All web sessions signed out — viewers must sign in again at the appliance gate.</div>}
+      {done && <div className="set-hint green" style={{ marginTop: 8 }}>✓ All web sessions signed out — viewers must sign in again at the service gate.</div>}
     </div>
   );
 }
@@ -201,7 +348,7 @@ function withCurrent(options: string[], current: string | undefined): string[] {
   return current && !options.includes(current) ? [current, ...options] : options;
 }
 
-export function SettingsView({ settings, groups, onChange }: any) {
+export function SettingsView({ settings, groups, services, onChange }: any) {
   const s = settings;
   // Real groups if the tenant has any, else just the current default — never
   // invent placeholder groups the user never created.
@@ -213,7 +360,7 @@ export function SettingsView({ settings, groups, onChange }: any) {
   return (
     <div className="view view-narrow">
       <h1 className="page-title">Settings <span className="admin-badge">admin</span></h1>
-      <p className="page-lede">Tenant-wide defaults. Changes apply across every device and teammate.</p>
+      <p className="page-lede">Tenant-wide defaults. Changes apply across every box and teammate.</p>
 
       <Card className="set-card">
         <SectionLabel>organization</SectionLabel>
@@ -223,6 +370,11 @@ export function SettingsView({ settings, groups, onChange }: any) {
         <SetRow label="Hub domain" hint="the name clients use to reach your boxes">
           <HubDomain current={s.subdomain || ''} onClaim={(slug) => onChange('subdomain', slug)} />
         </SetRow>
+      </Card>
+
+      <Card className="set-card">
+        <SectionLabel>custom domains <span className="beta-badge">free while in beta</span></SectionLabel>
+        <CustomDomains services={services || []} />
       </Card>
 
       <Card className="set-card">
@@ -236,11 +388,11 @@ export function SettingsView({ settings, groups, onChange }: any) {
       </Card>
 
       <Card className="set-card">
-        <SectionLabel>devices &amp; access</SectionLabel>
-        <SetRow label="Require approval for new devices" hint="new devices wait for an admin before they can serve">
+        <SectionLabel>boxes &amp; access</SectionLabel>
+        <SetRow label="Require approval for new boxes" hint="new boxes wait for an admin before they can serve">
           <Toggle on={s.requireApproval} onChange={(v: any) => onChange("requireApproval", v)} />
         </SetRow>
-        <SetRow label="Default group" hint="where newly enrolled devices land">
+        <SetRow label="Default group" hint="where newly enrolled boxes land">
           <select className="acl-select" value={s.defaultGroup} onChange={(e) => onChange("defaultGroup", e.target.value)}>
             {groupOptions.map((g) => <option key={g}>{g}</option>)}
           </select>

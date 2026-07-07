@@ -1,4 +1,4 @@
-// POST /api/finch/chat {appliance, messages} — the dashboard's "test in chat"
+// POST /api/finch/chat {service, messages} — the dashboard's "test in chat"
 // panel. Admin-only; relays to the hub's /chat/completions using the web's
 // service auth (no finch_ key), so chatting never mints keys.
 import { requireAdmin, hubFetch, errorResponse } from "@/lib/hub";
@@ -9,7 +9,7 @@ export async function POST(req: Request) {
     const body = await req.json().catch(() => ({}));
     const res = await hubFetch("/chat/completions", {
       method: "POST",
-      body: JSON.stringify({ appliance: body.appliance, messages: body.messages }),
+      body: JSON.stringify({ service: body.service, messages: body.messages }),
     });
     return new Response(await res.text(), {
       status: res.status,

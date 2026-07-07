@@ -26,12 +26,12 @@ import (
 // Exposed so the mobile SDK and host apps can display / report it.
 func Version() string { return agentVersion }
 
-// EmbedOptions configures one embedded appliance relay. All fields are plain
+// EmbedOptions configures one embedded service relay. All fields are plain
 // values so the mobile bind layer can pass them straight through.
 type EmbedOptions struct {
 	Hub            string // hub base URL; "" defaults to https://finchmcp.com
-	Machine        string // this device's name; "" defaults to os.Hostname()
-	AppPath        string // public URL segment / appliance id (informational here)
+	Box            string // this device's name; "" defaults to os.Hostname()
+	AppPath        string // public URL segment / service id (informational here)
 	Upstream       string // local service base URL, e.g. http://127.0.0.1:8080
 	CredentialPath string // file the refresh credential is read from / written to
 	Ticket         string // one-shot enrollment ticket (first run / re-enroll only)
@@ -45,9 +45,9 @@ func (o EmbedOptions) hub() string {
 	return strings.TrimRight(o.Hub, "/")
 }
 
-func (o EmbedOptions) machine() string {
-	if o.Machine != "" {
-		return o.Machine
+func (o EmbedOptions) box() string {
+	if o.Box != "" {
+		return o.Box
 	}
 	h, _ := os.Hostname()
 	return h
@@ -77,18 +77,18 @@ func EmbedEnroll(o EmbedOptions) error {
 	if o.Ticket == "" {
 		return fmt.Errorf("a ticket is required to enroll")
 	}
-	if _, _, err := enrollToState(o.hub(), o.machine(), o.Ticket, o.CredentialPath); err != nil {
+	if _, _, err := enrollToState(o.hub(), o.box(), o.Ticket, o.CredentialPath); err != nil {
 		return err
 	}
 	return nil
 }
 
 // RunConfig loads a finch.yml manifest and serves every ingress rule concurrently
-// — the same multi-appliance model as `finch run`, but ctx-aware and non-fatal so
+// — the same multi-service model as `finch run`, but ctx-aware and non-fatal so
 // a host program (the desktop tray app) can drive it and Stop() it cleanly. It
-// reuses the per-appliance Embed loop, and when the box is logged in (finch login)
-// best-effort self-approves each appliance so none are stuck pending — the CLI
-// token holder is the tenant admin. status, if non-nil, receives per-appliance
+// reuses the per-service Embed loop, and when the box is logged in (finch login)
+// best-effort self-approves each service so none are stuck pending — the CLI
+// token holder is the tenant admin. status, if non-nil, receives per-service
 // lifecycle updates (app_path, state, detail); the caller marshals to its UI.
 //
 // Returns nil once ctx is cancelled and all relays have wound down; a non-nil
@@ -107,7 +107,7 @@ func RunConfig(ctx context.Context, configPath string, status func(appPath, stat
 	}
 
 	// Self-approve via the saved CLI token (best-effort, idempotent): clears the
-	// pending gate so appliances go live without a dashboard hop. Only when the
+	// pending gate so services go live without a dashboard hop. Only when the
 	// token targets this manifest's hub.
 	if cred := loadCliCredQuiet(); cred != nil && cred.Hub == cfg.hubBase() {
 		for _, ing := range cfg.Ingress {
@@ -123,7 +123,7 @@ func RunConfig(ctx context.Context, configPath string, status func(appPath, stat
 			defer wg.Done()
 			if err := Embed(ctx, EmbedOptions{
 				Hub:            cfg.Hub,
-				Machine:        cfg.Machine,
+				Box:            cfg.Box,
 				AppPath:        ing.AppPath,
 				Upstream:       ing.Service,
 				CredentialPath: cfg.statePathFor(ing.AppPath),
@@ -146,7 +146,7 @@ func (c *config) hubBase() string {
 	return strings.TrimRight(c.Hub, "/")
 }
 
-// Embed resumes the appliance from its saved credential and holds the relay open,
+// Embed resumes the service from its saved credential and holds the relay open,
 // reconnecting with backoff, until ctx is cancelled. If no usable credential
 // exists and o.Ticket is set, it enrolls first (the same resume-then-ticket
 // fallback the single-service CLI path uses). status, if non-nil, receives
@@ -177,7 +177,7 @@ func Embed(ctx context.Context, o EmbedOptions, status func(state, detail string
 		}
 	}
 	if jr == nil && o.Ticket != "" {
-		st, ejr, eerr := enrollToState(hub, o.machine(), o.Ticket, o.CredentialPath)
+		st, ejr, eerr := enrollToState(hub, o.box(), o.Ticket, o.CredentialPath)
 		if eerr != nil {
 			return fmt.Errorf("enroll failed: %w", eerr)
 		}
@@ -188,7 +188,7 @@ func Embed(ctx context.Context, o EmbedOptions, status func(state, detail string
 		return fmt.Errorf("not enrolled: pass a Ticket on first run")
 	}
 
-	wsBase := relayURL(hub, jr.Appliance, jr.Machine)
+	wsBase := relayURL(hub, jr.Service, jr.Box)
 	connectToken := jr.ConnectToken
 	connectExp := tokenExp(connectToken)
 	status("live", jr.URL)
@@ -223,7 +223,7 @@ func Embed(ctx context.Context, o EmbedOptions, status func(state, detail string
 			}
 			connectToken = fresh.ConnectToken
 			connectExp = tokenExp(connectToken)
-			wsBase = relayURL(hub, fresh.Appliance, fresh.Machine)
+			wsBase = relayURL(hub, fresh.Service, fresh.Box)
 		}
 
 		wsURL := wsBase + "?ct=" + url.QueryEscape(connectToken)

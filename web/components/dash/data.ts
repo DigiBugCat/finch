@@ -8,21 +8,21 @@
 // here rather than imported across the repo boundary so `web` stays a
 // self-contained package. Keep them in sync with the worker types.
 
-export type ApplianceState =
+export type ServiceState =
   | "in_use"
   | "chirping"
   | "resting"
   | "invited"
   | "pending";
 
-/** A box that runs an appliance type. Path: /<appliance>/<machine>/mcp */
-export interface Machine {
+/** A box that runs a service. Path: /<service>/<box>/mcp */
+export interface Box {
   name: string;
   os: string;
   version: string;
-  state: ApplianceState;
-  appliance: string;
-  applianceLabel: string;
+  state: ServiceState;
+  service: string;
+  serviceLabel: string;
   keys: string[];
   address: string;
   outdated: boolean;
@@ -30,7 +30,7 @@ export interface Machine {
   relay: string;
   handshake: string;
   connected?: boolean;
-  // flattened-lens enrichment (the hub adds these on the Machines projection)
+  // flattened-lens enrichment (the hub adds these on the Boxes projection)
   group?: string;
   tags?: string[];
   owner?: string;
@@ -52,11 +52,11 @@ export interface Connection {
   protocol: string;
 }
 
-/** An appliance = a capability TYPE (web-scraper, printer, embeddings…). */
-export interface Appliance {
+/** A service = a capability TYPE (web-scraper, printer, embeddings…). */
+export interface Service {
   id: string;
   label: string;
-  state: ApplianceState;
+  state: ServiceState;
   owner: string;
   box: string;
   created: string;
@@ -70,8 +70,8 @@ export interface Appliance {
   routes: string[];
   keys: string[];
   components: { name: string; state: "online" | "offline"; log: string }[];
-  machines: Machine[];
-  machineCount: number;
+  boxes: Box[];
+  boxCount: number;
   calls: number;
   p50: number;
   p95: number;
@@ -83,27 +83,27 @@ export interface Appliance {
 }
 
 /** A key's reach, in STRUCTURED form — mirrors the worker's KeyScope
- *  (worker/src/types.ts). Either every appliance ({all:true}) or an explicit
- *  allow-list of appliance ids. NOT a free-text string: the hub validates this
+ *  (worker/src/types.ts). Either every service ({all:true}) or an explicit
+ *  allow-list of service ids. NOT a free-text string: the hub validates this
  *  shape at mint, and checkKey Gate 1 reads `scope.all === true` / the id list.
  *  Keep this in sync with the worker type — the two cross the wire verbatim. */
-export type KeyScope = { all: true } | { all?: false; appliances: string[] };
+export type KeyScope = { all: true } | { all?: false; services: string[] };
 
 /** Render a KeyScope as a human label for the dashboard (panels.tsx). The hub
  *  returns a KeyScope OBJECT, so rendering it raw yields "[object Object]";
- *  this collapses it to "all appliances" or a comma-joined id list. Tolerant of
+ *  this collapses it to "all services" or a comma-joined id list. Tolerant of
  *  a malformed/legacy value so the Keys table never renders garbage. */
 export function formatScope(scope: KeyScope | null | undefined): string {
   if (!scope) return "—";
-  if ("all" in scope && scope.all === true) return "all appliances";
-  const ids = Array.isArray((scope as { appliances?: unknown }).appliances)
-    ? (scope as { appliances: string[] }).appliances
+  if ("all" in scope && scope.all === true) return "all services";
+  const ids = Array.isArray((scope as { services?: unknown }).services)
+    ? (scope as { services: string[] }).services
     : [];
-  return ids.length ? ids.join(", ") : "no appliances";
+  return ids.length ? ids.join(", ") : "no services";
 }
 
 export interface AclEntity {
-  type: "user" | "group" | "key" | "tag" | "appliance" | "all";
+  type: "user" | "group" | "key" | "tag" | "service" | "all";
   name?: string;
 }
 export interface AclRule {
@@ -181,8 +181,8 @@ export interface DashUser {
 /** The full per-tenant state — what GET /api/finch/state returns. */
 export interface TenantState {
   host: string;
-  appliances: Appliance[];
-  machines: Machine[];
+  services: Service[];
+  boxes: Box[];
   keys: PublicKey[];
   groups: Group[];
   acl: AclRule[];

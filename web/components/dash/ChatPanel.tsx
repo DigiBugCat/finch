@@ -1,6 +1,6 @@
 "use client";
-// "Test in chat" — a chat window on the appliance detail. An LLM (Workers AI)
-// calls THIS appliance's MCP tools so you can confirm it works without leaving
+// "Test in chat" — a chat window on the service detail. An LLM (Workers AI)
+// calls THIS service's MCP tools so you can confirm it works without leaving
 // the dashboard. Relays via the web's service auth — no finch_ key needed.
 import { useEffect, useRef, useState } from 'react';
 import { Card, SectionLabel } from '@/components/dash/primitives';
@@ -9,7 +9,7 @@ type Item =
   | { kind: 'msg'; role: 'user' | 'assistant'; content: string; err?: boolean }
   | { kind: 'tool'; tool: string; args: any; result: string };
 
-export function ChatPanel({ appliance, online }: { appliance: string; online: boolean }) {
+export function ChatPanel({ service, online }: { service: string; online: boolean }) {
   const [items, setItems] = useState<Item[]>([]);
   const [input, setInput] = useState('');
   const [busy, setBusy] = useState(false);
@@ -32,7 +32,7 @@ export function ChatPanel({ appliance, online }: { appliance: string; online: bo
       const r = await fetch('/api/finch/chat', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ appliance, messages: hist.current }),
+        body: JSON.stringify({ service, messages: hist.current }),
       });
       const j = await r.json();
       const add: Item[] = (j.trace || []).map((x: any) => ({ kind: 'tool', tool: x.tool, args: x.args, result: x.result }));
@@ -51,7 +51,7 @@ export function ChatPanel({ appliance, online }: { appliance: string; online: bo
 
   return (
     <Card className="connect-card chatd-card">
-      <SectionLabel hint="ask an LLM to use this appliance's tools — a live check it works">test in chat</SectionLabel>
+      <SectionLabel hint="ask an LLM to use this service's tools — a live check it works">test in chat</SectionLabel>
 
       {!online ? (
         <div className="url-pending mono big-pending">🌙 resting — start the box to chat with its tools.</div>
@@ -59,12 +59,12 @@ export function ChatPanel({ appliance, online }: { appliance: string; online: bo
         <div className="chatd-win">
           <div className="chatd-winbar">
             <span className="chatd-wintitle">🐦 Assistant</span>
-            <span className="chatd-winmeta mono">Workers AI · gemma · calls {appliance}'s tools</span>
+            <span className="chatd-winmeta mono">Workers AI · gemma · calls {service}'s tools</span>
           </div>
 
           <div className="chatd-log" ref={logRef}>
             {items.length === 0 && (
-              <div className="chatd-empty">Ask anything — the model will call <b className="mono">{appliance}</b>'s tools to answer.</div>
+              <div className="chatd-empty">Ask anything — the model will call <b className="mono">{service}</b>'s tools to answer.</div>
             )}
             {items.map((it, i) =>
               it.kind === 'tool' ? (
@@ -94,7 +94,7 @@ export function ChatPanel({ appliance, online }: { appliance: string; online: bo
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={(e) => { if (e.key === 'Enter') send(); }}
-              placeholder={`Message ${appliance}…`}
+              placeholder={`Message ${service}…`}
             />
             <button type="button" className="chatd-send" onClick={send} disabled={busy || !input.trim()} aria-label="Send">↑</button>
           </div>

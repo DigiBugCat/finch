@@ -1,8 +1,8 @@
 package core
 
-// manage.go — in-process appliance management for embedders (the desktop tray).
+// manage.go — in-process service management for embedders (the desktop tray).
 // These mirror the `finch fleet` / `finch add` / `finch rm` CLI commands but return
-// errors instead of calling os.Exit, so a GUI can list, add, and remove appliances
+// errors instead of calling os.Exit, so a GUI can list, add, and remove services
 // without shelling out to the finch binary. They reuse the exact same CLI-token
 // requests, enroll-to-credential, and comment-preserving finch.yml edits.
 
@@ -28,7 +28,7 @@ func LoginInfo() (hub, email string, loggedIn bool) {
 }
 
 // Logout removes the saved CLI credential (the in-process equivalent of deleting
-// ~/.finch/cli.json). Already-enrolled appliances keep working from their own
+// ~/.finch/cli.json). Already-enrolled services keep working from their own
 // refresh credentials; this only drops the admin CLI token.
 func Logout() error {
 	if err := os.Remove(cliCredPath()); err != nil && !os.IsNotExist(err) {
@@ -89,14 +89,14 @@ func Login(hub string, onCode func(verificationURI, userCode string)) error {
 	return fmt.Errorf("timed out waiting for approval")
 }
 
-// AppInfo is one appliance as the hub reports it: its id (the app_path / URL
+// AppInfo is one service as the hub reports it: its id (the app_path / URL
 // segment) and current state ("chirping"/"pending"/"invited"/…).
 type AppInfo struct {
 	ID    string
 	State string
 }
 
-// Fleet lists this account's appliances (GET /api/cli/state). Requires `finch
+// Fleet lists this account's services (GET /api/cli/state). Requires `finch
 // login`. The in-process equivalent of `finch fleet`.
 func Fleet() ([]AppInfo, error) {
 	cred, err := loadCliCred()
@@ -107,7 +107,7 @@ func Fleet() ([]AppInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	apps, _ := st["appliances"].([]any)
+	apps, _ := st["services"].([]any)
 	out := make([]AppInfo, 0, len(apps))
 	for _, a := range apps {
 		m, _ := a.(map[string]any)
@@ -120,19 +120,19 @@ func Fleet() ([]AppInfo, error) {
 	return out, nil
 }
 
-// Node is one appliance-on-a-machine as the hub reports it (the tenant's fleet is
-// a flat list of these). Lets a GUI group by Machine — "this machine" vs "other
-// machines", Tailscale-style.
+// Node is one service-on-a-box as the hub reports it (the tenant's fleet is
+// a flat list of these). Lets a GUI group by Box — "this box" vs "other
+// boxes", Tailscale-style.
 type Node struct {
-	Machine   string // the box's name
-	Appliance string // the appliance id it serves
+	Box       string // the box's name
+	Service   string // the service id it serves
 	State     string // "chirping"/"in_use"/"offline"/…
 	OS        string
 	Connected bool
 }
 
-// FleetNodes returns every appliance-on-a-machine across the tenant (the flattened
-// `machines` list from GET /api/cli/state). Requires `finch login`.
+// FleetNodes returns every service-on-a-box across the tenant (the flattened
+// `boxes` list from GET /api/cli/state). Requires `finch login`.
 func FleetNodes() ([]Node, error) {
 	cred, err := loadCliCred()
 	if err != nil {
@@ -142,7 +142,7 @@ func FleetNodes() ([]Node, error) {
 	if err != nil {
 		return nil, err
 	}
-	ms, _ := st["machines"].([]any)
+	ms, _ := st["boxes"].([]any)
 	out := make([]Node, 0, len(ms))
 	for _, mi := range ms {
 		m, _ := mi.(map[string]any)
@@ -151,8 +151,8 @@ func FleetNodes() ([]Node, error) {
 		}
 		name, _ := m["name"].(string)
 		conn, _ := m["connected"].(bool)
-		n := Node{Machine: name, Connected: conn}
-		n.Appliance, _ = m["appliance"].(string)
+		n := Node{Box: name, Connected: conn}
+		n.Service, _ = m["service"].(string)
 		n.State, _ = m["state"].(string)
 		n.OS, _ = m["os"].(string)
 		if name != "" {
@@ -162,7 +162,7 @@ func FleetNodes() ([]Node, error) {
 	return out, nil
 }
 
-// Add enrolls an appliance and appends a ticketless ingress rule to configPath —
+// Add enrolls a service and appends a ticketless ingress rule to configPath —
 // the in-process equivalent of `finch add <appPath> --service <service>`. It
 // returns the registered id (the hub slugifies the name, so it may differ from
 // appPath) and the public URL. Requires `finch login`.
@@ -198,18 +198,18 @@ func Add(configPath, appPath, service string) (id, publicURL string, err error) 
 	}
 
 	host, _ := os.Hostname()
-	machine, credDir := addPaths(configPath, host)
+	box, credDir := addPaths(configPath, host)
 	statePath := filepath.Join(credDir, id+".json")
-	if _, _, eerr := enrollToState(cred.Hub, machine, ticket, statePath); eerr != nil {
+	if _, _, eerr := enrollToState(cred.Hub, box, ticket, statePath); eerr != nil {
 		return "", "", fmt.Errorf("saving credential failed: %w", eerr)
 	}
-	if werr := appendIngress(configPath, cred.Hub, id, service, machine); werr != nil {
+	if werr := appendIngress(configPath, cred.Hub, id, service, box); werr != nil {
 		return "", "", fmt.Errorf("could not write %s: %w", configPath, werr)
 	}
 	return id, publicURL, nil
 }
 
-// Remove releases an appliance from the tenant (the in-process equivalent of
+// Remove releases a service from the tenant (the in-process equivalent of
 // `finch rm <appPath>`) and drops its ingress rule from configPath. The local
 // finch.yml edit is best-effort — a hub-side removal that succeeds is reported as
 // success even if the manifest couldn't be rewritten.
@@ -218,7 +218,7 @@ func Remove(configPath, appPath string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := cliRequest("POST", cred.Hub, "/api/cli/appliances/release", cred.Token, map[string]string{"id": appPath}); err != nil {
+	if _, err := cliRequest("POST", cred.Hub, "/api/cli/services/release", cred.Token, map[string]string{"id": appPath}); err != nil {
 		return err
 	}
 	_ = removeIngress(configPath, appPath)

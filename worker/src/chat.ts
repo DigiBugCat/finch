@@ -1,14 +1,14 @@
 /// <reference types="@cloudflare/workers-types" />
 //
-// chat.ts — a tiny test chat that drives an appliance's MCP tools through a
+// chat.ts — a tiny test chat that drives a service's MCP tools through a
 // Workers AI model. Purely a "does my MCP endpoint actually work" check:
 //
-//   GET  /chat               → a self-contained chat page (appliance + finch_ key)
-//   POST /chat/completions   → one turn: the model may call the appliance's tools
+//   GET  /chat               → a self-contained chat page (service + finch_ key)
+//   POST /chat/completions   → one turn: the model may call the service's tools
 //
 // Tool use is PROMPT-BASED (the model emits a {"tool","args"} JSON line) so it
 // works regardless of a model's native function-calling support. Tool calls are
-// executed by relaying tools/call to the appliance over the SAME public path a
+// executed by relaying tools/call to the service over the SAME public path a
 // real client uses — so a green answer means the whole finch loop works.
 
 import type { Env } from "./index";
@@ -58,7 +58,7 @@ async function chatCompletion(req: Request, env: Env, origin: string): Promise<R
   } catch {
     return json(400, { error: "invalid JSON" });
   }
-  const appliance = String(body.appliance || "").trim();
+  const service = String(body.service || "").trim();
   // Keep only the most recent turns, each length-clamped, so a giant history
   // can't blow up the model context / cost.
   const userMessages: Msg[] = (Array.isArray(body.messages) ? body.messages : [])
@@ -67,8 +67,8 @@ async function chatCompletion(req: Request, env: Env, origin: string): Promise<R
       role: m && m.role === "assistant" ? "assistant" : "user",
       content: String((m && m.content) || "").slice(0, MAX_MSG_CHARS),
     }));
-  if (!appliance || !userMessages.length) {
-    return json(400, { error: "appliance and messages are required" });
+  if (!service || !userMessages.length) {
+    return json(400, { error: "service and messages are required" });
   }
 
   // Two ways to authorize the relay this chat performs:
@@ -89,20 +89,20 @@ async function chatCompletion(req: Request, env: Env, origin: string): Promise<R
     authHeaders = { authorization: `Bearer ${key}` };
   }
 
-  // Discover the appliance's tools (this also proves the relay works).
+  // Discover the service's tools (this also proves the relay works).
   let tools: any[];
   try {
-    const listed = await mcp(env, origin, appliance, authHeaders, "tools/list", {});
+    const listed = await mcp(env, origin, service, authHeaders, "tools/list", {});
     tools = listed?.tools || [];
   } catch (e: any) {
-    return json(502, { error: `couldn't reach ${appliance}: ${e.message || e}` });
+    return json(502, { error: `couldn't reach ${service}: ${e.message || e}` });
   }
   const toolNames = new Set(tools.map((t) => t.name));
 
   const sys: Msg = {
     role: "system",
     content:
-      `You are a concise assistant connected to the user's finch appliance "${appliance}". ` +
+      `You are a concise assistant connected to the user's finch service "${service}". ` +
       `You can call these tools:\n` +
       tools.map((t) => `- ${t.name}: ${t.description || ""}  schema=${JSON.stringify(t.inputSchema || {})}`).join("\n") +
       `\n\nTo call a tool, reply with ONE line of JSON and nothing else: {"tool":"<name>","args":{...}}. ` +
@@ -126,7 +126,7 @@ async function chatCompletion(req: Request, env: Env, origin: string): Promise<R
     if (hop < MAX_TOOL_HOPS && call && toolNames.has(call.tool)) {
       let result: string;
       try {
-        const r = await mcp(env, origin, appliance, authHeaders, "tools/call", { name: call.tool, arguments: call.args || {} });
+        const r = await mcp(env, origin, service, authHeaders, "tools/call", { name: call.tool, arguments: call.args || {} });
         result = r?.content?.[0]?.text ?? JSON.stringify(r);
       } catch (e: any) {
         result = `tool error: ${e.message || e}`;
@@ -141,10 +141,10 @@ async function chatCompletion(req: Request, env: Env, origin: string): Promise<R
   return json(200, { reply: "(stopped after tool loop)", trace });
 }
 
-/** Relay a JSON-RPC call to the appliance over our own MCP path. Uses the SELF
+/** Relay a JSON-RPC call to the service over our own MCP path. Uses the SELF
  *  service binding — a plain fetch to our own hostname is blocked (error 1042). */
-async function mcp(env: Env, origin: string, appliance: string, authHeaders: Record<string, string>, method: string, params: any): Promise<any> {
-  const res = await env.SELF.fetch(`${origin}/${encodeURIComponent(appliance)}/mcp`, {
+async function mcp(env: Env, origin: string, service: string, authHeaders: Record<string, string>, method: string, params: any): Promise<any> {
+  const res = await env.SELF.fetch(`${origin}/${encodeURIComponent(service)}/mcp`, {
     method: "POST",
     headers: { ...authHeaders, "content-type": "application/json" },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
@@ -155,7 +155,7 @@ async function mcp(env: Env, origin: string, appliance: string, authHeaders: Rec
   try {
     j = JSON.parse(text);
   } catch {
-    throw new Error(`non-JSON from appliance: ${text.slice(0, 120)}`);
+    throw new Error(`non-JSON from service: ${text.slice(0, 120)}`);
   }
   if (j.error) throw new Error(j.error.message || JSON.stringify(j.error));
   return j.result;
@@ -285,15 +285,15 @@ a{color:var(--amber);text-decoration:none}
   <span class="avatar">🐦</span>
   <div class="head-mid">
     <div class="head-id"><h1 id="hId">chat</h1><span class="pill pill-off" id="hPill">not connected</span></div>
-    <div class="head-sub">Chat with an LLM that calls your appliance's MCP tools — a quick "does my endpoint work" check.</div>
+    <div class="head-sub">Chat with an LLM that calls your service's MCP tools — a quick "does my endpoint work" check.</div>
   </div>
 </div>
 
 <div class="card">
   <div class="body">
-    <div class="seclabel">connect <small>your appliance + a finch_ key (stored in this browser only)</small></div>
+    <div class="seclabel">connect <small>your service + a finch_ key (stored in this browser only)</small></div>
     <div class="fields">
-      <input class="field" id="app" placeholder="appliance — e.g. hello" style="max-width:200px"/>
+      <input class="field" id="app" placeholder="service — e.g. hello" style="max-width:200px"/>
       <input class="field" id="key" placeholder="finch_… key" type="password"/>
     </div>
     <div class="hint">Mint a key in the dashboard → <b>Keys</b>. The model runs on Cloudflare Workers AI.</div>
@@ -328,12 +328,12 @@ function escapeHtml(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&
 async function send(){
   const app=$('#app').value.trim(), key=$('#key').value.trim(), text=$('#msg').value.trim();
   if(!text)return;
-  if(!app||!key){add('a err','Enter your appliance and a finch_ key above first.');return;}
+  if(!app||!key){add('a err','Enter your service and a finch_ key above first.');return;}
   localStorage.fchApp=app; localStorage.fchKey=key;
   $('#msg').value=''; add('u',text); hist.push({role:'user',content:text});
   $('#send').disabled=true; const thinking=add('a','');thinking.innerHTML='<span class=dots></span>';
   try{
-    const r=await fetch('/chat/completions',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({appliance:app,key,messages:hist})});
+    const r=await fetch('/chat/completions',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({service:app,key,messages:hist})});
     const j=await r.json();
     thinking.remove();
     (j.trace||[]).forEach(addTool);

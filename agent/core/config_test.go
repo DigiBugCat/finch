@@ -19,7 +19,7 @@ func writeYAML(t *testing.T, body string) string {
 func TestLoadConfig_OK(t *testing.T) {
 	p := writeYAML(t, `
 hub: https://hub.example.com
-machine: box1
+box: box1
 credentials-dir: /var/finch
 ingress:
   - app_path: printer
@@ -31,7 +31,7 @@ ingress:
 	if err != nil {
 		t.Fatalf("loadConfig: %v", err)
 	}
-	if c.Hub != "https://hub.example.com" || c.Machine != "box1" {
+	if c.Hub != "https://hub.example.com" || c.Box != "box1" {
 		t.Fatalf("top-level mismatch: %+v", c)
 	}
 	if len(c.Ingress) != 2 {
@@ -58,46 +58,46 @@ ingress:
 	if c.Hub != "https://finchmcp.com" {
 		t.Fatalf("hub default: %q", c.Hub)
 	}
-	if c.Machine != "fallback-host" {
-		t.Fatalf("machine default: %q", c.Machine)
+	if c.Box != "fallback-host" {
+		t.Fatalf("box default: %q", c.Box)
 	}
 }
 
-// addPaths/configMachine must honor the finch.yml `machine:` + `credentials-dir:`
+// addPaths/configBox must honor the finch.yml `box:` + `credentials-dir:`
 // so `finch add`/`finch enroll` register under the manifest name and write the
 // credential where `finch run` looks (findings #3 + #13).
 func TestAddPaths(t *testing.T) {
 	p := writeYAML(t, `
-machine: box1
+box: box1
 credentials-dir: /var/finch
 ingress:
   - app_path: printer
     service: http://127.0.0.1:8001
 `)
-	machine, credDir := addPaths(p, "fallback-host")
-	if machine != "box1" {
-		t.Errorf("machine = %q, want box1 (from finch.yml)", machine)
+	box, credDir := addPaths(p, "fallback-host")
+	if box != "box1" {
+		t.Errorf("box = %q, want box1 (from finch.yml)", box)
 	}
 	if credDir != "/var/finch" {
 		t.Errorf("credDir = %q, want /var/finch (from finch.yml)", credDir)
 	}
 	// Missing manifest -> hostname + default credentials dir.
-	machine, credDir = addPaths(filepath.Join(t.TempDir(), "nope.yml"), "fallback-host")
-	if machine != "fallback-host" {
-		t.Errorf("machine = %q, want fallback-host when no finch.yml", machine)
+	box, credDir = addPaths(filepath.Join(t.TempDir(), "nope.yml"), "fallback-host")
+	if box != "fallback-host" {
+		t.Errorf("box = %q, want fallback-host when no finch.yml", box)
 	}
 	if credDir != defaultCredentialsDir() {
 		t.Errorf("credDir = %q, want default %q", credDir, defaultCredentialsDir())
 	}
 }
 
-func TestConfigMachine(t *testing.T) {
-	p := writeYAML(t, "machine: lab-mini\n")
-	if got := configMachine(p, "host"); got != "lab-mini" {
-		t.Errorf("configMachine = %q, want lab-mini", got)
+func TestConfigBox(t *testing.T) {
+	p := writeYAML(t, "box: lab-mini\n")
+	if got := configBox(p, "host"); got != "lab-mini" {
+		t.Errorf("configBox = %q, want lab-mini", got)
 	}
-	if got := configMachine(filepath.Join(t.TempDir(), "nope.yml"), "host"); got != "host" {
-		t.Errorf("configMachine(missing) = %q, want host", got)
+	if got := configBox(filepath.Join(t.TempDir(), "nope.yml"), "host"); got != "host" {
+		t.Errorf("configBox(missing) = %q, want host", got)
 	}
 }
 
@@ -107,7 +107,7 @@ func TestAppendIngress_PreservesComments(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "finch.yml")
 	original := `# my hand-written finch.yml
 hub: https://hub.example.com
-machine: box1   # the lab mac mini
+box: box1   # the lab mac mini
 # keep my printer rule
 ingress:
   - app_path: printer
@@ -150,7 +150,7 @@ custom_key: keep-me   # finch doesn't model this
 func TestAppendIngress_UpdatesInPlace(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "finch.yml")
 	original := `hub: https://hub.example.com
-machine: box1
+box: box1
 ingress:
   - app_path: printer
     service: http://127.0.0.1:8001

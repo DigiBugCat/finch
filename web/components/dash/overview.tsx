@@ -1,8 +1,8 @@
 "use client";
-// Roost — Fleet: appliances (grouped, primary) + Machines (flat node lens).
+// Roost — Fleet: services (grouped, primary) + Boxes (flat node lens).
 import { useState } from 'react';
 import { Button, Card, DuskInput, PerchMeter, isOnline } from '@/components/dash/primitives';
-import { FleetTable, FleetCards, FleetCompact, MachinesTable } from '@/components/dash/fleet';
+import { FleetTable, FleetCards, FleetCompact, BoxesTable } from '@/components/dash/fleet';
 
 function GroupHead({ name, apps, meta }: any) {
   const onlineN = apps.filter((a: any) => isOnline(a.state)).length;
@@ -23,8 +23,8 @@ function GroupHead({ name, apps, meta }: any) {
   );
 }
 
-export function FleetView({ appliances, machines, overview, host, groups, onOpen, onRelease, onAddDevice, layout, setLayout }: any) {
-  const [lens, setLens] = useState("appliances"); // appliances | machines
+export function FleetView({ services, boxes, overview, host, groups, onOpen, onRelease, onAddDevice, layout, setLayout }: any) {
+  const [lens, setLens] = useState("services"); // services | boxes
   const [groupFilter, setGroupFilter] = useState("all");
   const [search, setSearch] = useState("");
   const [extraGroups, setExtraGroups] = useState<any[]>([]);
@@ -33,17 +33,17 @@ export function FleetView({ appliances, machines, overview, host, groups, onOpen
 
   const q = search.trim().toLowerCase();
 
-  // ---- group plumbing (appliances lens) ----
+  // ---- group plumbing (services lens) ----
   const metaMap: any = {};
   (groups || []).forEach((g: any) => { metaMap[g.name] = g; });
   const order = (groups || []).map((g: any) => g.name);
-  appliances.forEach((a: any) => { if (a.group && !order.includes(a.group)) order.push(a.group); });
+  services.forEach((a: any) => { if (a.group && !order.includes(a.group)) order.push(a.group); });
   const allNames = [...order, ...extraGroups.filter((n: any) => !order.includes(n))];
 
   const matchA = (a: any) => !q || [a.id, a.owner, a.group, "v" + a.version, a.state, ...(a.tags || []).map((t: any) => "tag:" + t)].join(" ").toLowerCase().includes(q);
   const byGroupAll: any = {}, byGroup: any = {};
   allNames.forEach((n: any) => { byGroupAll[n] = []; byGroup[n] = []; });
-  appliances.forEach((a: any) => {
+  services.forEach((a: any) => {
     const n = a.group || "default";
     (byGroupAll[n] = byGroupAll[n] || []).push(a);
     if (matchA(a)) (byGroup[n] = byGroup[n] || []).push(a);
@@ -63,29 +63,29 @@ export function FleetView({ appliances, machines, overview, host, groups, onOpen
     return <FleetCompact apps={list} host={host} onOpen={onOpen} onRelease={onRelease} />;
   };
 
-  // ---- machines lens ----
-  const matchM = (m: any) => !q || [m.name, m.os, m.appliance, "v" + m.version, m.address, m.owner, m.group].join(" ").toLowerCase().includes(q);
-  const shownMachines = machines.filter(matchM);
+  // ---- boxes lens ----
+  const matchM = (m: any) => !q || [m.name, m.os, m.service, "v" + m.version, m.address, m.owner, m.group].join(" ").toLowerCase().includes(q);
+  const shownBoxes = boxes.filter(matchM);
 
   return (
     <div className="view">
       <div className="fleet-header">
         <div>
           <h1 className="page-title">Fleet</h1>
-          <p className="page-lede">All your appliances, organized into groups. Switch to <b>Machines</b> for the box-level view.</p>
+          <p className="page-lede">All your services, organized into groups. Switch to <b>Boxes</b> for the box-level view.</p>
         </div>
-        <Button kind="accent" onClick={onAddDevice}>＋ Add device</Button>
+        <Button kind="accent" onClick={onAddDevice}>＋ Add box</Button>
       </div>
 
       {/* lens toggle */}
       <div className="lens-bar">
         <div className="seg lens-seg">
-          {[["appliances", "Appliances"], ["machines", "Machines"]].map(([k, l]) => (
+          {[["services", "Services"], ["boxes", "Boxes"]].map(([k, l]) => (
             <button key={k} className={`seg-btn ${lens === k ? "seg-on" : ""}`} onClick={() => setLens(k)}>{l}</button>
           ))}
         </div>
         <span className="lens-count dim">
-          {lens === "appliances" ? `${appliances.length} appliances` : `${machines.length} machines`}
+          {lens === "services" ? `${services.length} services` : `${boxes.length} boxes`}
         </span>
       </div>
 
@@ -93,16 +93,16 @@ export function FleetView({ appliances, machines, overview, host, groups, onOpen
       <div className="fleet-search">
         <span className="si">🔍</span>
         <input value={search} onChange={(e) => setSearch(e.target.value)}
-          placeholder={lens === "appliances" ? "Search by name, owner, group, tag…" : "Search by machine, OS, appliance, address…"}
+          placeholder={lens === "services" ? "Search by name, owner, group, tag…" : "Search by box, OS, service, address…"}
           spellCheck={false} autoCapitalize="off" autoCorrect="off" />
         {search && <button className="clr" onClick={() => setSearch("")} title="Clear">✕</button>}
       </div>
 
-      {lens === "appliances" ? (
+      {lens === "services" ? (
         <>
           <div className="group-bar">
             <button className={`group-chip ${groupFilter === "all" ? "on" : ""}`} onClick={() => setGroupFilter("all")}>
-              All <span className="ct">{appliances.length}</span>
+              All <span className="ct">{services.length}</span>
             </button>
             {allNames.map((name: any) => (
               <button key={name} className={`group-chip ${groupFilter === name ? "on" : ""}`} onClick={() => setGroupFilter(name)}>
@@ -121,7 +121,7 @@ export function FleetView({ appliances, machines, overview, host, groups, onOpen
           </div>
 
           <div className="fleet-toolbar">
-            <span className="fleet-count">{shownA} {shownA === 1 ? "appliance" : "appliances"}{q ? <> matching “<b>{search}</b>”</> : null}</span>
+            <span className="fleet-count">{shownA} {shownA === 1 ? "service" : "services"}{q ? <> matching “<b>{search}</b>”</> : null}</span>
             <div className="seg">
               {["table", "cards", "compact"].map((l) => (
                 <button key={l} className={`seg-btn ${layout === l ? "seg-on" : ""}`} onClick={() => setLayout(l)}>{l}</button>
@@ -139,7 +139,7 @@ export function FleetView({ appliances, machines, overview, host, groups, onOpen
                   {list.length
                     ? renderRows(list)
                     : <Card className="group-empty">
-                        <div className="dim">{q ? "No matches in this group." : "No appliances in this group yet."}</div>
+                        <div className="dim">{q ? "No matches in this group." : "No services in this group yet."}</div>
                         {!q && <Button kind="ghost" size="md" onClick={onAddDevice}>＋ Add one</Button>}
                       </Card>}
                 </div>
@@ -149,7 +149,7 @@ export function FleetView({ appliances, machines, overview, host, groups, onOpen
           </div>
         </>
       ) : (
-        <MachinesTable machines={shownMachines} host={host} onOpen={onOpen} query={search} />
+        <BoxesTable boxes={shownBoxes} host={host} onOpen={onOpen} query={search} />
       )}
     </div>
   );

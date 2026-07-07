@@ -1,20 +1,20 @@
 import { describe, it, expect } from "vitest";
 import { signToken, verifyToken, type TicketPayload } from "../src/auth";
 
-// /refresh trades a long-lived per-machine REFRESH token for a fresh
+// /refresh trades a long-lived per-box REFRESH token for a fresh
 // connect-token, so the box never re-uses the one-shot join ticket (the bug
 // that dropped a freshly-joined box ~2min in: the agent re-joined with the
 // burned ticket and 409'd forever).
 //
 // handleRefresh's accept predicate is exactly:
-//   payload && payload.kind === "refresh" && payload.machine
+//   payload && payload.kind === "refresh" && payload.box
 // and the _connect handler still requires kind === "connect". These tests pin
 // the kind-separation so a token minted for one plane can never be replayed on
 // another (cross-grant confusion), which is the whole security property.
 
 const SECRET = "test-ticket-secret";
 const nowSec = () => Math.floor(Date.now() / 1000);
-const ROUTE = { tenant: "org_1", appliance: "scraper", machine: "box-1" };
+const ROUTE = { tenant: "org_1", service: "scraper", box: "box-1" };
 
 async function mint(
   over: Partial<TicketPayload> = {},
@@ -22,8 +22,8 @@ async function mint(
 ): Promise<string> {
   const payload: TicketPayload = {
     tenant: ROUTE.tenant,
-    appliance: ROUTE.appliance,
-    machine: ROUTE.machine,
+    service: ROUTE.service,
+    box: ROUTE.box,
     kind: "refresh",
     exp: nowSec() + ttl,
     ...over,
@@ -34,7 +34,7 @@ async function mint(
 /** Mirror handleRefresh's accept predicate. */
 async function acceptsRefresh(token: string): Promise<boolean> {
   const p = await verifyToken(token, SECRET);
-  return !!(p && p.kind === "refresh" && p.machine);
+  return !!(p && p.kind === "refresh" && p.box);
 }
 
 /** Mirror index.ts's _connect accept predicate. */
@@ -44,8 +44,8 @@ async function acceptsConnect(token: string): Promise<boolean> {
     p &&
     p.kind === "connect" &&
     p.tenant === ROUTE.tenant &&
-    p.appliance === ROUTE.appliance &&
-    p.machine === ROUTE.machine
+    p.service === ROUTE.service &&
+    p.box === ROUTE.box
   );
 }
 
@@ -58,8 +58,8 @@ describe("refresh-token verify — accept + kind separation", () => {
     expect(await acceptsRefresh(await mint({}, -1))).toBe(false);
   });
 
-  it("rejects a refresh token with no machine binding", async () => {
-    expect(await acceptsRefresh(await mint({ machine: undefined }))).toBe(false);
+  it("rejects a refresh token with no box binding", async () => {
+    expect(await acceptsRefresh(await mint({ box: undefined }))).toBe(false);
   });
 
   it("does NOT accept a connect-token as a refresh token", async () => {
@@ -69,7 +69,7 @@ describe("refresh-token verify — accept + kind separation", () => {
 
   it("does NOT accept a join ticket as a refresh token", async () => {
     const join = await signToken(
-      { tenant: ROUTE.tenant, appliance: ROUTE.appliance, kind: "join", exp: nowSec() + 900 },
+      { tenant: ROUTE.tenant, service: ROUTE.service, kind: "join", exp: nowSec() + 900 },
       SECRET,
     );
     expect(await acceptsRefresh(join)).toBe(false);

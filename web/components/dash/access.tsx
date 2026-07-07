@@ -13,14 +13,14 @@ function tokenDst(d: any) {
   if (d.type === "all") return "*";
   if (d.type === "tag") return `tag:${d.name}`;
   if (d.type === "group") return `group:${d.name.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}`;
-  return d.name; // appliance
+  return d.name; // service
 }
 
-export function AccessView({ appliances, groups, keys, acl, users, onAdd, onRemove }: any) {
+export function AccessView({ services, groups, keys, acl, users, onAdd, onRemove }: any) {
   const [mode, setMode] = useState("rules"); // rules | policy
   const [dst, setDst] = useState<any[]>([]);
 
-  const allTags = [...new Set(appliances.flatMap((a: any) => a.tags || []))];
+  const allTags = [...new Set(services.flatMap((a: any) => a.tags || []))];
   // Real Clerk members (from /api/finch/state) — not a hardcoded phantom list.
   const userNames: string[] = (users || []).map((u: any) => u.name).filter(Boolean);
   const keyNames = keys.map((k: any) => k.label);
@@ -56,7 +56,7 @@ export function AccessView({ appliances, groups, keys, acl, users, onAdd, onRemo
   return (
     <div className="view view-narrow">
       <h1 className="page-title">Access <span className="admin-badge">admin</span></h1>
-      <p className="page-lede">Who can reach what. Every rule is enforced at the door — before a request ever touches a device. Tag your devices, then grant access by tag, group, or key.</p>
+      <p className="page-lede">Who can reach what. Every rule is enforced at the door — before a request ever touches a box. Tag your services, then grant access by tag, group, or key.</p>
 
       <div className="client-tabs" style={{ margin: "4px 0 0" }}>
         {[["rules", "Rules"], ["policy", "Raw policy"]].map(([k, l]) => (

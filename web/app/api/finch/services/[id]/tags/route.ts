@@ -1,4 +1,4 @@
-// PUT /api/finch/appliances/:id/tags {tags} -> hub PUT /api/appliances/:id/tags
+// PUT /api/finch/services/:id/tags {tags} -> hub PUT /api/services/:id/tags
 import { adminProxy, errorResponse } from "@/lib/hub";
 
 export async function PUT(
@@ -9,7 +9,7 @@ export async function PUT(
     const { id } = await params;
     return await adminProxy(
       req,
-      `/api/appliances/${encodeURIComponent(id)}/tags`,
+      `/api/services/${encodeURIComponent(id)}/tags`,
       "PUT",
     );
   } catch (err) {

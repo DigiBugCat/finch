@@ -20,7 +20,7 @@ const PLATS = [
 // We render that verbatim — no client-side ticket fabrication.
 export function EnrollView({ host, existingIds, groups, onEnrolled, onWatch }: any) {
   // ---- Primary path: ONE command that installs finch + signs the box in via
-  // the browser device-auth flow (no appliance id, no one-shot ticket). The hub
+  // the browser device-auth flow (no service id, no one-shot ticket). The hub
   // origin is fetched from the BFF so the command targets THIS environment
   // (staging vs prod), not a tenant's stored slug host. ----
   const [connect, setConnect] = useState<any>(null);
@@ -38,7 +38,7 @@ export function EnrollView({ host, existingIds, groups, onEnrolled, onWatch }: a
   const exposeCmd = "finch add myapp --service http://127.0.0.1:8000 && finch run";
 
   // ---- Advanced path (headless / no browser): mint a one-shot ticket for a
-  // NAMED appliance — the original flow. Kept for boxes that can't open a
+  // NAMED service — the original flow. Kept for boxes that can't open a
   // browser (CI provisioning, the embeddable SDK). Collapsed by default. ----
   const [advanced, setAdvanced] = useState(false);
   const [id, setId] = useState("");
@@ -53,7 +53,7 @@ export function EnrollView({ host, existingIds, groups, onEnrolled, onWatch }: a
   if (clean) {
     if (!/^[a-z0-9-]+$/.test(clean)) error = "lowercase letters, digits and dashes only";
     else if (clean.length > 40) error = "40 characters max";
-    else if (existingIds.includes(clean)) error = "an appliance with this id already exists";
+    else if (existingIds.includes(clean)) error = "a service with this id already exists";
   }
   const canMint = clean && !error && phase !== "minting";
 
@@ -61,7 +61,7 @@ export function EnrollView({ host, existingIds, groups, onEnrolled, onWatch }: a
     if (!canMint) return;
     setPhase("minting");
     setMintErr("");
-    // onEnrolled creates the appliance server-side and returns the hub's real
+    // onEnrolled creates the service server-side and returns the hub's real
     // EnrollResp (or null on failure). Render the ticket/install it gives back.
     const resp = await onEnrolled(clean, group);
     if (resp && resp.ticket) {
@@ -81,7 +81,7 @@ export function EnrollView({ host, existingIds, groups, onEnrolled, onWatch }: a
 
   return (
     <div className="view view-narrow">
-      <h1 className="page-title">Add a device <span className="page-emoji">🐣</span></h1>
+      <h1 className="page-title">Add a box <span className="page-emoji">🐣</span></h1>
       <p className="page-lede">Run one command on the box — it installs finch and signs in. Approve the code here in your browser, then expose a service with <code className="mono">finch add</code>.</p>
 
       <Card className="enroll-card">
@@ -100,7 +100,7 @@ export function EnrollView({ host, existingIds, groups, onEnrolled, onWatch }: a
           <CopyChip value={exposeCmd} className="command-copy" />
         </div>
         <div style={{ marginTop: 14, display: "flex", gap: 10, flexWrap: "wrap" }}>
-          <Button kind="accent" onClick={() => { window.location.href = "/cli"; }}>Approve a device code →</Button>
+          <Button kind="accent" onClick={() => { window.location.href = "/cli"; }}>Approve a box code →</Button>
           <Button kind="ghost" onClick={onWatch}>Watch the fleet →</Button>
         </div>
       </Card>
@@ -111,13 +111,13 @@ export function EnrollView({ host, existingIds, groups, onEnrolled, onWatch }: a
           className="dim"
           style={{ background: "none", border: 0, cursor: "pointer", fontSize: 13, fontWeight: 700, padding: 0 }}
         >
-          {advanced ? "▾ " : "▸ "}Headless box (no browser)? Pre-enroll a named appliance with a one-time ticket
+          {advanced ? "▾ " : "▸ "}Headless box (no browser)? Pre-enroll a named service with a one-time ticket
         </button>
       </div>
 
       {advanced && (
         <Card className="enroll-card" style={{ marginTop: 12 }}>
-          <SectionLabel hint="lowercase · digits · dashes · ≤40">appliance id</SectionLabel>
+          <SectionLabel hint="lowercase · digits · dashes · ≤40">service id</SectionLabel>
           <div className="enroll-input-row">
             <DuskInput value={id} onChange={(v: any) => { setId(v); if (phase === "minted") { setPhase("idle"); setEnrolled(null); } }}
               placeholder="calendar-sync" prefix={`${host}/`} error={!!error} autoFocus />

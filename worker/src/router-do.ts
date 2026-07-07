@@ -2,7 +2,7 @@
 //
 // RouterDO — the single global slug→tenantId index for the relay plane.
 //
-// The control plane keys TenantDO/ApplianceDO by the REAL tenant id (a Clerk org
+// The control plane keys TenantDO/BoxDO by the REAL tenant id (a Clerk org
 // id, or a user id). But the public relay URL is a vanity subdomain
 // (<slug>.finchmcp.com) and the slug is NOT the tenant id. This DO is the one
 // authoritative map from a request's host slug to the tenant id it belongs to.
@@ -37,6 +37,29 @@ const bad = (status: number, error: string): Response =>
 
 /** Canonical name of the singleton instance. */
 export const ROUTER_SINGLETON = "global";
+
+const DNS_LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+
+/** Validate a RouterDO key. Bare labels are legacy finchmcp slugs; dotted keys
+ *  are custom hostnames. Reject alternate spellings for finchmcp.com hosts so
+ *  `<slug>.finchmcp.com` always maps through the bare slug only. */
+export function isValidHostKey(key: string): boolean {
+  const s = key.trim().toLowerCase();
+  if (!s) return false;
+  if (!s.includes(".")) return DNS_LABEL_RE.test(s);
+  if (s.length > 253) return false;
+  if (
+    s === "finchmcp.com" ||
+    s.endsWith(".finchmcp.com") ||
+    s === "workers.dev" ||
+    s.endsWith(".workers.dev")
+  ) {
+    return false;
+  }
+  const labels = s.split(".");
+  if (labels.length < 2 || labels.some((label) => !label)) return false;
+  return labels.every((label) => DNS_LABEL_RE.test(label));
+}
 
 export class RouterDO extends DurableObject<Env> {
   /** Create the slug→tenant table if absent (idempotent; cheap no-op once it
@@ -93,6 +116,10 @@ export class RouterDO extends DurableObject<Env> {
           return ok(this.register(a.slug, a.tenant));
         case "lookup":
           return ok({ tenant: this.lookup(a.slug) });
+        case "unregister":
+          return ok(this.unregister(a.slug, a.tenant));
+        case "listForTenant":
+          return ok({ keys: this.listForTenant(a.tenant) });
         case "deviceStart":
           return ok(this.deviceStart(a.deviceCode, a.userCode, a.now, a.reqIp, a.reqUa));
         case "deviceDescribe":
@@ -109,7 +136,7 @@ export class RouterDO extends DurableObject<Env> {
     }
   }
 
-  /** Normalize a slug to the canonical host-label form (lowercase). */
+  /** Normalize a slug/host key to canonical lowercase form. */
   private norm(slug: unknown): string {
     return typeof slug === "string" ? slug.trim().toLowerCase() : "";
   }
@@ -127,7 +154,7 @@ export class RouterDO extends DurableObject<Env> {
   ): { ok: boolean; reason?: string; owner?: string } {
     const s = this.norm(slug);
     const t = typeof tenant === "string" ? tenant : "";
-    if (!s || !t) return { ok: false, reason: "bad-input" };
+    if (!s || !t || !isValidHostKey(s)) return { ok: false, reason: "bad-input" };
 
     const cur = this.lookup(s);
     if (cur) {
@@ -142,6 +169,22 @@ export class RouterDO extends DurableObject<Env> {
     return { ok: true };
   }
 
+  /** Delete slug/host-key ownership only for the owning tenant. Missing rows are
+   *  idempotent success; a row owned by another tenant fails closed. */
+  unregister(
+    slug: unknown,
+    tenant: unknown,
+  ): { ok: boolean; reason?: string; owner?: string } {
+    const s = this.norm(slug);
+    const t = typeof tenant === "string" ? tenant : "";
+    if (!s || !t || !isValidHostKey(s)) return { ok: false, reason: "bad-input" };
+    const cur = this.lookup(s);
+    if (!cur) return { ok: true };
+    if (cur !== t) return { ok: false, reason: "not-owner", owner: cur };
+    this.ctx.storage.sql.exec("DELETE FROM slugs WHERE slug = ?", s);
+    return { ok: true };
+  }
+
   /** Resolve a slug to its tenant id, or "" if unknown. */
   lookup(slug: unknown): string {
     const s = this.norm(slug);
@@ -150,6 +193,19 @@ export class RouterDO extends DurableObject<Env> {
       .exec<{ tenant: string }>("SELECT tenant FROM slugs WHERE slug = ?", s)
       .toArray();
     return rows.length ? rows[0].tenant : "";
+  }
+
+  /** All host keys currently mapped to a tenant. */
+  listForTenant(tenant: unknown): string[] {
+    const t = typeof tenant === "string" ? tenant : "";
+    if (!t) return [];
+    return this.ctx.storage.sql
+      .exec<{ slug: string }>(
+        "SELECT slug FROM slugs WHERE tenant = ? ORDER BY slug",
+        t,
+      )
+      .toArray()
+      .map((row) => row.slug);
   }
 
   // ---- CLI device-authorization codes -----------------------------------
@@ -370,4 +426,36 @@ export async function routerRegister(
     reason?: string;
     owner?: string;
   };
+}
+
+/** Unregister a slug/host-key mapping, but only for its owning tenant. */
+export async function routerUnregister(
+  env: Env,
+  slug: string,
+  tenant: string,
+): Promise<{ ok: boolean; reason?: string; owner?: string }> {
+  const res = await routerStub(env).fetch("https://router/op", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ op: "unregister", slug, tenant }),
+  });
+  return (await res.json()) as {
+    ok: boolean;
+    reason?: string;
+    owner?: string;
+  };
+}
+
+/** List every slug/host-key owned by a tenant. */
+export async function routerListForTenant(
+  env: Env,
+  tenant: string,
+): Promise<string[]> {
+  const res = await routerStub(env).fetch("https://router/op", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ op: "listForTenant", tenant }),
+  });
+  const out = (await res.json()) as { keys?: string[] };
+  return Array.isArray(out.keys) ? out.keys : [];
 }

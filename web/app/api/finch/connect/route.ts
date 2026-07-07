@@ -3,7 +3,7 @@
 // Returns the install-and-sign-in one-liner the dashboard shows on "Add a
 // device": it installs the finch CLI from the hub and runs `finch login`, which
 // starts the browser device-authorization flow (the box prints a short code the
-// operator approves at /cli). No appliance id or one-shot ticket — the box is
+// operator approves at /cli). No service id or one-shot ticket — the box is
 // named later with `finch add <name>`.
 //
 // The hub origin comes from HUB_URL (the real hub this web instance talks to),

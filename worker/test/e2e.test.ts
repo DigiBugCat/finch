@@ -16,7 +16,7 @@ import { signAssertion } from "../src/auth";
 // Tenancy: the relay plane resolves the tenant from the host slug. We use a
 // NON-slug test host (so slugFromHost() === "") and rely on the DEV=1 +
 // DEFAULT_TENANT fallback in resolveTenant(); we enroll under that SAME tenant
-// (DEFAULT_TENANT) so the key, the appliance, and the relay all share one
+// (DEFAULT_TENANT) so the key, the service, and the relay all share one
 // TenantDO. Test fixtures: FINCH_SERVICE_SECRET / TICKET_SECRET / DEFAULT_TENANT
 // / DEV live in wrangler.test.jsonc.
 
@@ -78,13 +78,13 @@ function b64(s: string): string {
   return btoa(s);
 }
 
-/** Poll GET /api/state until `pred` holds for the machine, or throw. The relay's
+/** Poll GET /api/state until `pred` holds for the box, or throw. The relay's
  *  load-balanced pick reads persisted liveness (connected && !pending), which is
- *  written by the ApplianceDO's markMachine inside ITS OWN ctx.waitUntil on WS
+ *  written by the BoxDO's markBox inside ITS OWN ctx.waitUntil on WS
  *  open — so it can lag the 101 by a tick. Poll instead of racing it. */
-async function waitForMachine(
-  appliance: string,
-  machine: string,
+async function waitForBox(
+  service: string,
+  box: string,
   pred: (m: any) => boolean,
   tries = 50,
 ): Promise<any> {
@@ -92,18 +92,18 @@ async function waitForMachine(
     const res = await api("GET", "/api/state");
     expect(res.status).toBe(200);
     const state = (await res.json()) as any;
-    const ap = (state.appliances ?? []).find((a: any) => a.id === appliance);
-    const m = ap?.machines?.find((x: any) => x.name === machine);
+    const ap = (state.services ?? []).find((a: any) => a.id === service);
+    const m = ap?.boxes?.find((x: any) => x.name === box);
     if (m && pred(m)) return m;
     // Yield to the event loop so the DO's waitUntil writes can land.
     await new Promise((r) => setTimeout(r, 0));
   }
-  throw new Error(`machine ${appliance}/${machine} never satisfied predicate`);
+  throw new Error(`box ${service}/${box} never satisfied predicate`);
 }
 
 describe("full-stack worker E2E — enroll → join → refresh → connect → key → relay", () => {
   it("runs the complete happy path and streams a relayed MCP body back as 'hello world'", async () => {
-    const machineName = `box-e2e-${Date.now()}`;
+    const boxName = `box-e2e-${Date.now()}`;
 
     // ---- 1. ENROLL: service-authed, signed-assertion tenant. ----
     const enrollRes = await api("POST", "/api/enroll", { name: "Scraper E2E" });
@@ -115,8 +115,8 @@ describe("full-stack worker E2E — enroll → join → refresh → connect → 
       install: string;
       expiresAt: number;
     };
-    const appliance = enroll.id;
-    expect(appliance).toBeTruthy();
+    const service = enroll.id;
+    expect(service).toBeTruthy();
     expect(enroll.ticket).toBeTruthy();
 
     // ---- 2. JOIN: ticket-authed; returns connectToken AND refreshToken. ----
@@ -126,7 +126,7 @@ describe("full-stack worker E2E — enroll → join → refresh → connect → 
         headers: { "content-type": "application/json", host: HOST },
         body: JSON.stringify({
           ticket: enroll.ticket,
-          machine: machineName,
+          box: boxName,
           os: "darwin",
           version: "1.4.0",
         }),
@@ -136,15 +136,15 @@ describe("full-stack worker E2E — enroll → join → refresh → connect → 
     const join = (await joinRes.json()) as {
       ok: boolean;
       tenant: string;
-      appliance: string;
-      machine: string;
+      service: string;
+      box: string;
       connectToken: string;
       refreshToken: string;
     };
     expect(join.ok).toBe(true);
     expect(join.tenant).toBe(TENANT); // same TenantDO the key+relay will use
-    expect(join.appliance).toBe(appliance);
-    expect(join.machine).toBe(machineName);
+    expect(join.service).toBe(service);
+    expect(join.box).toBe(boxName);
     expect(join.connectToken).toBeTruthy();
     expect(join.refreshToken).toBeTruthy();
 
@@ -167,7 +167,7 @@ describe("full-stack worker E2E — enroll → join → refresh → connect → 
     expect(typeof refresh.connectToken).toBe("string");
 
     // A bogus refresh token is rejected (401). (Distinct from the 403 a real
-    // refresh token for a removed machine would get — here the HMAC fails.)
+    // refresh token for a removed box would get — here the HMAC fails.)
     const badRefresh = await call(
       new Request(`${BASE}/refresh`, {
         method: "POST",
@@ -181,7 +181,7 @@ describe("full-stack worker E2E — enroll → join → refresh → connect → 
     //      connect-token from /refresh (proves the refresh-minted token actually
     //      authenticates the relay channel through the real worker). ----
     const connectUrl =
-      `${BASE}/${appliance}/${encodeURIComponent(machineName)}/_connect` +
+      `${BASE}/${service}/${encodeURIComponent(boxName)}/_connect` +
       `?ct=${encodeURIComponent(refresh.connectToken)}`;
     const connectRes = await call(
       new Request(connectUrl, { headers: { Upgrade: "websocket", host: HOST } }),
@@ -191,28 +191,28 @@ describe("full-stack worker E2E — enroll → join → refresh → connect → 
     expect(agent).toBeTruthy();
     agent.accept(); // accept the client (agent-writing) end
 
-    // The ApplianceDO marks the machine connected inside its own waitUntil on the
+    // The BoxDO marks the box connected inside its own waitUntil on the
     // 101; wait for that liveness to land before we approve / relay.
-    await waitForMachine(appliance, machineName, (m) => m.connected === true);
+    await waitForBox(service, boxName, (m) => m.connected === true);
 
-    // ---- Approve the appliance so the machine leaves "pending" (requireApproval
-    //      defaults true). The LB relay picks only machines that are
+    // ---- Approve the service so the box leaves "pending" (requireApproval
+    //      defaults true). The LB relay picks only boxes that are
     //      connected && state !== "pending". ----
     const approveRes = await api(
       "POST",
-      `/api/appliances/${encodeURIComponent(appliance)}/approve`,
+      `/api/services/${encodeURIComponent(service)}/approve`,
     );
     expect(approveRes.status).toBe(200);
-    await waitForMachine(
-      appliance,
-      machineName,
+    await waitForBox(
+      service,
+      boxName,
       (m) => m.connected === true && m.state !== "pending",
     );
 
     // ---- 5. KEY: mint a finch_ key that ACTUALLY WORKS. scope:{all:true} clears
     //      Gate 1; owner:"you" gives the key a user identity that the fresh
     //      tenant's locked default ACL rule (src user "you" → dst all) matches,
-    //      clearing Gate 2. Both gates of checkKey pass for THIS appliance. ----
+    //      clearing Gate 2. Both gates of checkKey pass for THIS service. ----
     const keyRes = await api("POST", "/api/keys", {
       label: "e2e-key",
       scope: { all: true },
@@ -230,7 +230,7 @@ describe("full-stack worker E2E — enroll → join → refresh → connect → 
     //      must reassemble to exactly "hello world". ----
     const reqSeen = nextFrame(agent);
     const relayPromise = call(
-      new Request(`${BASE}/${appliance}/mcp`, {
+      new Request(`${BASE}/${service}/mcp`, {
         method: "POST",
         headers: {
           "content-type": "application/json",
@@ -244,7 +244,7 @@ describe("full-stack worker E2E — enroll → join → refresh → connect → 
     const reqFrame = await reqSeen;
     expect(reqFrame.type).toBe("req");
     expect(reqFrame.method).toBe("POST");
-    expect(reqFrame.path).toBe("/mcp"); // DO stripped /<app>/<machine>
+    expect(reqFrame.path).toBe("/mcp"); // DO stripped /<app>/<box>
     expect(reqFrame.body).toBe(
       '{"jsonrpc":"2.0","id":1,"method":"initialize"}',
     );
@@ -277,7 +277,7 @@ describe("full-stack worker E2E — enroll → join → refresh → connect → 
     // ---- 7. NEGATIVE: same /mcp with NO key → 401; with a WRONG finch_ key
     //      (well-formed bearer, never minted) → 403. ----
     const noKey = await call(
-      new Request(`${BASE}/${appliance}/mcp`, {
+      new Request(`${BASE}/${service}/mcp`, {
         method: "POST",
         headers: { "content-type": "application/json", host: HOST },
         body: "{}",
@@ -286,7 +286,7 @@ describe("full-stack worker E2E — enroll → join → refresh → connect → 
     expect(noKey.status).toBe(401);
 
     const wrongKey = await call(
-      new Request(`${BASE}/${appliance}/mcp`, {
+      new Request(`${BASE}/${service}/mcp`, {
         method: "POST",
         headers: {
           "content-type": "application/json",
@@ -301,14 +301,14 @@ describe("full-stack worker E2E — enroll → join → refresh → connect → 
     agent.close(1000, "e2e done");
   });
 
-  it("public appliance relays any path with NO finch_ key; flipping back to key re-gates it", async () => {
-    const machineName = `box-pub-${Date.now()}`;
+  it("public service relays any path with NO finch_ key; flipping back to key re-gates it", async () => {
+    const boxName = `box-pub-${Date.now()}`;
 
     // Enroll → join → connect → approve (same scaffolding as the happy path).
     const enroll = (await (await api("POST", "/api/enroll", {
       name: "Public Site",
     })).json()) as { id: string; ticket: string };
-    const appliance = enroll.id;
+    const service = enroll.id;
 
     const join = (await (await call(
       new Request(`${BASE}/join`, {
@@ -316,7 +316,7 @@ describe("full-stack worker E2E — enroll → join → refresh → connect → 
         headers: { "content-type": "application/json", host: HOST },
         body: JSON.stringify({
           ticket: enroll.ticket,
-          machine: machineName,
+          box: boxName,
           os: "linux",
           version: "1.4.0",
         }),
@@ -325,7 +325,7 @@ describe("full-stack worker E2E — enroll → join → refresh → connect → 
 
     const connectRes = await call(
       new Request(
-        `${BASE}/${appliance}/${encodeURIComponent(machineName)}/_connect` +
+        `${BASE}/${service}/${encodeURIComponent(boxName)}/_connect` +
           `?ct=${encodeURIComponent(join.connectToken)}`,
         { headers: { Upgrade: "websocket", host: HOST } },
       ),
@@ -333,27 +333,27 @@ describe("full-stack worker E2E — enroll → join → refresh → connect → 
     expect(connectRes.status).toBe(101);
     const agent = connectRes.webSocket!;
     agent.accept();
-    await waitForMachine(appliance, machineName, (m) => m.connected === true);
+    await waitForBox(service, boxName, (m) => m.connected === true);
     await api(
       "POST",
-      `/api/appliances/${encodeURIComponent(appliance)}/approve`,
+      `/api/services/${encodeURIComponent(service)}/approve`,
     );
-    await waitForMachine(
-      appliance,
-      machineName,
+    await waitForBox(
+      service,
+      boxName,
       (m) => m.connected === true && m.state !== "pending",
     );
 
-    // Default appliance is key-gated: a no-key call still 401s.
+    // Default service is key-gated: a no-key call still 401s.
     const preFlip = await call(
-      new Request(`${BASE}/${appliance}/index.html`, { headers: { host: HOST } }),
+      new Request(`${BASE}/${service}/index.html`, { headers: { host: HOST } }),
     );
     expect(preFlip.status).toBe(401);
 
     // Flip to PUBLIC via the BFF route.
     const flip = await api(
       "PUT",
-      `/api/appliances/${encodeURIComponent(appliance)}/auth`,
+      `/api/services/${encodeURIComponent(service)}/auth`,
       { mode: "public" },
     );
     expect(flip.status).toBe(200);
@@ -363,7 +363,7 @@ describe("full-stack worker E2E — enroll → join → refresh → connect → 
     // not load-balanced away), and the response streams back 200.
     const reqSeen = nextFrame(agent);
     const relayPromise = call(
-      new Request(`${BASE}/${appliance}/index.html`, {
+      new Request(`${BASE}/${service}/index.html`, {
         method: "GET",
         headers: { host: HOST },
       }),
@@ -391,12 +391,12 @@ describe("full-stack worker E2E — enroll → join → refresh → connect → 
     // Flip back to KEY — the same no-key call is re-gated to 401.
     const unflip = await api(
       "PUT",
-      `/api/appliances/${encodeURIComponent(appliance)}/auth`,
+      `/api/services/${encodeURIComponent(service)}/auth`,
       { mode: "key" },
     );
     expect(unflip.status).toBe(200);
     const reGated = await call(
-      new Request(`${BASE}/${appliance}/index.html`, { headers: { host: HOST } }),
+      new Request(`${BASE}/${service}/index.html`, { headers: { host: HOST } }),
     );
     expect(reGated.status).toBe(401);
 

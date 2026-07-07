@@ -2,21 +2,21 @@ import { describe, it, expect } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
 import vectors from "./relay-vectors.json";
 import {
-  MAX_STREAMS_PER_MACHINE,
+  MAX_STREAMS_PER_BOX,
   RELAY_HEAD_TIMEOUT_MS,
   RELAY_IDLE_MS,
   RELAY_STREAM_HARD_CAP_BYTES,
-} from "../src/appliance-do";
+} from "../src/box-do";
 
-// The APPLIANCE binding's stub type (DurableObjectStub<undefined> in this
-// config). runInDurableObject hands the callback the real ApplianceDO instance;
+// The BOX binding's stub type (DurableObjectStub<undefined> in this
+// config). runInDurableObject hands the callback the real BoxDO instance;
 // we type those callbacks `any` since we reach into private methods (onIdle)
 // that the public class type doesn't expose.
-type Stub = ReturnType<typeof env.APPLIANCE.get>;
+type Stub = ReturnType<typeof env.BOX.get>;
 
-// DO STREAMING INTEGRATION (vitest-pool-workers, real ApplianceDO inside workerd).
+// DO STREAMING INTEGRATION (vitest-pool-workers, real BoxDO inside workerd).
 //
-// We drive the genuine ApplianceDO streaming pump end-to-end over a REAL
+// We drive the genuine BoxDO streaming pump end-to-end over a REAL
 // WebSocket pair, exactly as production does:
 //   1. Open a WS to the DO's /_connect to register the agent side. The DO accepts
 //      `server` (getWebSockets("agent")[0]) and hands us back `client` — the
@@ -37,37 +37,37 @@ type Stub = ReturnType<typeof env.APPLIANCE.get>;
 // the private idle handler deterministically without a 5-minute real wait.
 
 let seq = 0;
-function freshMachine() {
+function freshBox() {
   return {
     tenant: "org_relay",
-    appliance: "scraper",
-    machine: `box_${Date.now()}_${seq++}`,
+    service: "scraper",
+    box: `box_${Date.now()}_${seq++}`,
   };
 }
 
-function stubFor(m: { tenant: string; appliance: string; machine: string }) {
-  const name = `${m.tenant}:${m.appliance}:${m.machine}`;
-  return env.APPLIANCE.get(env.APPLIANCE.idFromName(name));
+function stubFor(m: { tenant: string; service: string; box: string }) {
+  const name = `${m.tenant}:${m.service}:${m.box}`;
+  return env.BOX.get(env.BOX.idFromName(name));
 }
 
-/** Per-machine relay URL the public path forwards. The DO strips the two leading
- *  /<appliance>/<machine> segments to derive the upstream path. */
+/** Per-box relay URL the public path forwards. The DO strips the two leading
+ *  /<service>/<box> segments to derive the upstream path. */
 function relayUrl(
-  m: { appliance: string; machine: string },
+  m: { service: string; box: string },
   rest = "mcp",
 ): string {
-  return `https://hub/${m.appliance}/${encodeURIComponent(m.machine)}/${rest}`;
+  return `https://hub/${m.service}/${encodeURIComponent(m.box)}/${rest}`;
 }
 
 /** Register a fake agent over a real WS upgrade to the DO's _connect (the DO
  *  itself does no auth; index.ts gates that). Returns the agent's client end. */
 async function connectAgent(
   stub: Stub,
-  m: { tenant: string; appliance: string; machine: string },
+  m: { tenant: string; service: string; box: string },
 ): Promise<WebSocket> {
   const url =
-    `https://hub/${m.appliance}/${encodeURIComponent(m.machine)}/_connect` +
-    `?tenant=${m.tenant}&appliance=${m.appliance}&machine=${encodeURIComponent(m.machine)}`;
+    `https://hub/${m.service}/${encodeURIComponent(m.box)}/_connect` +
+    `?tenant=${m.tenant}&service=${m.service}&box=${encodeURIComponent(m.box)}`;
   const res = await stub.fetch(url, { headers: { Upgrade: "websocket" } });
   expect(res.status).toBe(101);
   const client = res.webSocket!;
@@ -117,7 +117,7 @@ function withId(frame: any, id: string) {
 
 /** Fire the DO's PRIVATE idle handler for a relay id deterministically, instead
  *  of waiting out RELAY_IDLE_MS (300s). runInDurableObject hands us the live
- *  ApplianceDO instance; onIdle is private, so we reach it via `any`. The stub is
+ *  BoxDO instance; onIdle is private, so we reach it via `any`. The stub is
  *  cast to sidestep the binding's `DurableObjectStub<undefined>` generic (which
  *  trips TS2589 deep-instantiation on runInDurableObject's `O extends DO`). */
 // runInDurableObject's generic (`O extends DurableObject`) trips TS2589
@@ -153,9 +153,9 @@ async function drainExpectingError(res: Response): Promise<Error | null> {
   }
 }
 
-describe("ApplianceDO streaming relay — head + chunks + end", () => {
+describe("BoxDO streaming relay — head + chunks + end", () => {
   it("streams status+headers FIRST, then reassembles the body to 'hello world'", async () => {
-    const m = freshMachine();
+    const m = freshBox();
     const stub = stubFor(m);
     const agent = await connectAgent(stub, m);
 
@@ -198,7 +198,7 @@ describe("ApplianceDO streaming relay — head + chunks + end", () => {
   });
 
   it("excludes hop-by-hop headers the agent (defensively) re-sent in head", async () => {
-    const m = freshMachine();
+    const m = freshBox();
     const stub = stubFor(m);
     const agent = await connectAgent(stub, m);
 
@@ -236,7 +236,7 @@ describe("ApplianceDO streaming relay — head + chunks + end", () => {
   it("tolerates a head with the `headers` key absent (no forwardable headers)", async () => {
     // When every upstream header is hop-by-hop, the agent emits a head with no
     // `headers` key; the DO must not crash iterating `undefined`. (review: major)
-    const m = freshMachine();
+    const m = freshBox();
     const stub = stubFor(m);
     const agent = await connectAgent(stub, m);
 
@@ -258,9 +258,9 @@ describe("ApplianceDO streaming relay — head + chunks + end", () => {
   });
 });
 
-describe("ApplianceDO streaming relay — err before head", () => {
+describe("BoxDO streaming relay — err before head", () => {
   it("turns an err frame into a plain Response with the agent's status (502)", async () => {
-    const m = freshMachine();
+    const m = freshBox();
     const stub = stubFor(m);
     const agent = await connectAgent(stub, m);
 
@@ -287,7 +287,7 @@ describe("ApplianceDO streaming relay — err before head", () => {
   });
 
   it("turns an SSRF-reject err (403) into a 403 Response", async () => {
-    const m = freshMachine();
+    const m = freshBox();
     const stub = stubFor(m);
     const agent = await connectAgent(stub, m);
 
@@ -307,9 +307,9 @@ describe("ApplianceDO streaming relay — err before head", () => {
   });
 });
 
-describe("ApplianceDO streaming relay — idle timeout", () => {
+describe("BoxDO streaming relay — idle timeout", () => {
   it("504s a head-less stream when the idle timer fires before any head", async () => {
-    const m = freshMachine();
+    const m = freshBox();
     const stub = stubFor(m);
     const agent = await connectAgent(stub, m);
 
@@ -330,7 +330,7 @@ describe("ApplianceDO streaming relay — idle timeout", () => {
   });
 
   it("errors the body stream (and resets the agent) when idle fires AFTER head", async () => {
-    const m = freshMachine();
+    const m = freshBox();
     const stub = stubFor(m);
     const agent = await connectAgent(stub, m);
 
@@ -368,9 +368,9 @@ describe("ApplianceDO streaming relay — idle timeout", () => {
   });
 });
 
-describe("ApplianceDO streaming relay — reset / offline", () => {
+describe("BoxDO streaming relay — reset / offline", () => {
   it("503s with X-Finch-Offline when no agent socket is registered", async () => {
-    const m = freshMachine();
+    const m = freshBox();
     const stub = stubFor(m);
     // No _connect -> getWebSockets('agent')[0] is undefined.
     const res = await stub.fetch(
@@ -381,7 +381,7 @@ describe("ApplianceDO streaming relay — reset / offline", () => {
   });
 
   it("errors the in-flight readable when the agent sends a reset mid-stream", async () => {
-    const m = freshMachine();
+    const m = freshBox();
     const stub = stubFor(m);
     const agent = await connectAgent(stub, m);
 
@@ -412,7 +412,7 @@ describe("ApplianceDO streaming relay — reset / offline", () => {
   });
 
   it("resets ALL in-flight streams when the agent socket closes mid-body", async () => {
-    const m = freshMachine();
+    const m = freshBox();
     const stub = stubFor(m);
     const agent = await connectAgent(stub, m);
 
@@ -442,17 +442,17 @@ describe("ApplianceDO streaming relay — reset / offline", () => {
   });
 });
 
-describe("ApplianceDO streaming relay — per-machine stream cap (S1)", () => {
+describe("BoxDO streaming relay — per-box stream cap (S1)", () => {
   it("pins the slowloris constants: pre-head 120s, post-head idle 300s, cap 32", () => {
     // The pre-head timer must be TIGHTER than the streaming idle so head-less
     // (slowloris) slots recycle fast; the cap bounds concurrent DO memory.
     expect(RELAY_HEAD_TIMEOUT_MS).toBe(120_000);
     expect(RELAY_IDLE_MS).toBe(300_000);
-    expect(MAX_STREAMS_PER_MACHINE).toBe(32);
+    expect(MAX_STREAMS_PER_BOX).toBe(32);
   });
 
   it("429s the request over the cap; a freed slot admits the next request", async () => {
-    const m = freshMachine();
+    const m = freshBox();
     const stub = stubFor(m);
     const agent = await connectAgent(stub, m);
 
@@ -484,15 +484,15 @@ describe("ApplianceDO streaming relay — per-machine stream cap (S1)", () => {
 
     // Fill EVERY slot: the fetches park awaiting head (a slow/silent upstream).
     const parked: Promise<Response>[] = [];
-    for (let i = 0; i < MAX_STREAMS_PER_MACHINE; i++) {
+    for (let i = 0; i < MAX_STREAMS_PER_BOX; i++) {
       parked.push(
         stub.fetch(new Request(relayUrl(m), { method: "POST", body: "x" })),
       );
     }
-    await waitForReqs(MAX_STREAMS_PER_MACHINE);
+    await waitForReqs(MAX_STREAMS_PER_BOX);
 
     // One more is over the cap → 429, terminal (no X-Finch-Offline: the LB
-    // must NOT treat a saturated machine as offline / fail its load over).
+    // must NOT treat a saturated box as offline / fail its load over).
     const over = await stub.fetch(
       new Request(relayUrl(m), { method: "POST", body: "x" }),
     );
@@ -539,8 +539,8 @@ describe("ApplianceDO streaming relay — per-machine stream cap (S1)", () => {
   }, 10_000);
 });
 
-describe("ApplianceDO streaming relay — backpressure (window frames)", () => {
-  // RELAY_WINDOW_BYTES in appliance-do.ts. The response ReadableStream uses a
+describe("BoxDO streaming relay — backpressure (window frames)", () => {
+  // RELAY_WINDOW_BYTES in box-do.ts. The response ReadableStream uses a
   // ByteLengthQueuingStrategy with this high-water-mark; once the DO has buffered
   // >= HWM bytes without the consumer reading, desiredSize<=0 and the DO sends a
   // {credits:0} PAUSE down to the agent.
@@ -557,7 +557,7 @@ describe("ApplianceDO streaming relay — backpressure (window frames)", () => {
   }
 
   it("pauses the agent (credits:0) past the HWM, then resumes (credits>0) on drain, body intact", async () => {
-    const m = freshMachine();
+    const m = freshBox();
     const stub = stubFor(m);
     const agent = await connectAgent(stub, m);
 
@@ -642,7 +642,7 @@ describe("ApplianceDO streaming relay — backpressure (window frames)", () => {
   });
 
   it("does not pause a small response that never crosses the HWM", async () => {
-    const m = freshMachine();
+    const m = freshBox();
     const stub = stubFor(m);
     const agent = await connectAgent(stub, m);
 
@@ -680,7 +680,7 @@ describe("ApplianceDO streaming relay — backpressure (window frames)", () => {
   });
 
   it("hard-resets a stream when a non-cooperating agent floods past the hard cap (S2 OOM backstop)", async () => {
-    const m = freshMachine();
+    const m = freshBox();
     const stub = stubFor(m);
     const agent = await connectAgent(stub, m);
 

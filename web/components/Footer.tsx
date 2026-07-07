@@ -7,7 +7,7 @@ export default function Footer() {
         <div className="foot-grid">
           <div className="foot-brand">
             <a className="logo" href="#top"><span className="logo-mark">🐦</span> Finch</a>
-            <p>The open roost for MCP appliances. Send a box home, hand over the endpoint, and let your agent reach the real world.</p>
+            <p>The open roost for MCP services. Send a box home, hand over the endpoint, and let your agent reach the real world.</p>
           </div>
           <div className="foot-col">
             <h5>Product</h5>

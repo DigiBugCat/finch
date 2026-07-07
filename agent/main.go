@@ -1,4 +1,4 @@
-// Command finch is the appliance agent binary. All logic lives in the importable
+// Command finch is the service agent binary. All logic lives in the importable
 // core package (github.com/digibugcat/finch/agent/core) so the same relay engine
 // can be embedded elsewhere — e.g. the gomobile-bound Android SDK in ../mobile.
 //

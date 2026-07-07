@@ -76,11 +76,11 @@ export default function CliApprove() {
       </div>
       <div className="cli-box">
         <span className="eyebrow">🔑 Connect the finch CLI</span>
-        <h1>Authorize a device</h1>
+        <h1>Authorize a box</h1>
         {state === 'done' ? (
           <>
             <p className="cli-sub">Your terminal is now logged in to <b>{account}</b>. Close this tab and head back to it.</p>
-            <div className="cli-ok">✓ Device approved</div>
+            <div className="cli-ok">✓ Box approved</div>
           </>
         ) : (
           <>
@@ -103,11 +103,11 @@ export default function CliApprove() {
               : <div className="cli-err">No active login for that code — check it or run <code className="mono">finch login</code> again.</div>)}
             <div className="cli-grant">This grants a CLI token (~30 days) acting as <b>{account}</b>.</div>
             <button type="button" className="btn btn-lg btn-amber" onClick={approve} disabled={state === 'busy' || !origin?.found}>
-              {state === 'busy' ? 'Approving…' : 'Approve device'}
+              {state === 'busy' ? 'Approving…' : 'Approve box'}
             </button>
             {state === 'error' && <div className="cli-err">{msg}</div>}
             <div className="cli-warn">
-              ⚠️ Only approve a code <b>you</b> just started with <code className="mono">finch login</code> on a device you control.
+              ⚠️ Only approve a code <b>you</b> just started with <code className="mono">finch login</code> on a box you control.
               If someone sent you this code, do not approve it — it would give <i>their</i> terminal access to your account.
               You can revoke all CLI tokens anytime in Settings → CLI access.
             </div>

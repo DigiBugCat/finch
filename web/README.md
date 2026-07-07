@@ -1,7 +1,7 @@
 # finch dashboard (`web/`)
 
 The finch control-plane UI: sign in (Clerk), watch your fleet, mint `finch_`
-keys, manage access, and test appliances. Next.js (App Router) deployed to
+keys, manage access, and test services. Next.js (App Router) deployed to
 **Cloudflare Workers via [OpenNext](https://opennext.js.org/cloudflare)** —
 **not** Vercel.
 
@@ -12,9 +12,9 @@ keys, manage access, and test appliances. Next.js (App Router) deployed to
 
 | Surface | What |
 |---|---|
-| **Fleet** | Your appliances + machines, grouped; live status, traffic, p50/p95. |
-| **Appliance detail** | The connect URL (Claude/Cursor/JSON snippets), traffic, machines + key revocation, recent calls, and a **"test in chat"** panel — an LLM (Cloudflare Workers AI) calls the appliance's MCP tools so you can confirm it works without leaving the dashboard. |
-| **Keys** | Mint/revoke `finch_` bearer keys (a default-deny ACL governs which reach which appliance). |
+| **Fleet** | Your services + boxes, grouped; live status, traffic, p50/p95. |
+| **Service detail** | The connect URL (Claude/Cursor/JSON snippets), traffic, boxes + key revocation, recent calls, and a **"test in chat"** panel — an LLM (Cloudflare Workers AI) calls the service's MCP tools so you can confirm it works without leaving the dashboard. |
+| **Keys** | Mint/revoke `finch_` bearer keys (a default-deny ACL governs which reach which service). |
 | **Settings** | **Hub domain** — claim a `<slug>.finchmcp.com` with a live availability check. **CLI access** — generate the token you paste into `finch login`. Organization (read-only identity), default group, key expiry. |
 | **Users / Access / Logs** | Clerk org members, ACL rules, the audit log. |
 
