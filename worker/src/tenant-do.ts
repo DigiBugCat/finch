@@ -536,29 +536,43 @@ export class TenantDO extends DurableObject<Env> {
    *  slug so even a pathological collision run leaves the tenant with a
    *  working public host. Mutates `s` but does NOT save — callers save.
    *  Returns whether a slug was newly claimed. */
+  private slugClaimAttempted = false;
   private async ensureDefaultSlug(s: StoredState): Promise<boolean> {
     if (s.settings.subdomain) return false;
+    // Once per DO instance: if the router is down we must NOT re-run this
+    // retry loop on every dashboard poll — the next instance retries.
+    if (this.slugClaimAttempted) return false;
+    this.slugClaimAttempted = true;
+
+    const tenant = this.tenantId();
+    if (!tenant) return false;
     const ADJ = ["sunny", "amber", "dusk", "quiet", "brave", "lucky", "misty", "cozy", "swift", "fern", "maple", "ember", "cedar", "pebble", "noble", "tidal"];
     const BIRD = ["finch", "wren", "robin", "sparrow", "lark", "swift", "martin", "thrush", "siskin", "tanager", "plover", "kestrel"];
+    const candidates: string[] = [];
     for (let n = 0; n < 8; n++) {
-      const slug =
+      candidates.push(
         `${ADJ[Math.floor(Math.random() * ADJ.length)]}-` +
-        `${BIRD[Math.floor(Math.random() * BIRD.length)]}-` +
-        `${Math.floor(Math.random() * 90) + 10}`;
-      if (await this.registerSlug(slug)) {
-        s.settings.subdomain = slug;
-        s.host = `${slug}.finchmcp.com`;
-        return true;
-      }
+          `${BIRD[Math.floor(Math.random() * BIRD.length)]}-` +
+          `${Math.floor(Math.random() * 90) + 10}`,
+      );
     }
-    const base = this.slugify(this.tenantId(), "tenant");
+    const base = this.slugify(tenant, "tenant");
     for (let n = 0; n < 20; n++) {
-      const slug = n === 0 ? base : `${base}-${n + 1}`;
-      if (await this.registerSlug(slug)) {
+      candidates.push(n === 0 ? base : `${base}-${n + 1}`);
+    }
+    for (const slug of candidates) {
+      let res: { ok: boolean; reason?: string };
+      try {
+        res = await routerRegister(this.env, slug, tenant);
+      } catch {
+        return false; // router unavailable — don't hammer it 28×
+      }
+      if (res.ok) {
         s.settings.subdomain = slug;
         s.host = `${slug}.finchmcp.com`;
         return true;
       }
+      if (res.reason !== "collision") return false; // only collisions are retryable
     }
     return false;
   }
