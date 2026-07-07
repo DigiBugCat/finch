@@ -117,6 +117,7 @@
         // actually relays + shows up chirping in their dashboard on staging.
         // (Prod has none of this — it fails closed and routes by slug subdomain.)
         "DEFAULT_TENANT": "user_3F74fiQzwjM6UPfl9axNpA1jgyQ",
+        "CLERK_ISSUER": "https://strong-terrier-95.clerk.accounts.dev",
         "DEV": "1",
         "WEB_URL": "https://finch-web-staging.pantainos.workers.dev",
         // Custom-hostname tiers, demoable on staging: the operator tenant may

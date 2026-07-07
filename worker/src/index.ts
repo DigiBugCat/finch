@@ -27,6 +27,7 @@ import {
   signSession,
   serviceOk,
   verifyAssertion,
+  verifyClerkOAuthToken,
 } from "./auth";
 import type { TicketPayload } from "./auth";
 
@@ -50,6 +51,7 @@ export interface Env {
   DEFAULT_TENANT?: string; // DEV-ONLY tenant fallback when no slug resolves
   DEV?: string; // "1" in the dev env; gates the DEFAULT_TENANT fallback
   WEB_URL?: string; // dashboard base URL — the `finch login` device page lives at <WEB_URL>/cli
+  CLERK_ISSUER?: string; // Clerk OAuth AS base (e.g. https://<slug>.clerk.accounts.dev) — enables the MCP OAuth plane (RFC 9728 discovery + Clerk-token bearers); unset = feature off
   VANITY_SUFFIXES?: string; // comma-separated first-party custom-hostname suffixes, e.g. "aviary.run"
   VANITY_TENANT?: string; // only this tenant may claim VANITY_SUFFIXES hostnames
   CF_API_TOKEN?: string; // secret: Cloudflare for SaaS API token (never log)
@@ -475,6 +477,33 @@ export default {
       return Response.redirect(`${base}/${parts[1]}`, 302);
     }
 
+    // ---- OAuth resource-server discovery (RFC 9728). OAuth-only MCP clients
+    //      (claude.ai custom connectors) fetch this to find the authorization
+    //      server (Clerk), dynamically register there, and run the code flow —
+    //      the finch_ key plane is untouched. The path suffix names the
+    //      protected resource (/.well-known/oauth-protected-resource/<svc>/mcp).
+    //      Served only when CLERK_ISSUER is configured. ----
+    if (
+      req.method === "GET" &&
+      parts[0] === ".well-known" &&
+      parts[1] === "oauth-protected-resource" &&
+      env.CLERK_ISSUER
+    ) {
+      const suffix = parts.slice(2).join("/");
+      const body = JSON.stringify({
+        resource: `https://${host}${suffix ? `/${suffix}` : ""}`,
+        authorization_servers: [env.CLERK_ISSUER],
+        bearer_methods_supported: ["header"],
+      });
+      return new Response(body, {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+          "access-control-allow-origin": "*",
+        },
+      });
+    }
+
     // ---- MCP / relay plane. Tenant id resolves from the host slug via the
     //      singleton RouterDO (slug→tenantId). FAIL CLOSED on an unknown slug. ----
     const { tenant, hostKey } = await resolveTenant(host, env);
@@ -747,10 +776,32 @@ async function relayMcp(
       tenant;
 
   let caller = svcAuthed ? "dashboard" : "web";
+  // OAUTH PLANE: a non-finch_ bearer with CLERK_ISSUER configured is tried as a
+  // Clerk OAuth access token (claude.ai custom connectors — they can't send
+  // finch_ keys). A verified token whose identity IS this tenant (user or org)
+  // authorizes the relay like browserAuthed; a verified token for a DIFFERENT
+  // tenant is a hard 403. An unverifiable token falls through to the key gate,
+  // whose 401 carries the resource_metadata challenge pointing back at Clerk.
+  let oauthAuthed = false;
+  if (!svcAuthed && !browserAuthed && env.CLERK_ISSUER) {
+    const m = (req.headers.get("authorization") || "").match(
+      /^Bearer\s+(?!finch_)(\S+)$/,
+    );
+    if (m) {
+      const who = await verifyClerkOAuthToken(m[1], env.CLERK_ISSUER);
+      const id = who?.sub || who?.user_id;
+      if (who && (id === tenant || who.org_id === tenant)) {
+        oauthAuthed = true;
+        caller = `oauth:${id}`;
+      } else if (who) {
+        return json(403, { error: "token identity does not own this tenant" });
+      }
+    }
+  }
   // A browser that cleared the login wall (valid finch_session cookie) is an
   // authorized web caller — like svcAuthed, it bypasses the per-key checkKey
   // gate. The wall already proved the service is reachable by this session.
-  if (!svcAuthed && !browserAuthed) {
+  if (!svcAuthed && !browserAuthed && !oauthAuthed) {
     // ALWAYS consult the TenantDO — even with NO bearer — because a PUBLIC
     // service (an open webpage) must be reachable without a key. We parse the
     // bearer when present (empty hash when absent) and let checkKey decide:
@@ -772,7 +823,21 @@ async function relayMcp(
       // before). A present-but-rejected key → 403 with the cause distinguished
       // ("unknown key" vs "known key, not granted by the tenant's ACL").
       if (!m) {
-        return json(401, { error: "missing or malformed finch_ bearer key" });
+        // The 401 challenge is what OAuth-capable clients key on: it points at
+        // our RFC 9728 metadata, which points at Clerk (discovery → DCR → code
+        // flow). Bearer-key clients ignore it and behave exactly as before.
+        const headers: Record<string, string> = {
+          "content-type": "application/json",
+        };
+        if (env.CLERK_ISSUER) {
+          headers["www-authenticate"] =
+            `Bearer resource_metadata="https://${new URL(req.url).host}` +
+            `/.well-known/oauth-protected-resource/${service}/mcp"`;
+        }
+        return new Response(
+          JSON.stringify({ error: "missing or malformed finch_ bearer key" }),
+          { status: 401, headers },
+        );
       }
       const error =
         check.reason === "acl"

@@ -359,3 +359,43 @@ export async function verifyAssertion(
   if (!p || p.kind !== expectedKind) return null;
   return p.tenant;
 }
+
+// ---- Clerk OAuth token verification (the MCP OAuth plane) -------------------
+// OAuth-only MCP clients (claude.ai custom connectors) can't send finch_ keys;
+// they present a Clerk-issued OAuth access token instead. We verify it against
+// Clerk's userinfo endpoint (works for opaque and JWT tokens alike — no JWKS or
+// token-format assumptions) and hand back the identity so relayMcp can check it
+// against the resolved tenant. A tiny isolate-local cache keeps the per-call
+// Clerk round-trip off the hot path for chatty MCP sessions.
+
+const CLERK_TOKEN_CACHE = new Map<string, { who: ClerkIdentity | null; exp: number }>();
+const CLERK_TOKEN_CACHE_TTL_MS = 60_000;
+const CLERK_TOKEN_CACHE_MAX = 500;
+
+export interface ClerkIdentity {
+  sub?: string;      // Clerk user id (user_…)
+  user_id?: string;  // some Clerk responses use user_id
+  org_id?: string;   // present when the token is org-scoped
+}
+
+export async function verifyClerkOAuthToken(
+  token: string,
+  issuer: string,
+): Promise<ClerkIdentity | null> {
+  const key = await hashKey(token); // reuse the SHA-256 helper — never cache raw tokens
+  const now = Date.now();
+  const hit = CLERK_TOKEN_CACHE.get(key);
+  if (hit && hit.exp > now) return hit.who;
+  let who: ClerkIdentity | null = null;
+  try {
+    const r = await fetch(`${issuer.replace(/\/+$/, "")}/oauth/userinfo`, {
+      headers: { authorization: `Bearer ${token}` },
+    });
+    if (r.ok) who = (await r.json()) as ClerkIdentity;
+  } catch {
+    who = null; // network fault reads as unauthenticated; caller 401s
+  }
+  if (CLERK_TOKEN_CACHE.size >= CLERK_TOKEN_CACHE_MAX) CLERK_TOKEN_CACHE.clear();
+  CLERK_TOKEN_CACHE.set(key, { who, exp: now + CLERK_TOKEN_CACHE_TTL_MS });
+  return who;
+}
