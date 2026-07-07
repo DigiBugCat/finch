@@ -186,10 +186,22 @@
       "ai": { "binding": "AI" },
       "services": [{ "binding": "SELF", "service": "finch-prod" }],
       "routes": [
-        { "pattern": "finchmcp.com/*", "zone_name": "finchmcp.com" },
+        // The apex is SHARED: finch-web-prod owns finchmcp.com/* (dashboard,
+        // marketing, /api/finch BFF); the hub claims only the agent/CLI paths
+        // below. More-specific path routes win over web's catch-all.
+        { "pattern": "finchmcp.com/join*", "zone_name": "finchmcp.com" },
+        { "pattern": "finchmcp.com/refresh*", "zone_name": "finchmcp.com" },
+        { "pattern": "finchmcp.com/api/cli/*", "zone_name": "finchmcp.com" },
+        { "pattern": "finchmcp.com/install*", "zone_name": "finchmcp.com" },
+        { "pattern": "finchmcp.com/releases/*", "zone_name": "finchmcp.com" },
         { "pattern": "*.finchmcp.com/*", "zone_name": "finchmcp.com" },
-        { "pattern": "*.aviary.run/*", "zone_name": "aviary.run" },
-        { "pattern": "*/*", "zone_name": "finchmcp.com" }
+        { "pattern": "*.aviary.run/*", "zone_name": "aviary.run" }
+        // BYO custom hostnames also need the catch-all route below, which
+        // Cloudflare only accepts once Cloudflare-for-SaaS is enabled on the
+        // finchmcp.com zone (dashboard: SSL/TLS → Custom Hostnames → Enable;
+        // fallback origin = fallback.finchmcp.com, DNS record already exists).
+        // Re-add once enabled:
+        //   { "pattern": "*/*", "zone_name": "finchmcp.com" }
       ],
       "durable_objects": {
         "bindings": [
