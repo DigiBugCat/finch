@@ -60,7 +60,14 @@
       // HUB_URL is the public-fetch fallback; unused once the FINCH_HUB service
       // binding is the path web→hub takes.
       "vars": {
-        "HUB_URL": "https://finchmcp.com"
+        "HUB_URL": "https://finchmcp.com",
+        // Production Clerk instance (clerk.finchmcp.com). Publishable key is
+        // PUBLIC; the secret half (CLERK_SECRET_KEY) is a wrangler secret.
+        "NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY": "pk_live_Y2xlcmsuZmluY2htY3AuY29tJA",
+        "NEXT_PUBLIC_CLERK_SIGN_IN_URL": "/sign-in",
+        "NEXT_PUBLIC_CLERK_SIGN_UP_URL": "/sign-up",
+        "NEXT_PUBLIC_CLERK_SIGN_IN_FALLBACK_REDIRECT_URL": "/dashboard",
+        "NEXT_PUBLIC_CLERK_SIGN_UP_FALLBACK_REDIRECT_URL": "/dashboard"
       },
       "routes": [
         { "pattern": "finchmcp.com/*", "zone_name": "finchmcp.com" }

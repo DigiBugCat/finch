@@ -103,16 +103,50 @@ describe("GET /portal/start", () => {
     expect(loc).toContain("&rd=" + encodeURIComponent("/"));
   });
 
-  it("rejects a slug that isn't a single DNS label (host-injection guard)", async () => {
+  it("rejects a slug that isn't a valid host key (host-injection guard)", async () => {
     const fetchSpy = vi.spyOn(globalThis, "fetch");
 
-    const res = await GET(
-      startReq("?slug=" + encodeURIComponent("evil.com") + "&rd=%2F"),
+    // Custom domains mean full hostnames are now syntactically allowed, but
+    // anything that isn't clean lowercase DNS labels is refused before any
+    // network call: path/scheme junk, empty labels, uppercase.
+    for (const bad of [
+      "evil.com/x",
+      "https://evil.com",
+      "evil..com",
+      ".evil.com",
+      "evil.com.",
+      "evil_underscore.com",
+      "",
+    ]) {
+      const res = await GET(
+        startReq("?slug=" + encodeURIComponent(bad) + "&rd=%2F"),
+      );
+      expect(res.status, `slug=${JSON.stringify(bad)}`).toBe(400);
+    }
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("accepts a full custom hostname only via the hub ownership check", async () => {
+    // A syntactically valid full hostname is no longer rejected up front —
+    // the hub verifies routerLookup(key) === tenant and 403s otherwise.
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ grant: "G" }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      }),
     );
 
-    expect(res.status).toBe(400);
-    // Never reached the hub — we refuse before any network call.
-    expect(fetchSpy).not.toHaveBeenCalled();
+    const res = await GET(
+      startReq("?slug=" + encodeURIComponent("mcp.customer.com") + "&rd=%2F"),
+    );
+
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe(
+      "https://mcp.customer.com/__finch/cb?g=G&rd=" + encodeURIComponent("/"),
+    );
+    // The grant request carried the full hostname as the slug/host key.
+    const [, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string).slug).toBe("mcp.customer.com");
   });
 
   it("surfaces a clean 403 when the tenant doesn't own the service", async () => {
