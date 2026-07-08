@@ -8,12 +8,13 @@ import "./globals.css";
 const clerkAppearance = {
   variables: {
     colorBackground: "#2d271c", // --card
-    colorInputBackground: "#1c1711", // --input-bg
-    colorText: "#f1e9d8", // --ink
-    colorTextSecondary: "#a89d85", // --dim
-    colorInputText: "#f1e9d8",
+    colorInput: "#1c1711", // --input-bg
+    colorForeground: "#f1e9d8", // --ink
+    colorMutedForeground: "#a89d85", // --dim
+    colorInputForeground: "#f1e9d8",
     colorPrimary: "#f2b443", // --amber
-    colorTextOnPrimaryBackground: "#2a200c", // matches .btn-amber ink
+    colorPrimaryForeground: "#2a200c", // matches .btn-amber ink
+    colorBorder: "#3f3725",
     colorDanger: "#e8848f", // --red
     colorSuccess: "#79d995", // --green
     colorNeutral: "#f1e9d8",
