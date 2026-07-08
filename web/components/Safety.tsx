@@ -5,7 +5,7 @@ export default function Safety() {
         <div className="sec-head">
           <span className="sec-tag">SAFETY</span>
           <h2>Outbound-only, auth-first, by construction.</h2>
-          <p>Security isn&apos;t a setting in Finch — it&apos;s the wiring. Here&apos;s what you get for free, on every endpoint.</p>
+          <p>Security isn&apos;t a setting in Finch. It&apos;s the wiring. Every endpoint gets all of this by default.</p>
         </div>
         <div className="safety-grid">
           <div className="safety">
@@ -16,7 +16,7 @@ export default function Safety() {
           <div className="safety">
             <div className="safety-ic">🕳️</div>
             <h4>No open ports</h4>
-            <p>Your box dials out — it never accepts connections. Runs behind home NAT, CGNAT, any firewall — zero inbound setup.</p>
+            <p>Your box dials out. It never accepts connections. Runs behind home NAT, CGNAT, any firewall with zero inbound setup.</p>
           </div>
           <div className="safety">
             <div className="safety-ic">🔑</div>
@@ -26,7 +26,7 @@ export default function Safety() {
           <div className="safety">
             <div className="safety-ic">🏡</div>
             <h4>Private by design</h4>
-            <p>Your data stays on your box. Finch routes the request — it never sees or stores what flows through.</p>
+            <p>Your data stays on your box. Finch routes the request. It never sees or stores what flows through.</p>
           </div>
         </div>
       </div>

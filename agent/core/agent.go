@@ -54,7 +54,7 @@ import (
 // `-ldflags "-X main.agentVersion=<v>"`; the literal here is the source of
 // truth that CI (scripts/check-versions.mjs) asserts matches the worker's
 // LATEST_AGENT and the web dashboard constant. Keep all three in sync.
-var agentVersion = "1.5.2"
+var agentVersion = "1.5.3"
 
 // connectSkew is how long before a connect-token's exp we treat it as already
 // expired and force a fresh /join, so we never dial with a token that lapses
@@ -268,6 +268,9 @@ func Main() {
 			return
 		case "call":
 			cmdCall(os.Args[2:])
+			return
+		case "update":
+			cmdUpdate(os.Args[2:])
 			return
 		case "guide":
 			printGuide()
@@ -549,7 +552,7 @@ func runService(o serviceOpts) {
 
 		wsURL := wsBase + "?ct=" + url.QueryEscape(connectToken)
 		start := time.Now()
-		if err := serve(context.Background(), wsURL, upstreamURL, o.forwardAll); err != nil {
+		if err := serve(context.Background(), wsURL, upstreamURL, o.forwardAll, hub); err != nil {
 			log.Printf("%s: link down: %v (reconnecting in %s)", lp, err, backoff)
 			backoffSleep()
 			continue
@@ -732,8 +735,9 @@ func (o *outStream) setPaused(p bool) {
 
 // serve holds one relay connection for its lifetime; returns on disconnect.
 // forwardAll is threaded down to each forward() so resolveUpstream knows whether
-// to confine to /mcp (default) or forward the whole host.
-func serve(parent context.Context, wsURL string, upstream *url.URL, forwardAll bool) error {
+// to confine to /mcp (default) or forward the whole host. hub is the box's own
+// hub base URL — the pinned source a hub-pushed "update" frame downloads from.
+func serve(parent context.Context, wsURL string, upstream *url.URL, forwardAll bool, hub string) error {
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 
@@ -859,6 +863,12 @@ func serve(parent context.Context, wsURL string, upstream *url.URL, forwardAll b
 				os.cancel()
 				remove(f.ID)
 			}
+		case "update":
+			// Out-of-band hub push (dashboard "update now"): self-update from OUR
+			// hub's /releases and re-exec in place. Runs in a goroutine so the
+			// read loop (and in-flight forwards) are never blocked; singleflight
+			// inside drops repeats. Old agents ignore this frame (default case).
+			go selfUpdateFromHub(hub)
 		}
 	}
 }

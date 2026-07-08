@@ -1,10 +1,10 @@
 {
   "$comment": [
-    "RELAY v2 FROZEN FRAME CONTRACT — shared golden vectors for the streaming relay.",
+    "RELAY v2 FROZEN FRAME CONTRACT \u2014 shared golden vectors for the streaming relay.",
     "Both the TS codec test (worker/test/relay-stream.test.ts) and the Go codec test",
     "(agent/relay_vectors_test.go) load THIS SAME file and assert each frame round-trips",
     "to/from the byte-for-byte JSON in `wire`. If you change the wire shape, change it",
-    "HERE and both sides re-pass — that is the point of a single fixture.",
+    "HERE and both sides re-pass \u2014 that is the point of a single fixture.",
     "",
     "Wire rules (must hold on both sides):",
     "  - One WS message = one frame = one JSON object, UTF-8 text.",
@@ -18,7 +18,7 @@
     "",
     "`wire` is the canonical JSON object each side serializes/parses. Field ORDER in",
     "`wire` is NOT significant (JSON object); assert by decoding to a struct/object and",
-    "comparing fields, and (for chunks) by decoding base64 and comparing bytes — do not",
+    "comparing fields, and (for chunks) by decoding base64 and comparing bytes \u2014 do not",
     "string-compare the serialized JSON. `bytes_utf8` on chunks is the decoded payload",
     "for convenience; it is NOT part of the wire frame."
   ],
@@ -54,10 +54,22 @@
         "type": "head",
         "status": 200,
         "headers": [
-          ["content-type", "text/event-stream"],
-          ["mcp-session-id", "sess-abc"],
-          ["set-cookie", "a=1; Path=/"],
-          ["set-cookie", "b=2; Path=/"]
+          [
+            "content-type",
+            "text/event-stream"
+          ],
+          [
+            "mcp-session-id",
+            "sess-abc"
+          ],
+          [
+            "set-cookie",
+            "a=1; Path=/"
+          ],
+          [
+            "set-cookie",
+            "b=2; Path=/"
+          ]
         ]
       }
     },
@@ -110,7 +122,7 @@
     },
     "reset_no_message": {
       "direction": "either",
-      "note": "A reset with no message — proves `message` is omitted (not \"\") on the wire.",
+      "note": "A reset with no message \u2014 proves `message` is omitted (not \"\") on the wire.",
       "wire": {
         "id": "11111111-1111-4111-8111-111111111111",
         "type": "reset"
@@ -133,6 +145,14 @@
         "type": "window",
         "credits": 1048576
       }
+    },
+    "update": {
+      "direction": "DO->agent",
+      "note": "Out-of-band control push (dashboard 'update now'): the agent self-updates from ITS OWN hub's /releases and re-execs in place. Not tied to any request stream \u2014 id is the reserved sentinel \"_ctl\" (request ids are crypto-random hex). Carries NO url/payload by design: the update source is pinned to the box's configured hub. Agents older than 1.5.3 ignore unknown frame types (safe rollout).",
+      "wire": {
+        "id": "_ctl",
+        "type": "update"
+      }
     }
   },
   "streamScript": {
@@ -140,6 +160,11 @@
     "id": "11111111-1111-4111-8111-111111111111",
     "expectStatus": 200,
     "expectBodyUtf8": "hello world",
-    "sequence": ["head", "chunk_hello", "chunk_world", "end"]
+    "sequence": [
+      "head",
+      "chunk_hello",
+      "chunk_world",
+      "end"
+    ]
   }
 }

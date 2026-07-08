@@ -420,7 +420,7 @@ func TestServe_FakeDOBackpressureAndReset(t *testing.T) {
 	defer httpSrv.Close()
 
 	wsURL := "ws" + strings.TrimPrefix(httpSrv.URL, "http")
-	go func() { serveErr <- serve(context.Background(), wsURL, upstream, false) }()
+	go func() { serveErr <- serve(context.Background(), wsURL, upstream, false, "") }()
 
 	// The fake DO drives the whole script then closes; serve() returns on the
 	// closed link. Bound the whole test so a hang fails loudly.

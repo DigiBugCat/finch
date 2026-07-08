@@ -376,7 +376,7 @@ function tenantStub(env: Env, tenant: string) {
 }
 
 /** Per-box relay DO stub. Keyed `${tenant}:${service}:${box}`. */
-function boxStub(
+export function boxStub(
   env: Env,
   tenant: string,
   service: string,

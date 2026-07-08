@@ -70,7 +70,7 @@ func wireFor(t *testing.T, v vectorsFile, name string) json.RawMessage {
 // with the shared contract on every frame type.
 func TestVectors_CodecRoundTrip(t *testing.T) {
 	v := loadVectors(t)
-	for _, name := range []string{"req", "head", "chunk_hello", "chunk_world", "end", "err", "reset", "reset_no_message"} {
+	for _, name := range []string{"req", "head", "chunk_hello", "chunk_world", "end", "err", "reset", "reset_no_message", "update"} {
 		name := name
 		t.Run(name, func(t *testing.T) {
 			wire := wireFor(t, v, name)

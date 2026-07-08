@@ -17,6 +17,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -24,6 +25,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -129,6 +131,7 @@ Usage:
   finch keys [list|mint <label> --service <id>|revoke <id>]   Manage client finch_ keys
   finch domain [ls|add <hostname>|rm <hostname>]   Manage custom hostnames
   finch rm <service>                 Remove a service
+  finch update [--force]               Self-update this binary + restart the serve cleanly
   finch revoke-tokens                  De-authorize every CLI login (incl. this box)
   finch join --ticket <t> --upstream <url>   Run one service straight from flags
   finch guide                          Full agent operating manual (point an AI agent at this)
@@ -1169,4 +1172,233 @@ func yamlWriteFile(configPath string, doc *yaml.Node) error {
 		return err
 	}
 	return os.WriteFile(configPath, out, 0o600)
+}
+
+// cmdUpdate: finch update [--hub URL] [--force] [--restart=auto|service|self|none]
+//
+// Self-update the box: fetch the latest release binary from $HUB/releases/
+// finch-<os>-<arch>, atomically swap it over this executable, then bring the
+// RUNNING serve onto the new version without leaving two `finch run` processes
+// fighting over the relay socket (the "superseded" flap). Restart strategy:
+//
+//   service — if a `finch-tunnel` systemd --user service manages the serve,
+//             `systemctl --user restart` it: the old process is stopped BEFORE
+//             the new one starts, so the hub never sees two live sockets.
+//   self    — exec the freshly-installed binary over THIS process (portable, no
+//             service manager). A running `finch run` becomes the new version in
+//             place (~1s relay blip); a bare `finch update` just re-execs and
+//             exits after reporting the version.
+//   auto    — service when a finch-tunnel service is detected, else self.
+//   none    — swap the binary only; leave the running process alone (you restart
+//             it). Useful in scripts.
+func cmdUpdate(args []string) {
+	fs := flag.NewFlagSet("update", flag.ExitOnError)
+	hubFlag := fs.String("hub", "", "finch hub base URL (defaults to the logged-in hub)")
+	force := fs.Bool("force", false, "reinstall even if already on the latest version")
+	restart := fs.String("restart", "auto", "how to restart the running serve: auto|service|self|none")
+	_ = fs.Parse(args)
+
+	// Hub: explicit flag, else the logged-in cli.json hub, else the prod default.
+	hub := *hubFlag
+	if hub == "" {
+		if c := loadCliCredQuiet(); c != nil && c.Hub != "" {
+			hub = c.Hub
+		} else {
+			hub = "https://finchmcp.com"
+		}
+	}
+	hub = strings.TrimRight(hub, "/")
+
+	self, updated, err := performUpdate(hub, *force)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "finch: update failed: %v\n", err)
+		os.Exit(1)
+	}
+	if !updated {
+		fmt.Printf("finch: already on the latest version (%s)\n", agentVersion)
+		return
+	}
+	fmt.Printf("finch: installed new binary at %s\n", self)
+
+	// Bring the running serve onto the new binary.
+	mode := *restart
+	if mode == "auto" {
+		if finchTunnelActive() {
+			mode = "service"
+		} else {
+			mode = "self"
+		}
+	}
+	switch mode {
+	case "none":
+		fmt.Println("finch: binary swapped — restart your serve to apply.")
+	case "service":
+		fmt.Println("finch: restarting finch-tunnel.service (clean handoff, no supersede)…")
+		out, rerr := exec.Command("systemctl", "--user", "restart", "finch-tunnel.service").CombinedOutput()
+		if rerr != nil {
+			fmt.Fprintf(os.Stderr, "finch: service restart failed: %v\n%s\n", rerr, out)
+			fmt.Fprintln(os.Stderr, "finch: binary IS updated — restart the serve manually.")
+			os.Exit(1)
+		}
+		fmt.Println("finch: finch-tunnel restarted on the new version.")
+	case "self":
+		// Re-exec this process over the new binary. syscall.Exec REPLACES the
+		// process image, so a running `finch run` continues as the new version
+		// (its relay reconnects) and a bare `finch update` simply re-runs on the
+		// new binary. Args after "update" are dropped so we don't re-update.
+		reexec := []string{self}
+		if runningAsServe() {
+			reexec = append(reexec, "run")
+		}
+		fmt.Println("finch: re-exec onto the new binary…")
+		if eerr := syscallExec(self, reexec); eerr != nil {
+			fmt.Fprintf(os.Stderr, "finch: re-exec failed: %v (binary is updated; restart manually)\n", eerr)
+			os.Exit(1)
+		}
+	default:
+		fmt.Fprintf(os.Stderr, "finch: unknown --restart mode %q (use auto|service|self|none)\n", mode)
+		os.Exit(1)
+	}
+}
+
+// performUpdate is the shared self-update core used by BOTH `finch update` (CLI)
+// and the hub-pushed remote update (relay "update" frame): version-gate against
+// the hub's /api/version (skip when already current, unless force), then fetch
+// $HUB/releases/finch-<os>-<arch> and atomically swap it over this executable.
+// Returns the resolved binary path and whether a swap actually happened. The
+// download source is ALWAYS the box's own hub — never caller-supplied — so a
+// forged trigger can at worst cause a re-download of the pinned release.
+func performUpdate(hub string, force bool) (self string, updated bool, err error) {
+	hub = strings.TrimRight(hub, "/")
+	if !force {
+		if latest, verr := hubLatestVersion(hub); verr == nil && latest != "" && latest == agentVersion {
+			return "", false, nil
+		}
+	}
+	// Resolve THIS executable's real path — the atomic swap target. Follow the
+	// symlink so we replace the actual file, not a symlink into it.
+	self, err = os.Executable()
+	if err != nil {
+		return "", false, fmt.Errorf("cannot locate own binary: %w", err)
+	}
+	if resolved, rerr := filepath.EvalSymlinks(self); rerr == nil {
+		self = resolved
+	}
+	asset := fmt.Sprintf("finch-%s-%s", runtime.GOOS, updateArch())
+	if err := downloadAndSwap(hub+"/releases/"+asset, self); err != nil {
+		return self, false, err
+	}
+	return self, true, nil
+}
+
+// updateInFlight makes hub-pushed updates singleflight: repeated "update" frames
+// (retries, double-clicks) are dropped while one attempt is running.
+var updateInFlight atomic.Bool
+
+// selfUpdateFromHub handles a hub-pushed relay "update" frame: swap the binary
+// via performUpdate, then re-exec THIS process in place (same PID — safe under
+// systemd and bare alike; the relay drops for ~1s and reconnects as the new
+// version, so there are never two serves fighting over the socket). On any
+// failure it logs and keeps serving on the old binary — a broken update must
+// never take the box offline.
+func selfUpdateFromHub(hub string) {
+	if !updateInFlight.CompareAndSwap(false, true) {
+		return
+	}
+	defer updateInFlight.Store(false)
+	self, updated, err := performUpdate(hub, false)
+	if err != nil {
+		log.Printf("finch: hub-pushed update failed: %v (still serving on %s)", err, agentVersion)
+		return
+	}
+	if !updated {
+		log.Printf("finch: hub-pushed update: already on the latest version (%s)", agentVersion)
+		return
+	}
+	log.Printf("finch: hub-pushed update installed — re-exec onto the new binary")
+	if err := syscallExec(self, os.Args); err != nil {
+		log.Printf("finch: re-exec failed: %v (binary is updated; restart to apply)", err)
+	}
+}
+
+// updateArch maps Go's GOARCH to the goreleaser asset arch suffix (arm → armv6/
+// armv7 by GOARM). Matches the naming in .goreleaser.yaml and installScript().
+func updateArch() string {
+	switch runtime.GOARCH {
+	case "arm":
+		if os.Getenv("GOARM") == "7" {
+			return "armv7"
+		}
+		return "armv6"
+	default:
+		return runtime.GOARCH // amd64, arm64
+	}
+}
+
+// hubLatestVersion asks the hub for the current LATEST_AGENT so `finch update`
+// can no-op when already current. Best-effort: any error → "" (caller updates
+// anyway). The hub exposes it at /api/version (public, unauthenticated).
+func hubLatestVersion(hub string) (string, error) {
+	req, err := http.NewRequest(http.MethodGet, hub+"/api/version", nil)
+	if err != nil {
+		return "", err
+	}
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		return "", fmt.Errorf("hub %d", res.StatusCode)
+	}
+	var body struct {
+		Latest string `json:"latest"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+		return "", err
+	}
+	return body.Latest, nil
+}
+
+// downloadAndSwap fetches url to a temp file NEXT TO dst (same dir → atomic
+// rename), makes it executable, then renames it over dst. Downloading to a temp
+// first means a failed/partial download never bricks the running binary; the
+// rename is atomic on POSIX so there's no torn-write window.
+func downloadAndSwap(url, dst string) error {
+	res, err := http.Get(url)
+	if err != nil {
+		return err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		return fmt.Errorf("download %s: hub %d", url, res.StatusCode)
+	}
+	dir := filepath.Dir(dst)
+	tmp, err := os.CreateTemp(dir, ".finch-update-*")
+	if err != nil {
+		return fmt.Errorf("temp file in %s: %w (need write access to install dir)", dir, err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // no-op after a successful rename
+	if _, err := io.Copy(tmp, res.Body); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmpName, 0o755); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, dst); err != nil {
+		return fmt.Errorf("installing over %s: %w", dst, err)
+	}
+	return nil
+}
+
+// finchTunnelActive reports whether a running finch-tunnel systemd --user
+// service is managing the serve (the clean-restart target).
+func finchTunnelActive() bool {
+	out, _ := exec.Command("systemctl", "--user", "is-active", "finch-tunnel.service").Output()
+	return strings.TrimSpace(string(out)) == "active"
 }

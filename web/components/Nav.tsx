@@ -22,7 +22,7 @@ export default function Nav() {
           <a href="#how">How it works</a>
           <a href="#abilities">Abilities</a>
           <a href="#safety">Safety</a>
-          <a href="#beta">Beta</a>
+          <a href="#pricing">Pricing</a>
           <a href="#faq">FAQ</a>
         </div>
         <div className="nav-cta">

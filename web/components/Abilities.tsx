@@ -4,8 +4,8 @@ export default function Abilities() {
       <div className="wrap">
         <div className="sec-head">
           <span className="sec-tag">ABILITIES</span>
-          <h2>What will yours expose?</h2>
-          <p>Grab a ready-made server or write the tool logic yourself — it's just an MCP server. Finch wraps it in auth and a URL either way. Each one becomes a tool your agent can reach for.</p>
+          <h2>What can you put behind it?</h2>
+          <p>Bring any MCP server, ready-made or your own. Finch wraps it in auth and a URL. Each one becomes a tool your agent can call.</p>
         </div>
         <div className="ability-grid">
           <div className="ability">

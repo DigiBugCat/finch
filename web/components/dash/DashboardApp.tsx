@@ -126,6 +126,17 @@ export default function DashboardApp() {
       { method: "POST", body: JSON.stringify({ box: boxName, service: appId, key }) },
       "🔑 key revoked", "couldn't revoke key");
 
+  // Push a hub→box "update" frame: the live box self-updates from the hub's
+  // /releases and re-execs in place; the poll shows the new version when it
+  // re-joins (~7s). Offline boxes 503 — the row keeps the copy-paste fallback.
+  const updateBox = (appId: any, boxName: any) =>
+    void mutate(
+      `/api/finch/services/${encodeURIComponent(appId)}/boxes/${encodeURIComponent(boxName)}/update`,
+      { method: "POST" },
+      `⬆ update pushed to ${boxName} — it'll chirp back on the new version`,
+      `couldn't update ${boxName}`,
+    );
+
   // --- keys (the tenant-level Keys view) ---------------------------
   // Mint a real finch_ key via the hub; returns the MintKeyResp so KeysView can
   // reveal the plaintext once. Revoke by the key's stable id (not its label).
@@ -245,7 +256,7 @@ export default function DashboardApp() {
             {view === "detail" && current && (
               <DetailView app={current} host={host} onBack={() => go("overview")}
                 onRelease={releaseDevice} onTags={setTags} onApprove={approveDevice} onDecline={declineDevice}
-                onRevokeBoxKey={revokeBoxKey} />
+                onRevokeBoxKey={revokeBoxKey} onUpdateBox={updateBox} />
             )}
             {view === "detail" && !current && (
               <div className="view"><button className="backlink" onClick={() => go("overview")}>← Fleet</button>

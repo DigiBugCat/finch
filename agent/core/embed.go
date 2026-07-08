@@ -229,7 +229,7 @@ func Embed(ctx context.Context, o EmbedOptions, status func(state, detail string
 		wsURL := wsBase + "?ct=" + url.QueryEscape(connectToken)
 		start := time.Now()
 		status("connected", "")
-		serr := serve(ctx, wsURL, up, o.ForwardAll)
+		serr := serve(ctx, wsURL, up, o.ForwardAll, hub)
 		if ctx.Err() != nil {
 			return nil // Stop() cancelled the link — clean shutdown
 		}

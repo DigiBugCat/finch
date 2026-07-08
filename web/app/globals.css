@@ -124,6 +124,25 @@ section{position:relative; z-index:1}
 .sec-head h2{font-size:clamp(30px,4vw,44px); font-weight:900}
 .sec-head p{color:var(--dim); font-size:18.5px; margin-top:16px; text-wrap:pretty}
 
+/* ---------- why finch: before / after ---------- */
+.ba{display:grid; grid-template-columns:1fr 1fr; gap:20px; max-width:940px; margin:0 auto}
+.ba-card{background:var(--card); border:1px solid var(--line); border-radius:20px; padding:28px 26px}
+.ba-before{opacity:.85}
+.ba-after{border-color:var(--line2); background:var(--card-hi)}
+.ba-h{margin-bottom:18px}
+.ba-tag{font-weight:800; font-size:12.5px; letter-spacing:.07em; color:var(--dim2)}
+.ba-tag-ok{color:var(--green)}
+.ba-list{list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:12px}
+.ba-list li{display:flex; align-items:flex-start; gap:10px; font-size:15.5px; font-weight:600}
+.ba-before .ba-list li{color:var(--dim)}
+.ba-x{color:var(--red); font-weight:900; flex-shrink:0}
+.ba-ck{color:var(--green); font-weight:900; flex-shrink:0}
+.ba-term{background:var(--input-bg); border:1px solid var(--line); border-radius:12px; padding:14px 16px;
+  display:flex; flex-direction:column; gap:7px; font-size:12.5px; margin-bottom:20px; overflow-x:auto; white-space:nowrap}
+.ba-prompt{color:var(--dim2); margin-right:7px}
+.ba-ok{color:var(--green)}
+@media (max-width:860px){ .ba{grid-template-columns:1fr} }
+
 /* ---------- value (3 pillars) ---------- */
 .pillars{display:grid; grid-template-columns:repeat(3,1fr); gap:20px}
 .pillar{background:var(--card); border:1px solid var(--line); border-radius:20px; padding:30px 26px; transition:.2s}
@@ -132,6 +151,30 @@ section{position:relative; z-index:1}
   font-size:24px; background:var(--amber-soft); box-shadow:0 0 0 1px rgba(242,180,67,.18); margin-bottom:20px}
 .pillar h3{font-size:21px; font-weight:800; margin-bottom:10px}
 .pillar p{color:var(--dim); font-size:15.5px}
+
+/* ---------- pricing tiers ---------- */
+.tiers{display:grid; grid-template-columns:repeat(3,1fr); gap:20px; align-items:stretch}
+.tier{position:relative; display:flex; flex-direction:column; background:var(--card); border:1px solid var(--line);
+  border-radius:20px; padding:32px 28px; transition:.2s}
+.tier{opacity:.55; filter:saturate(.6)}
+.tier:hover{border-color:var(--line2); transform:translateY(-3px)}
+.tier-hi{opacity:1; filter:none; border-color:var(--amber); background:var(--card-hi);
+  box-shadow:0 0 0 1px var(--amber), 0 20px 50px -20px rgba(242,180,67,.35)}
+.tier-badge{position:absolute; top:-12px; left:50%; transform:translateX(-50%); background:var(--amber); color:#2a200c;
+  font-weight:800; font-size:11.5px; letter-spacing:.06em; padding:5px 13px; border-radius:999px; white-space:nowrap}
+.tier-name{font-size:20px; font-weight:800; margin-bottom:14px}
+.tier-price{display:flex; align-items:baseline; gap:8px; margin-bottom:14px}
+.tier-amt{font-size:34px; font-weight:900; line-height:1}
+.tier-note{color:var(--dim); font-size:14px; font-weight:600}
+.tier-blurb{color:var(--dim); font-size:15px; margin-bottom:22px; text-wrap:pretty}
+.tier-feats{list-style:none; margin:0 0 26px; padding:0; display:flex; flex-direction:column; gap:11px; flex:1}
+.tier-feats li{display:flex; align-items:flex-start; gap:10px; color:var(--ink); font-size:15px; font-weight:600}
+.tier-check{color:var(--amber); font-weight:900; flex-shrink:0}
+.tier-cta{width:100%; justify-content:center}
+.tier-foot{text-align:center; color:var(--dim); font-size:15px; margin-top:36px}
+.tier-foot a{color:var(--amber); font-weight:700}
+.tier-foot a:hover{text-decoration:underline}
+@media (max-width:860px){ .tiers{grid-template-columns:1fr} }
 
 /* ---------- how it works ---------- */
 .steps{display:grid; grid-template-columns:repeat(3,1fr); gap:22px; counter-reset:s}

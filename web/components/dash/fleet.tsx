@@ -145,7 +145,7 @@ export function BoxesTable({ boxes, host, onOpen, query }: any) {
 }
 
 // ============ BOX DETAIL ====================================
-export function DetailView({ app, host, onBack, onRelease, onTags, onApprove, onDecline, onRevokeBoxKey }: any) {
+export function DetailView({ app, host, onBack, onRelease, onTags, onApprove, onDecline, onRevokeBoxKey, onUpdateBox }: any) {
   const [tab, setTab] = useState("claude");
   const [newTag, setNewTag] = useState("");
   const url = mcpUrl(host, app.id);
@@ -268,7 +268,14 @@ export function DetailView({ app, host, onBack, onRelease, onTags, onApprove, on
                     <span key={k} className="kchip mono">🔑 {k}<button className="tag-x" title="revoke" onClick={() => onRevokeBoxKey(app.id, m.name, k)}>×</button></span>
                   )) : <span className="dim">none</span>}
                 </span>
-                {m.outdated && <span className="mach-update mono">finch update <CopyChip value="finch update" /></span>}
+                {m.outdated && (
+                  // A CONNECTED box can take a hub-pushed update (relay frame →
+                  // self-update → re-exec); an offline one can't receive the
+                  // frame, so it keeps the copy-paste hint.
+                  isOnline(m.state) && onUpdateBox
+                    ? <span className="mach-update mono">⬆ <InlineConfirm prompt="push update?" trigger="update now" onConfirm={() => onUpdateBox(app.id, m.name)} /></span>
+                    : <span className="mach-update mono">finch update <CopyChip value="finch update" /></span>
+                )}
               </div>
             </div>
           )) : <div className="dim">No boxes yet — this service is waiting for a box to phone home.</div>}

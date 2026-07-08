@@ -189,6 +189,36 @@ export class BoxDO extends DurableObject<Env> {
       return new Response(null, { status: 101, webSocket: client });
     }
 
+    // ---- Control push: hub-internal only. The public relay forwards ARBITRARY
+    // client paths here (/<service>/<box>/_control would land as relPath
+    // /_control), so path alone is NOT trust — the caller must present the
+    // service secret (same trust model as serviceOk()), which only the hub's own
+    // /api/box-update endpoint holds. Pushes an out-of-band frame (currently
+    // just "update": self-update + re-exec) to the live agent socket. The frame
+    // carries no URL — the agent downloads from its own configured hub, so a
+    // control push can at worst trigger a re-download of the pinned release. ----
+    if (relPath.startsWith("/_control")) {
+      const secret = this.env.FINCH_SERVICE_SECRET;
+      if (!secret || req.headers.get("X-Finch-Service") !== secret) {
+        // Fail closed (404, not 403): don't advertise the control surface to
+        // relay clients probing reserved paths.
+        return json(404, { error: "not found" });
+      }
+      if (req.method !== "POST") return json(405, { error: "POST only" });
+      const live = this.ctx.getWebSockets("agent")[0];
+      if (!live) {
+        return json(
+          503,
+          { error: "box offline", id: parts[0] },
+          { "X-Finch-Offline": "1" },
+        );
+      }
+      // "_ctl" is a reserved out-of-band id: request ids are crypto-random hex
+      // (never "_ctl"), and the agent's update handler ignores id entirely.
+      live.send(JSON.stringify({ id: "_ctl", type: "update" }));
+      return json(200, { ok: true });
+    }
+
     // ---- Public request: relay it to the connected agent. ----
     const agent = this.ctx.getWebSockets("agent")[0];
     if (!agent) {

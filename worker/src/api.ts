@@ -11,7 +11,7 @@
 //   - /join is the ONE exception — it's TICKET-authed (the box presents the
 //     stateless join ticket it was handed at enroll). No service secret.
 
-import { rateLimitOk, clientIp, json, tenantOp, type Env } from "./index";
+import { rateLimitOk, clientIp, json, tenantOp, boxStub, type Env } from "./index";
 import {
   serviceOk,
   signToken,
@@ -76,6 +76,7 @@ import type {
   TenantState,
   PublicKey,
 } from "./types";
+import { LATEST_AGENT } from "./types";
 
 // Join tickets are short-lived AND single-use (jti replay-checked at /join), so
 // a 15-minute window is ample for the enroll → install → join flow while sharply
@@ -232,6 +233,13 @@ export async function handleApi(
   if (path === "/refresh") {
     if (method !== "POST") return json(405, { error: "POST only" });
     return handleRefresh(req, env, host);
+  }
+
+  // ---- /api/version — public, unauthenticated. The current agent version, so
+  //      `finch update` can no-op when a box is already on the latest build.
+  //      Mirrors the LATEST_AGENT literal the dashboard's update tooltip reads. ----
+  if (path === "/api/version" && method === "GET") {
+    return json(200, { latest: LATEST_AGENT });
   }
 
   // ---- /api/cli/* — authed by a CLI token (a long-lived tenant assertion the
@@ -458,6 +466,39 @@ export async function handleApi(
     const userCode = String(body.userCode || "").trim();
     if (!userCode) return json(400, { error: "userCode required" });
     return json(200, await routerDeviceDescribe(env, userCode));
+  }
+
+  // POST /api/box-update {service, box} — push an out-of-band "update" frame to
+  // a LIVE box's relay socket: the agent self-updates from this hub's /releases
+  // and re-execs in place (dashboard "update now" button). Tenant-scoped by the
+  // verified assertion; the box must exist in this tenant's registry (never
+  // spins up a BoxDO for an unknown name). 503 X-Finch-Offline when the box has
+  // no live agent socket — the dashboard falls back to the copy-paste hint.
+  if (method === "POST" && seg.length === 1 && seg[0] === "box-update") {
+    if (!(await rateLimitOk(env.JOIN_LIMIT, `boxupd:${tenant}`))) {
+      return json(429, { error: "rate limited" });
+    }
+    const body = await readJson(req);
+    const service = String(body.service || "").trim();
+    const box = String(body.box || "").trim();
+    if (!service || !box) return json(400, { error: "service and box required" });
+    const reg = await tenantOp<{ exists: boolean }>(env, tenant, "boxExists", {
+      service,
+      box,
+    });
+    if (!reg?.exists) return json(404, { error: "unknown box" });
+    // The DO's /_control gate re-checks this same secret (the public relay can
+    // route arbitrary paths to the DO, so path alone is not trust).
+    // The DO strips two leading path segments (/<service>/<box>/<rest>).
+    const ctlPath = `/${encodeURIComponent(service)}/${encodeURIComponent(box)}/_control`;
+    const res = await boxStub(env, tenant, service, box).fetch(
+      `https://box${ctlPath}`,
+      {
+        method: "POST",
+        headers: { "X-Finch-Service": env.FINCH_SERVICE_SECRET },
+      },
+    );
+    return res;
   }
 
   if (method === "POST" && seg.length === 1 && seg[0] === "device-approve") {
