@@ -1,0 +1,25 @@
+# Finch
+
+> Finch turns a local HTTP or MCP service on your own machine into a secure public endpoint. The box dials out to the Finch hub, so nothing listens and no ports open. Auth is checked at the edge before a request reaches your box. Clients reach services at https://<slug>.finchmcp.com/<app_path>/ (MCP servers answer at /<app_path>/mcp) with an Authorization: Bearer finch_<key> header.
+
+Finch is operated from a CLI. Every command is non-interactive and supports --json. If you are an AI agent driving Finch, install it and run `finch guide`: it prints a complete, self-contained operating manual.
+
+Core loop: `finch login` (one-time browser approval) → `finch add <app_path> --service http://127.0.0.1:<port>` → `finch run` → paste the printed URL into any MCP client with a key from `finch keys mint`.
+
+## Docs
+
+- [Quickstart](https://finchmcp.com/docs): install, log in, add a service, run, connect a client
+- [Services & boxes](https://finchmcp.com/docs/services): the service/box model, finch.yml, states, enrolling more boxes
+- [Keys & auth](https://finchmcp.com/docs/auth): finch_ keys, mint/list/revoke, the CLI admin token, how auth is checked at the edge
+- [Access control](https://finchmcp.com/docs/acls): default-deny rules, granting by user, group, key, or tag; per-agent scoping
+- [Domains](https://finchmcp.com/docs/domains): the automatic <slug>.finchmcp.com hub domain and custom hostnames
+- [CLI reference](https://finchmcp.com/docs/cli): every command, grouped, with the finch.yml format
+
+## Install
+
+- [Install script](https://finchmcp.com/install): `curl -fsSL finchmcp.com/install | sh` (macOS and Linux)
+
+## Optional
+
+- [Dashboard](https://finchmcp.com/dashboard): services, boxes, keys, access rules, users, logs
+- [Pricing](https://finchmcp.com/#pricing): free during beta; Hobby stays free for individuals and small groups

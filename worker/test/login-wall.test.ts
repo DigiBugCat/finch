@@ -240,7 +240,7 @@ describe("login wall — keyless browser hit on a private service", () => {
     const res = await call(
       new Request(`${base}/${service}/index.html?x=1`, {
         method: "GET",
-        headers: { host },
+        headers: { host, accept: "text/html" },
         redirect: "manual",
       }),
     );
@@ -255,10 +255,12 @@ describe("login wall — keyless browser hit on a private service", () => {
     agent.close(1000, "done");
   });
 
-  it("walls a keyless non-bearer call (the new default replaces the bare 401)", async () => {
+  it("401s a keyless MCP call with the OAuth challenge (no wall for machine callers)", async () => {
     const { host, base, service, agent } = await standUpService();
-    // A keyless POST /mcp with NO finch_ bearer is a browser-shaped request: under
-    // the new contract it 302s to the wall (it used to be a bare 401).
+    // A keyless POST /mcp is a MACHINE request (no Accept: text/html): it must
+    // reach the key gate and get the 401 whose WWW-Authenticate challenge is how
+    // OAuth-capable clients (claude.ai connectors) discover the flow. Walling it
+    // 302'd them to a browser portal they can't use — "couldn't connect".
     const res = await call(
       new Request(`${base}/${service}/mcp`, {
         method: "POST",
@@ -267,10 +269,30 @@ describe("login wall — keyless browser hit on a private service", () => {
         redirect: "manual",
       }),
     );
-    expect(res.status).toBe(302);
-    expect(new URL(res.headers.get("location")!).pathname).toBe(
-      "/portal/start",
+    expect(res.status).toBe(401);
+    agent.close(1000, "done");
+  });
+
+  it("never walls a non-finch_ bearer (OAuth access tokens reach the relay gates)", async () => {
+    const { host, base, service, agent } = await standUpService();
+    // The claude.ai connector regression: after completing the Clerk OAuth flow
+    // the client calls with a plain Bearer token. Walling it 302'd the client to
+    // the browser portal. It must reach relayMcp's gates instead (which 401/403
+    // an unverifiable token — anything but a redirect).
+    const res = await call(
+      new Request(`${base}/${service}/mcp`, {
+        method: "POST",
+        headers: {
+          host,
+          "content-type": "application/json",
+          authorization: "Bearer not-a-finch-key-oauth-token",
+        },
+        body: "{}",
+        redirect: "manual",
+      }),
     );
+    expect(res.status).not.toBe(302);
+    expect([401, 403]).toContain(res.status);
     agent.close(1000, "done");
   });
 
@@ -283,7 +305,7 @@ describe("login wall — keyless browser hit on a private service", () => {
     const relayP = call(
       new Request(`${base}/${service}/index.html`, {
         method: "GET",
-        headers: { host, cookie: `finch_session=${cookie}` },
+        headers: { host, accept: "text/html", cookie: `finch_session=${cookie}` },
         redirect: "manual",
       }),
     );
@@ -309,6 +331,7 @@ describe("login wall — keyless browser hit on a private service", () => {
         method: "GET",
         headers: {
           host,
+          accept: "text/html",
           // A logged-in browser carries BOTH the login-wall cookie AND the hosted
           // app's own cookies. A blanket "contains finch_" strip would delete the
           // whole header and break the site; only finch_session must be removed.
@@ -340,7 +363,7 @@ describe("login wall — keyless browser hit on a private service", () => {
     const relayP = call(
       new Request(`${base}/${service}/index.html`, {
         method: "GET",
-        headers: { host, cookie: `finch_session=${cookie}` },
+        headers: { host, accept: "text/html", cookie: `finch_session=${cookie}` },
         redirect: "manual",
       }),
     );
@@ -419,7 +442,7 @@ describe("login wall — keyless browser hit on a private service", () => {
     const relayP = call(
       new Request(`${base}/${service}/index.html`, {
         method: "GET",
-        headers: { host },
+        headers: { host, accept: "text/html" },
         redirect: "manual",
       }),
     );
@@ -442,7 +465,7 @@ describe("login wall — session cookie validity", () => {
     const res = await call(
       new Request(`${base}/${service}/index.html`, {
         method: "GET",
-        headers: { host, cookie: `finch_session=${cookie}` },
+        headers: { host, accept: "text/html", cookie: `finch_session=${cookie}` },
         redirect: "manual",
       }),
     );
@@ -468,7 +491,7 @@ describe("login wall — session cookie validity", () => {
     const res = await call(
       new Request(`${base}/${service}/index.html`, {
         method: "GET",
-        headers: { host, cookie: `finch_session=${forged}` },
+        headers: { host, accept: "text/html", cookie: `finch_session=${forged}` },
         redirect: "manual",
       }),
     );
@@ -487,7 +510,7 @@ describe("login wall — session cookie validity", () => {
     const res = await call(
       new Request(`${base}/${service}/index.html`, {
         method: "GET",
-        headers: { host, cookie: `finch_session=${expired}` },
+        headers: { host, accept: "text/html", cookie: `finch_session=${expired}` },
         redirect: "manual",
       }),
     );
@@ -504,7 +527,7 @@ describe("login wall — session cookie validity", () => {
     const relayP = call(
       new Request(`${base}/${service}/index.html`, {
         method: "GET",
-        headers: { host, cookie: `finch_session=${cookie}` },
+        headers: { host, accept: "text/html", cookie: `finch_session=${cookie}` },
         redirect: "manual",
       }),
     );
@@ -527,7 +550,7 @@ describe("login wall — session cookie validity", () => {
     const res = await call(
       new Request(`${base}/${service}/index.html`, {
         method: "GET",
-        headers: { host, cookie: `finch_session=${cookie}` },
+        headers: { host, accept: "text/html", cookie: `finch_session=${cookie}` },
         redirect: "manual",
       }),
     );
@@ -544,7 +567,7 @@ describe("login wall — session cookie validity", () => {
     const relayP = call(
       new Request(`${base}/${service}/index.html`, {
         method: "GET",
-        headers: { host, cookie: `finch_session=${cookie}` },
+        headers: { host, accept: "text/html", cookie: `finch_session=${cookie}` },
         redirect: "manual",
       }),
     );
@@ -562,7 +585,7 @@ describe("login wall — session cookie validity", () => {
     const res = await call(
       new Request(`${base}/${service}/index.html`, {
         method: "GET",
-        headers: { host, cookie: `finch_session=${cookie}` },
+        headers: { host, accept: "text/html", cookie: `finch_session=${cookie}` },
         redirect: "manual",
       }),
     );
@@ -579,7 +602,7 @@ describe("/__finch/cb — portal grant → session cookie hand-off", () => {
     const res = await call(
       new Request(
         `${base}/__finch/cb?g=${encodeURIComponent(grant)}&rd=${encodeURIComponent("/scraper/mcp")}`,
-        { method: "GET", headers: { host }, redirect: "manual" },
+        { method: "GET", headers: { host, accept: "text/html" }, redirect: "manual" },
       ),
     );
     expect(res.status).toBe(302);
@@ -606,7 +629,7 @@ describe("/__finch/cb — portal grant → session cookie hand-off", () => {
     const first = await call(
       new Request(`${base}/__finch/cb?g=${encodeURIComponent(grant)}&rd=%2F`, {
         method: "GET",
-        headers: { host },
+        headers: { host, accept: "text/html" },
         redirect: "manual",
       }),
     );
@@ -617,7 +640,7 @@ describe("/__finch/cb — portal grant → session cookie hand-off", () => {
     const replay = await call(
       new Request(`${base}/__finch/cb?g=${encodeURIComponent(grant)}&rd=%2F`, {
         method: "GET",
-        headers: { host },
+        headers: { host, accept: "text/html" },
         redirect: "manual",
       }),
     );
@@ -635,7 +658,7 @@ describe("/__finch/cb — portal grant → session cookie hand-off", () => {
     const res = await call(
       new Request(`${base}/__finch/cb?g=${encodeURIComponent(grant)}&rd=%2F`, {
         method: "GET",
-        headers: { host },
+        headers: { host, accept: "text/html" },
         redirect: "manual",
       }),
     );
@@ -649,7 +672,7 @@ describe("/__finch/cb — portal grant → session cookie hand-off", () => {
     const res = await call(
       new Request(`${base}/__finch/cb?g=${encodeURIComponent(grant)}&rd=%2F`, {
         method: "GET",
-        headers: { host },
+        headers: { host, accept: "text/html" },
         redirect: "manual",
       }),
     );
@@ -664,7 +687,7 @@ describe("/__finch/cb — portal grant → session cookie hand-off", () => {
     const r1 = await call(
       new Request(
         `${base}/__finch/cb?g=${encodeURIComponent(g1)}&rd=${encodeURIComponent("https://evil.example/phish")}`,
-        { method: "GET", headers: { host }, redirect: "manual" },
+        { method: "GET", headers: { host, accept: "text/html" }, redirect: "manual" },
       ),
     );
     expect(r1.status).toBe(302);
@@ -675,7 +698,7 @@ describe("/__finch/cb — portal grant → session cookie hand-off", () => {
     const r2 = await call(
       new Request(
         `${base}/__finch/cb?g=${encodeURIComponent(g2)}&rd=${encodeURIComponent("//evil.example/phish")}`,
-        { method: "GET", headers: { host }, redirect: "manual" },
+        { method: "GET", headers: { host, accept: "text/html" }, redirect: "manual" },
       ),
     );
     expect(r2.status).toBe(302);
@@ -703,7 +726,7 @@ describe("/__finch/logout — clears the session cookie", () => {
     const res = await call(
       new Request(`${base}/__finch/logout?rd=${encodeURIComponent("/dash")}`, {
         method: "GET",
-        headers: { host },
+        headers: { host, accept: "text/html" },
         redirect: "manual",
       }),
     );
@@ -719,7 +742,7 @@ describe("/__finch/logout — clears the session cookie", () => {
     const res = await call(
       new Request(
         `${base}/__finch/logout?rd=${encodeURIComponent("https://evil.example")}`,
-        { method: "GET", headers: { host }, redirect: "manual" },
+        { method: "GET", headers: { host, accept: "text/html" }, redirect: "manual" },
       ),
     );
     expect(res.status).toBe(302);

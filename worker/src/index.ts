@@ -204,10 +204,28 @@ async function maybeBrowserGate(
   service: string,
   originalPathAndQuery: string,
 ): Promise<GateDecision> {
-  // 1. A finch_ bearer means the MCP/key plane — checkKey inside relayMcp is the
-  //    authority; never wall it. (Matches relayMcp's own bearer parse.)
+  // 1. ANY bearer means a machine caller — relayMcp's own gates are the
+  //    authority (checkKey for finch_ keys, verifyClerkOAuthToken for OAuth
+  //    access tokens); never wall it. Walling non-finch_ bearers was the bug
+  //    that broke claude.ai connectors: the client completed the Clerk OAuth
+  //    flow, came back with a valid access token, and got 302'd to the browser
+  //    portal instead of reaching the OAuth verifier. No privilege is granted
+  //    here — an invalid bearer still 401/403s in relayMcp.
   const auth = req.headers.get("authorization") || "";
-  if (/^Bearer\s+finch_[A-Za-z0-9_-]+$/.test(auth)) {
+  if (/^Bearer\s+\S+$/.test(auth)) {
+    return { browserAuthed: false };
+  }
+
+  // 1b. Only wall BROWSER NAVIGATIONS. A bearer-less MCP/API client (POST, or
+  //     an Accept without text/html) must fall through to relayMcp's key gate,
+  //     whose 401 carries the WWW-Authenticate resource_metadata challenge —
+  //     that challenge is how OAuth-capable clients (claude.ai) discover the
+  //     flow at all. A 302-to-portal here reads as "couldn't connect" to them.
+  //     Browsers always send GET/HEAD with Accept: text/html on navigation.
+  const isBrowserNav =
+    (req.method === "GET" || req.method === "HEAD") &&
+    (req.headers.get("accept") || "").includes("text/html");
+  if (!isBrowserNav) {
     return { browserAuthed: false };
   }
 

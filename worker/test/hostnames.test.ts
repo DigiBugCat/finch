@@ -248,7 +248,7 @@ describe("relay and login wall on custom hostnames", () => {
     const goodSeen = nextFrame(ctx.agent);
     const good = call(
       new Request(`${ctx.base}/${ctx.service}/index.html`, {
-        headers: { host, cookie: `finch_session=${cookie}` },
+        headers: { host, accept: "text/html", cookie: `finch_session=${cookie}` },
       }),
     );
     reply200(ctx.agent, (await goodSeen).id);
@@ -258,7 +258,7 @@ describe("relay and login wall on custom hostnames", () => {
     expect((await router({ op: "register", slug: otherHost, tenant: ctx.tenant })).ok).toBe(true);
     const bad = await call(
       new Request(`https://${otherHost}/${ctx.service}/index.html`, {
-        headers: { host: otherHost, cookie: `finch_session=${cookie}` },
+        headers: { host: otherHost, accept: "text/html", cookie: `finch_session=${cookie}` },
         redirect: "manual",
       }),
     );
