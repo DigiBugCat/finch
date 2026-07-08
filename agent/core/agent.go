@@ -605,7 +605,13 @@ func join(hub, ticket, box string) (*joinResp, error) {
 // rejects it (403) if the box was removed from the dashboard, which is how
 // revocation propagates to the box within a connect-token TTL.
 func refresh(hub, refreshToken string) (*joinResp, error) {
-	body, _ := json.Marshal(map[string]string{"refreshToken": refreshToken})
+	// version rides along so the hub can re-stamp it: after a hub-pushed update
+	// the agent re-execs and resumes via /refresh (never /join), so this is the
+	// only place the NEW version reaches the registry. Older hubs ignore it.
+	body, _ := json.Marshal(map[string]string{
+		"refreshToken": refreshToken,
+		"version":      agentVersion,
+	})
 	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(hub, "/")+"/refresh", bytes.NewReader(body))
 	if err != nil {
 		return nil, err

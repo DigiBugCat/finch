@@ -1030,6 +1030,18 @@ async function handleRefresh(
     return json(403, { error: "box no longer registered" });
   }
 
+  // Re-stamp the agent version when the box reports one (it re-execs onto a
+  // new binary after a hub-pushed update and resumes HERE, never via /join —
+  // without this the registry keeps the pre-update version forever). Older
+  // agents send no version → no-op. Best-effort: never blocks the refresh.
+  if (typeof body.version === "string" && body.version) {
+    await tenantOp(env, tenant, "boxVersion", {
+      service,
+      box,
+      version: body.version,
+    });
+  }
+
   const connectExp =
     Math.floor(Date.now() / 1000) + CONNECT_TOKEN_TTL_SECONDS;
   const connectToken = await signToken(
