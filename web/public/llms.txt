@@ -6,6 +6,39 @@ Finch is operated from a CLI. Every command is non-interactive and supports --js
 
 Core loop: `finch login` (one-time browser approval) → `finch add <app_path> --service http://127.0.0.1:<port>` → `finch run` → paste the printed URL into any MCP client with a key from `finch keys mint`.
 
+## Base case: hello world, end to end
+
+```bash
+pip install fastmcp
+cat > server.py <<'EOF'
+from fastmcp import FastMCP
+
+mcp = FastMCP("hello")
+
+@mcp.tool
+def greet(name: str) -> str:
+    """Say hello."""
+    return f"Hello, {name}!"
+
+if __name__ == "__main__":
+    mcp.run(transport="http", port=8000)
+EOF
+python server.py &                                   # serves MCP on http://127.0.0.1:8000
+
+curl -fsSL finchmcp.com/install | sh                 # install finch (macOS/Linux)
+finch login                                          # one-time browser approval
+finch add hello --service http://127.0.0.1:8000      # writes finch.yml (no secrets)
+finch run                                            # -> https://<slug>.finchmcp.com/hello/
+
+# verify from another shell
+finch test hello                                     # lists the greet tool
+finch call hello greet --args '{"name": "world"}'    # -> Hello, world!
+
+# give a client access
+finch keys mint my-claude --service hello            # finch_ key, shown once
+# MCP endpoint: https://<slug>.finchmcp.com/hello/mcp with Authorization: Bearer finch_...
+```
+
 ## Docs
 
 - [Quickstart](https://finchmcp.com/docs): install, log in, add a service, run, connect a client
