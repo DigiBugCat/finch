@@ -35,6 +35,10 @@ export default function Acls() {
         A key&apos;s identity for rule matching is the key itself (by label or id),
         the user who owns it, and any groups that user or key belongs to.
       </p>
+      <p>
+        One exception: a service whose auth is set to <b>public</b> skips both
+        gates. It needs no key at all, so access rules do not apply to it.
+      </p>
 
       <h2>Rules: source may reach destinations</h2>
       <p>
@@ -60,6 +64,12 @@ export default function Acls() {
           </tbody>
         </table>
       </div>
+      <p>
+        The dashboard&apos;s rule builder offers <code>tag</code> and{' '}
+        <code>group</code> destinations. <code>service</code> and{' '}
+        <code>all</code> exist in the rule model (the seeded owner rule uses{' '}
+        <code>all</code>) but are not choices in the builder.
+      </p>
       <p>
         Tags are the practical unit. Tag your services on the Services page, then
         grant by tag: a rule like <code>key:crawler</code> may reach{' '}
@@ -102,7 +112,7 @@ finch keys mint research-agent --service scraper
 finch keys revoke &lt;id&gt;`}</Code>
       <p>
         Then in the dashboard, grant <code>key:research-agent</code> access to the
-        services (or tag) it should reach. Different users and agents get different
+        tag (or group) it should reach. Different users and agents get different
         views of your fleet, and revoking one key cuts off exactly one caller.
       </p>
       <div className="docs-note">
@@ -123,7 +133,7 @@ finch keys revoke &lt;id&gt;`}</Code>
             <tr><th>Role</th><th>Can do</th></tr>
           </thead>
           <tbody>
-            <tr><td>Owner</td><td>Everything. One per tenant, cannot be removed or demoted.</td></tr>
+            <tr><td>Owner</td><td>Everything. Cannot be removed or demoted.</td></tr>
             <tr><td>Admin</td><td>Administer the tenant: boxes, access rules, keys, users.</td></tr>
             <tr><td>Member</td><td>Use the services they have been granted access to.</td></tr>
           </tbody>

@@ -19,8 +19,8 @@ export default function Footer() {
           </div>
           <div className="foot-col">
             <h5>Resources</h5>
-            <a href="#">Docs</a>
-            <a href="#">Build an ability</a>
+            <Link href="/docs">Docs</Link>
+            <Link href="/docs/services">Add a service</Link>
             <a href="#faq">FAQ</a>
             <a href="#">Status</a>
           </div>

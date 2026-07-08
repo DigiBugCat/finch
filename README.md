@@ -93,8 +93,12 @@ single-box service — server-initiated sampling/elicitation. Pause/resume
 - ✅ Reconnect forever, including across reboots (persisted refresh credential)
 - ✅ **CLI: `finch login` (browser approval) → `finch add` → `finch run`** — enroll
   and serve from the box, no dashboard ticket copying
-- ✅ **`finch.toml` manifest** — one process fronts many local services, each its own
-  service (cloudflared-style ingress)
+- ✅ **`finch.yml` manifest** — one process fronts many local services, each its own
+  service (cloudflared-style ingress); found in the cwd or `~/.finch/finch.yml`
+- ✅ **Remote update** — an outdated box shows an ⬆ badge; click **update now** in the
+  dashboard (or run `finch update` on the box) and the agent swaps its binary
+  atomically and restarts in place — no SSH, no second process. Binaries are
+  served from R2 at `$HUB/releases/<asset>`
 - ✅ Dashboard: fleet, keys (default-deny ACL), settings (hub-domain slug picker +
   CLI access tokens), and a **"test in chat"** panel that drives a service's MCP
   tools through an LLM (Cloudflare Workers AI)
@@ -120,7 +124,7 @@ finch add printer --service http://127.0.0.1:8000 --name "Label Printer"
 finch run            #  → https://<your-slug>.finchmcp.com/printer/mcp
 ```
 
-`finch add` writes a [`finch.toml`](agent/finch.example.toml) manifest; `finch
+`finch add` writes a [`finch.yml`](agent/finch.example.yml) manifest; `finch
 run` serves every rule in it (add more services with more `finch add` calls —
 one process fronts them all). Then point any MCP client at the printed URL with
 a `finch_` key (mint one in the dashboard → **Keys**), or test it right in the

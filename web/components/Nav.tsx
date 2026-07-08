@@ -24,6 +24,7 @@ export default function Nav() {
           <a href="#safety">Safety</a>
           <a href="#pricing">Pricing</a>
           <a href="#faq">FAQ</a>
+          <Link href="/docs">Docs</Link>
         </div>
         <div className="nav-cta">
           <Show when="signed-out">

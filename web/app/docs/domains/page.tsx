@@ -22,10 +22,10 @@ export default function Domains() {
       <Code>{`https://<slug>.finchmcp.com/<app_path>/
 <span class="c"># an MCP server answers at /<app_path>/mcp</span>`}</Code>
       <p>
-        Claim or change the slug in the dashboard under Settings, in the Hub domain row.
-        Availability is checked live as you type. Slugs are lowercase letters, digits,
-        and hyphens, at least 3 characters. Until you claim one, clients can&apos;t reach
-        your boxes by name.
+        A slug is assigned automatically the first time you open the dashboard or a box
+        enrolls, so your account always has a working public host. Change it in the
+        dashboard under Settings, in the Hub domain row. Availability is checked live as
+        you type. Slugs are lowercase letters, digits, and hyphens, at least 3 characters.
       </p>
 
       <h2>Custom domains</h2>
@@ -67,8 +67,9 @@ export default function Domains() {
 finch domain add mcp.example.com   <span class="c"># add one; prints the CNAME to configure</span>
 finch domain rm mcp.example.com    <span class="c"># remove one; traffic stops immediately</span>`}</Code>
       <p>
-        <code>finch domain ls</code> supports <code>--json</code> for scripting. The hub
-        validates ownership; the slug itself is claimed in the dashboard, not the CLI.
+        <code>finch domain ls</code> supports <code>--json</code> for scripting. Removal
+        only works for hostnames on your account; the hub slug itself is changed in the
+        dashboard, not the CLI.
       </p>
 
       <div className="docs-foot">
