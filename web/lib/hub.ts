@@ -19,6 +19,7 @@ import { auth } from "@clerk/nextjs/server";
 // The assertion signer lives in its own dependency-free module so it can be
 // contract-tested against the hub's verifyAssertion (worker/src/auth.ts).
 import { signAssertion } from "./assertion";
+import { hasFeature } from "./entitlements";
 
 /** A thrown HttpError short-circuits a route handler with a JSON response. */
 export class HttpError extends Error {
@@ -132,6 +133,24 @@ export async function requireAdmin(): Promise<ResolvedTenant> {
   return ctx;
 }
 
+/**
+ * Authorize a *sharing* action: admin (as requireAdmin) AND the tenant is
+ * entitled to the "sharing" feature. Sharing — inviting org teammates and
+ * managing ACL access — is a paid Team capability; an unentitled tenant gets
+ * 402 (Payment Required) so the UI can tell "not on a plan" from "not an admin".
+ *
+ * This is the enforcement half of the entitlement seam (see lib/entitlements).
+ * During beta hasFeature() returns true, so this behaves exactly like
+ * requireAdmin until real billing flips the seam on.
+ */
+export async function requireSharing(): Promise<ResolvedTenant> {
+  const ctx = await requireAdmin();
+  if (!(await hasFeature(ctx.tenant, "sharing"))) {
+    throw new HttpError(402, "a Team plan is required to share");
+  }
+  return ctx;
+}
+
 /** Mint a long-lived CLI token for the admin's tenant — the credential the
  *  `finch` CLI presents to /api/cli/*. Admin-only. The HUB mints it (epoch-bound,
  *  kind:"cli") so it can be revoked via cli-revoke without rotating the secret. */
@@ -241,6 +260,18 @@ export async function adminProxy(
   method: string,
 ): Promise<Response> {
   await requireAdmin();
+  return hubProxy(hubPath, { method, body: await req.text() });
+}
+
+/** Like adminProxy, but gates on the "sharing" entitlement (requireSharing)
+ *  rather than admin alone. Used by the ACL routes — managing access is a paid
+ *  Team capability. */
+export async function sharingProxy(
+  req: Request,
+  hubPath: string,
+  method: string,
+): Promise<Response> {
+  await requireSharing();
   return hubProxy(hubPath, { method, body: await req.text() });
 }
 

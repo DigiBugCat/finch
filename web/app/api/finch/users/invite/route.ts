@@ -3,11 +3,11 @@
 // directly. Requires an active org (you can't invite a teammate to a
 // personal/no-org tenant). requireAdmin() blocks members from inviting outsiders.
 import { clerkClient } from "@clerk/nextjs/server";
-import { errorResponse, HttpError, requireAdmin, toClerkOrgRole } from "@/lib/hub";
+import { errorResponse, HttpError, requireSharing, toClerkOrgRole } from "@/lib/hub";
 
 export async function POST(req: Request) {
   try {
-    const { orgId, userId } = await requireAdmin();
+    const { orgId, userId } = await requireSharing();
     if (!orgId) {
       throw new HttpError(
         400,

@@ -5,14 +5,14 @@
 // authorization itself (requireAdmin blocks members) and refuses to remove the
 // last remaining admin/owner so the tenant is never left without an admin.
 import { clerkClient } from "@clerk/nextjs/server";
-import { errorResponse, HttpError, isClerkOrgAdmin, requireAdmin } from "@/lib/hub";
+import { errorResponse, HttpError, isClerkOrgAdmin, requireSharing } from "@/lib/hub";
 
 export async function DELETE(
   _req: Request,
   { params }: { params: Promise<{ id: string }> },
 ) {
   try {
-    const { orgId } = await requireAdmin();
+    const { orgId } = await requireSharing();
     if (!orgId) {
       throw new HttpError(400, "an active organization is required");
     }

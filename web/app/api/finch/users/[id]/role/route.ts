@@ -10,7 +10,7 @@ import {
   errorResponse,
   HttpError,
   isClerkOrgAdmin,
-  requireAdmin,
+  requireSharing,
   toClerkOrgRole,
 } from "@/lib/hub";
 
@@ -19,7 +19,7 @@ export async function POST(
   { params }: { params: Promise<{ id: string }> },
 ) {
   try {
-    const { orgId } = await requireAdmin();
+    const { orgId } = await requireSharing();
     if (!orgId) {
       throw new HttpError(400, "an active organization is required");
     }
