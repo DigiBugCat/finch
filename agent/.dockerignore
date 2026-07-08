@@ -1,0 +1,9 @@
+finch
+finch-tray
+tray
+mobile
+scripts
+*.md
+finch.example.yml
+Dockerfile
+.dockerignore

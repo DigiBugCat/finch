@@ -96,6 +96,25 @@ logged in) trades the one-shot dashboard ticket for a refresh credential under
 `credentials-dir/`. On later runs the agent resumes from that credential, so no
 ticket is ever needed again.
 
+## Docker
+
+The agent runs as a container too — a tunnel sidecar next to your MCP server.
+All state (login, credentials, `finch.yml`) lives under `/data`, so one volume
+persists everything:
+
+```bash
+docker build -t finch-agent ./agent
+docker run --rm -v finch-data:/data finch-agent login --hub https://finchmcp.com <token>
+docker run --rm -v finch-data:/data finch-agent add hello --service http://host.docker.internal:8000
+docker run -d --restart unless-stopped -v finch-data:/data finch-agent   # = finch run
+```
+
+The entrypoint is the binary (default command `run`), so any subcommand works
+via `docker run`. For the full sidecar pattern — agent + MCP server as compose
+services, enrolled by compose DNS name — see
+[`examples/docker-compose/`](../examples/docker-compose/). Inside a container,
+upgrade by rebuilding/pulling the image, not `finch update`.
+
 ## Auth & credentials
 
 - **`finch login`** saves a long-lived **CLI token** (a tenant credential, ~90

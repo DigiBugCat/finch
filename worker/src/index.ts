@@ -323,6 +323,18 @@ const DEFAULT_RELEASES_BASE =
 // `finch-${os}-${arch}` and GoReleaser's archive name_template.
 const RELEASE_ASSET_RE = /^finch-(darwin|linux)-(amd64|arm64|armv6|armv7)$/;
 
+// The OAuth scopes the MCP resource actually needs — identity only.
+// verifyClerkOAuthToken reads sub/user_id/org_id from Clerk's userinfo, so
+// `openid` covers verification; `offline_access` keeps connectors connected via
+// refresh tokens. Advertised in BOTH the 401 WWW-Authenticate scope hint and
+// the RFC 9728 scopes_supported (single const so the two can't drift). Without
+// these, claude.ai falls back to requesting every scope the AS supports —
+// including public/private metadata the hub never reads — which both bloats
+// the consent screen and overgrants the issued token. Deliberately NOT
+// filtered from the proxied AS metadata: that document must stay faithful to
+// what Clerk actually supports.
+const MCP_SCOPES = ["openid", "offline_access"];
+
 /** Percent-decode a path segment, tolerating a malformed encoding (a raw "%"
  *  in a name would make decodeURIComponent throw). Falls back to the raw value
  *  so a bad encoding degrades to "wrong box" rather than a 500. */
@@ -534,6 +546,12 @@ export default {
         resource: `https://${host}${suffix ? `/${suffix}` : ""}`,
         authorization_servers: [env.CLERK_ISSUER],
         bearer_methods_supported: ["header"],
+        // The scopes THIS resource actually needs — identity only. MCP clients
+        // (claude.ai) request the scopes advertised here (or in the 401
+        // challenge's scope hint) instead of everything the AS supports, so
+        // the consent screen stops asking for profile/email/metadata that the
+        // hub never reads (verifyClerkOAuthToken consumes only sub/org_id).
+        scopes_supported: MCP_SCOPES,
       });
       return new Response(body, {
         status: 200,
@@ -560,13 +578,18 @@ export default {
         parts[1] === "openid-configuration") &&
       env.CLERK_ISSUER
     ) {
-      const up = await fetch(
-        `${env.CLERK_ISSUER}/.well-known/oauth-authorization-server`,
-      );
-      if (!up.ok) {
+      // Fail closed as a clean 502 on ANY upstream failure — a thrown fetch
+      // (Clerk unreachable) must not surface as an unhandled 500.
+      let meta: Record<string, unknown>;
+      try {
+        const up = await fetch(
+          `${env.CLERK_ISSUER}/.well-known/oauth-authorization-server`,
+        );
+        if (!up.ok) throw new Error(`upstream ${up.status}`);
+        meta = (await up.json()) as Record<string, unknown>;
+      } catch {
         return json(502, { error: "authorization server metadata unavailable" });
       }
-      const meta = (await up.json()) as Record<string, unknown>;
       if (!meta.registration_endpoint) {
         meta.registration_endpoint = `${env.CLERK_ISSUER}/oauth/register`;
       }
@@ -925,9 +948,13 @@ async function relayMcp(
           "content-type": "application/json",
         };
         if (env.CLERK_ISSUER) {
+          // scope is the client's PRIORITY-1 source for what to request
+          // (claude.ai: challenge scope > resource-metadata scopes_supported >
+          // everything the AS supports) — identity only, see MCP_SCOPES.
           headers["www-authenticate"] =
             `Bearer resource_metadata="https://${new URL(req.url).host}` +
-            `/.well-known/oauth-protected-resource/${service}/mcp"`;
+            `/.well-known/oauth-protected-resource/${service}/mcp", ` +
+            `scope="${MCP_SCOPES.join(" ")}"`;
         }
         return new Response(
           JSON.stringify({ error: "missing or malformed finch_ bearer key" }),

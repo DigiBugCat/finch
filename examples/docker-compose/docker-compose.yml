@@ -1,0 +1,37 @@
+# finch in Docker — the agent as a tunnel sidecar next to your MCP server.
+#
+# One-time setup (state persists in the `finch-data` volume):
+#
+#   docker compose run --rm finch login --hub https://finchmcp.com <cli-token>
+#   docker compose run --rm finch add hello --service http://hello-mcp:8000 --name "Hello MCP"
+#
+# Then serve (prints the public URL):
+#
+#   docker compose up -d
+#   docker compose logs -f finch
+#
+# Swap `hello-mcp` for your own MCP server container; the service URL in
+# `finch add` is its compose service name + port. Nothing here publishes a
+# port to the host — the agent dials OUT to the hub.
+
+services:
+  hello-mcp:
+    image: python:3.12-alpine
+    command: python3 /app/server.py
+    environment:
+      HOST: 0.0.0.0   # reachable from the finch container (not the host)
+    volumes:
+      - ../hello-mcp/server.py:/app/server.py:ro
+    restart: unless-stopped
+
+  finch:
+    build: ../../agent
+    # image: ghcr.io/digibugcat/finch-agent:latest   # once a registry image is published
+    volumes:
+      - finch-data:/data
+    depends_on:
+      - hello-mcp
+    restart: unless-stopped
+
+volumes:
+  finch-data:

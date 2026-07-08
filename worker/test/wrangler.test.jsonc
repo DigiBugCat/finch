@@ -22,7 +22,11 @@
     "WEB_URL": "https://web.test",
     "VANITY_SUFFIXES": "aviary.run",
     "VANITY_TENANT": "tenant_vanity",
-    "BYO_CNAME_TARGET": "finchmcp.com"
+    "BYO_CNAME_TARGET": "finchmcp.com",
+    // Activates the OAuth plane (RFC 9728 discovery, AS-metadata proxy, 401
+    // scope hint, Clerk-bearer verification) so tests can assert its shapes.
+    // A fake origin — upstream fetches to it are stubbed with fetchMock.
+    "CLERK_ISSUER": "https://clerk.test"
   },
   "durable_objects": {
     "bindings": [

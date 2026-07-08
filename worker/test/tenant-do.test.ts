@@ -125,12 +125,12 @@ describe("TenantDO.registerBox — box state", () => {
       service: "scraper",
       box: "box-1",
       os: "linux",
-      version: "1.5.6",
+      version: "1.5.7",
     });
     const state = await op<any>(t, "getState");
     const ap = state.services.find((a: any) => a.id === "scraper");
     expect(ap.boxes).toHaveLength(1);
-    expect(ap.boxes[0].version).toBe("1.5.6");
+    expect(ap.boxes[0].version).toBe("1.5.7");
     expect(ap.boxes[0].outdated).toBe(false); // matches LATEST_AGENT
   });
 

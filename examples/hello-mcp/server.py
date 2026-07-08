@@ -16,12 +16,14 @@ Tools: echo, add, now, roll.
 """
 import datetime
 import json
+import os
 import random
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PROTOCOL = "2025-06-18"
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 8000
+HOST = os.environ.get("HOST", "127.0.0.1")  # 0.0.0.0 when serving across containers
 
 # ---- the tools this server exposes -----------------------------------------
 TOOLS = [
@@ -124,5 +126,5 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    print(f"hello-mcp listening on http://127.0.0.1:{PORT}  (tools: echo, add, now, roll)")
-    ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+    print(f"hello-mcp listening on http://{HOST}:{PORT}  (tools: echo, add, now, roll)")
+    ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
