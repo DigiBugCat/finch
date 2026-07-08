@@ -30,3 +30,21 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # Mirror the published binaries into the finch-releases R2 bucket — the
+      # hub serves GET /releases/<asset> from it (binding RELEASES). The repo
+      # is private, so the GitHub assets are NOT anonymously fetchable; R2 is
+      # what the installer and hub-pushed updates actually download.
+      # `gh release download` re-fetches the just-published assets so we mirror
+      # exactly what shipped (not the local dist/ layout).
+      - name: Mirror release binaries to R2
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -eu
+          mkdir -p /tmp/release-assets
+          gh release download "${GITHUB_REF_NAME}" --dir /tmp/release-assets --clobber
+          for f in /tmp/release-assets/*; do
+            npx wrangler@4 r2 object put "finch-releases/$(basename "$f")" --file "$f" --remote
+          done

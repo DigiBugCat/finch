@@ -128,6 +128,11 @@
         "BYO_CNAME_TARGET": "finchmcp.com"
       },
       "ai": { "binding": "AI" },
+      // Agent release binaries, served directly at GET /releases/<asset>. The
+      // repo is PRIVATE so the old GitHub-redirect 404s for anonymous callers
+      // (installer + remote update both broke); binaries are uploaded to this
+      // bucket by the release workflow instead. Same bucket for staging + prod.
+      "r2_buckets": [{ "binding": "RELEASES", "bucket_name": "finch-releases" }],
       // Self service-binding: the /chat tool-runner relays MCP calls back through
       // our own service path. A direct fetch to our workers.dev host is blocked
       // (error 1042); a service binding to ourselves is the supported way.
@@ -185,6 +190,8 @@
         //   wrangler secret put CF_API_TOKEN --env production
       },
       "ai": { "binding": "AI" },
+      // Release binaries at GET /releases/<asset> — see the staging note.
+      "r2_buckets": [{ "binding": "RELEASES", "bucket_name": "finch-releases" }],
       "services": [{ "binding": "SELF", "service": "finch-prod" }],
       "routes": [
         // The apex is SHARED: finch-web-prod owns finchmcp.com/* (dashboard,

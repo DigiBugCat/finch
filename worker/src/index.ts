@@ -60,9 +60,14 @@ export interface Env {
   AI: Ai; // Workers AI binding — powers the /chat test interface
   SELF: Fetcher; // self service-binding — /chat relays MCP back through our own service path
 
-  // Where GET /releases/<asset> redirects to fetch the agent binary. Defaults to
-  // the project's GitHub Releases "latest" assets; override per-env if binaries
-  // are hosted elsewhere (e.g. an R2 bucket).
+  // Agent release binaries, served directly at GET /releases/<asset> (uploaded
+  // by the release workflow). Preferred over RELEASES_BASE: the repo is private,
+  // so a GitHub redirect 404s for anonymous callers.
+  RELEASES?: R2Bucket;
+
+  // Fallback redirect target for GET /releases/<asset> when the RELEASES
+  // binding is absent (local dev, tests). Defaults to the project's GitHub
+  // Releases "latest" assets.
   RELEASES_BASE?: string;
 
   // Cloudflare Rate Limiting bindings (unsafe.bindings ratelimit). Optional so
@@ -470,6 +475,23 @@ export default {
       parts.length === 2 &&
       RELEASE_ASSET_RE.test(parts[1])
     ) {
+      // Prefer the R2 bucket (binding RELEASES, uploaded by the release
+      // workflow): the repo is private, so the GitHub redirect 404s for
+      // anonymous callers — which silently broke the installer AND hub-pushed
+      // updates. The redirect remains only as a fallback for envs without the
+      // binding (local dev with RELEASES_BASE, tests).
+      if (env.RELEASES) {
+        const obj = await env.RELEASES.get(parts[1]);
+        if (!obj) return json(404, { error: "release asset not found" });
+        return new Response(obj.body, {
+          headers: {
+            "content-type": "application/octet-stream",
+            "content-length": String(obj.size),
+            etag: obj.httpEtag,
+            "cache-control": "public, max-age=300",
+          },
+        });
+      }
       const base = (env.RELEASES_BASE || DEFAULT_RELEASES_BASE).replace(
         /\/+$/,
         "",

@@ -1,0 +1,74 @@
+/* Finch docs — Tailscale-style layout on the Dusk theme.
+   Grouped left sidebar, single content column, quiet type-first pages. */
+
+.docs-shell{display:grid; grid-template-columns:250px 1fr; gap:0; max-width:1160px;
+  margin:0 auto; padding:0 28px; min-height:calc(100vh - 68px)}
+
+/* ---- sidebar ---- */
+.docs-side{border-right:1px solid var(--line); padding:36px 24px 60px 0;
+  position:sticky; top:68px; align-self:start; max-height:calc(100vh - 68px); overflow-y:auto}
+.docs-group{margin-bottom:26px}
+.docs-group-h{font-size:11.5px; font-weight:800; text-transform:uppercase; letter-spacing:.08em;
+  color:var(--dim2); margin-bottom:8px}
+.docs-side a{display:block; color:var(--dim); font-weight:600; font-size:14.5px;
+  padding:6px 10px; border-radius:8px; transition:.12s}
+.docs-side a:hover{color:var(--ink); background:var(--card2)}
+.docs-side a.on{color:var(--amber); background:var(--amber-soft); font-weight:700}
+
+/* ---- content ---- */
+.docs-main{padding:44px 0 90px 44px; min-width:0}
+.docs-main h1{font-size:34px; font-weight:900; margin-bottom:10px}
+.docs-lede{color:var(--dim); font-size:17.5px; margin-bottom:34px; max-width:62ch; text-wrap:pretty}
+.docs-main h2{font-size:22px; font-weight:800; margin:40px 0 12px; padding-top:8px}
+.docs-main h3{font-size:17px; font-weight:800; margin:26px 0 8px}
+.docs-main p{color:var(--ink); font-size:15.5px; line-height:1.65; margin:0 0 14px; max-width:68ch}
+.docs-main p.dim, .docs-main li.dim{color:var(--dim)}
+.docs-main ul, .docs-main ol{margin:0 0 16px; padding-left:22px; max-width:68ch}
+.docs-main li{font-size:15.5px; line-height:1.65; margin-bottom:6px}
+.docs-main a{color:var(--amber); font-weight:600}
+.docs-main a:hover{text-decoration:underline}
+.docs-main code{font-family:var(--mono); font-size:.86em; background:var(--card2);
+  border:1px solid var(--line); border-radius:6px; padding:1.5px 6px}
+
+/* code blocks */
+.docs-code{background:var(--input-bg); border:1px solid var(--line); border-radius:12px;
+  padding:16px 18px; margin:0 0 18px; overflow-x:auto; max-width:760px}
+.docs-code code{background:none; border:none; padding:0; font-size:13px; line-height:1.7;
+  white-space:pre; display:block; color:var(--ink)}
+.docs-code .c{color:var(--dim2)}   /* comment */
+.docs-code .o{color:var(--green)}  /* output */
+
+/* callout */
+.docs-note{background:var(--card); border:1px solid var(--line2); border-left:3px solid var(--amber);
+  border-radius:10px; padding:13px 16px; margin:0 0 18px; font-size:14.5px; color:var(--dim); max-width:760px}
+.docs-note b{color:var(--ink)}
+
+/* tables */
+.docs-table-wrap{overflow-x:auto; margin:0 0 18px; max-width:760px}
+.docs-main table{border-collapse:collapse; font-size:14.5px; width:100%}
+.docs-main th{text-align:left; font-size:12px; text-transform:uppercase; letter-spacing:.06em;
+  color:var(--dim2); font-weight:800; padding:8px 14px 8px 0; border-bottom:1px solid var(--line2)}
+.docs-main td{padding:9px 14px 9px 0; border-bottom:1px solid var(--line); vertical-align:top}
+.docs-main td:first-child{white-space:nowrap}
+
+/* docs home cards */
+.docs-cards{display:grid; grid-template-columns:1fr 1fr; gap:16px; margin:26px 0 10px; max-width:760px}
+.docs-card{display:block; background:var(--card); border:1px solid var(--line); border-radius:16px;
+  padding:20px 22px; transition:.15s}
+.docs-card:hover{border-color:var(--line2); background:var(--card-hi); transform:translateY(-2px); text-decoration:none !important}
+.docs-card h3{margin:0 0 6px; font-size:16.5px}
+.docs-card p{margin:0; color:var(--dim); font-size:14px}
+
+/* prev/next footer */
+.docs-foot{display:flex; justify-content:space-between; gap:14px; margin-top:56px;
+  padding-top:22px; border-top:1px solid var(--line); max-width:760px}
+.docs-foot a{font-weight:700; font-size:14.5px}
+
+@media (max-width:860px){
+  .docs-shell{grid-template-columns:1fr}
+  .docs-side{position:static; border-right:none; border-bottom:1px solid var(--line);
+    max-height:none; padding:22px 0 10px; display:flex; gap:20px; overflow-x:auto}
+  .docs-group{margin-bottom:12px; flex-shrink:0}
+  .docs-main{padding:30px 0 70px}
+  .docs-cards{grid-template-columns:1fr}
+}
