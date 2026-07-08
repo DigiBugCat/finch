@@ -118,6 +118,8 @@ finch hub. Your box dials OUT, so nothing listens and no ports are opened.
 
 Usage:
   finch login [--hub URL]              Log in (opens the browser to approve a code)
+  finch login --headless               Log in on a screenless box over SSH: prints a link
+                                          + code (approve on your phone), no local browser
   finch add <app_path> --service <url> Enroll a service and append it to finch.yml
                                           <app_path> becomes the URL: <slug>.finchmcp.com/<app_path>/
   finch enroll <app_path> --ticket <t> Save a box-side credential from a dashboard ticket (one time)
@@ -320,6 +322,7 @@ func cmdLogin(args []string) {
 	fs := flag.NewFlagSet("login", flag.ExitOnError)
 	hub := fs.String("hub", "https://finchmcp.com", "finch hub base URL")
 	tokenFlag := fs.String("token", "", "CLI token (or pass as a positional argument)")
+	headless := fs.Bool("headless", false, "no local browser: print the link + code (open it on any device, e.g. your phone) and poll — for a screenless box reached over SSH")
 	_ = fs.Parse(args)
 
 	token := *tokenFlag
@@ -331,7 +334,7 @@ func cmdLogin(args []string) {
 	// the --token path has none.
 	email := ""
 	if token == "" {
-		token, email = deviceLogin(*hub)
+		token, email = deviceLogin(*hub, *headless)
 	}
 
 	// Validate against the hub and learn which tenant the token acts as.
@@ -351,7 +354,13 @@ func cmdLogin(args []string) {
 // token): start a code, point the user at the dashboard to approve it, poll until
 // approved, and return the issued token plus the approver's email (for the account
 // label; may be ""). Exits on error/expiry/timeout.
-func deviceLogin(hub string) (string, string) {
+//
+// headless=true is for a screenless box reached over SSH: it skips the (useless)
+// local browser spawn and force-flushes stdout so the link+code reach the far end
+// of the pipe immediately instead of sitting buffered while the poll loop blocks.
+// The flow is otherwise identical — you approve the code on any device (your phone
+// is fine), and it polls the same ~10-minute window before giving up.
+func deviceLogin(hub string, headless bool) (string, string) {
 	start, err := cliRequest("POST", hub, "/api/cli/device/start", "", struct{}{})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "finch: could not start login: %v\n", err)
@@ -373,8 +382,14 @@ func deviceLogin(hub string) (string, string) {
 	}
 
 	fmt.Printf("\n  To finish login, open this page on any device (your phone or laptop\n  is fine — you do NOT need a browser on this machine):\n\n      %s\n\n  and confirm this code:  %s\n\n", uri, userCode)
-	openBrowser(uri)
+	if !headless {
+		openBrowser(uri)
+	}
 	fmt.Print("  Waiting for approval")
+	// Over SSH / a pipe, os.Stdout is fully buffered: flush now so the link and
+	// code land immediately instead of being trapped behind the blocking poll
+	// loop below (the exact symptom on a headless box).
+	_ = os.Stdout.Sync()
 
 	deadline := time.Now().Add(time.Duration(expires) * time.Second)
 	for time.Now().Before(deadline) {

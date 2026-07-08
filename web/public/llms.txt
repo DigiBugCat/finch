@@ -4,7 +4,7 @@
 
 Finch is operated from a CLI. Every command is non-interactive and supports --json. If you are an AI agent driving Finch, install it and run `finch guide`: it prints a complete, self-contained operating manual.
 
-Core loop: `finch login` (one-time approval — prints a link + code, you open the link on ANY device incl. your phone, so a headless box needs no local browser) → `finch add <app_path> --service http://127.0.0.1:<port>` → `finch run` → paste the printed URL into any MCP client with a key from `finch keys mint`. Fully unattended provisioning (no human): mint a one-shot ticket via `finch token` or the dashboard's "Add box", then `finch run --ticket -`.
+Core loop: `finch login` (one-time approval — prints a link + code, you open the link on ANY device incl. your phone, so a headless box needs no local browser; over SSH use `finch login --headless` to skip the local browser spawn and flush the link straight to your terminal) → `finch add <app_path> --service http://127.0.0.1:<port>` → `finch run` → paste the printed URL into any MCP client with a key from `finch keys mint`. Fully unattended provisioning (no human): mint a one-shot ticket via `finch token` or the dashboard's "Add box", then `finch run --ticket -`.
 
 ## Base case: hello world, end to end
 

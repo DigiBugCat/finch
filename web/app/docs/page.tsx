@@ -60,7 +60,9 @@ if __name__ == "__main__":
         or even a screen, so a headless server (a Mini, a Pi, a VPS) logs in fine:
         open the link on your phone, confirm the code, and the waiting box gets its
         credential. This is the only human step; every other command is
-        non-interactive and supports <code>--json</code>.
+        non-interactive and supports <code>--json</code>. On a screenless box reached
+        over SSH, use <code>finch login --headless</code> — same flow, but it skips
+        the (pointless) local browser and flushes the link straight to your terminal.
       </p>
       <p>
         Fully unattended (CI, imaging a fleet) with no human at all? Mint a one-shot
