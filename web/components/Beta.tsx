@@ -18,8 +18,9 @@ const TIERS = [
   },
   {
     name: 'Team',
-    price: 'TBD',
-    note: 'flat monthly',
+    price: 'Free',
+    note: 'in beta',
+    muted: true,
     blurb: 'Control which users and agents can reach which services.',
     cta: { label: 'Get started →', href: '/sign-up', style: 'btn-ghost' },
     features: [
@@ -32,8 +33,8 @@ const TIERS = [
   },
   {
     name: 'Enterprise',
-    price: 'Custom',
-    note: 'talk to us',
+    price: 'Contact us',
+    note: '',
     blurb: 'Need SSO, an SLA, or something bespoke? Let’s talk.',
     cta: { label: 'Contact us', href: 'mailto:hello@aviary.run', style: 'btn-ghost' },
     features: [
@@ -56,7 +57,7 @@ export default function Beta() {
 
         <div className="tiers">
           {TIERS.map((t) => (
-            <div key={t.name} className={`tier${t.highlight ? ' tier-hi' : ''}`}>
+            <div key={t.name} className={`tier${t.highlight ? ' tier-hi' : ''}${t.muted ? ' tier-muted' : ''}`}>
               {t.highlight && <span className="tier-badge">FREE IN BETA</span>}
               <h3 className="tier-name">{t.name}</h3>
               <div className="tier-price">
@@ -77,7 +78,7 @@ export default function Beta() {
         </div>
 
         <p className="tier-foot">
-          Everything above is free while we&apos;re in beta. Questions? Email{' '}
+          Team plan features are free during beta. Questions? Email{' '}
           <a href="mailto:hello@aviary.run">hello@aviary.run</a>.
         </p>
       </div>

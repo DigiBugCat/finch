@@ -156,9 +156,9 @@ section{position:relative; z-index:1}
 .tiers{display:grid; grid-template-columns:repeat(3,1fr); gap:20px; align-items:stretch}
 .tier{position:relative; display:flex; flex-direction:column; background:var(--card); border:1px solid var(--line);
   border-radius:20px; padding:32px 28px; transition:.2s}
-.tier{opacity:.55; filter:saturate(.6)}
 .tier:hover{border-color:var(--line2); transform:translateY(-3px)}
-.tier-hi{opacity:1; filter:none; border-color:var(--amber); background:var(--card-hi);
+.tier-muted{opacity:.55; filter:saturate(.6)}
+.tier-hi{border-color:var(--amber); background:var(--card-hi);
   box-shadow:0 0 0 1px var(--amber), 0 20px 50px -20px rgba(242,180,67,.35)}
 .tier-badge{position:absolute; top:-12px; left:50%; transform:translateX(-50%); background:var(--amber); color:#2a200c;
   font-weight:800; font-size:11.5px; letter-spacing:.06em; padding:5px 13px; border-radius:999px; white-space:nowrap}
