@@ -351,9 +351,21 @@ func Main() {
 			log.Printf("finch: enrolled — credential saved to %s", *statePath)
 		}
 	}
+	// Refuse to start if another finch run already holds this state — a second
+	// process would dial out for the same slugs and supersede the incumbent
+	// relay, causing the two to flap forever. (The systemd unit is the intended
+	// owner; this stops a stray manual `finch run` from fighting it.)
+	release, ok := lockState(*statePath)
+	if !ok {
+		log.Fatalf("finch: another finch run already holds %s — refusing to start a second relay", *statePath)
+	}
+	defer release()
+
 	// Thread the ticket into the run path so a same-hub-but-revoked credential can
 	// still recover from a fresh ticket: runService re-enrolls if resume fails.
-	runService(serviceOpts{
+	// superviseService restarts the relay on a panic/unexpected return, matching
+	// config mode's self-heal.
+	superviseService(serviceOpts{
 		hub: *hub, statePath: *statePath, upstream: upstreamURL,
 		ticket: *ticket, box: *box, forwardAll: *forwardAll,
 	})
@@ -399,6 +411,14 @@ func runConfig(cfg *config) {
 	if len(cfg.Ingress) == 0 {
 		log.Fatal("finch: finch.yml has no ingress rules — nothing to serve")
 	}
+	// One box-level lock for the whole config run: a second finch run against the
+	// same credentials dir would dial the same slugs and supersede these relays,
+	// flapping both. (The systemd unit is the intended owner.)
+	release, ok := lockState(filepath.Join(cfg.CredentialsDir, "finch-run"))
+	if !ok {
+		log.Fatalf("finch: another finch run already serves %s — refusing to start a second relay", cfg.CredentialsDir)
+	}
+	defer release()
 	// If this box is logged in (finch login), self-approve the services we
 	// serve — the CLI token holder is the tenant admin, so no dashboard hop.
 	autoApprove := loadCliCredQuiet() != nil
@@ -416,7 +436,7 @@ func runConfig(cfg *config) {
 		wg.Add(1)
 		go func(ing ingress, up *url.URL, sp string) {
 			defer wg.Done()
-			runService(serviceOpts{
+			superviseService(serviceOpts{
 				hub: cfg.Hub, statePath: sp, upstream: up,
 				label: ing.AppPath, autoApprove: autoApprove, forwardAll: ing.ForwardAll,
 			})
@@ -444,14 +464,50 @@ type serviceOpts struct {
 	box         string // box name the ticket fallback enrolls under
 }
 
+// superviseService keeps one app's relay alive for the whole process lifetime.
+// runService already reconnects forever on its own, so the only ways it hands
+// control back are (a) a panic somewhere in the serve/forward path, which would
+// otherwise silently kill just this goroutine and leave the app dark while
+// siblings keep running, or (b) an unexpected return of the reconnect loop. Both
+// are treated as transient: log and restart after a short delay. The one
+// non-transient outcome is "not enrolled" (runService returns enrolled=false),
+// which is an operator/config error no restart can fix — we stop and leave the
+// sibling apps running. This is the self-heal that makes a single wedged app
+// (see the woodpecker silent-relay incident) recover without a full restart.
+func superviseService(o serviceOpts) {
+	lp := "finch"
+	if o.label != "" {
+		lp = "finch[" + o.label + "]"
+	}
+	for {
+		enrolled := func() (enrolled bool) {
+			defer func() {
+				if r := recover(); r != nil {
+					// A panic left enrolled at its zero value (false); force true so
+					// the caller restarts rather than treating it as "not enrolled".
+					enrolled = true
+					log.Printf("%s: relay panic recovered: %v — restarting in 5s", lp, r)
+				}
+			}()
+			return runService(o)
+		}()
+		if !enrolled {
+			return // not enrolled — a restart can't help; let siblings run.
+		}
+		log.Printf("%s: relay exited unexpectedly — restarting in 5s", lp)
+		time.Sleep(5 * time.Second)
+	}
+}
+
 // runService resumes one already-enrolled service from its saved credential,
 // then holds its relay open and reconnects forever. `o.label` prefixes logs (the
 // ingress app_path in config mode, empty in single-service mode). Enrollment is
 // normally a separate one-time step (`finch enroll`); in single-service mode a
 // fresh `o.ticket` is a fallback that re-enrolls when the saved credential is
-// missing/revoked. If no usable credential and no ticket are found this logs how
-// to enroll and returns, so a sibling rule in config mode survives.
-func runService(o serviceOpts) {
+// missing/revoked. It returns false only when no usable credential and no ticket
+// are found (logs how to enroll); the forever-reconnect loop otherwise never
+// returns, so a normal return is unexpected and reported as enrolled=true.
+func runService(o serviceOpts) (enrolled bool) {
 	hub, statePath, upstreamURL, label, autoApprove := o.hub, o.statePath, o.upstream, o.label, o.autoApprove
 	lp := "finch"
 	if label != "" {
@@ -492,7 +548,7 @@ func runService(o serviceOpts) {
 			enrollHint = "<app_path>"
 		}
 		log.Printf("%s: not enrolled — run: finch enroll %s --ticket <t>", lp, enrollHint)
-		return
+		return false
 	}
 	// Describe the rule by its full name: the application, its public endpoint,
 	// and the local service it fronts.
