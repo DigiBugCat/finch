@@ -54,7 +54,7 @@ import (
 // `-ldflags "-X main.agentVersion=<v>"`; the literal here is the source of
 // truth that CI (scripts/check-versions.mjs) asserts matches the worker's
 // LATEST_AGENT and the web dashboard constant. Keep all three in sync.
-var agentVersion = "1.5.5"
+var agentVersion = "1.5.6"
 
 // connectSkew is how long before a connect-token's exp we treat it as already
 // expired and force a fresh /join, so we never dial with a token that lapses

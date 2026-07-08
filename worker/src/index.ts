@@ -544,6 +544,61 @@ export default {
       });
     }
 
+    // ---- AS metadata on the RESOURCE origin. claude.ai fetches the OAuth
+    //      authorization-server metadata from the MCP server's OWN host,
+    //      ignoring the external authorization_servers pointer in the RFC 9728
+    //      doc (anthropics/claude-ai-mcp#82) — without this, that fetch fell
+    //      through to the relay and 503'd, surfacing as
+    //      "registration_endpoint_missing". Proxy Clerk's metadata here (both
+    //      well-known spellings), guaranteeing registration_endpoint is present
+    //      (Clerk omits it from openid-configuration even with DCR enabled).
+    //      The endpoints inside still point at Clerk — we only host the doc. ----
+    if (
+      req.method === "GET" &&
+      parts[0] === ".well-known" &&
+      (parts[1] === "oauth-authorization-server" ||
+        parts[1] === "openid-configuration") &&
+      env.CLERK_ISSUER
+    ) {
+      const up = await fetch(
+        `${env.CLERK_ISSUER}/.well-known/oauth-authorization-server`,
+      );
+      if (!up.ok) {
+        return json(502, { error: "authorization server metadata unavailable" });
+      }
+      const meta = (await up.json()) as Record<string, unknown>;
+      if (!meta.registration_endpoint) {
+        meta.registration_endpoint = `${env.CLERK_ISSUER}/oauth/register`;
+      }
+      return new Response(JSON.stringify(meta), {
+        status: 200,
+        headers: {
+          "content-type": "application/json",
+          "access-control-allow-origin": "*",
+          "cache-control": "public, max-age=300",
+        },
+      });
+    }
+
+    // ---- Hardcoded /register fallback: some claude builds POST /register on
+    //      the resource origin instead of the advertised registration_endpoint
+    //      (anthropics/claude-code#36743). Forward to Clerk's DCR endpoint.
+    //      (Reserves the bare /register path ahead of the relay, like
+    //      /.well-known — a tenant service named "register" would be shadowed
+    //      for this exact root POST only.) ----
+    if (
+      req.method === "POST" &&
+      parts.length === 1 &&
+      parts[0] === "register" &&
+      env.CLERK_ISSUER
+    ) {
+      return fetch(`${env.CLERK_ISSUER}/oauth/register`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: req.body,
+      });
+    }
+
     // ---- MCP / relay plane. Tenant id resolves from the host slug via the
     //      singleton RouterDO (slug→tenantId). FAIL CLOSED on an unknown slug. ----
     const { tenant, hostKey } = await resolveTenant(host, env);
