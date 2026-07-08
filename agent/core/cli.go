@@ -372,7 +372,7 @@ func deviceLogin(hub string) (string, string) {
 		expires = v
 	}
 
-	fmt.Printf("\n  To finish login, open this page in your browser:\n\n      %s\n\n  and confirm this code:  %s\n\n", uri, userCode)
+	fmt.Printf("\n  To finish login, open this page on any device (your phone or laptop\n  is fine — you do NOT need a browser on this machine):\n\n      %s\n\n  and confirm this code:  %s\n\n", uri, userCode)
 	openBrowser(uri)
 	fmt.Print("  Waiting for approval")
 

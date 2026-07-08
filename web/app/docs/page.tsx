@@ -45,10 +45,29 @@ if __name__ == "__main__":
       <p>Works on macOS and Linux. Anything that stays on and runs a shell can run Finch.</p>
 
       <h2>3. Log in</h2>
-      <Code>{`finch login`}</Code>
+      <Code>{`finch login
+<span class="o">  To finish login, open this page on any device (your phone or laptop
+  is fine — you do NOT need a browser on this machine):
+
+      https://finchmcp.com/cli?code=ZDTJ-9W63
+
+  and confirm this code:  ZDTJ-9W63
+
+  Waiting for approval… ✓ logged in as you@example.com</span>`}</Code>
       <p>
-        Opens a browser once to approve a short code. This is the only human step;
-        every other command is non-interactive and supports <code>--json</code>.
+        Finch prints a link and a code, then waits. Open the link on{' '}
+        <strong>any device</strong> — the box you run this on doesn&apos;t need a browser
+        or even a screen, so a headless server (a Mini, a Pi, a VPS) logs in fine:
+        open the link on your phone, confirm the code, and the waiting box gets its
+        credential. This is the only human step; every other command is
+        non-interactive and supports <code>--json</code>.
+      </p>
+      <p>
+        Fully unattended (CI, imaging a fleet) with no human at all? Mint a one-shot
+        ticket on a machine that&apos;s already logged in with <code>finch token</code>{' '}
+        (or in the dashboard under <em>Add box</em>) and hand it to the new box:{' '}
+        <code>finch run --ticket -</code>. For a single box you&apos;re setting up
+        yourself, <code>finch login</code> from your phone is the easy path.
       </p>
 
       <h2>4. Add the service</h2>
