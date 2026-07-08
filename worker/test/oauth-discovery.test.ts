@@ -21,7 +21,6 @@ import { signAssertion } from "../src/auth";
 const SERVICE = env.FINCH_SERVICE_SECRET;
 const HOST = "hub.test";
 const BASE = `http://${HOST}`;
-const ISSUER = env.CLERK_ISSUER!; // "https://clerk.test" (test fixture)
 
 const nowSec = () => Math.floor(Date.now() / 1000);
 
@@ -125,7 +124,14 @@ describe("RFC 9728 protected-resource metadata", () => {
     expect(res.status).toBe(200);
     const doc = (await res.json()) as any;
     expect(doc.resource).toBe(`https://${HOST}/svc/mcp`);
-    expect(doc.authorization_servers).toEqual([ISSUER]);
+    // The AS pointer names THIS host, not Clerk directly, so a spec-compliant
+    // client (ChatGPT) fetches AS metadata from us — routing its DCR through the
+    // /register scope-injection proxy instead of straight to Clerk (which would
+    // omit `openid` and 401 at /authorize). The proxied AS doc rewrites `issuer`
+    // to match; authorize/token/jwks inside still point at Clerk. That issuer
+    // rewrite is verified live via curl (CLERK_ISSUER is a fake origin here, so
+    // the proxy happy-path can't run in this pool-workers build — see header).
+    expect(doc.authorization_servers).toEqual([`https://${HOST}`]);
     expect(doc.bearer_methods_supported).toEqual(["header"]);
     expect(doc.scopes_supported).toEqual(["openid", "offline_access"]);
   });

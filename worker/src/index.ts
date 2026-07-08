@@ -544,7 +544,19 @@ export default {
       const suffix = parts.slice(2).join("/");
       const body = JSON.stringify({
         resource: `https://${host}${suffix ? `/${suffix}` : ""}`,
-        authorization_servers: [env.CLERK_ISSUER],
+        // Advertise OURSELVES as the authorization server, NOT Clerk directly.
+        // A spec-compliant client (ChatGPT) follows this pointer to fetch AS
+        // metadata; if it points at Clerk, the client reads Clerk's own doc
+        // (registration_endpoint = clerk.finchmcp.com/oauth/register) and DCRs
+        // straight against Clerk, BYPASSING our /register scope-injection proxy.
+        // Clerk's DCR default omits `openid`, so the client is then rejected at
+        // /authorize with invalid_scope. Pointing here routes AS-metadata
+        // discovery through our proxy (below), which rewrites registration_endpoint
+        // to /register so every DCR carries MCP_SCOPES. authorize/token/jwks
+        // inside that doc still point at Clerk — we're only the nominal AS.
+        // (Claude read AS metadata from this resource origin regardless, so it
+        // already worked; this makes the pointer honest for everyone else.)
+        authorization_servers: [`https://${host}`],
         bearer_methods_supported: ["header"],
         // The scopes THIS resource actually needs — identity only. MCP clients
         // (claude.ai) request the scopes advertised here (or in the 401
@@ -590,9 +602,26 @@ export default {
       } catch {
         return json(502, { error: "authorization server metadata unavailable" });
       }
-      if (!meta.registration_endpoint) {
-        meta.registration_endpoint = `${env.CLERK_ISSUER}/oauth/register`;
-      }
+      // Advertise OUR OWN host as the registration endpoint (not Clerk's) so
+      // every DCR POST flows through the /register proxy below, where we inject
+      // the scopes Clerk needs. Some clients (poke.com) omit `scope` at DCR;
+      // Clerk then defaults to a scope set WITHOUT `openid`, so the client —
+      // being an OIDC client that needs an id_token — silently aborts before
+      // the consent screen. Routing DCR through us lets us force `openid`
+      // (MCP_SCOPES) in regardless of what the client sent. Claude already
+      // POSTs /register on this origin, so this only makes the advertised path
+      // match reality.
+      meta.registration_endpoint = `https://${host}/register`;
+      // Rewrite `issuer` to match the host this doc is served from. RFC 8414
+      // requires the returned `issuer` to byte-equal the AS identifier the
+      // client used to fetch metadata; since our RFC 9728 doc now names THIS
+      // host as the authorization server, a strict client (ChatGPT) rejects the
+      // doc if `issuer` still says clerk.finchmcp.com. Only the metadata
+      // identity moves — authorize/token/jwks below still point at Clerk, and
+      // token validation is UNAFFECTED: verifyClerkOAuthToken introspects the
+      // opaque token against env.CLERK_ISSUER /oauth/userinfo and never asserts
+      // the token's `iss`, so the minted-by-Clerk token still verifies.
+      meta.issuer = `https://${host}`;
       return new Response(JSON.stringify(meta), {
         status: 200,
         headers: {
@@ -603,22 +632,47 @@ export default {
       });
     }
 
-    // ---- Hardcoded /register fallback: some claude builds POST /register on
-    //      the resource origin instead of the advertised registration_endpoint
-    //      (anthropics/claude-code#36743). Forward to Clerk's DCR endpoint.
-    //      (Reserves the bare /register path ahead of the relay, like
-    //      /.well-known — a tenant service named "register" would be shadowed
-    //      for this exact root POST only.) ----
+    // ---- DCR proxy: our AS metadata points registration_endpoint here, so
+    //      every dynamic client registration POSTs to us first. We inject the
+    //      scopes this resource needs (MCP_SCOPES = openid offline_access) into
+    //      the body before forwarding to Clerk's /oauth/register. WHY: some
+    //      clients (poke.com) send no `scope` at DCR; Clerk then registers them
+    //      with a default set WITHOUT `openid`, and an OIDC client that needs an
+    //      id_token aborts before the consent screen ("Connection failed"). By
+    //      merging our required scopes in, the registered client always carries
+    //      `openid`, so the flow reaches consent. Harmless for clients that
+    //      already request openid (claude.ai) — it's a set-union, and a broader
+    //      grant only widens the consent prompt, which the user still approves.
+    //      (Also still catches the claude build that POSTs /register on the
+    //      resource origin — anthropics/claude-code#36743.) Reserves the bare
+    //      /register path ahead of the relay, like /.well-known. ----
     if (
       req.method === "POST" &&
       parts.length === 1 &&
       parts[0] === "register" &&
       env.CLERK_ISSUER
     ) {
+      // Read the client's DCR body ONCE as text, union our required scopes into
+      // `scope`, and forward. On any parse failure, forward the raw text
+      // unchanged — never break registration just because we couldn't augment
+      // it. (Reading text first avoids a half-consumed req.body on a throw.)
+      const raw = await req.text();
+      let body = raw;
+      try {
+        const reg = JSON.parse(raw) as Record<string, unknown>;
+        const requested =
+          typeof reg.scope === "string" && reg.scope.length
+            ? reg.scope.split(/\s+/).filter(Boolean)
+            : [];
+        reg.scope = [...new Set([...requested, ...MCP_SCOPES])].join(" ");
+        body = JSON.stringify(reg);
+      } catch {
+        // non-JSON body — forward the original text as-is
+      }
       return fetch(`${env.CLERK_ISSUER}/oauth/register`, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: req.body,
+        body,
       });
     }
 
