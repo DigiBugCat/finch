@@ -96,7 +96,7 @@ describe("TenantDO.registerBox — box state", () => {
       os: "linux",
       version: "1.4.0",
     });
-    expect(r.state).toBe("chirping");
+    expect(r.state).toBe("online");
   });
 
   it("auto-creates the service if it joins an unknown service id", async () => {
@@ -568,7 +568,7 @@ describe("TenantDO.approve — derives liveness from connected (#12)", () => {
     await op(t, "approve", { id: "scraper" });
     const state = await op<any>(t, "getState");
     const m = state.boxes.find((mm: any) => mm.name === "box-1");
-    expect(m.state).toBe("resting"); // not "chirping"
+    expect(m.state).toBe("offline"); // not "online"
   });
 });
 

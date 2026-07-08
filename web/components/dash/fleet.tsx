@@ -51,7 +51,7 @@ export function FleetTable({ apps, host, onOpen, onRelease, head = true }: any) 
           <span className="c-state"><StatePill state={a.state} /></span>
           <span className="c-url">
             {a.state === "invited"
-              ? <span className="url-pending mono">waiting to fly home…</span>
+              ? <span className="url-pending mono">waiting for first connection…</span>
               : <MonoUrl url={mcpUrl(host, a.id)} onClick={(e: any) => e.stopPropagation()} />}
           </span>
           <span className="c-owner mono">
@@ -84,7 +84,7 @@ export function FleetCards({ apps, host, onOpen, onRelease }: any) {
           <p className="appcard-blurb">{a.blurb}</p>
           {a.tags && a.tags.length > 0 && <TagList tags={a.tags} />}
           {a.state === "invited"
-            ? <div className="url-pending mono appcard-url">🎟 waiting to fly home…</div>
+            ? <div className="url-pending mono appcard-url">🎟 waiting for first connection…</div>
             : <MonoUrl url={mcpUrl(host, a.id)} onClick={(e: any) => e.stopPropagation()} />}
           <div className="appcard-foot">
             <span className="mono dim">
@@ -244,7 +244,7 @@ export function DetailView({ app, host, onBack, onRelease, onTags, onApprove, on
                 <AreaChart values={app.traffic24h} color="#f2b443" h={150} />
                 <div className="chart-axis">{["-24h", "-18h", "-12h", "-6h", "now"].map((t) => <span key={t} className="x-tick">{t}</span>)}</div>
               </>
-            : <div className="url-pending mono big-pending">🌙 resting — no live traffic to show.</div>}
+            : <div className="url-pending mono big-pending">offline. no live traffic to show.</div>}
         </Card>
 
         {/* Boxes */}
@@ -312,7 +312,7 @@ export function DetailView({ app, host, onBack, onRelease, onTags, onApprove, on
               <span className="feed-ms mono dim">{c.ms}ms</span>
               <span className="act-time mono dim">{c.ago}</span>
             </div>
-          )) : <div className="dim">no calls while resting.</div>}
+          )) : <div className="dim">no calls while offline.</div>}
         </Card>
 
         {/* Danger */}
@@ -320,10 +320,10 @@ export function DetailView({ app, host, onBack, onRelease, onTags, onApprove, on
           <SectionLabel>danger zone</SectionLabel>
           <div className="danger-row">
             <div>
-              <div className="danger-title">Release this service</div>
-              <div className="dim danger-sub">Removes it and every box from the roost and revokes their credentials. The boxes keep the code.</div>
+              <div className="danger-title">Delete this service</div>
+              <div className="dim danger-sub">Removes the service and every box, and revokes their credentials. The boxes keep the code.</div>
             </div>
-            <InlineConfirm prompt="set free?" trigger="release" onConfirm={() => onRelease(app.id)} />
+            <InlineConfirm prompt="delete this service?" trigger="delete" onConfirm={() => onRelease(app.id)} />
           </div>
         </Card>
       </div>

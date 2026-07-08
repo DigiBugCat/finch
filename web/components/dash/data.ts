@@ -10,8 +10,8 @@
 
 export type ServiceState =
   | "in_use"
-  | "chirping"
-  | "resting"
+  | "online"
+  | "offline"
   | "invited"
   | "pending";
 

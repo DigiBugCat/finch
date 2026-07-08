@@ -38,7 +38,7 @@ Two delivery modes make this explicit per command:
 | `enqueue` | fire-and-forget; at-least-once; device must `ack` | yes (durable log, monotonic `seq`) | "toggle the relay", "kick off backup" |
 
 A `call` to a device that isn't reachable within its `deadline` fails fast
-(`resting`). An `enqueue` to an offline device just sits in the log and is
+(`offline`). An `enqueue` to an offline device just sits in the log and is
 replayed on next sync. **Connected `call`s never touch storage** — that's what
 keeps the hot path at memory speed (it's exactly today's relay).
 
@@ -113,7 +113,7 @@ same mailbox.
 |---|---|---|---|---|
 | `always_on` | WiFi active | live doorbell; DO may keep warm | ~network RTT | n/a (plugged in) |
 | `low_power` | modem-sleep (DTIM) | live doorbell; connection held; longer ping | ~DTIM (0.1–1s) | days–weeks |
-| `deep_sleep` | off between wakes | **queue only** (`enqueue`); device drains on wake; `call`s fail-fast `resting` or wait for a wake window | = wake interval | months–years |
+| `deep_sleep` | off between wakes | **queue only** (`enqueue`); device drains on wake; `call`s fail-fast `offline` or wait for a wake window | = wake interval | months–years |
 
 Why this works: **the WebSocket is nearly free — it's one idle TCP socket.**
 What costs power is keeping the WiFi radio listening, and modem-sleep (the radio
@@ -135,13 +135,13 @@ device into the single-digit-mA range. The two real knobs:
 - Place the DO **near the device** (`locationHint` on first contact) — the
   unavoidable leg is hub→device, so make that short.
 
-## Online / offline ("chirping" / "resting")
+## Online / offline
 
 Derived, not asserted:
 - `always_on`/`low_power`: online = connection present (last ping within
   ~2× `ping_interval`).
 - `deep_sleep`: online = last sync within ~1.5× its wake interval; otherwise
-  "resting" — but `enqueue`d commands are still safely waiting.
+  "offline" — but `enqueue`d commands are still safely waiting.
 
 ## What a device MUST implement (the whole MCU job)
 

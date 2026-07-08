@@ -24,7 +24,7 @@ function Kpi({ label, value, unit, delta, sub, spark, color, extra }: any) {
 export function HomeView({ services, boxes, overview, host, onOpen, onApprove, onAddDevice }: any) {
   const ov = overview;
   const online = services.filter((a: any) => isOnline(a.state));
-  const resting = services.filter((a: any) => a.state === "resting");
+  const resting = services.filter((a: any) => a.state === "offline" || a.state === "resting");
   const invited = services.filter((a: any) => a.state === "invited");
   const pending = services.filter((a: any) => a.state === "pending");
 
@@ -32,14 +32,14 @@ export function HomeView({ services, boxes, overview, host, onOpen, onApprove, o
   pending.forEach((a: any) => issues.push({ tone: "green", ic: "⏳", title: `${a.id} is waiting for approval`, sub: `Connected from ${a.box}, owned by ${a.owner}. Approve to let traffic through.`, cta: ["Approve", () => onApprove(a.id)] }));
   online.filter((a: any) => a.err >= 1).forEach((a: any) => issues.push({ tone: "red", ic: "⚠", title: `${a.id} · ${a.err}% errors`, sub: `p95 ${a.p95}ms · above your 1% comfort line over the last 24h.`, cta: ["Inspect", () => onOpen(a.id)] }));
   services.filter((a: any) => a.outdated).forEach((a: any) => issues.push({ tone: "amber", ic: "⬆", title: `${a.id} has a box out of date`, sub: `One or more boxes are behind v${ov.latest}. Open it for the update command.`, cta: ["Update", () => onOpen(a.id)] }));
-  invited.forEach((a: any) => issues.push({ tone: "amber", ic: "🎟", title: `${a.id} hasn't phoned home`, sub: "Ticket is waiting — run the install command on the box.", cta: ["Open", () => onOpen(a.id)] }));
+  invited.forEach((a: any) => issues.push({ tone: "amber", ic: "🎟", title: `${a.id} hasn't connected yet`, sub: "Ticket is waiting. Run the install command on the box.", cta: ["Open", () => onOpen(a.id)] }));
   const hasErr = issues.some((i: any) => i.tone === "red");
 
   return (
     <div className="view">
       <Card className="roost-head">
         <div className="roost-head-left">
-          <h1 className="roost-title">Your flock, this evening <span className="moon">🌙</span></h1>
+          <h1 className="roost-title">Your services</h1>
           <p className="roost-sub">
             <b className="n-on">{online.length} online</b> · {resting.length} offline
             {invited.length ? <> · <b className="n-inv">{invited.length} invited</b></> : null}
@@ -47,9 +47,9 @@ export function HomeView({ services, boxes, overview, host, onOpen, onApprove, o
           </p>
         </div>
         <div className="roost-head-right">
-          <div className="perch-wrap" title="Perch meter — one bar per service">
+          <div className="perch-wrap" title="One bar per service">
             <PerchMeter items={services} big />
-            <span className="perch-cap">perch meter</span>
+            <span className="perch-cap">status</span>
           </div>
           <Button kind="accent" size="md" onClick={onAddDevice}>＋ Add box</Button>
         </div>
@@ -58,7 +58,7 @@ export function HomeView({ services, boxes, overview, host, onOpen, onApprove, o
       <div className="ov-label">Observability <span className="dim">· last 24 hours</span></div>
       <div className="kpi-row kpi-row-3">
         <Kpi label="Services online" value={ov.activeNow} unit={` / ${ov.total}`}
-          sub={`${boxes.filter((m: any) => m.state === "chirping" || m.state === "in_use").length} of ${boxes.length} boxes up`}
+          sub={`${boxes.filter((m: any) => isOnline(m.state)).length} of ${boxes.length} boxes up`}
           extra={<div className="kpi-states"><PerchMeter items={services} /></div>} />
         <Kpi label="Latency p50" value={ov.p50} unit="ms" sub={`p95 ${ov.p95}ms`} spark={ov.latency24h} color="#c4a8ef" />
         <Kpi label="Error rate" value={ov.errRate} unit="%" delta={-0.3}

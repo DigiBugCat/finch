@@ -5,13 +5,18 @@
 
 export type ServiceState =
   | "in_use"
-  | "chirping"
-  | "resting"
+  | "online"
+  | "offline"
   | "invited"
   | "pending";
 
+/** Map legacy wire/stored values (pre-rename "chirping"/"resting") onto the
+ *  current union. Applied once on DO load; safe on already-current values. */
+export const normalizeState = (s: string): ServiceState =>
+  s === "chirping" ? "online" : s === "resting" ? "offline" : (s as ServiceState);
+
 export const isOnline = (s: ServiceState): boolean =>
-  s === "chirping" || s === "in_use";
+  s === "online" || s === "in_use";
 
 /** A box that runs a service. Path: /<service>/<box>/mcp */
 export interface Box {

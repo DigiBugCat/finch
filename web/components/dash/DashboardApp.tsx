@@ -87,7 +87,7 @@ export default function DashboardApp() {
 
   const releaseDevice = (id: any) => {
     void mutate(`/api/finch/services/${encodeURIComponent(id)}/release`,
-      { method: "POST" }, `🕊 ${id} set free`, `couldn't release ${id}`);
+      { method: "POST" }, `${id} deleted`, `couldn't delete ${id}`);
     if (view === "detail") go("overview");
   };
 
@@ -108,7 +108,7 @@ export default function DashboardApp() {
 
   const approveDevice = (id: any) =>
     void mutate(`/api/finch/services/${encodeURIComponent(id)}/approve`,
-      { method: "POST" }, `🐦 ${id} approved — now chirping`, `couldn't approve ${id}`);
+      { method: "POST" }, `${id} approved and online`, `couldn't approve ${id}`);
 
   const declineDevice = (id: any) => {
     void mutate(`/api/finch/services/${encodeURIComponent(id)}/decline`,
@@ -236,10 +236,10 @@ export default function DashboardApp() {
 
       <main className="main">
         {showLoading && (
-          <div className="view"><Card><p className="dim" style={{ padding: 20 }}>Loading your flock…</p></Card></div>
+          <div className="view"><Card><p className="dim" style={{ padding: 20 }}>Loading your services…</p></Card></div>
         )}
         {!showLoading && error && !state && (
-          <div className="view"><Card><p className="dim" style={{ padding: 20 }}>Couldn’t load your flock — {error}</p></Card></div>
+          <div className="view"><Card><p className="dim" style={{ padding: 20 }}>Couldn’t load services: {error}</p></Card></div>
         )}
 
         {!showLoading && state && (
@@ -260,7 +260,7 @@ export default function DashboardApp() {
             )}
             {view === "detail" && !current && (
               <div className="view"><button className="backlink" onClick={() => go("overview")}>← Fleet</button>
-                <Card><p className="dim" style={{ padding: 20 }}>This service has left the roost.</p></Card></div>
+                <Card><p className="dim" style={{ padding: 20 }}>This service was deleted.</p></Card></div>
             )}
             {view === "enroll" && (
               <EnrollView host={host} existingIds={services.map((a: any) => a.id)} groups={groups.map((g: any) => g.name)} onEnrolled={enrollDevice} onWatch={() => go("overview")} />

@@ -90,7 +90,7 @@ func Login(hub string, onCode func(verificationURI, userCode string)) error {
 }
 
 // AppInfo is one service as the hub reports it: its id (the app_path / URL
-// segment) and current state ("chirping"/"pending"/"invited"/…).
+// segment) and current state ("online"/"pending"/"invited"/…).
 type AppInfo struct {
 	ID    string
 	State string
@@ -126,7 +126,7 @@ func Fleet() ([]AppInfo, error) {
 type Node struct {
 	Box       string // the box's name
 	Service   string // the service id it serves
-	State     string // "chirping"/"in_use"/"offline"/…
+	State     string // "online"/"in_use"/"offline"/…
 	OS        string
 	Connected bool
 }

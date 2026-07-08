@@ -90,7 +90,7 @@ needed for your FIRST box.
 
 ## Inspect state
   finch status --json     # am I logged in (which tenant)? what does finch.yml serve?
-  finch fleet --json      # every service + its state (chirping/resting/pending)
+  finch fleet --json      # every service + its state (online/offline/pending)
   finch domain ls         # custom hostnames mapped to this account
 
 ## finch.yml (what 'finch add' writes — holds NO secrets)

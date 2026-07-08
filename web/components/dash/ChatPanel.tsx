@@ -54,7 +54,7 @@ export function ChatPanel({ service, online }: { service: string; online: boolea
       <SectionLabel hint="ask an LLM to use this service's tools — a live check it works">test in chat</SectionLabel>
 
       {!online ? (
-        <div className="url-pending mono big-pending">🌙 resting — start the box to chat with its tools.</div>
+        <div className="url-pending mono big-pending">offline. start the box to chat with its tools.</div>
       ) : (
         <div className="chatd-win">
           <div className="chatd-winbar">

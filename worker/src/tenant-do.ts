@@ -38,6 +38,7 @@ import {
   type RecentCall,
   type ServiceState,
   isOnline,
+  normalizeState,
   LATEST_AGENT,
 } from "./types";
 
@@ -122,7 +123,7 @@ function timeAgo(ts?: number, now = Date.now()): string {
 
 /** UNIFIED liveness for a box: online iff it holds a live relay socket AND
  *  has been approved (state !== "pending"). The two former read paths
- *  (getState's isOnline(state) and pickHealthyBox's connected||chirping)
+ *  (getState's isOnline(state) and pickHealthyBox's connected||online)
  *  now share this one rule, so the dashboard and the LB picker can't disagree
  *  about which boxes are reachable. */
 function boxOnline(m: { connected?: boolean; state: ServiceState }): boolean {
@@ -246,6 +247,8 @@ export class TenantDO extends DurableObject<Env> {
           return ok(await this.claimTicket(a.jti, a.exp));
         case "boxExists":
           return ok(await this.boxExists(a.service, a.box));
+        case "boxVersion":
+          return ok(await this.boxVersion(a.service, a.box, a.version));
         case "recordCall":
           return ok(
             await this.recordCall(
@@ -276,7 +279,17 @@ export class TenantDO extends DurableObject<Env> {
     return {
       ...base,
       ...stored,
-      services: Array.isArray(stored.services) ? stored.services : [],
+      // normalize legacy state names ("chirping"/"resting") stored before the
+      // online/offline rename — one-way, idempotent.
+      services: (Array.isArray(stored.services) ? stored.services : []).map(
+        (sv: any) => ({
+          ...sv,
+          state: normalizeState(sv.state),
+          boxes: Array.isArray(sv.boxes)
+            ? sv.boxes.map((b: any) => ({ ...b, state: normalizeState(b.state) }))
+            : [],
+        }),
+      ),
       keys: Array.isArray(stored.keys) ? stored.keys : [],
       groups: Array.isArray(stored.groups) ? stored.groups : [],
       acl: Array.isArray(stored.acl) ? stored.acl : base.acl,
@@ -382,12 +395,12 @@ export class TenantDO extends DurableObject<Env> {
       // online. Liveness is UNIFIED across read paths: a box is online iff
       // it holds a live relay socket AND has been approved (state !== pending) —
       // the same rule pickHealthyBox uses. With no boxes we keep the
-      // service's own lifecycle state (invited/pending/resting) untouched.
+      // service's own lifecycle state (invited/pending/offline) untouched.
       let state: ServiceState = a.state;
       if (boxes.length) {
         const anyOnline = boxes.some((m) => boxOnline(m));
         const anyPending = boxes.some((m) => m.state === "pending");
-        state = anyOnline ? "chirping" : anyPending ? "pending" : "resting";
+        state = anyOnline ? "online" : anyPending ? "pending" : "offline";
       }
       const version = boxes.length ? boxes[0].version : a.version;
       const outdated =
@@ -464,7 +477,7 @@ export class TenantDO extends DurableObject<Env> {
   ): Overview {
     // The fleet's 24h HISTORY is built over ALL services (the buckets here are
     // already rolled to a trailing window, index 23 = now). Building it only over
-    // currently-online services made a resting box's stored history vanish the
+    // currently-online services made an offline box's stored history vanish the
     // moment it idled — the chart must still show the traffic it served.
     const traffic24h = Array.from({ length: 24 }, (_, h) =>
       services.reduce((sum, a) => sum + (a.traffic24h[h] || 0), 0),
@@ -757,14 +770,14 @@ export class TenantDO extends DurableObject<Env> {
     const ap = this.findService(s, id);
     if (!ap) return { ok: false };
     // Approve = clear the pending gate. Liveness is then owned by markBox: an
-    // approved-but-disconnected box must read "resting", not "chirping". So
-    // derive from m.connected rather than flipping straight to chirping.
+    // approved-but-disconnected box must read "offline", not "online". So
+    // derive from m.connected rather than flipping straight to online.
     for (const m of ap.boxes) {
-      if (m.state === "pending") m.state = m.connected ? "chirping" : "resting";
+      if (m.state === "pending") m.state = m.connected ? "online" : "offline";
     }
     if (ap.state === "pending") {
       const anyConnected = ap.boxes.some((mm) => mm.connected);
-      ap.state = anyConnected ? "chirping" : "resting";
+      ap.state = anyConnected ? "online" : "offline";
     }
     this.log(s, {
       cat: "device",
@@ -1124,8 +1137,37 @@ export class TenantDO extends DurableObject<Env> {
     return { exists: ap.boxes.some((m) => m.name === box) };
   }
 
+  /** Re-stamp a box's agent version from /refresh. After a hub-pushed update
+   *  the agent re-execs and resumes via /refresh (never /join), so this is the
+   *  only channel the NEW version reaches the registry — without it the
+   *  dashboard shows the pre-update version (and its ⬆ badge) forever.
+   *  `outdated` needs no write: getState recomputes it from version on read. */
+  private async boxVersion(
+    service: unknown,
+    box: unknown,
+    version: unknown,
+  ): Promise<{ ok: boolean }> {
+    if (
+      typeof service !== "string" ||
+      typeof box !== "string" ||
+      typeof version !== "string" ||
+      !version
+    ) {
+      return { ok: false };
+    }
+    const s = await this.load();
+    const m = this.findService(s, service)?.boxes.find((x) => x.name === box);
+    if (!m) return { ok: false };
+    if (m.version !== version) {
+      m.version = version.slice(0, 32);
+      m.outdated = m.version !== LATEST_AGENT;
+      await this.save(s);
+    }
+    return { ok: true };
+  }
+
   /** Agent join: register (or refresh) a box under a service. Sets the
-   *  service pending|chirping per settings.requireApproval. */
+   *  service pending|online per settings.requireApproval. */
   private async registerBox(
     service: string,
     box: string,
@@ -1152,16 +1194,16 @@ export class TenantDO extends DurableObject<Env> {
     }
     const requireApproval = s.settings.requireApproval;
     // The state a GENUINELY NEW box starts in.
-    const newState: ServiceState = requireApproval ? "pending" : "chirping";
+    const newState: ServiceState = requireApproval ? "pending" : "online";
     const now = Date.now();
 
     let m = ap.boxes.find((mm) => mm.name === box);
     if (m) {
       // RE-JOIN of a known box (agent restart): refresh os/version/lastSeen
-      // but DO NOT clobber its lifecycle state. Re-stamping pending|chirping here
+      // but DO NOT clobber its lifecycle state. Re-stamping pending|online here
       // would demote an already-approved, live box back to pending on every agent
       // restart. The only legitimate demotion is leaving "invited"; markBox
-      // owns connected↔chirping/resting transitions from here on. A still-pending
+      // owns connected↔online/offline transitions from here on. A still-pending
       // box stays pending (re-approval not retriggered).
       m.os = os;
       m.version = version;
@@ -1225,10 +1267,10 @@ export class TenantDO extends DurableObject<Env> {
     if (!m) return { ok: false };
     const now = Date.now();
     m.connected = connected;
-    // markBox is the SOLE authority for connected↔chirping/resting. Don't
+    // markBox is the SOLE authority for connected↔online/offline. Don't
     // override a pending (unapproved) box's lifecycle state.
     if (m.state !== "pending") {
-      m.state = connected ? "chirping" : "resting";
+      m.state = connected ? "online" : "offline";
     }
     if (connected) {
       m.lastSeenAt = now;
@@ -1237,14 +1279,14 @@ export class TenantDO extends DurableObject<Env> {
 
     const anyConnected = ap.boxes.some((mm) => mm.connected);
     if (ap.state !== "pending" && ap.state !== "invited") {
-      ap.state = anyConnected ? "chirping" : "resting";
+      ap.state = anyConnected ? "online" : "offline";
     }
     if (anyConnected) ap.lastSeenAt = now;
 
     this.log(s, {
       cat: "device",
       actor: service,
-      action: connected ? "started chirping" : "went resting",
+      action: connected ? "came online" : "went offline",
       target: box,
       ip: "",
     });

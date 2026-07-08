@@ -38,12 +38,15 @@ export function CopyChip({ value, label = "Copy", className = "" }: any) {
 export function StatePill({ state }: any) {
   const map: any = {
     in_use: { cls: "pill-live", dot: true, text: "in use" },
+    online: { cls: "pill-live", dot: true, text: "online" },
+    offline: { cls: "pill-rest", dot: false, text: "offline" },
+    // legacy wire names, pre-rename workers
     chirping: { cls: "pill-live", dot: true, text: "online" },
     resting: { cls: "pill-rest", dot: false, text: "offline" },
     invited: { cls: "pill-invited", dot: false, text: "invited" },
     pending: { cls: "pill-invited", dot: false, text: "pending" },
   };
-  const s = map[state] || map.resting;
+  const s = map[state] || map.offline;
   return (
     <span className={`pill ${s.cls}`}>
       {s.dot && <span className="pill-dot" />}
@@ -54,9 +57,9 @@ export function StatePill({ state }: any) {
   );
 }
 
-export const isOnline = (st: any) => st === "chirping" || st === "in_use";
+export const isOnline = (st: any) => st === "online" || st === "chirping" || st === "in_use";
 
-// ---- Avatar (🐦, grayscale when resting) -------------------------
+// ---- Avatar (🐦, grayscale when offline) -------------------------
 export function Avatar({ state, size = 36 }: any) {
   const online = isOnline(state);
   const cls = (state === "invited" || state === "pending") ? "avatar avatar-invited" : online ? "avatar avatar-on" : "avatar avatar-off";
@@ -68,7 +71,7 @@ export function Avatar({ state, size = 36 }: any) {
 }
 
 // ---- PerchMeter --------------------------------------------------
-// One bar per service; lit green online, amber invited, dim resting.
+// One bar per service; lit green online, amber invited, dim offline.
 export function PerchMeter({ items, big = false }: any) {
   return (
     <div className={`perch ${big ? "perch-big" : ""}`}>
@@ -110,7 +113,7 @@ export function MaskedSecret({ value, prefix = "", note }: any) {
 }
 
 // ---- InlineConfirm — arm/disarm destructive action ---------------
-export function InlineConfirm({ prompt = "set free?", onConfirm, trigger = "delete" }: any) {
+export function InlineConfirm({ prompt = "are you sure?", onConfirm, trigger = "delete" }: any) {
   const [armed, setArmed] = useState(false);
   if (!armed) {
     return (

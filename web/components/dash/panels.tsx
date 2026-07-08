@@ -155,7 +155,7 @@ export function EnrollView({ host, existingIds, groups, onEnrolled, onWatch }: a
           </div>
           <div className="ticket-foot">
             <MaskedSecret value={ticket} note={null} />
-            <span className="ticket-msg">🎟 one-time ticket — <b className="mono">{enrolledId}</b> has one hour to fly home.</span>
+            <span className="ticket-msg">🎟 one-time ticket: <b className="mono">{enrolledId}</b> has one hour to connect.</span>
           </div>
           <div className="listening">
             <span className="listening-pulse" />
@@ -163,7 +163,7 @@ export function EnrollView({ host, existingIds, groups, onEnrolled, onWatch }: a
               <div style={{ fontWeight: 700 }}>Listening for <b className="mono own-you">{enrolledId}</b> to phone home<span className="dots">…</span></div>
               <div className="dim" style={{ fontSize: 12.5 }}>Run the command on the box — it appears here the moment it connects.</div>
             </div>
-            <Button kind="ghost" onClick={onWatch}>Watch it fly home →</Button>
+            <Button kind="ghost" onClick={onWatch}>Watch it connect →</Button>
           </div>
         </Card>
       )}

@@ -464,7 +464,7 @@ func rowTitle(app, state, detail string) string {
 
 func prettyState(s string) string {
 	switch s {
-	case "connected", "live", "chirping", "in_use":
+	case "connected", "live", "online", "chirping", "in_use":
 		return "live"
 	case "connecting":
 		return "connecting…"
