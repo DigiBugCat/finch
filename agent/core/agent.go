@@ -1172,6 +1172,20 @@ func findManifest() string {
 	return ""
 }
 
+// defaultManifestPath is where add/status operate by default: the manifest
+// findManifest discovers (cwd first, then the dotfile home), or — when none
+// exists yet — ~/.finch/finch.yml, so a fresh `finch add` creates the manifest
+// in the box's dotfile home instead of littering whatever cwd it ran from.
+func defaultManifestPath() string {
+	if p := findManifest(); p != "" {
+		return p
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return filepath.Join(home, ".finch", "finch.yml")
+	}
+	return "finch.yml"
+}
+
 func loadConfig(path, hostName string) (*config, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {

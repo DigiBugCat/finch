@@ -786,7 +786,7 @@ func cmdToken(args []string) {
 func cmdStatus(args []string) {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
 	asJSON := fs.Bool("json", false, "JSON output")
-	configPath := fs.String("config", "finch.yml", "finch.yml to summarize")
+	configPath := fs.String("config", defaultManifestPath(), "finch.yml to summarize")
 	_ = fs.Parse(args)
 
 	type ingressStatus struct {
@@ -852,7 +852,7 @@ func cmdStatus(args []string) {
 func cmdAdd(args []string) {
 	fs := flag.NewFlagSet("add", flag.ExitOnError)
 	service := fs.String("service", "", "local server URL to expose (required), e.g. http://127.0.0.1:8000")
-	configPath := fs.String("config", "finch.yml", "finch.yml to append the ingress rule to")
+	configPath := fs.String("config", defaultManifestPath(), "finch.yml to append the ingress rule to")
 	asJSON := fs.Bool("json", false, "print the result as JSON (for scripts/agents)")
 
 	// Go's flag parser stops at the first positional, so pull a leading <app_path>
@@ -1170,6 +1170,13 @@ func yamlWriteFile(configPath string, doc *yaml.Node) error {
 	out, err := yaml.Marshal(doc)
 	if err != nil {
 		return err
+	}
+	// A fresh manifest may target ~/.finch/finch.yml before anything else has
+	// created the dotfile dir (defaultManifestPath).
+	if dir := filepath.Dir(configPath); dir != "." {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return err
+		}
 	}
 	return os.WriteFile(configPath, out, 0o600)
 }
