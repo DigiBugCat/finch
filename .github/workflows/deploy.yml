@@ -15,9 +15,9 @@ name: deploy
 # Required repo/environment config:
 #   secrets: CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID
 #   vars:    NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY  (pk_test_… staging / pk_live_… prod)
-# Protect the `production` GitHub Environment with required reviewers. Also
-# protect the production branch and require the CI checks before merge. A tag
-# or a push to any other branch can never select production here.
+# Protect the production branch and require the CI checks before merge. When
+# the repository plan supports Environment reviewers, enable one as a second
+# manual gate. A tag or push to any other branch can never select production.
 
 on:
   workflow_run:

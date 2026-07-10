@@ -6,7 +6,7 @@ Finch has three deliberately separate lanes:
 | --- | --- | --- |
 | pull request | CI only | Every PR |
 | `main` | staging (`finch-staging`, `finch-web-staging`) | Successful CI push |
-| `production` | production (`finch-prod`, `finch-web-prod`) | Successful CI push plus GitHub Environment approval |
+| `production` | production (`finch-prod`, `finch-web-prod`) | Successful CI push; Environment approval when supported |
 
 Version tags remain the trigger for `.github/workflows/release.yml`, which
 builds and publishes Finch **agent binaries only**. A tag never deploys the hub
@@ -27,8 +27,10 @@ In GitHub, configure these controls once:
    existing `CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, and
    `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` in that environment; do not share the
    staging and production credentials.
-2. On `production`, enable required reviewers, prevent self-review when the
-   team size permits, and restrict deployment branches to `production`.
+2. Restrict the `production` Environment to the `production` branch. If the
+   repository plan supports Environment reviewers, require one and prevent
+   self-review when the team size permits. Otherwise the protected production
+   branch is the approval gate.
 3. Protect `main` and `production`. Require pull requests and the `versions`,
    `worker`, `web`, and `agent` CI checks; disallow force pushes and branch
    deletion. Require at least two approvals for `production` if the team size
@@ -39,23 +41,22 @@ In GitHub, configure these controls once:
    runtime secrets between environments.
 
 GitHub environment protection is configured in repository settings, not in a
-workflow file. Until the required reviewer and branch restriction are enabled,
-the YAML's `environment: production` label alone does **not** create an approval
-gate.
+workflow file. The YAML's `environment: production` label alone does **not**
+create an approval gate. This repository currently restricts each Environment
+to its matching branch and protects both branches; add an Environment reviewer
+if the billing plan later enables it.
 
-For the initial rollout, configure the protected `production` Environment
-first, then create `production` from the current `main` after these workflows
-are present on the default branch. Creating the branch can trigger CI and queue
-a production approval; reject that run if this is only branch setup. The first
-real promotion should still be a reviewed `main` to `production` pull request.
+For the initial rollout, configure the protected `production` branch and
+Environment first, then create `production` from the current `main`. The first
+real promotion should be a reviewed `main` to `production` pull request.
 
 ## Promotion
 
 Develop on a feature branch and merge to `main`. Once staging CI, deployment,
 and smoke checks pass, promote the same tested history with a pull request from
-`main` to `production`. Merging that PR runs CI again; the production deployment
-then pauses at the protected Environment for approval. Do not commit directly
-to `production` and do not use tags as a production deployment trigger.
+`main` to `production`. Merging that PR runs CI again and deploys only after all
+production checks pass; plans with Environment reviewers add a manual approval.
+Do not commit directly to `production` or use tags as a deploy trigger.
 
 Staging deployments are latest-wins: a newer successful `main` run cancels an
 older in-progress staging release. Production deployments are serialized and
