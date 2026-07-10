@@ -360,6 +360,392 @@ export async function verifyAssertion(
   return p.tenant;
 }
 
+// ---- signed caller assertions (Finch edge -> hosted service) ------------
+//
+// Once a relay caller has authenticated, the Worker replaces all caller-
+// supplied identity headers with a short-lived ES256 compact JWS. Hosted
+// services verify the signature with the public JWKS and then enforce the
+// tenant/service audience plus the bound HTTP method and public path.
+//
+// The signing set is a private JWKS stored as a Worker secret. Keeping more
+// than one key in the set lets operators publish a replacement public key
+// before making it active and retain the old public key until all assertions
+// signed with it have expired. The active key is selected by an ordinary,
+// non-secret kid variable; private key material is never returned by jwks().
+
+export type CallerAuthMethod =
+  | "finch_key"
+  | "oauth"
+  | "browser"
+  | "service";
+
+/** Claims injected into X-Finch-Assertion after successful edge auth. */
+export interface CallerAssertionClaims {
+  iss: string;
+  sub: string;
+  aud: string;
+  tenant: string;
+  service: string;
+  auth_method: CallerAuthMethod;
+  method: string;
+  /** Exact path + query delivered to the hosted application. */
+  upstream_path: string;
+  /** Normalized path presented at the Finch edge, retained for audit/binding. */
+  public_path: string;
+  /** base64url(SHA-256(raw request body)); digest of empty bytes when absent. */
+  body_sha256: string;
+  iat: number;
+  nbf: number;
+  exp: number;
+  jti: string;
+  session_id?: string;
+  actor?: string;
+  key_id?: string;
+  key_label?: string;
+}
+
+export interface CallerAssertionConfig {
+  /** kid of the private key used for new assertions. */
+  activeKid?: string;
+  /** JSON-encoded private JWKS: {"keys":[{EC P-256 private JWK}, ...]}. */
+  privateJwks?: string;
+}
+
+export type CallerAssertionJwk = JsonWebKey & {
+  kid: string;
+  alg?: string;
+  use?: string;
+};
+
+interface ParsedAssertionKeySet {
+  keys: CallerAssertionJwk[];
+  byKid: Map<string, CallerAssertionJwk>;
+}
+
+let parsedAssertionKeySetCache:
+  | { raw: string; set: ParsedAssertionKeySet }
+  | undefined;
+let assertionSigningKeyCache:
+  | { raw: string; kid: string; key: CryptoKey }
+  | undefined;
+let assertionSelfTestCache:
+  | { raw: string; kid: string; issuer: string }
+  | undefined;
+
+/** True when assertion signing was requested. Partial config is intentionally
+ *  considered enabled so a bad rollout fails closed rather than silently
+ *  forwarding a request without an identity assertion. */
+export function callerAssertionsConfigured(
+  config: CallerAssertionConfig,
+): boolean {
+  return !!(config.activeKid || config.privateJwks);
+}
+
+function parseAssertionKeySet(raw: string): ParsedAssertionKeySet {
+  if (parsedAssertionKeySetCache?.raw === raw) {
+    return parsedAssertionKeySetCache.set;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error("FINCH_ASSERTION_PRIVATE_JWKS is not valid JSON");
+  }
+  const keys = (parsed as any)?.keys;
+  if (!Array.isArray(keys) || keys.length === 0) {
+    throw new Error("FINCH_ASSERTION_PRIVATE_JWKS must contain a non-empty keys array");
+  }
+  const byKid = new Map<string, CallerAssertionJwk>();
+  for (const candidate of keys) {
+    if (
+      !candidate ||
+      candidate.kty !== "EC" ||
+      candidate.crv !== "P-256" ||
+      typeof candidate.x !== "string" ||
+      typeof candidate.y !== "string" ||
+      typeof candidate.kid !== "string" ||
+      !candidate.kid
+    ) {
+      throw new Error("assertion JWKS keys must be named EC P-256 JWKs");
+    }
+    if (candidate.alg !== undefined && candidate.alg !== "ES256") {
+      throw new Error(`assertion key ${candidate.kid} must use alg ES256`);
+    }
+    if (byKid.has(candidate.kid)) {
+      throw new Error(`duplicate assertion key id: ${candidate.kid}`);
+    }
+    byKid.set(candidate.kid, candidate as CallerAssertionJwk);
+  }
+  const set = { keys: keys as CallerAssertionJwk[], byKid };
+  parsedAssertionKeySetCache = { raw, set };
+  return set;
+}
+
+function publicAssertionJwk(key: CallerAssertionJwk): CallerAssertionJwk {
+  return {
+    kty: "EC",
+    crv: "P-256",
+    x: key.x,
+    y: key.y,
+    kid: key.kid,
+    alg: "ES256",
+    use: "sig",
+  };
+}
+
+/** Public rotation set for /.well-known/finch-jwks.json. */
+export function callerAssertionJwks(config: CallerAssertionConfig): {
+  keys: CallerAssertionJwk[];
+} {
+  if (!config.privateJwks) {
+    throw new Error("FINCH_ASSERTION_PRIVATE_JWKS is required");
+  }
+  const set = parseAssertionKeySet(config.privateJwks);
+  return { keys: set.keys.map(publicAssertionJwk) };
+}
+
+/** Sign one compact JWS using the configured active ES256 key. */
+export async function signCallerAssertion(
+  claims: CallerAssertionClaims,
+  config: CallerAssertionConfig,
+): Promise<string> {
+  if (!config.activeKid || !config.privateJwks) {
+    throw new Error(
+      "FINCH_ASSERTION_ACTIVE_KID and FINCH_ASSERTION_PRIVATE_JWKS are both required",
+    );
+  }
+  const set = parseAssertionKeySet(config.privateJwks);
+  const jwk = set.byKid.get(config.activeKid);
+  if (!jwk) {
+    throw new Error(`active assertion key not found: ${config.activeKid}`);
+  }
+  if (typeof jwk.d !== "string" || !jwk.d) {
+    throw new Error(`active assertion key ${config.activeKid} has no private component`);
+  }
+  const header = bytesToB64url(
+    enc.encode(
+      JSON.stringify({ alg: "ES256", kid: config.activeKid, typ: "JWT" }),
+    ),
+  );
+  const payload = bytesToB64url(enc.encode(JSON.stringify(claims)));
+  const signingInput = `${header}.${payload}`;
+  let key: CryptoKey;
+  if (
+    assertionSigningKeyCache?.raw === config.privateJwks &&
+    assertionSigningKeyCache.kid === config.activeKid
+  ) {
+    key = assertionSigningKeyCache.key;
+  } else {
+    key = await crypto.subtle.importKey(
+      "jwk",
+      jwk,
+      { name: "ECDSA", namedCurve: "P-256" },
+      false,
+      ["sign"],
+    );
+    assertionSigningKeyCache = {
+      raw: config.privateJwks,
+      kid: config.activeKid,
+      key,
+    };
+  }
+  const signature = await crypto.subtle.sign(
+    { name: "ECDSA", hash: "SHA-256" },
+    key,
+    enc.encode(signingInput),
+  );
+  return `${signingInput}.${bytesToB64url(new Uint8Array(signature))}`;
+}
+
+/** Prove the configured active private key can sign a token that verifies
+ *  against the exact public JWKS we emit. The successful result is cached per
+ *  isolate/config so the public JWKS endpoint is not an ECDSA signing oracle or
+ *  a CPU-amplification surface. No token or private material leaves this
+ *  function. */
+export async function selfTestCallerAssertion(
+  config: CallerAssertionConfig,
+  issuer: string,
+): Promise<string> {
+  if (!config.activeKid || !config.privateJwks || !issuer) {
+    throw new Error(
+      "FINCH_ASSERTION_ACTIVE_KID, FINCH_ASSERTION_PRIVATE_JWKS, and " +
+        "FINCH_ASSERTION_ISSUER are required",
+    );
+  }
+  if (
+    assertionSelfTestCache?.raw === config.privateJwks &&
+    assertionSelfTestCache.kid === config.activeKid &&
+    assertionSelfTestCache.issuer === issuer
+  ) {
+    return config.activeKid;
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  const tenant = "finch-assertion-self-test";
+  const service = "finch-assertion-self-test";
+  const claims: CallerAssertionClaims = {
+    iss: issuer,
+    sub: "service:finch-assertion-self-test",
+    aud: `finch:${tenant}:${service}`,
+    tenant,
+    service,
+    auth_method: "service",
+    method: "GET",
+    upstream_path: "/.well-known/finch-jwks.json",
+    public_path: "/.well-known/finch-jwks.json",
+    body_sha256: "47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU",
+    iat: now,
+    nbf: now - 5,
+    exp: now + 60,
+    jti: crypto.randomUUID(),
+  };
+  const token = await signCallerAssertion(claims, config);
+  const publicJwks = callerAssertionJwks(config);
+  const verified = await verifyCallerAssertion(token, publicJwks, {
+    now,
+    issuer,
+    audience: claims.aud,
+    tenant,
+    service,
+    method: claims.method,
+    upstreamPath: claims.upstream_path,
+    publicPath: claims.public_path,
+    bodySha256: claims.body_sha256,
+  });
+  if (!verified || verified.jti !== claims.jti) {
+    throw new Error("active assertion key failed its sign/verify self-test");
+  }
+  assertionSelfTestCache = {
+    raw: config.privateJwks,
+    kid: config.activeKid,
+    issuer,
+  };
+  return config.activeKid;
+}
+
+export interface CallerAssertionExpectations {
+  issuer?: string;
+  audience?: string;
+  tenant?: string;
+  service?: string;
+  method?: string;
+  upstreamPath?: string;
+  publicPath?: string;
+  bodySha256?: string;
+  now?: number;
+}
+
+/** Verification helper used by contract tests and non-Python consumers. Hosted
+ *  applications should fetch the public JWKS and apply the same checks. */
+export async function verifyCallerAssertion(
+  token: string,
+  jwks: { keys: CallerAssertionJwk[] },
+  expected: CallerAssertionExpectations = {},
+): Promise<CallerAssertionClaims | null> {
+  const parts = token.split(".");
+  if (parts.length !== 3) return null;
+  let header: any;
+  let claims: any;
+  let signature: Uint8Array;
+  try {
+    header = JSON.parse(new TextDecoder().decode(b64urlToBytes(parts[0])));
+    claims = JSON.parse(new TextDecoder().decode(b64urlToBytes(parts[1])));
+    signature = b64urlToBytes(parts[2]);
+  } catch {
+    return null;
+  }
+  if (
+    header?.alg !== "ES256" ||
+    typeof header?.kid !== "string" ||
+    header.typ !== "JWT"
+  ) {
+    return null;
+  }
+  const jwk = jwks.keys.find(
+    (k) => k.kid === header.kid && k.kty === "EC" && k.crv === "P-256",
+  );
+  if (!jwk) return null;
+  let key: CryptoKey;
+  try {
+    key = await crypto.subtle.importKey(
+      "jwk",
+      jwk,
+      { name: "ECDSA", namedCurve: "P-256" },
+      false,
+      ["verify"],
+    );
+  } catch {
+    return null;
+  }
+  const valid = await crypto.subtle.verify(
+    { name: "ECDSA", hash: "SHA-256" },
+    key,
+    signature,
+    enc.encode(`${parts[0]}.${parts[1]}`),
+  );
+  if (!valid) return null;
+
+  const strings = [
+    "iss",
+    "sub",
+    "aud",
+    "tenant",
+    "service",
+    "auth_method",
+    "method",
+    "upstream_path",
+    "public_path",
+    "body_sha256",
+    "jti",
+  ];
+  if (strings.some((name) => typeof claims?.[name] !== "string" || !claims[name])) {
+    return null;
+  }
+  if (
+    typeof claims.iat !== "number" ||
+    typeof claims.nbf !== "number" ||
+    typeof claims.exp !== "number"
+  ) {
+    return null;
+  }
+  const now = expected.now ?? Math.floor(Date.now() / 1000);
+  if (claims.exp <= now || claims.nbf > now + 5 || claims.iat > now + 5) return null;
+  if (claims.exp - claims.iat > 300) return null; // assertions are always short-lived
+  if (
+    !["finch_key", "oauth", "browser", "service"].includes(
+      claims.auth_method,
+    )
+  ) {
+    return null;
+  }
+  if (expected.issuer !== undefined && claims.iss !== expected.issuer) return null;
+  if (expected.audience !== undefined && claims.aud !== expected.audience) return null;
+  if (expected.tenant !== undefined && claims.tenant !== expected.tenant) return null;
+  if (expected.service !== undefined && claims.service !== expected.service) return null;
+  if (expected.method !== undefined && claims.method !== expected.method.toUpperCase()) {
+    return null;
+  }
+  if (
+    expected.upstreamPath !== undefined &&
+    claims.upstream_path !== expected.upstreamPath
+  ) {
+    return null;
+  }
+  if (
+    expected.publicPath !== undefined &&
+    claims.public_path !== expected.publicPath
+  ) {
+    return null;
+  }
+  if (
+    expected.bodySha256 !== undefined &&
+    claims.body_sha256 !== expected.bodySha256
+  ) {
+    return null;
+  }
+  return claims as CallerAssertionClaims;
+}
+
 // ---- Clerk OAuth token verification (the MCP OAuth plane) -------------------
 // OAuth-only MCP clients (claude.ai custom connectors) can't send finch_ keys;
 // they present a Clerk-issued OAuth access token instead. We verify it against
@@ -381,16 +767,19 @@ export interface ClerkIdentity {
 export async function verifyClerkOAuthToken(
   token: string,
   issuer: string,
+  userinfoFetcher?: Pick<Fetcher, "fetch">,
 ): Promise<ClerkIdentity | null> {
-  const key = await hashKey(token); // reuse the SHA-256 helper — never cache raw tokens
+  const key = await hashKey(`${issuer}\0${token}`); // never cache raw tokens
   const now = Date.now();
   const hit = CLERK_TOKEN_CACHE.get(key);
   if (hit && hit.exp > now) return hit.who;
   let who: ClerkIdentity | null = null;
   try {
-    const r = await fetch(`${issuer.replace(/\/+$/, "")}/oauth/userinfo`, {
-      headers: { authorization: `Bearer ${token}` },
-    });
+    const target = `${issuer.replace(/\/+$/, "")}/oauth/userinfo`;
+    const init = { headers: { authorization: `Bearer ${token}` } };
+    const r = userinfoFetcher
+      ? await userinfoFetcher.fetch(target, init)
+      : await fetch(target, init);
     if (r.ok) who = (await r.json()) as ClerkIdentity;
   } catch {
     who = null; // network fault reads as unauthenticated; caller 401s

@@ -251,13 +251,17 @@ export class BoxDO extends DurableObject<Env> {
     }
 
     const id = crypto.randomUUID();
+    const forwardedHeaders = new Headers(req.headers);
+    const assertion = forwardedHeaders.get("x-finch-assertion") || "";
+    forwardedHeaders.delete("x-finch-assertion");
     const frame: ReqFrame = {
       id,
       type: "req",
       method: req.method,
       path: relPath,
-      headers: Object.fromEntries(req.headers),
+      headers: Object.fromEntries(forwardedHeaders),
       body,
+      ...(assertion ? { assertion } : {}),
     };
 
     // Register the stream and arm the idle timer BEFORE sending, so a head/chunk

@@ -18,26 +18,37 @@
 import { BoxDO } from "./box-do";
 import { TenantDO } from "./tenant-do";
 import { RouterDO, routerLookup } from "./router-do";
+import { AviaryEnrollmentDO } from "./aviary-enrollment-do";
 import { handleApi, isApiPath } from "./api";
 import { handleChat } from "./chat";
 import {
   hashKey,
+  genJti,
   verifyToken,
   verifySession,
   signSession,
   serviceOk,
   verifyAssertion,
   verifyClerkOAuthToken,
+  callerAssertionsConfigured,
+  callerAssertionJwks,
+  selfTestCallerAssertion,
+  signCallerAssertion,
 } from "./auth";
-import type { TicketPayload } from "./auth";
+import type {
+  CallerAssertionClaims,
+  CallerAuthMethod,
+  TicketPayload,
+} from "./auth";
 
-export { BoxDO, TenantDO, RouterDO };
+export { BoxDO, TenantDO, RouterDO, AviaryEnrollmentDO };
 
 export interface Env {
   // Durable Object namespaces.
   BOX: DurableObjectNamespace; // per-box WS relay (BoxDO)
   TENANT: DurableObjectNamespace; // per-tenant control-plane state (TenantDO)
   ROUTER: DurableObjectNamespace; // singleton slug→tenantId index (RouterDO)
+  AVIARY_ENROLLMENT: DurableObjectNamespace; // proof-bound service enrollment state
 
   // Secrets / vars (wrangler vars in dev via .dev.vars; secrets in prod).
   FINCH_SERVICE_SECRET: string; // web-app -> control API shared secret
@@ -51,7 +62,19 @@ export interface Env {
   DEFAULT_TENANT?: string; // DEV-ONLY tenant fallback when no slug resolves
   DEV?: string; // "1" in the dev env; gates the DEFAULT_TENANT fallback
   WEB_URL?: string; // dashboard base URL — the `finch login` device page lives at <WEB_URL>/cli
+  // Comma-separated HTTPS origins permitted when Aviary verification lives on
+  // a different origin than the hub. WEB_URL must be the hub origin unless it
+  // appears here; arbitrary response/manifest-provided origins are never used.
+  AVIARY_VERIFICATION_ORIGINS?: string;
   CLERK_ISSUER?: string; // Clerk OAuth AS base (e.g. https://<slug>.clerk.accounts.dev) — enables the MCP OAuth plane (RFC 9728 discovery + Clerk-token bearers); unset = feature off
+  CLERK_USERINFO?: Fetcher; // optional service binding; tests/local deployments may avoid public userinfo fetches
+  // ES256 caller assertions injected into requests after Finch authenticates
+  // them. PRIVATE_JWKS is a secret JSON JWKS containing one or more EC P-256
+  // private keys; ACTIVE_KID selects the current signer. Keeping old keys in
+  // the set publishes them from /.well-known/finch-jwks.json during rotation.
+  FINCH_ASSERTION_PRIVATE_JWKS?: string;
+  FINCH_ASSERTION_ACTIVE_KID?: string;
+  FINCH_ASSERTION_ISSUER?: string;
   VANITY_SUFFIXES?: string; // comma-separated first-party custom-hostname suffixes, e.g. "aviary.run"
   VANITY_TENANT?: string; // only this tenant may claim VANITY_SUFFIXES hostnames
   CF_API_TOKEN?: string; // secret: Cloudflare for SaaS API token (never log)
@@ -126,6 +149,123 @@ const SESSION_TTL_SECONDS = 12 * 60 * 60;
 // replayed against a sibling tenant's host.
 const SESSION_COOKIE = "finch_session";
 
+// Caller-controlled copies are removed before any relay authentication runs;
+// only the Worker may inject this header after a successful auth decision.
+const CALLER_ASSERTION_HEADER = "x-finch-assertion";
+const CALLER_ASSERTION_TTL_SECONDS = 60;
+const RESERVED_CALLER_IDENTITY_HEADERS = new Set([
+  CALLER_ASSERTION_HEADER,
+  "x-finch-caller",
+  "x-finch-user",
+  "x-finch-tenant",
+  "x-finch-auth-method",
+  "x-finch-session",
+  "x-finch-principal",
+]);
+
+function stripUntrustedCallerIdentity(headers: Headers): void {
+  for (const name of [...headers.keys()]) {
+    if (
+      RESERVED_CALLER_IDENTITY_HEADERS.has(name) ||
+      name.startsWith("x-finch-identity-")
+    ) {
+      headers.delete(name);
+    }
+  }
+}
+
+interface BrowserCaller {
+  userId: string;
+  sessionId?: string;
+}
+
+interface RelayCaller {
+  sub: string;
+  authMethod: CallerAuthMethod;
+  sessionId?: string;
+  actor?: string;
+  keyId?: string;
+  keyLabel?: string;
+}
+
+function callerAssertionConfig(env: Env) {
+  return {
+    activeKid: env.FINCH_ASSERTION_ACTIVE_KID,
+    privateJwks: env.FINCH_ASSERTION_PRIVATE_JWKS,
+  };
+}
+
+/** Stable, tenant-scoped audience understood by AviaryMCP's FinchAuth. */
+export function callerAssertionAudience(tenant: string, service: string): string {
+  return `finch:${tenant}:${service}`;
+}
+
+function base64url(bytes: Uint8Array): string {
+  let binary = "";
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return btoa(binary)
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+async function requestBodySha256(body: ArrayBuffer | null): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    body ?? new Uint8Array(0),
+  );
+  return base64url(new Uint8Array(digest));
+}
+
+/** Inject a Worker-minted assertion, or preserve legacy behavior when the
+ *  assertion feature is entirely unconfigured. A partial/broken config throws;
+ *  callers convert that into a 503 rather than silently losing authentication. */
+async function injectCallerAssertion(
+  headers: Headers,
+  req: Request,
+  env: Env,
+  tenant: string,
+  service: string,
+  caller: RelayCaller | null,
+  upstreamPath: string,
+  body: ArrayBuffer | null,
+): Promise<void> {
+  stripUntrustedCallerIdentity(headers);
+  if (!caller) return; // public/anonymous relay: never claim an authenticated identity
+  const config = callerAssertionConfig(env);
+  if (!callerAssertionsConfigured(config)) return; // backward-compatible rollout
+  if (!env.FINCH_ASSERTION_ISSUER) {
+    throw new Error("FINCH_ASSERTION_ISSUER is required");
+  }
+  const now = Math.floor(Date.now() / 1000);
+  const claims: CallerAssertionClaims = {
+    iss: env.FINCH_ASSERTION_ISSUER,
+    sub: caller.sub,
+    aud: callerAssertionAudience(tenant, service),
+    tenant,
+    service,
+    auth_method: caller.authMethod,
+    method: req.method.toUpperCase(),
+    upstream_path: upstreamPath,
+    // URL parsing removes dot segments and gives the exact public path seen by
+    // the Worker. Query parameters are deliberately not copied into identity.
+    public_path: new URL(req.url).pathname || "/",
+    body_sha256: await requestBodySha256(body),
+    iat: now,
+    nbf: now - 5,
+    exp: now + CALLER_ASSERTION_TTL_SECONDS,
+    jti: crypto.randomUUID(),
+    ...(caller.sessionId ? { session_id: caller.sessionId } : {}),
+    ...(caller.actor ? { actor: caller.actor } : {}),
+    ...(caller.keyId ? { key_id: caller.keyId } : {}),
+    ...(caller.keyLabel ? { key_label: caller.keyLabel } : {}),
+  };
+  headers.set(
+    CALLER_ASSERTION_HEADER,
+    await signCallerAssertion(claims, config),
+  );
+}
+
 /** Parse a single cookie value out of a Cookie header. Returns "" if absent.
  *  Minimal + allocation-light; cookie values here are base64url envelopes (no
  *  special chars), so a plain name=value split per pair is sufficient. */
@@ -179,7 +319,11 @@ export function safeRelPath(rd: string | null | undefined): string {
  *  same way a service-authed dashboard call does). */
 type GateDecision =
   | { wall: Response }
-  | { wall?: undefined; browserAuthed: boolean };
+  | {
+      wall?: undefined;
+      browserAuthed: boolean;
+      browserCaller?: BrowserCaller;
+    };
 
 /** AUTH-BY-REQUEST-TYPE gate that runs RIGHT BEFORE relayMcp for both the
  *  pinned-box and load-balanced branches. It decides whether the login wall
@@ -287,7 +431,8 @@ async function browserGate(
       sess &&
       sess.kind === "session" &&
       sess.tenant === tenant &&
-      sess.slug === hostKey
+      sess.slug === hostKey &&
+      !!sess.userId
     ) {
       // Stale-cookie check: the tenant can "sign everyone out" by bumping its
       // sessionEpoch; a cookie minted under an older epoch is treated as logged
@@ -298,7 +443,13 @@ async function browserGate(
         "sessionEpoch",
       );
       if ((sess.epoch ?? 0) === (epoch ?? 0)) {
-        return { browserAuthed: true }; // valid cookie → relay as a web caller
+        return {
+          browserAuthed: true,
+          browserCaller: {
+            userId: sess.userId,
+            ...(sess.jti ? { sessionId: sess.jti } : {}),
+          },
+        }; // valid cookie → relay as a web caller
       }
     }
   }
@@ -455,6 +606,42 @@ export default {
     const host = req.headers.get("host") || url.host;
     const path = url.pathname;
     const parts = path.split("/").filter(Boolean);
+
+    // Public verification material for Finch caller assertions. This contains
+    // only EC public coordinates; private `d` values never leave the secret
+    // binding. When signing is disabled for a backwards-compatible deployment,
+    // the endpoint is absent rather than advertising an unusable empty set.
+    if (path === "/.well-known/finch-jwks.json") {
+      const config = callerAssertionConfig(env);
+      if (!callerAssertionsConfigured(config)) {
+        return json(404, { error: "caller assertions are not configured" });
+      }
+      try {
+        // This is stronger than a shape check: it imports the configured active
+        // private key, signs an internal fixed-scope token, and verifies it with
+        // the exact public JWKS below. The helper caches success per isolate and
+        // never exposes the token or private material.
+        const activeKid = await selfTestCallerAssertion(
+          config,
+          env.FINCH_ASSERTION_ISSUER || "",
+        );
+        const body = callerAssertionJwks(config);
+        return new Response(JSON.stringify(body), {
+          status: 200,
+          headers: {
+            "content-type": "application/jwk-set+json",
+            "cache-control": "public, max-age=300",
+            "x-finch-active-kid": activeKid,
+          },
+        });
+      } catch (error) {
+        console.error(
+          "caller assertion JWKS unavailable",
+          error instanceof Error ? error.message : String(error),
+        );
+        return json(503, { error: "caller assertion signer unavailable" });
+      }
+    }
 
     // ---- Control plane: /api/* and /join -> api.ts ----
     if (isApiPath(path)) {
@@ -763,6 +950,13 @@ export default {
     // the upstream and we load-balance across the service's healthy pool.
     // (`_connect` is the one reserved segment, handled above before we get here.)
     if (service) {
+      // SPOOF STRIP FIRST: no authentication or authorization path may observe
+      // a caller-supplied Finch identity. The only assertion that can reach the
+      // hosted service is minted later by relayMcp after auth succeeds.
+      const untrustedHeaders = new Headers(req.headers);
+      stripUntrustedCallerIdentity(untrustedHeaders);
+      req = new Request(req, { headers: untrustedHeaders });
+
       // THROTTLE FIRST — per-(tenant,IP), BEFORE any DO round-trip. The login wall
       // below (maybeBrowserGate's checkKey probe + browserGate's sessionEpoch DO
       // call) and the relay itself all hit Durable Objects; gating here makes a
@@ -794,7 +988,7 @@ export default {
       if (gate.wall) return gate.wall;
       // A valid session cookie authorizes the relay as a web caller (cleared the
       // wall) — relayMcp skips the per-key checkKey gate for it, like svcAuthed.
-      const browserAuthed = gate.browserAuthed;
+      const browserCaller = gate.browserCaller;
 
       let pinned = "";
       if (second) {
@@ -820,7 +1014,14 @@ export default {
       if (pinned) {
         // Specific box: upstream = everything after <service>/<box>.
         const upstream = parts.slice(2).join("/");
-        return relayMcp(req, env, ctx, tenant, service, pinned, path, upstream, browserAuthed);
+        const allowed = await tenantOp<{ exists: boolean; allowed: boolean }>(
+          env,
+          tenant,
+          "routeAllowed",
+          { service, path: upstream ? `/${upstream}` : "/" },
+        );
+        if (!allowed.allowed) return json(404, { error: "route not exposed by service manifest" });
+        return relayMcp(req, env, ctx, tenant, service, pinned, path, upstream, browserCaller);
       }
 
       // Load-balanced across the service. Upstream = everything after
@@ -829,6 +1030,13 @@ export default {
       // WHOLE healthy pool (shuffled) and FAIL OVER inside relayMcp on a
       // stale-pick "service offline" 503. (code-review #12)
       const upstream = parts.slice(1).join("/");
+      const allowed = await tenantOp<{ exists: boolean; allowed: boolean }>(
+        env,
+        tenant,
+        "routeAllowed",
+        { service, path: upstream ? `/${upstream}` : "/" },
+      );
+      if (!allowed.allowed) return json(404, { error: "route not exposed by service manifest" });
       const pool = await pickHealthyPool(env, tenant, service);
       if (!pool.length) {
         // No healthy box at all. Record this 503 too, so a load-balanced
@@ -847,7 +1055,7 @@ export default {
         );
         return json(503, { error: "service offline", service });
       }
-      return relayMcp(req, env, ctx, tenant, service, pool, path, upstream, browserAuthed);
+      return relayMcp(req, env, ctx, tenant, service, pool, path, upstream, browserCaller);
     }
 
     return json(404, { error: "not found", path });
@@ -923,7 +1131,7 @@ async function relayMcp(
   boxOrPool: string | string[],
   route: string,
   upstream: string,
-  browserAuthed = false,
+  browserCaller?: BrowserCaller,
 ): Promise<Response> {
   // NOTE: the per-(tenant,IP) RELAY_LIMIT is applied by the caller at the TOP of
   // the `if (service)` block — BEFORE the login-wall DO round-trips — so it is
@@ -947,7 +1155,19 @@ async function relayMcp(
     (await verifyAssertion(req.headers.get("x-finch-auth") || "", env.FINCH_SERVICE_SECRET)) ===
       tenant;
 
+  const browserAuthed = !!browserCaller;
   let caller = svcAuthed ? "dashboard" : "web";
+  let edgeCaller: RelayCaller | null = svcAuthed
+    ? { sub: "service:finch-dashboard", authMethod: "service" }
+    : browserCaller
+      ? {
+          sub: `user:${browserCaller.userId}`,
+          authMethod: "browser",
+          ...(browserCaller.sessionId
+            ? { sessionId: browserCaller.sessionId }
+            : {}),
+        }
+      : null;
   // OAUTH PLANE: a non-finch_ bearer with CLERK_ISSUER configured is tried as a
   // Clerk OAuth access token (claude.ai custom connectors — they can't send
   // finch_ keys). A verified token whose identity IS this tenant (user or org)
@@ -960,11 +1180,20 @@ async function relayMcp(
       /^Bearer\s+(?!finch_)(\S+)$/,
     );
     if (m) {
-      const who = await verifyClerkOAuthToken(m[1], env.CLERK_ISSUER);
+      const who = await verifyClerkOAuthToken(
+        m[1],
+        env.CLERK_ISSUER,
+        env.CLERK_USERINFO,
+      );
       const id = who?.sub || who?.user_id;
       if (who && (id === tenant || who.org_id === tenant)) {
         oauthAuthed = true;
-        caller = `oauth:${id}`;
+        const subject = id || who.org_id!;
+        caller = `oauth:${subject}`;
+        edgeCaller = {
+          sub: `user:${subject}`,
+          authMethod: "oauth",
+        };
       } else if (who) {
         return json(403, { error: "token identity does not own this tenant" });
       }
@@ -987,6 +1216,8 @@ async function relayMcp(
     const check = await tenantOp<{
       allowed: boolean;
       keyLabel: string;
+      keyId?: string;
+      keyOwner?: string;
       public?: boolean;
       reason?: "no-key" | "scope" | "acl" | "expired";
     }>(env, tenant, "checkKey", { hash, service });
@@ -1026,6 +1257,15 @@ async function relayMcp(
       return json(403, { error });
     }
     caller = check.public ? "public" : check.keyLabel || "finch_key";
+    edgeCaller = check.public
+      ? null
+      : {
+          sub: `key:${check.keyId || check.keyLabel}`,
+          authMethod: "finch_key",
+          ...(check.keyOwner ? { actor: check.keyOwner } : {}),
+          ...(check.keyId ? { keyId: check.keyId } : {}),
+          ...(check.keyLabel ? { keyLabel: check.keyLabel } : {}),
+        };
   }
   const pool =
     typeof boxOrPool === "string" ? [boxOrPool] : boxOrPool;
@@ -1055,7 +1295,6 @@ async function relayMcp(
     if (name === "cookie") continue;
     if (value.includes("finch_")) relayHeaders.delete(name);
   }
-
   // Buffer the body ONCE so we can replay it across failover candidates (a
   // streaming body can't be re-sent). Enforce the real size cap here too, since
   // content-length may be absent for a chunked request.
@@ -1065,6 +1304,28 @@ async function relayMcp(
     if (bodyBytes.byteLength > MAX_RELAY_BODY_BYTES) {
       return json(413, { error: "request body too large" });
     }
+  }
+  try {
+    const upstreamPath =
+      (upstream ? `/${upstream}` : "/") + new URL(req.url).search;
+    await injectCallerAssertion(
+      relayHeaders,
+      req,
+      env,
+      tenant,
+      service,
+      edgeCaller,
+      upstreamPath,
+      bodyBytes,
+    );
+  } catch (error) {
+    // A requested assertion configuration is part of the auth boundary. Never
+    // downgrade to an unsigned request if its signer is missing or malformed.
+    console.error(
+      "caller assertion signing failed",
+      error instanceof Error ? error.message : String(error),
+    );
+    return json(503, { error: "caller assertion signer unavailable" });
   }
 
   const start = Date.now();
@@ -1203,6 +1464,7 @@ async function handleFinchCb(
       slug: hostKey,
       userId: grant.userId,
       epoch: epoch ?? 0,
+      jti: genJti(),
       exp,
     } as TicketPayload,
     env.SESSION_SECRET,

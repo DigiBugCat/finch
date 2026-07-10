@@ -2,8 +2,8 @@ name: deploy
 
 # Continuous delivery for the hub (worker/) + dashboard (web/).
 #
-#   push to main        → deploy STAGING   (finch-staging / finch-web-staging)
-#   push a v* git tag   → deploy PRODUCTION (finch-prod    / finch-web-prod)
+#   successful CI on main       → deploy STAGING
+#   successful CI on production → deploy PRODUCTION
 #
 # The hub is deployed BEFORE the web in each env: web's FINCH_HUB service
 # binding targets the matching hub Worker, which must already exist.
@@ -15,35 +15,61 @@ name: deploy
 # Required repo/environment config:
 #   secrets: CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID
 #   vars:    NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY  (pk_test_… staging / pk_live_… prod)
-# Production is a protected GitHub Environment (require a reviewer) so a tag
-# can't ship to prod without a human click.
+# Protect the `production` GitHub Environment with required reviewers. Also
+# protect the production branch and require the CI checks before merge. A tag
+# or a push to any other branch can never select production here.
 
 on:
-  push:
-    branches: [main]
-    tags: ["v*"]
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
 
 permissions:
+  actions: read
   contents: read
 
 concurrency:
-  group: deploy-${{ github.ref }}
-  cancel-in-progress: false
+  group: deploy-${{ github.event.workflow_run.event }}-${{ github.event.workflow_run.head_branch }}
+  # Supersede stale staging releases. Never cancel an in-flight production
+  # release; it must finish (or fail visibly) before the next promotion.
+  cancel-in-progress: ${{ github.event.workflow_run.head_branch == 'main' }}
 
 jobs:
   target:
-    # Resolve which env this ref deploys to (tag → production, main → staging).
+    if: >-
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      (github.event.workflow_run.head_branch == 'main' ||
+       github.event.workflow_run.head_branch == 'production')
     runs-on: ubuntu-latest
     outputs:
       env: ${{ steps.pick.outputs.env }}
+      sha: ${{ steps.verify.outputs.sha }}
     steps:
       - id: pick
         run: |
-          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+          if [[ "${{ github.event.workflow_run.head_branch }}" == production ]]; then
             echo "env=production" >> "$GITHUB_OUTPUT"
           else
             echo "env=staging" >> "$GITHUB_OUTPUT"
           fi
+      - name: Download the tested release candidate
+        uses: actions/download-artifact@v4
+        with:
+          name: release-candidate
+          path: release-candidate
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+      - id: verify
+        name: Verify artifact, branch, and commit identity
+        env:
+          EXPECTED_SHA: ${{ github.event.workflow_run.head_sha }}
+          EXPECTED_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          test "$(cat release-candidate/commit.sha)" = "$EXPECTED_SHA"
+          test "$(cat release-candidate/branch)" = "$EXPECTED_BRANCH"
+          test "$(cat release-candidate/ci-run-id)" = '${{ github.event.workflow_run.id }}'
+          echo "sha=$EXPECTED_SHA" >> "$GITHUB_OUTPUT"
 
   hub:
     needs: target
@@ -57,6 +83,10 @@ jobs:
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # workflow_run otherwise checks out the default branch, which could
+          # deploy code different from the commit CI actually tested.
+          ref: ${{ needs.target.outputs.sha }}
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -67,6 +97,23 @@ jobs:
       # preflight (in the deploy script) blocks shipping dev secrets / a
       # fail-open prod tenant before wrangler ever runs.
       - run: npm run deploy${{ needs.target.outputs.env == 'staging' && ':staging' || '' }}
+      # The JWKS handler performs an isolate-cached sign/verify using the
+      # deployed ACTIVE_KID + private secret before it serves the public set.
+      # This catches a missing/mismatched/malformed signer after Cloudflare has
+      # activated the version, without ever exporting or logging the secret.
+      - name: Smoke deployed caller-assertion signer
+        env:
+          DEPLOY_ENV: ${{ needs.target.outputs.env }}
+        run: |
+          if [[ "$DEPLOY_ENV" == "production" ]]; then
+            npm run smoke:assertions -- \
+              https://jwks.finchmcp.com/.well-known/finch-jwks.json \
+              finch-prod-2026-07
+          else
+            npm run smoke:assertions -- \
+              https://finch-staging.pantainos.workers.dev/.well-known/finch-jwks.json \
+              finch-staging-2026-07
+          fi
 
   web:
     needs: [target, hub]
@@ -83,6 +130,8 @@ jobs:
       NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY: ${{ vars.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.target.outputs.sha }}
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
@@ -91,3 +140,30 @@ jobs:
       - run: npm ci
       - run: npm test
       - run: npm run deploy${{ needs.target.outputs.env == 'staging' && ':staging' || '' }}
+
+  smoke:
+    needs: [target, hub, web]
+    runs-on: ubuntu-latest
+    environment: ${{ needs.target.outputs.env }}
+    steps:
+      - name: Smoke the deployed dashboard
+        env:
+          DEPLOY_ENV: ${{ needs.target.outputs.env }}
+        run: |
+          if [[ "$DEPLOY_ENV" == production ]]; then
+            url=https://finchmcp.com/
+          else
+            url=https://finch-web-staging.pantainos.workers.dev/
+          fi
+          curl --fail --silent --show-error --location \
+            --retry 5 --retry-all-errors --retry-delay 3 \
+            --max-time 20 "$url" >/dev/null
+      - name: Record deployment summary
+        run: |
+          {
+            echo '### Finch deployment'
+            echo ''
+            echo '- Environment: `${{ needs.target.outputs.env }}`'
+            echo '- Commit: `${{ needs.target.outputs.sha }}`'
+            echo '- CI run: `${{ github.event.workflow_run.html_url }}`'
+          } >> "$GITHUB_STEP_SUMMARY"

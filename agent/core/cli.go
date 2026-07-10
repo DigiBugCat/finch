@@ -236,12 +236,15 @@ func cliRequest(method, hub, path, token string, body any) (map[string]any, erro
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
-	res, err := http.DefaultClient.Do(req)
+	res, err := controlPlaneHTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer res.Body.Close()
-	raw, _ := io.ReadAll(res.Body)
+	raw, err := readBoundedControlResponse(res.Body)
+	if err != nil {
+		return nil, err
+	}
 	var out map[string]any
 	_ = json.Unmarshal(raw, &out)
 	if res.StatusCode != 200 {
@@ -814,6 +817,7 @@ func cmdStatus(args []string) {
 		Tenant   string          `json:"tenant,omitempty"`
 		Config   string          `json:"config,omitempty"`
 		Ingress  []ingressStatus `json:"ingress"`
+		Services []ServiceStatus `json:"services,omitempty"`
 	}{Ingress: []ingressStatus{}}
 
 	if cred := loadCliCredQuiet(); cred != nil {
@@ -832,6 +836,9 @@ func cmdStatus(args []string) {
 		for _, ing := range cfg.Ingress {
 			st.Ingress = append(st.Ingress, ingressStatus{AppPath: ing.AppPath, Service: ing.Service})
 		}
+	}
+	if services, err := readRuntimeServices(); err == nil {
+		st.Services = services
 	}
 
 	if *asJSON {
@@ -856,6 +863,12 @@ func cmdStatus(args []string) {
 		}
 	} else {
 		fmt.Println("no finch.yml here — `finch add <app_path> --service <url>` to create one")
+	}
+	if len(st.Services) > 0 {
+		fmt.Printf("running agent has %d effective service(s):\n", len(st.Services))
+		for _, service := range st.Services {
+			fmt.Printf("  • %-16s → %-12s (%s, %s)\n", service.AppPath, service.State, service.Source, service.Upstream)
+		}
 	}
 }
 
@@ -1203,16 +1216,16 @@ func yamlWriteFile(configPath string, doc *yaml.Node) error {
 // RUNNING serve onto the new version without leaving two `finch run` processes
 // fighting over the relay socket (the "superseded" flap). Restart strategy:
 //
-//   service — if a `finch-tunnel` systemd --user service manages the serve,
-//             `systemctl --user restart` it: the old process is stopped BEFORE
-//             the new one starts, so the hub never sees two live sockets.
-//   self    — exec the freshly-installed binary over THIS process (portable, no
-//             service manager). A running `finch run` becomes the new version in
-//             place (~1s relay blip); a bare `finch update` just re-execs and
-//             exits after reporting the version.
-//   auto    — service when a finch-tunnel service is detected, else self.
-//   none    — swap the binary only; leave the running process alone (you restart
-//             it). Useful in scripts.
+//	service — if a `finch-tunnel` systemd --user service manages the serve,
+//	          `systemctl --user restart` it: the old process is stopped BEFORE
+//	          the new one starts, so the hub never sees two live sockets.
+//	self    — exec the freshly-installed binary over THIS process (portable, no
+//	          service manager). A running `finch run` becomes the new version in
+//	          place (~1s relay blip); a bare `finch update` just re-execs and
+//	          exits after reporting the version.
+//	auto    — service when a finch-tunnel service is detected, else self.
+//	none    — swap the binary only; leave the running process alone (you restart
+//	          it). Useful in scripts.
 func cmdUpdate(args []string) {
 	fs := flag.NewFlagSet("update", flag.ExitOnError)
 	hubFlag := fs.String("hub", "", "finch hub base URL (defaults to the logged-in hub)")

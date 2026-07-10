@@ -1,0 +1,38 @@
+{
+  "description": "Cross-language Finch ES256 caller assertion verification vector. now is fixed so expiry checks are deterministic.",
+  "now": 1893456010,
+  "request_body": "{}",
+  "jwks": {
+    "keys": [
+      {
+        "kty": "EC",
+        "x": "XRXIDU18gCC2U-mUTm6FSFMWUPVi4kr7zoN604qBPQA",
+        "y": "_iUnSvmhcoJ11wZm3y55HR9P16mq6neJSYITA-yeWhQ",
+        "crv": "P-256",
+        "kid": "finch-contract-2030",
+        "alg": "ES256",
+        "use": "sig"
+      }
+    ]
+  },
+  "token": "eyJhbGciOiJFUzI1NiIsImtpZCI6ImZpbmNoLWNvbnRyYWN0LTIwMzAiLCJ0eXAiOiJKV1QifQ.eyJpc3MiOiJodHRwczovL2ZpbmNoLnRlc3QiLCJzdWIiOiJrZXk6a19jb250cmFjdCIsImF1ZCI6ImZpbmNoOnRlbmFudC1jb250cmFjdDpzZXJ2aWNlLWNvbnRyYWN0IiwidGVuYW50IjoidGVuYW50LWNvbnRyYWN0Iiwic2VydmljZSI6InNlcnZpY2UtY29udHJhY3QiLCJhdXRoX21ldGhvZCI6ImZpbmNoX2tleSIsIm1ldGhvZCI6IlBPU1QiLCJ1cHN0cmVhbV9wYXRoIjoiL2FwaS92MS90b29scy9zZWFyY2g_bGltaXQ9MiIsInB1YmxpY19wYXRoIjoiL3NlcnZpY2UtY29udHJhY3QvYXBpL3YxL3Rvb2xzL3NlYXJjaCIsImJvZHlfc2hhMjU2IjoiUkJOdm8xV3paNG9SUnEwVzktaGtucFQ3VDhJZjUzNkRFTUJnOWh5cV80byIsImlhdCI6MTg5MzQ1NjAwMCwibmJmIjoxODkzNDU1OTk1LCJleHAiOjE4OTM0NTYwNjAsImp0aSI6IjAwMDAwMDAwLTAwMDAtNDAwMC04MDAwLTAwMDAwMDAwMDAwMSIsImtleV9pZCI6ImtfY29udHJhY3QiLCJrZXlfbGFiZWwiOiJjb250cmFjdCIsImFjdG9yIjoidXNlcl9jb250cmFjdCJ9.Lsv0XZmQxMASjDvOuLtOx08QzENM0OJWDWsZID8I2DfZYCe0pm-NY89nqqiEkSzQX5TvMFtCbm694xiU5O3wwA",
+  "claims": {
+    "iss": "https://finch.test",
+    "sub": "key:k_contract",
+    "aud": "finch:tenant-contract:service-contract",
+    "tenant": "tenant-contract",
+    "service": "service-contract",
+    "auth_method": "finch_key",
+    "method": "POST",
+    "upstream_path": "/api/v1/tools/search?limit=2",
+    "public_path": "/service-contract/api/v1/tools/search",
+    "body_sha256": "RBNvo1WzZ4oRRq0W9-hknpT7T8If536DEMBg9hyq_4o",
+    "iat": 1893456000,
+    "nbf": 1893455995,
+    "exp": 1893456060,
+    "jti": "00000000-0000-4000-8000-000000000001",
+    "key_id": "k_contract",
+    "key_label": "contract",
+    "actor": "user_contract"
+  }
+}

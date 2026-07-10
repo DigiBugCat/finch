@@ -31,6 +31,10 @@ import {
   routerDeviceDescribe,
 } from "./router-do";
 import { signAssertion, verifyAssertionPayload } from "./auth";
+import {
+  handleAviaryEnrollmentApi,
+  isAviaryEnrollmentPath,
+} from "./aviary-enrollment-api";
 
 // A CLI token is a long-lived tenant assertion, distinguished from a per-call
 // assertion by kind:"cli" + an epoch the tenant can bump to revoke. 30 days.
@@ -220,6 +224,13 @@ export async function handleApi(
   const url = new URL(req.url);
   const path = url.pathname;
   const method = req.method;
+
+  // Aviary service-device enrollment is intentionally separate from the CLI
+  // tenant-admin device flow. start/poll are proof-bound public routes;
+  // describe/approve/deny authenticate inside their dedicated handler.
+  if (isAviaryEnrollmentPath(path)) {
+    return handleAviaryEnrollmentApi(req, env, host);
+  }
 
   // ---- /join — ticket-authed (NOT service-authed) ----
   if (path === "/join") {
@@ -1028,6 +1039,20 @@ async function handleRefresh(
   });
   if (!reg.exists) {
     return json(403, { error: "box no longer registered" });
+  }
+  // Aviary-issued refresh credentials carry a per-box epoch. A successfully
+  // persisted re-enrollment ACK atomically advances it, invalidating the prior
+  // refresh token without affecting legacy tokens (which have no epoch).
+  if (typeof payload.epoch === "number") {
+    const current = await tenantOp<{ exists: boolean; epoch?: number }>(
+      env,
+      tenant,
+      "boxCredentialEpoch",
+      { service, box },
+    );
+    if (!current.exists || current.epoch !== payload.epoch) {
+      return json(403, { error: "refresh credential superseded" });
+    }
   }
 
   // Re-stamp the agent version when the box reports one (it re-execs onto a

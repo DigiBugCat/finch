@@ -48,7 +48,14 @@ import {
 // fields that getState() recomputes (state/boxes/outdated/metrics live on
 // the service, but `boxes` flatten + overview are computed on read).
 
-interface StoredService extends Service {}
+interface StoredService extends Service {
+  // Present only for services created by the Aviary device flow. It makes an
+  // approval retry idempotent without treating an unrelated pre-existing
+  // service with the same app path as safe to overwrite.
+  aviaryManifestSha256?: string;
+  aviaryManaged?: boolean;
+  aviaryApprovalNonce?: string;
+}
 
 interface StoredState {
   host: string;
@@ -194,6 +201,32 @@ export class TenantDO extends DurableObject<Env> {
           return ok(await this.getState());
         case "enroll":
           return ok(await this.enroll(a.name, a.group));
+        case "registerAviaryService": {
+          const r = await this.registerAviaryService(
+            a.manifest,
+            a.manifestSha256,
+            a.approvalNonce,
+          );
+          if (!r.ok) return bad(409, r.error || "aviary registration failed");
+          return ok(r);
+        }
+        case "releaseAviaryService":
+          return ok(
+            await this.releaseAviaryService(
+              a.appPath,
+              a.manifestSha256,
+              a.approvalNonce,
+            ),
+          );
+        case "commitAviaryCredentialEpoch":
+          return ok(
+            await this.commitAviaryCredentialEpoch(
+              a.appPath,
+              a.box,
+              a.approvalNonce,
+              a.credentialEpoch,
+            ),
+          );
         case "release":
           return ok(await this.release(a.id));
         case "approve":
@@ -247,6 +280,10 @@ export class TenantDO extends DurableObject<Env> {
           return ok(await this.claimTicket(a.jti, a.exp));
         case "boxExists":
           return ok(await this.boxExists(a.service, a.box));
+        case "boxCredentialEpoch":
+          return ok(await this.boxCredentialEpoch(a.service, a.box));
+        case "routeAllowed":
+          return ok(await this.routeAllowed(a.service, a.path));
         case "boxVersion":
           return ok(await this.boxVersion(a.service, a.box, a.version));
         case "recordCall":
@@ -749,6 +786,229 @@ export class TenantDO extends DurableObject<Env> {
     return { id };
   }
 
+  /** Atomically claim an exact app_path and register its exact Aviary box.
+   *  Browser approval has already happened, so the new box starts offline
+   *  rather than entering the generic join flow's second approval gate.
+   *  Existing services are never renamed or widened. The only idempotent case
+   *  is the same durable manifest digest created by this flow. */
+  private async registerAviaryService(
+    raw: unknown,
+    manifestSha256: unknown,
+    approvalNonce: unknown,
+  ): Promise<{ ok: boolean; error?: string; id?: string; created?: boolean; credentialEpoch?: number }> {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      return { ok: false, error: "invalid_manifest" };
+    }
+    const manifest = raw as Record<string, unknown>;
+    const id = typeof manifest.app_path === "string" ? manifest.app_path : "";
+    const label = typeof manifest.service === "string" ? manifest.service : "";
+    const box = cleanBoxName(manifest.machine);
+    const digest = typeof manifestSha256 === "string" ? manifestSha256 : "";
+    const nonce = typeof approvalNonce === "string" ? approvalNonce : "";
+    const auth = manifest.edge_auth;
+    const routes = Array.isArray(manifest.routes)
+      ? manifest.routes.filter((v): v is string => typeof v === "string")
+      : [];
+    if (
+      !/^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,61}[A-Za-z0-9])?$/.test(id) ||
+      !/^[A-Za-z0-9 ._-]{1,100}$/.test(label) ||
+      !box ||
+      !/^[a-f0-9]{64}$/.test(digest) ||
+      !/^[a-f0-9]{32}$/.test(nonce) ||
+      (auth !== "key" && auth !== "public") ||
+      routes.length < 1 ||
+      routes.length > 16
+    ) {
+      return { ok: false, error: "invalid_manifest" };
+    }
+
+    const s = await this.load();
+    const existing = this.findService(s, id);
+    if (existing) {
+      const existingBox = existing.boxes.find((candidate) => candidate.name === box);
+      const sameRoutes =
+        existing.routes.length === routes.length &&
+        existing.routes.every((route, index) => route === routes[index]);
+      if (existing.aviaryManaged === true && existingBox && sameRoutes && existing.auth === auth) {
+        const stored = existingBox as Box & {
+          aviaryCredentialEpoch?: number;
+          aviaryPendingCredentialEpoch?: number;
+          aviaryPendingApprovalNonce?: string;
+        };
+        if (stored.aviaryPendingApprovalNonce === nonce) {
+          return {
+            ok: true,
+            id,
+            created: false,
+            credentialEpoch: stored.aviaryPendingCredentialEpoch,
+          };
+        }
+        if (stored.aviaryPendingApprovalNonce) {
+          return { ok: false, error: "credential_rotation_pending" };
+        }
+        const nextEpoch = (stored.aviaryCredentialEpoch ?? 0) + 1;
+        stored.aviaryPendingCredentialEpoch = nextEpoch;
+        stored.aviaryPendingApprovalNonce = nonce;
+        this.log(s, {
+          cat: "device",
+          actor: "aviary enrollment",
+          action: "approved credential rotation",
+          target: `${id}/${box} epoch ${nextEpoch}`,
+          ip: "",
+        });
+        await this.save(s);
+        return { ok: true, id, created: false, credentialEpoch: nextEpoch };
+      }
+      return { ok: false, error: "app_path_collision" };
+    }
+    if (s.services.length >= MAX_SERVICES_PER_TENANT) {
+      return { ok: false, error: "service_limit" };
+    }
+
+    const group = s.settings.defaultGroup || "";
+    const service = this.newService(id, label, group);
+    service.auth = auth;
+    service.routes = [...routes];
+    service.state = "offline";
+    service.blurb = "Approved Aviary service — waiting for the relay to connect.";
+    service.aviaryManaged = true;
+    service.aviaryManifestSha256 = digest;
+    service.aviaryApprovalNonce = nonce;
+    service.boxes.push({
+      name: box,
+      os: "unknown",
+      version: "",
+      state: "offline",
+      service: id,
+      serviceLabel: label,
+      keys: [],
+      address: "",
+      outdated: true,
+      lastSeen: "never",
+      lastSeenAt: 0,
+      relay: "—",
+      handshake: "never",
+      handshakeAt: 0,
+      connected: false,
+      aviaryCredentialEpoch: 0,
+      aviaryPendingCredentialEpoch: 1,
+      aviaryPendingApprovalNonce: nonce,
+    } as Box);
+    service.boxCount = 1;
+    service.box = box;
+    service.lastSeenAt = 0;
+    s.services.push(service);
+    if (group && !s.groups.some((candidate) => candidate.name === group)) {
+      s.groups.push({ name: group, members: ["you"] });
+    }
+    await this.ensureDefaultSlug(s);
+    this.log(s, {
+      cat: "device",
+      actor: "aviary enrollment",
+      action: "approved service enrollment",
+      target: `${id}/${box} ${digest.slice(-12)}`,
+      ip: "",
+    });
+    await this.save(s);
+    return { ok: true, id, created: true, credentialEpoch: 1 };
+  }
+
+  /** Compensating action for an Aviary approval that timed out after claiming
+   *  the tenant registry but before durably publishing its grant. It is scoped
+   *  by both app path and manifest digest, so it cannot delete a legacy service
+   *  or a later enrollment that reused the path. */
+  private async releaseAviaryService(
+    appPath: unknown,
+    manifestSha256: unknown,
+    approvalNonce: unknown,
+  ): Promise<{ ok: boolean }> {
+    if (
+      typeof appPath !== "string" ||
+      typeof manifestSha256 !== "string" ||
+      typeof approvalNonce !== "string"
+    ) {
+      return { ok: false };
+    }
+    const s = await this.load();
+    const service = this.findService(s, appPath);
+    if (
+      !service ||
+      service.aviaryManaged !== true
+    ) {
+      return { ok: false };
+    }
+    const pendingBox = service.boxes.find(
+      (candidate) =>
+        (candidate as any).aviaryPendingApprovalNonce === approvalNonce,
+    ) as (Box & {
+      aviaryPendingApprovalNonce?: string;
+      aviaryPendingCredentialEpoch?: number;
+    }) | undefined;
+    if (service.aviaryApprovalNonce !== approvalNonce) {
+      if (!pendingBox) return { ok: false };
+      delete pendingBox.aviaryPendingApprovalNonce;
+      delete pendingBox.aviaryPendingCredentialEpoch;
+      await this.save(s);
+      return { ok: true };
+    }
+    if (service.aviaryManifestSha256 !== manifestSha256) return { ok: false };
+    s.services = s.services.filter((candidate) => candidate !== service);
+    this.log(s, {
+      cat: "device",
+      actor: "aviary enrollment",
+      action: "rolled back incomplete enrollment",
+      target: `${appPath} ${manifestSha256.slice(-12)}`,
+      ip: "",
+    });
+    await this.save(s);
+    return { ok: true };
+  }
+
+  private async commitAviaryCredentialEpoch(
+    appPath: unknown,
+    box: unknown,
+    approvalNonce: unknown,
+    credentialEpoch: unknown,
+  ): Promise<{ ok: boolean }> {
+    if (
+      typeof appPath !== "string" ||
+      typeof box !== "string" ||
+      typeof approvalNonce !== "string" ||
+      typeof credentialEpoch !== "number"
+    ) {
+      return { ok: false };
+    }
+    const s = await this.load();
+    const service = this.findService(s, appPath);
+    const stored = service?.boxes.find((candidate) => candidate.name === box) as
+      | (Box & {
+          aviaryCredentialEpoch?: number;
+          aviaryPendingCredentialEpoch?: number;
+          aviaryPendingApprovalNonce?: string;
+        })
+      | undefined;
+    if (!service?.aviaryManaged || !stored) return { ok: false };
+    if (stored.aviaryCredentialEpoch === credentialEpoch) return { ok: true };
+    if (
+      stored.aviaryPendingApprovalNonce !== approvalNonce ||
+      stored.aviaryPendingCredentialEpoch !== credentialEpoch
+    ) {
+      return { ok: false };
+    }
+    stored.aviaryCredentialEpoch = credentialEpoch;
+    delete stored.aviaryPendingApprovalNonce;
+    delete stored.aviaryPendingCredentialEpoch;
+    this.log(s, {
+      cat: "device",
+      actor: "aviary enrollment",
+      action: "activated service credential",
+      target: `${appPath}/${box} epoch ${credentialEpoch}`,
+      ip: "",
+    });
+    await this.save(s);
+    return { ok: true };
+  }
+
   private async release(id: string): Promise<{ ok: boolean }> {
     const s = await this.load();
     const before = s.services.length;
@@ -820,6 +1080,12 @@ export class TenantDO extends DurableObject<Env> {
     const s = await this.load();
     const ap = this.findService(s, id);
     if (!ap) return { ok: false, error: "unknown service" };
+    if (ap.aviaryManaged && ap.auth !== "public" && mode === "public") {
+      return {
+        ok: false,
+        error: "aviary service requires a new public-access approval",
+      };
+    }
     ap.auth = mode;
     this.log(s, {
       cat: "device",
@@ -1137,6 +1403,49 @@ export class TenantDO extends DurableObject<Env> {
     return { exists: ap.boxes.some((m) => m.name === box) };
   }
 
+  private async boxCredentialEpoch(
+    service: unknown,
+    box: unknown,
+  ): Promise<{ exists: boolean; epoch?: number }> {
+    if (typeof service !== "string" || typeof box !== "string") {
+      return { exists: false };
+    }
+    const s = await this.load();
+    const ap = this.findService(s, service);
+    const stored = ap?.boxes.find((candidate) => candidate.name === box) as
+      | (Box & { aviaryCredentialEpoch?: number })
+      | undefined;
+    if (!ap || !stored) return { exists: false };
+    return {
+      exists: true,
+      ...(typeof stored.aviaryCredentialEpoch === "number"
+        ? { epoch: stored.aviaryCredentialEpoch }
+        : {}),
+    };
+  }
+
+  /** Defense-in-depth Worker-side enforcement of an Aviary manifest's exact
+   *  route prefixes. Legacy services have an empty route list and retain their
+   *  historical forward-all behavior. Prefixes are segment-aware: /api/v1
+   *  matches itself and /api/v1/x, never /api/v10. */
+  private async routeAllowed(
+    service: unknown,
+    path: unknown,
+  ): Promise<{ exists: boolean; allowed: boolean }> {
+    if (typeof service !== "string" || typeof path !== "string") {
+      return { exists: false, allowed: false };
+    }
+    const s = await this.load();
+    const ap = this.findService(s, service);
+    if (!ap) return { exists: false, allowed: false };
+    if (!ap.aviaryManaged) return { exists: true, allowed: true };
+    const routes = Array.isArray(ap.routes) ? ap.routes : [];
+    const allowed = routes.some(
+      (prefix) => path === prefix || path.startsWith(`${prefix}/`),
+    );
+    return { exists: true, allowed };
+  }
+
   /** Re-stamp a box's agent version from /refresh. After a hub-pushed update
    *  the agent re-execs and resumes via /refresh (never /join), so this is the
    *  only channel the NEW version reaches the registry — without it the
@@ -1404,6 +1713,8 @@ export class TenantDO extends DurableObject<Env> {
   ): Promise<{
     allowed: boolean;
     keyLabel: string;
+    keyId?: string;
+    keyOwner?: string;
     public?: boolean;
     reason?: "no-key" | "scope" | "acl" | "expired";
   }> {
@@ -1451,7 +1762,12 @@ export class TenantDO extends DurableObject<Env> {
       return { allowed: false, keyLabel: key.label, reason: "acl" };
     }
 
-    return { allowed: true, keyLabel: key.label };
+    return {
+      allowed: true,
+      keyLabel: key.label,
+      keyId: key.id,
+      keyOwner: key.owner,
+    };
   }
 
   /** Evaluate the tenant's ACL rules for a key reaching a service.

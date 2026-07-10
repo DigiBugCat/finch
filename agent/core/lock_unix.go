@@ -20,13 +20,33 @@ import (
 // fd; closing the fd (release) drops it.
 func lockState(statePath string) (release func(), ok bool) {
 	lockPath := statePath + ".lock"
-	if err := os.MkdirAll(filepath.Dir(lockPath), 0o700); err != nil {
-		// Can't create the dir — don't block startup on the guard; proceed unlocked.
-		return func() {}, true
+	dir := filepath.Dir(lockPath)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, false
 	}
-	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+	info, err := os.Lstat(dir)
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return nil, false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || int(stat.Uid) != os.Geteuid() {
+		return nil, false
+	}
+	if filepath.Clean(dir) != "." && info.Mode().Perm()&0o022 != 0 {
+		return nil, false
+	}
+	fd, err := syscall.Open(lockPath, syscall.O_CREAT|syscall.O_RDWR|syscall.O_CLOEXEC|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
-		return func() {}, true // best-effort: never let the guard itself break run.
+		return nil, false
+	}
+	f := os.NewFile(uintptr(fd), lockPath)
+	if f == nil {
+		syscall.Close(fd)
+		return nil, false
+	}
+	if err := f.Chmod(0o600); err != nil {
+		f.Close()
+		return nil, false
 	}
 	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		f.Close()

@@ -29,13 +29,14 @@ func Version() string { return agentVersion }
 // EmbedOptions configures one embedded service relay. All fields are plain
 // values so the mobile bind layer can pass them straight through.
 type EmbedOptions struct {
-	Hub            string // hub base URL; "" defaults to https://finchmcp.com
-	Box            string // this device's name; "" defaults to os.Hostname()
-	AppPath        string // public URL segment / service id (informational here)
-	Upstream       string // local service base URL, e.g. http://127.0.0.1:8080
-	CredentialPath string // file the refresh credential is read from / written to
-	Ticket         string // one-shot enrollment ticket (first run / re-enroll only)
-	ForwardAll     bool   // forward the whole host (default: confine to /mcp)
+	Hub            string   // hub base URL; "" defaults to https://finchmcp.com
+	Box            string   // this device's name; "" defaults to os.Hostname()
+	AppPath        string   // public URL segment / service id (informational here)
+	Upstream       string   // local service base URL, e.g. http://127.0.0.1:8080
+	CredentialPath string   // file the refresh credential is read from / written to
+	Ticket         string   // one-shot enrollment ticket (first run / re-enroll only)
+	ForwardAll     bool     // forward the whole host (default: confine to /mcp)
+	Routes         []string // optional segment-aware allowlist; used by AviaryMCP leases
 }
 
 func (o EmbedOptions) hub() string {
@@ -111,7 +112,8 @@ func RunConfig(ctx context.Context, configPath string, status func(appPath, stat
 	// token targets this manifest's hub.
 	if cred := loadCliCredQuiet(); cred != nil && cred.Hub == cfg.hubBase() {
 		for _, ing := range cfg.Ingress {
-			_ = cliApprove(cred, ing.AppPath)
+			appPath := ing.AppPath
+			go func() { _ = cliApprove(cred, appPath) }()
 		}
 	}
 
@@ -167,12 +169,14 @@ func Embed(ctx context.Context, o EmbedOptions, status func(state, detail string
 
 	// Resume from the saved credential for THIS hub; fall back to the ticket.
 	var jr *joinResp
+	var resumeErr error
 	refreshToken := ""
 	if saved, _ := loadState(o.CredentialPath); saved != nil && saved.RefreshToken != "" && saved.Hub == hub {
-		if r, rerr := refresh(hub, saved.RefreshToken); rerr == nil {
+		if r, rerr := refreshContext(ctx, hub, saved.RefreshToken); rerr == nil {
 			jr, refreshToken = r, saved.RefreshToken
 			status("connecting", "resumed from saved credential")
 		} else {
+			resumeErr = rerr
 			status("warn", fmt.Sprintf("saved credential unusable: %v", rerr))
 		}
 	}
@@ -185,13 +189,20 @@ func Embed(ctx context.Context, o EmbedOptions, status func(state, detail string
 		status("enrolled", "credential saved")
 	}
 	if jr == nil {
+		if resumeErr != nil {
+			if isHubAuthRejection(resumeErr) {
+				return fmt.Errorf("saved credential rejected: %w", resumeErr)
+			}
+			return fmt.Errorf("resume service: %w", resumeErr)
+		}
 		return fmt.Errorf("not enrolled: pass a Ticket on first run")
 	}
 
 	wsBase := relayDialURL(jr, hub)
+	publicURL := jr.URL
 	connectToken := jr.ConnectToken
 	connectExp := tokenExp(connectToken)
-	status("live", jr.URL)
+	status("assigned", jr.URL)
 
 	// Exponential backoff (capped 30s); ctx-aware sleep returns false if cancelled.
 	backoff := time.Second
@@ -213,8 +224,11 @@ func Embed(ctx context.Context, o EmbedOptions, status func(state, detail string
 		}
 		// Refresh the connect-token near expiry by trading the refresh token.
 		if time.Now().Add(connectSkew).After(connectExp) {
-			fresh, rerr := refresh(hub, refreshToken)
+			fresh, rerr := refreshContext(ctx, hub, refreshToken)
 			if rerr != nil {
+				if isHubAuthRejection(rerr) {
+					return fmt.Errorf("saved credential rejected: %w", rerr)
+				}
 				status("reconnecting", fmt.Sprintf("refresh failed: %v", rerr))
 				if !sleep() {
 					return nil
@@ -224,12 +238,17 @@ func Embed(ctx context.Context, o EmbedOptions, status func(state, detail string
 			connectToken = fresh.ConnectToken
 			connectExp = tokenExp(connectToken)
 			wsBase = relayDialURL(fresh, hub)
+			if fresh.URL != "" {
+				publicURL = fresh.URL
+			}
 		}
 
 		wsURL := wsBase + "?ct=" + url.QueryEscape(connectToken)
 		start := time.Now()
-		status("connected", "")
-		serr := serve(ctx, wsURL, up, o.ForwardAll, hub)
+		status("connecting", "dialing Finch relay")
+		serr := serveWithRoutesStatus(ctx, wsURL, up, o.ForwardAll, o.Routes, hub, func() {
+			status("live", publicURL)
+		})
 		if ctx.Err() != nil {
 			return nil // Stop() cancelled the link — clean shutdown
 		}
