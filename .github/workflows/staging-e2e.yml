@@ -24,7 +24,7 @@ jobs:
         mode: [local, agent]
     env:
       E2E_ROOT: /tmp/finch-staging-e2e
-      AVIARY_VERSION: ${{ vars.AVIARY_MCP_E2E_VERSION || '0.1.0rc4' }}
+      AVIARY_VERSION: ${{ vars.AVIARY_MCP_E2E_VERSION || '0.1.0rc5' }}
       FINCH_CLI_JSON: ${{ secrets.FINCH_STAGING_E2E_CLI_JSON }}
     steps:
       - uses: actions/checkout@v4

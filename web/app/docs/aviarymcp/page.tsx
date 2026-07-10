@@ -21,8 +21,8 @@ export default function AviaryMCPDocs() {
       </p>
 
       <div className="docs-note">
-        <b>Public release candidate.</b> Version <code>0.1.0rc4</code> is available on{' '}
-        <a href="https://pypi.org/project/aviary-mcp/0.1.0rc4/" target="_blank" rel="noreferrer">
+        <b>Public release candidate.</b> Version <code>0.1.0rc5</code> is available on{' '}
+        <a href="https://pypi.org/project/aviary-mcp/0.1.0rc5/" target="_blank" rel="noreferrer">
           PyPI
         </a>{' '}
         and requires the Finch 1.6 agent. The normal Finch CLI and <code>finch.yml</code>{' '}
@@ -57,7 +57,7 @@ export default function AviaryMCPDocs() {
         AviaryMCP is published publicly on PyPI. Pin the release candidate while
         evaluating it so a future prerelease does not change underneath your service.
       </p>
-      <Code>{`python -m pip install 'aviary-mcp==0.1.0rc4'`}</Code>
+      <Code>{`python -m pip install 'aviary-mcp==0.1.0rc5'`}</Code>
 
       <h2>2. Define the service</h2>
       <p>Save this as <code>server.py</code>:</p>
