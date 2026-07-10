@@ -6,19 +6,41 @@ const expectedActiveKid = process.argv[3] || "finch-prod-2026-07";
 if (!url.startsWith("https://")) {
   throw new Error("caller-assertion JWKS smoke target must use HTTPS");
 }
-const smokeUrl = new URL(url);
-// Rotation deliberately gives normal JWKS consumers a five-minute cache. A
-// unique query makes this deployment probe observe the newly activated Worker
-// and active kid instead of a valid-but-stale pre-rotation response.
-smokeUrl.searchParams.set("_finch_smoke", Date.now().toString(36));
-
-const response = await fetch(smokeUrl, {
-  headers: { accept: "application/jwk-set+json" },
-  redirect: "error",
-  signal: AbortSignal.timeout(10_000),
-});
-if (!response.ok) {
-  throw new Error(`JWKS ${url} returned HTTP ${response.status}`);
+// Cloudflare can route the first few requests to the newly activated code
+// before its secret binding is visible in every isolate. Retry that short
+// propagation window; the endpoint itself still fails closed with 503.
+let response;
+let lastError;
+const attempts = 12;
+for (let attempt = 1; attempt <= attempts; attempt++) {
+  const smokeUrl = new URL(url);
+  // Rotation deliberately gives normal JWKS consumers a five-minute cache. A
+  // unique query makes each deployment probe observe the active Worker.
+  smokeUrl.searchParams.set(
+    "_finch_smoke",
+    `${Date.now().toString(36)}-${attempt}`,
+  );
+  try {
+    const candidate = await fetch(smokeUrl, {
+      headers: { accept: "application/jwk-set+json" },
+      redirect: "error",
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (candidate.ok) {
+      response = candidate;
+      break;
+    }
+    lastError = new Error(`JWKS ${url} returned HTTP ${candidate.status}`);
+  } catch (error) {
+    lastError = error;
+  }
+  if (attempt < attempts) {
+    console.warn(`JWKS signer not ready (attempt ${attempt}/${attempts}); retrying`);
+    await new Promise((resolve) => setTimeout(resolve, 5_000));
+  }
+}
+if (!response) {
+  throw lastError || new Error(`JWKS ${url} did not become ready`);
 }
 if (!(response.headers.get("content-type") || "").includes("application/jwk-set+json")) {
   throw new Error("JWKS response did not use application/jwk-set+json");
