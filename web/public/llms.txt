@@ -60,7 +60,7 @@ finch keys mint my-claude --service hello            # finch_ key, shown once
 
 ## AviaryMCP release candidate
 
-AviaryMCP 0.1.0rc6 is public on PyPI (`python -m pip install 'aviary-mcp==0.1.0rc6'`) and is the preferred path for a new Python service. Its project-specific machine-readable guide is https://raw.githubusercontent.com/DigiBugCat/aviary-mcp/main/llms.txt. It subclasses FastMCP and follows the normal FastMCP convention: create `mcp = AviaryMCP("My MCP Server")`, register tools with `@mcp.tool`, and call `mcp.run()`.
+AviaryMCP 0.1.0rc6 is public on PyPI (`python -m pip install 'aviary-mcp==0.1.0rc6'`) and is the preferred path for a new Python service. Its project-specific machine-readable guide is `/aviarymcp-llms.txt` on this origin. It subclasses FastMCP and follows the normal FastMCP convention: create `mcp = AviaryMCP("My MCP Server")`, register tools with `@mcp.tool`, and call `mcp.run()`.
 
 ```python
 from aviary_mcp import AviaryMCP, Finch

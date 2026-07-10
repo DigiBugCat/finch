@@ -1,0 +1,105 @@
+# AviaryMCP
+
+> AviaryMCP is an opinionated, FastMCP-compatible Python runtime that defines a tool once and serves it through MCP, generated REST endpoints, and OpenAPI, with optional Finch enrollment and authenticated exposure.
+
+## Canonical links
+
+- Documentation: https://finchmcp.com/docs/aviarymcp
+- PyPI: https://pypi.org/project/aviary-mcp/
+- Finch: https://finchmcp.com/
+- Fleet guide: /llms.txt on this origin
+
+## Install
+
+Pin the current release candidate:
+
+```console
+python -m pip install 'aviary-mcp==0.1.0rc6'
+```
+
+## FastMCP convention
+
+AviaryMCP subclasses FastMCP and uses its normal server conventions. The conventional server variable is `mcp`:
+
+```python
+from aviary_mcp import AviaryMCP
+
+mcp = AviaryMCP("My MCP Server")
+
+@mcp.tool
+def greet(name: str) -> str:
+    return f"Hello, {name}!"
+
+mcp.run(transport="http", host="127.0.0.1", port=8000)
+```
+
+Existing FastMCP code generally changes only the import and constructor:
+
+```diff
+-from fastmcp import FastMCP
++from aviary_mcp import AviaryMCP
+
+-mcp = FastMCP("My MCP Server")
++mcp = AviaryMCP("My MCP Server")
+```
+
+Continue to use `@mcp.tool`, `@mcp.resource`, `@mcp.prompt`, `mcp.mount(...)`, and `mcp.run()` normally.
+
+## Finch connectors
+
+Use `Finch.local` when the Python service should own a dedicated Finch child:
+
+```python
+from aviary_mcp import AviaryMCP, Finch
+
+mcp = AviaryMCP(
+    "weather",
+    finch=Finch.local(
+        path="weather",
+        binary="/absolute/path/to/finch",
+    ),
+)
+
+@mcp.tool
+def forecast(city: str) -> dict:
+    return {"city": city, "temperature": 72}
+
+mcp.run()
+```
+
+Use `Finch.agent(path="weather", socket="/absolute/control.sock")` to connect to an existing Finch agent. Both modes use ordinary `mcp.run()` and expose the same application at `/mcp`, `/api/v1`, and `/birdz`.
+
+## Generated interfaces
+
+- `POST /mcp`: FastMCP Streamable HTTP transport.
+- `GET /api/v1/tools`: generated tool catalog.
+- `POST /api/v1/tools/{tool_name}`: invoke the same registered tool through JSON REST.
+- `GET /api/v1/openapi.json`: generated OpenAPI 3.1 document.
+- `GET /birdz`: application liveness.
+- `GET /birdz/ready`: Finch relay readiness when exposed through Finch.
+
+MCP and REST share FastMCP's registry, schemas, validation, middleware, handler, and AviaryMCP authorization decision. Do not implement a second REST handler for a tool.
+
+## Authentication and safety
+
+- `access="local"` is the default and may bind only to loopback.
+- Supplying `auth=` or `mcp_auth=` selects private authenticated operation.
+- A Finch connector with default `edge_auth="key"` automatically configures Finch caller-assertion verification.
+- `edge_auth="public"` must be chosen explicitly and requires separate approval.
+- `Finch.local` requires an explicit absolute Finch binary path and Finch 1.6.0 or newer.
+- Do not duplicate an AviaryMCP-managed application path in `finch.yml`.
+
+## Composition
+
+Mount ordinary FastMCP children into an AviaryMCP parent with FastMCP's live composition API:
+
+```python
+from fastmcp import FastMCP
+from aviary_mcp import AviaryMCP
+
+weather = FastMCP("weather")
+mcp = AviaryMCP("aviary")
+mcp.mount(weather, namespace="weather")
+```
+
+The mounted tools appear through MCP, REST, and OpenAPI. Prefer `mount()` over the deprecated one-time `import_server()` API.
