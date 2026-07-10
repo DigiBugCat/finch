@@ -30,6 +30,7 @@ from urllib.request import Request, urlopen
 DEFAULT_STAGING_HUB = "https://finch-staging.pantainos.workers.dev"
 OPT_IN = "FINCH_STAGING_E2E"
 MODES = frozenset({"local", "agent"})
+APP_RESTART_TIMEOUT = 90
 
 
 class SmokeFailure(RuntimeError):
@@ -449,15 +450,33 @@ def main() -> int:
             agent.stop()
             agent = AgentProcess(binary, hub, credentials, control_socket, box)
         app = AppProcess(env)
-        deadline = time.monotonic() + 30
+        # Finch.local includes binary validation, child startup, and the
+        # configured 60-second relay activation window. Give the full public
+        # lifecycle contract time to settle rather than imposing a shorter
+        # runner-only deadline.
+        deadline = time.monotonic() + APP_RESTART_TIMEOUT
+        local_status: int | None = None
         while True:
+            if app.process.poll() is not None:
+                raise SmokeFailure(
+                    f"AviaryMCP exited during restart ({app.process.returncode})"
+                )
+            try:
+                local_status, _ = request_json(
+                    "GET", f"http://127.0.0.1:{port}/birdz"
+                )
+            except (OSError, ValueError):
+                local_status = None
             status, payload = request_json(
                 "POST", rest_url, token=token, body={"a": 19, "b": 23}
             )
             if status == 200 and result_value(payload) == 42:
                 break
             if time.monotonic() >= deadline:
-                raise SmokeFailure("service did not resume after application restart")
+                raise SmokeFailure(
+                    "service did not resume after application restart "
+                    f"(local health status: {local_status})"
+                )
             time.sleep(1)
         if credential_fingerprint(credential_root, app_path) != first_fingerprint:
             raise SmokeFailure("saved service credential changed across app restart")
