@@ -110,7 +110,10 @@ def request_json(
     body: dict[str, Any] | None = None,
     spoof_assertion: bool = False,
 ) -> tuple[int, Any]:
-    headers = {"Accept": "application/json"}
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "AviaryMCP-Staging-E2E/1.0",
+    }
     if token is not None:
         headers["Authorization"] = f"Bearer {token}"
     if spoof_assertion:
