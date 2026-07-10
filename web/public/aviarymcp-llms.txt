@@ -7,7 +7,7 @@
 - Documentation: https://finchmcp.com/docs/aviarymcp
 - PyPI: https://pypi.org/project/aviary-mcp/
 - Finch: https://finchmcp.com/
-- Fleet guide: /llms.txt on this origin
+- Fleet guide: [/llms.txt](/llms.txt) on this origin
 
 ## Install
 
