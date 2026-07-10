@@ -29,7 +29,7 @@ export default function AviaryMCPDocs() {
         remain supported for existing, non-Python, and non-SDK services.
         {' '}Machine-readable guidance is available in the hosted{' '}
         <a href="/llms.txt">llms.txt</a> and AviaryMCP&apos;s{' '}
-        <a href="https://github.com/DigiBugCat/aviary-mcp/blob/main/llms.txt" target="_blank" rel="noreferrer">
+        <a href="/aviarymcp-llms.txt">
           project llms.txt
         </a>.
       </div>
