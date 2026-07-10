@@ -18,7 +18,7 @@ jobs:
     environment: staging
     timeout-minutes: 12
     env:
-      E2E_ROOT: ${{ runner.temp }}/finch-staging-e2e
+      E2E_ROOT: /tmp/finch-staging-e2e
       AVIARY_VERSION: ${{ vars.AVIARY_MCP_E2E_VERSION || '0.1.0rc3' }}
       FINCH_CLI_JSON: ${{ secrets.FINCH_STAGING_E2E_CLI_JSON }}
     steps:
@@ -54,17 +54,19 @@ jobs:
             "aviary-mcp==$AVIARY_VERSION"
 
       - name: Verify offline production-safety gates
-        run: "$E2E_ROOT/venv/bin/python" e2e/staging/test_safety.py
+        run: |
+          "$E2E_ROOT/venv/bin/python" e2e/staging/test_safety.py
 
       - name: Exercise AviaryMCP against Finch staging
         env:
           FINCH_STAGING_E2E: "1"
-          FINCH_E2E_BINARY: ${{ runner.temp }}/finch-staging-e2e/finch
-          FINCH_E2E_CLI_HOME: ${{ runner.temp }}/finch-staging-e2e/home
-          FINCH_CONTROL_SOCKET: ${{ runner.temp }}/finch-staging-e2e/run/control.sock
-          FINCH_CREDENTIALS_DIR: ${{ runner.temp }}/finch-staging-e2e/credentials
+          FINCH_E2E_BINARY: /tmp/finch-staging-e2e/finch
+          FINCH_E2E_CLI_HOME: /tmp/finch-staging-e2e/home
+          FINCH_CONTROL_SOCKET: /tmp/finch-staging-e2e/run/control.sock
+          FINCH_CREDENTIALS_DIR: /tmp/finch-staging-e2e/credentials
           FINCH_E2E_EXPECTED_AVIARY_VERSION: ${{ env.AVIARY_VERSION }}
-        run: "$E2E_ROOT/venv/bin/python" e2e/staging/run.py
+        run: |
+          "$E2E_ROOT/venv/bin/python" e2e/staging/run.py
 
       - name: Remove temporary credentials
         if: always()
