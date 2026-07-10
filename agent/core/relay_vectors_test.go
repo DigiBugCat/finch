@@ -325,6 +325,51 @@ func TestForward_HeadChunkEndSequence(t *testing.T) {
 	}
 }
 
+func TestForward_OnlyDedicatedAssertionFieldCanSetIdentity(t *testing.T) {
+	received := make(chan http.Header, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received <- r.Header.Clone()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	cw := &collectingWriter{}
+	forward(context.Background(), mustParse(t, srv.URL+"/mcp"), frame{
+		ID: "identity-1", Type: "req", Method: "POST", Path: "/mcp",
+		Assertion: "trusted.worker.jws",
+		ReqHeaders: map[string]string{
+			"X-Finch-Assertion":       "spoofed",
+			"X-Finch-User":            "spoofed-user",
+			"X-Finch-Caller":          "spoofed-caller",
+			"X-Finch-Tenant":          "spoofed-tenant",
+			"X-Finch-Auth-Method":     "spoofed-method",
+			"X-Finch-Session":         "spoofed-session",
+			"X-Finch-Principal":       "spoofed-principal",
+			"X-Finch-Identity-Custom": "spoofed-custom",
+			"X-Finch-Service":         "spoofed-service",
+			"X-Finch-Auth":            "spoofed-auth",
+			"X-Ordinary":              "preserved",
+		},
+	}, cw.write, nil, false)
+
+	headers := <-received
+	if got := headers.Get("X-Finch-Assertion"); got != "trusted.worker.jws" {
+		t.Fatalf("trusted assertion = %q", got)
+	}
+	if got := headers.Get("X-Ordinary"); got != "preserved" {
+		t.Fatalf("ordinary header = %q", got)
+	}
+	for _, name := range []string{
+		"X-Finch-User", "X-Finch-Caller", "X-Finch-Tenant", "X-Finch-Auth-Method",
+		"X-Finch-Session", "X-Finch-Principal", "X-Finch-Identity-Custom",
+		"X-Finch-Service", "X-Finch-Auth",
+	} {
+		if got := headers.Get(name); got != "" {
+			t.Errorf("reserved header %s leaked as %q", name, got)
+		}
+	}
+}
+
 // TestForward_PreHeadDialFail asserts a dial failure (no server) produces a
 // single pre-head `err` frame with status 502 — the DO can still fail over.
 func TestForward_PreHeadDialFail(t *testing.T) {

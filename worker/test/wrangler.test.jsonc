@@ -20,6 +20,7 @@
     // The login wall 302s here; a stable test value lets the e2e assert the
     // Location host without depending on prod config.
     "WEB_URL": "https://web.test",
+    "AVIARY_VERIFICATION_ORIGINS": "https://web.test",
     "VANITY_SUFFIXES": "aviary.run",
     "VANITY_TENANT": "tenant_vanity",
     "BYO_CNAME_TARGET": "finchmcp.com",
@@ -32,13 +33,15 @@
     "bindings": [
       { "name": "BOX", "class_name": "BoxDO" },
       { "name": "TENANT", "class_name": "TenantDO" },
-      { "name": "ROUTER", "class_name": "RouterDO" }
+      { "name": "ROUTER", "class_name": "RouterDO" },
+      { "name": "AVIARY_ENROLLMENT", "class_name": "AviaryEnrollmentDO" }
     ]
   },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["ApplianceDO"] },
     { "tag": "v2", "new_sqlite_classes": ["TenantDO"] },
     { "tag": "v3", "new_sqlite_classes": ["RouterDO"] },
-    { "tag": "v4", "renamed_classes": [{ "from": "ApplianceDO", "to": "BoxDO" }] }
+    { "tag": "v4", "renamed_classes": [{ "from": "ApplianceDO", "to": "BoxDO" }] },
+    { "tag": "v5", "new_sqlite_classes": ["AviaryEnrollmentDO"] }
   ]
 }

@@ -2,7 +2,7 @@
   "$comment": [
     "RELAY v2 FROZEN FRAME CONTRACT \u2014 shared golden vectors for the streaming relay.",
     "Both the TS codec test (worker/test/relay-stream.test.ts) and the Go codec test",
-    "(agent/relay_vectors_test.go) load THIS SAME file and assert each frame round-trips",
+    "(agent/core/relay_vectors_test.go) load THIS SAME file and assert each frame round-trips",
     "to/from the byte-for-byte JSON in `wire`. If you change the wire shape, change it",
     "HERE and both sides re-pass \u2014 that is the point of a single fixture.",
     "",
@@ -33,7 +33,7 @@
   "frames": {
     "req": {
       "direction": "DO->agent",
-      "note": "The relayed request. body is the buffered request body as a UTF-8 string. headers is a name->value map (request side stays a map; the DO builds it from Object.fromEntries(req.headers), the agent reads it as map[string]string).",
+      "note": "The relayed request. body is the buffered request body as a UTF-8 string. headers is an untrusted name->value map (request side stays a map). assertion is the optional Worker-minted ES256 caller JWS carried separately; the agent strips reserved identity headers from headers and injects only assertion as X-Finch-Assertion.",
       "wire": {
         "id": "11111111-1111-4111-8111-111111111111",
         "type": "req",
@@ -43,7 +43,8 @@
           "content-type": "application/json",
           "mcp-session-id": "sess-abc"
         },
-        "body": "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}"
+        "body": "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}",
+        "assertion": "eyJhbGciOiJFUzI1NiIsImtpZCI6InRlc3QtMjAyNiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJmaW5jaDp0ZW5hbnQ6c2VydmljZSJ9.dGVzdC1zaWduYXR1cmU"
       }
     },
     "head": {

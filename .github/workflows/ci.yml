@@ -2,7 +2,10 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    # Both deployable branches must pass the exact same gate. The deploy
+    # workflow consumes this workflow's release-candidate artifact and will
+    # not run from a raw push.
+    branches: [main, production]
   pull_request:
 
 permissions:
@@ -18,6 +21,7 @@ jobs:
         with:
           node-version: "22"
       - run: node scripts/check-versions.mjs
+      - run: node scripts/check-assertion-vector-drift.mjs
 
   worker:
     runs-on: ubuntu-latest
@@ -33,6 +37,10 @@ jobs:
           cache-dependency-path: worker/package-lock.json
       - run: npm ci
       - run: npm run typecheck
+      - name: Exercise assertion-key pre-upload validation
+        run: |
+          node scripts/generate-assertion-jwks.mjs finch-ci \
+            | node scripts/validate-assertion-jwks.mjs finch-ci
       # Validates wrangler.jsonc + bundling for the env we actually deploy.
       - run: npx wrangler deploy --dry-run --env production
       - run: npm test
@@ -69,3 +77,35 @@ jobs:
       - run: go build ./...
       - run: go vet ./...
       - run: go test ./...
+      - run: sh -n docker-entrypoint.sh docker-entrypoint_test.sh dependency-lock-sha256.sh
+      - run: sh docker-entrypoint_test.sh
+      - run: ./dependency-lock-sha256.sh "$(./dependency-lock-sha256.sh)"
+      - name: Build hardened container image
+        working-directory: .
+        run: docker build -t finch-agent:test ./agent
+      - name: Verify container runs as the fixed non-root UID
+        working-directory: .
+        run: test "$(docker run --rm --entrypoint id finch-agent:test -u)" = "10001"
+
+  release-candidate:
+    # This small immutable hand-off makes a successful *whole* CI run, rather
+    # than an independently racing push event, the input to deployment.
+    if: github.event_name == 'push'
+    needs: [versions, worker, web, agent]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Record the tested commit
+        env:
+          CANDIDATE_SHA: ${{ github.sha }}
+          CANDIDATE_BRANCH: ${{ github.ref_name }}
+        run: |
+          mkdir release-candidate
+          printf '%s\n' "$CANDIDATE_SHA" > release-candidate/commit.sha
+          printf '%s\n' "$CANDIDATE_BRANCH" > release-candidate/branch
+          printf '%s\n' '${{ github.run_id }}' > release-candidate/ci-run-id
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-candidate
+          path: release-candidate/
+          if-no-files-found: error
+          retention-days: 30

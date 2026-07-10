@@ -32,10 +32,12 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -54,12 +56,39 @@ import (
 // `-ldflags "-X main.agentVersion=<v>"`; the literal here is the source of
 // truth that CI (scripts/check-versions.mjs) asserts matches the worker's
 // LATEST_AGENT and the web dashboard constant. Keep all three in sync.
-var agentVersion = "1.5.7"
+var agentVersion = "1.6.0"
 
 // connectSkew is how long before a connect-token's exp we treat it as already
 // expired and force a fresh /join, so we never dial with a token that lapses
 // mid-handshake.
 const connectSkew = 5 * time.Second
+
+const controlPlaneResponseLimit = 1 << 20 // 1 MiB
+const credentialStateLimit = 64 << 10
+
+var controlPlaneHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 15 * time.Second,
+		ExpectContinueTimeout: time.Second,
+	},
+	Timeout: 30 * time.Second,
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
+
+type hubHTTPStatusError struct {
+	Status int
+}
+
+func (e *hubHTTPStatusError) Error() string { return fmt.Sprintf("hub returned HTTP %d", e.Status) }
+
+func isHubAuthRejection(err error) bool {
+	var statusErr *hubHTTPStatusError
+	return errors.As(err, &statusErr) && (statusErr.Status == http.StatusUnauthorized || statusErr.Status == http.StatusForbidden)
+}
 
 // headerPair is one ordered [name, value] header tuple. It marshals to / from a
 // JSON 2-element array (e.g. ["set-cookie","a=1"]) so the `head` frame can carry
@@ -99,6 +128,9 @@ type frame struct {
 	Path       string            `json:"path,omitempty"`
 	ReqHeaders map[string]string `json:"-"`
 	Body       string            `json:"body,omitempty"`
+	// Assertion is the only trusted path for the Worker's signed caller JWS.
+	// Reserved X-Finch-* identity headers in ReqHeaders are always stripped.
+	Assertion string `json:"assertion,omitempty"`
 
 	// head (agent -> DO): ordered, duplicate-preserving [name,value] pairs.
 	HeadHeaders []headerPair `json:"-"`
@@ -133,6 +165,7 @@ type frameWire struct {
 	HeadHeaders []headerPair      `json:"-"`
 	Headers     json.RawMessage   `json:"headers,omitempty"`
 	Body        string            `json:"body,omitempty"`
+	Assertion   string            `json:"assertion,omitempty"`
 	Data        string            `json:"data,omitempty"`
 	Status      int               `json:"status,omitempty"`
 	Message     string            `json:"message,omitempty"`
@@ -144,7 +177,7 @@ type frameWire struct {
 func (f frame) MarshalJSON() ([]byte, error) {
 	w := frameWire{
 		ID: f.ID, Type: f.Type,
-		Method: f.Method, Path: f.Path, Body: f.Body,
+		Method: f.Method, Path: f.Path, Body: f.Body, Assertion: f.Assertion,
 		Data: f.Data, Status: f.Status, Message: f.Message,
 		Credits: f.Credits,
 	}
@@ -175,7 +208,7 @@ func (f *frame) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	f.ID, f.Type = w.ID, w.Type
-	f.Method, f.Path, f.Body = w.Method, w.Path, w.Body
+	f.Method, f.Path, f.Body, f.Assertion = w.Method, w.Path, w.Body, w.Assertion
 	f.Data, f.Status, f.Message = w.Data, w.Status, w.Message
 	f.Credits = w.Credits
 	f.ReqHeaders, f.HeadHeaders = nil, nil
@@ -282,9 +315,12 @@ func Main() {
 	}
 
 	hostName, _ := os.Hostname()
-	hub := flag.String("hub", "https://finchmcp.com", "finch hub base URL (http[s]://…)")
+	runCommand := len(os.Args) > 1 && os.Args[1] == "run"
+	defaultHub := agentDefaultHub()
+	defaultBox := agentDefaultBox(hostName)
+	hub := flag.String("hub", defaultHub, "finch hub base URL (http[s]://…)")
 	ticket := flag.String("ticket", "", "one-shot enrollment ticket from the dashboard (first run only; '-' reads it from stdin, or set FINCH_TICKET; later runs resume from --state)")
-	box := flag.String("box", hostName, "this box's name")
+	box := flag.String("box", defaultBox, "this box's name")
 	upstream := flag.String("upstream", "http://127.0.0.1:8000", "local MCP server base URL")
 	statePath := flag.String("state", defaultStatePath(), "file that persists the per-box refresh credential so a restart needs no new ticket")
 	configPath := flag.String("config", "", "path to a finch.yml manifest; serves every ingress rule (one local service per app_path) over one process")
@@ -333,6 +369,14 @@ func Main() {
 		runConfig(cfg)
 		return
 	}
+	// `finch run` is also the zero-config AviaryMCP daemon mode. With no
+	// finch.yml it owns only the local control socket and starts relays as SDK
+	// leases arrive; bare `finch` retains the historical single-service path.
+	if runCommand {
+		credentialsDir := dynamicCredentialsDir()
+		runConfig(&config{Hub: *hub, Box: *box, CredentialsDir: credentialsDir})
+		return
+	}
 
 	// Single-service: confine forwarded requests to one upstream (SSRF guard in
 	// forward()). Parse it once.
@@ -371,6 +415,27 @@ func Main() {
 	})
 }
 
+func agentDefaultHub() string {
+	if configured := strings.TrimSpace(os.Getenv("FINCH_HUB")); configured != "" {
+		return configured
+	}
+	return "https://finchmcp.com"
+}
+
+func agentDefaultBox(hostName string) string {
+	if configured := strings.TrimSpace(os.Getenv("FINCH_BOX")); configured != "" {
+		return configured
+	}
+	return hostName
+}
+
+func dynamicCredentialsDir() string {
+	if configured := strings.TrimSpace(os.Getenv("FINCH_CREDENTIALS_DIR")); configured != "" {
+		return expandHome(configured)
+	}
+	return filepath.Dir(defaultStatePath())
+}
+
 // enrollToState trades a one-shot ticket for a long-lived refresh credential via
 // /join and persists it (0600) to statePath, returning the join response too so
 // callers can read the hub-slugified service id. Shared by the single-service
@@ -407,7 +472,7 @@ func persistJoin(hub string, jr *joinResp, statePath string) (*agentState, error
 // rule maps a public path (<slug>.finchmcp.com/<app_path>/…) to a local service.
 // A rule with a bad service or a not-yet-enrolled service is logged and
 // skipped; its siblings keep running.
-func runConfig(cfg *config) {
+func runLegacyConfig(cfg *config) {
 	if len(cfg.Ingress) == 0 {
 		log.Fatal("finch: finch.yml has no ingress rules — nothing to serve")
 	}
@@ -623,25 +688,32 @@ func runService(o serviceOpts) (enrolled bool) {
 // (including the per-box connect-token). Safe to call again on reconnect
 // while the ticket remains within its own TTL.
 func join(hub, ticket, box string) (*joinResp, error) {
+	return joinContext(context.Background(), hub, ticket, box)
+}
+
+func joinContext(ctx context.Context, hub, ticket, box string) (*joinResp, error) {
 	body, _ := json.Marshal(map[string]string{
 		"ticket":  ticket,
 		"box":     box,
 		"os":      osLabel(),
 		"version": agentVersion,
 	})
-	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(hub, "/")+"/join", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(hub, "/")+"/join", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("content-type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := controlPlaneHTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
+	b, err := readBoundedControlResponse(resp.Body)
+	if err != nil {
+		return nil, err
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("hub %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+		return nil, &hubHTTPStatusError{Status: resp.StatusCode}
 	}
 	var jr joinResp
 	if err := json.Unmarshal(b, &jr); err != nil {
@@ -661,6 +733,10 @@ func join(hub, ticket, box string) (*joinResp, error) {
 // rejects it (403) if the box was removed from the dashboard, which is how
 // revocation propagates to the box within a connect-token TTL.
 func refresh(hub, refreshToken string) (*joinResp, error) {
+	return refreshContext(context.Background(), hub, refreshToken)
+}
+
+func refreshContext(ctx context.Context, hub, refreshToken string) (*joinResp, error) {
 	// version rides along so the hub can re-stamp it: after a hub-pushed update
 	// the agent re-execs and resumes via /refresh (never /join), so this is the
 	// only place the NEW version reaches the registry. Older hubs ignore it.
@@ -668,19 +744,22 @@ func refresh(hub, refreshToken string) (*joinResp, error) {
 		"refreshToken": refreshToken,
 		"version":      agentVersion,
 	})
-	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(hub, "/")+"/refresh", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(hub, "/")+"/refresh", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("content-type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := controlPlaneHTTPClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
+	b, err := readBoundedControlResponse(resp.Body)
+	if err != nil {
+		return nil, err
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("hub %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+		return nil, &hubHTTPStatusError{Status: resp.StatusCode}
 	}
 	var jr joinResp
 	if err := json.Unmarshal(b, &jr); err != nil {
@@ -690,6 +769,17 @@ func refresh(hub, refreshToken string) (*joinResp, error) {
 		return nil, fmt.Errorf("refresh rejected: %s", jr.Error)
 	}
 	return &jr, nil
+}
+
+func readBoundedControlResponse(body io.Reader) ([]byte, error) {
+	b, err := io.ReadAll(io.LimitReader(body, controlPlaneResponseLimit+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(b) > controlPlaneResponseLimit {
+		return nil, fmt.Errorf("hub response exceeds %d bytes", controlPlaneResponseLimit)
+	}
+	return b, nil
 }
 
 // tokenExp decodes the (unsigned) expiry from a finch HMAC token of the form
@@ -800,16 +890,33 @@ func (o *outStream) setPaused(p bool) {
 // to confine to /mcp (default) or forward the whole host. hub is the box's own
 // hub base URL — the pinned source a hub-pushed "update" frame downloads from.
 func serve(parent context.Context, wsURL string, upstream *url.URL, forwardAll bool, hub string) error {
+	return serveWithRoutes(parent, wsURL, upstream, forwardAll, nil, hub)
+}
+
+// serveWithRoutes is the dynamic-service form of serve. Legacy callers keep
+// the historical /mcp-or-forward_all behavior through serve above; AviaryMCP
+// supplies an explicit, segment-aware list such as /mcp, /api/v1, and /birdz.
+func serveWithRoutes(parent context.Context, wsURL string, upstream *url.URL, forwardAll bool, routes []string, hub string) error {
+	return serveWithRoutesStatus(parent, wsURL, upstream, forwardAll, routes, hub, nil)
+}
+
+func serveWithRoutesStatus(parent context.Context, wsURL string, upstream *url.URL, forwardAll bool, routes []string, hub string, onConnected func()) error {
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 
-	c, _, err := websocket.Dial(ctx, wsURL, nil)
+	c, response, err := websocket.Dial(ctx, wsURL, nil)
 	if err != nil {
-		return err
+		if response != nil {
+			return fmt.Errorf("Finch relay dial failed (HTTP %d)", response.StatusCode)
+		}
+		return fmt.Errorf("Finch relay dial failed")
 	}
 	defer c.Close(websocket.StatusNormalClosure, "bye")
 	c.SetReadLimit(32 << 20) // 32 MiB frames
 	log.Printf("finch: relay open -> %s", upstream)
+	if onConnected != nil {
+		onConnected()
+	}
 
 	// One writer at a time: coder/websocket forbids concurrent writes. write
 	// returns an error so a streaming forward() can ABORT mid-stream when the DO
@@ -906,7 +1013,7 @@ func serve(parent context.Context, wsURL string, upstream *url.URL, forwardAll b
 			outMu.Unlock()
 			go func(f frame, os *outStream) {
 				defer remove(f.ID)
-				forward(fctx, upstream, f, write, os, forwardAll)
+				forwardWithRoutes(fctx, upstream, f, write, os, forwardAll, routes)
 			}(f, os)
 		case "window":
 			if os := lookup(f.ID); os != nil {
@@ -962,7 +1069,11 @@ const relayChunkSize = 32 << 10
 // unbounded. The head is emitted before any wait — head is never paused. os may
 // be nil (no flow control / direct unit-test call): then it never pauses.
 func forward(ctx context.Context, upstream *url.URL, f frame, write func(frame) error, os *outStream, forwardAll bool) {
-	target, err := resolveUpstream(upstream, f.Path, forwardAll)
+	forwardWithRoutes(ctx, upstream, f, write, os, forwardAll, nil)
+}
+
+func forwardWithRoutes(ctx context.Context, upstream *url.URL, f frame, write func(frame) error, os *outStream, forwardAll bool, routes []string) {
+	target, err := resolveUpstreamWithRoutes(upstream, f.Path, forwardAll, routes)
 	if err != nil {
 		// SSRF reject — pre-head, so the DO turns this into a 403 response.
 		write(frame{ID: f.ID, Type: "err", Status: 403, Message: err.Error()})
@@ -975,7 +1086,11 @@ func forward(ctx context.Context, upstream *url.URL, f frame, write func(frame) 
 		return
 	}
 	for k, v := range f.ReqHeaders {
-		switch strings.ToLower(k) {
+		lower := strings.ToLower(k)
+		if isReservedFinchIdentityHeader(lower) {
+			continue
+		}
+		switch lower {
 		case "host", "connection", "upgrade", "content-length", "transfer-encoding", "authorization":
 			// hop-by-hop / recomputed / credential — never forward to the box.
 			// (The hub already strips the caller's finch_ key; we drop it again
@@ -984,8 +1099,11 @@ func forward(ctx context.Context, upstream *url.URL, f frame, write func(frame) 
 			req.Header.Set(k, v)
 		}
 	}
+	if f.Assertion != "" {
+		req.Header.Set("X-Finch-Assertion", f.Assertion)
+	}
 
-	resp, err := relayClient(upstream, forwardAll).Do(req)
+	resp, err := relayClientWithRoutes(upstream, forwardAll, routes).Do(req)
 	if err != nil {
 		// Dial / connect failure — pre-head, so the DO maps it to a 502 and may
 		// still fail over to another box.
@@ -1060,6 +1178,20 @@ func forward(ctx context.Context, upstream *url.URL, f frame, write func(frame) 
 	}
 }
 
+func isReservedFinchIdentityHeader(lower string) bool {
+	if strings.HasPrefix(lower, "x-finch-identity-") {
+		return true
+	}
+	switch lower {
+	case "x-finch-assertion", "x-finch-caller", "x-finch-user",
+		"x-finch-tenant", "x-finch-auth-method", "x-finch-session",
+		"x-finch-principal", "x-finch-service", "x-finch-auth":
+		return true
+	default:
+		return false
+	}
+}
+
 // relayClient returns an http.Client for the relay forward path whose redirect
 // policy re-runs the SSRF confinement on EVERY hop. Go's default client follows
 // up to 10 redirects to an ARBITRARY host/scheme, which would let a fronted
@@ -1069,6 +1201,10 @@ func forward(ctx context.Context, upstream *url.URL, f frame, write func(frame) 
 // trusted base + the redirect's path and refuse the hop if it doesn't match,
 // so a Location can never move host/scheme or climb out of the prefix.
 func relayClient(base *url.URL, forwardAll bool) *http.Client {
+	return relayClientWithRoutes(base, forwardAll, nil)
+}
+
+func relayClientWithRoutes(base *url.URL, forwardAll bool, routes []string) *http.Client {
 	return &http.Client{
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 10 {
@@ -1083,7 +1219,7 @@ func relayClient(base *url.URL, forwardAll bool) *http.Client {
 			if req.URL.Scheme != base.Scheme || req.URL.Host != base.Host {
 				return fmt.Errorf("redirect blocked (SSRF confinement): %q leaves %s://%s", req.URL.String(), base.Scheme, base.Host)
 			}
-			if _, err := resolveUpstream(base, req.URL.Path, forwardAll); err != nil {
+			if _, err := resolveUpstreamWithRoutes(base, req.URL.Path, forwardAll, routes); err != nil {
 				return fmt.Errorf("redirect blocked (SSRF confinement): %w", err)
 			}
 			return nil
@@ -1109,6 +1245,10 @@ func relayClient(base *url.URL, forwardAll bool) *http.Client {
 // forward the WHOLE /<app_path>/* subtree — for a website or any non-MCP HTTP
 // app. In every case host/scheme come only from the trusted base, never the frame.
 func resolveUpstream(base *url.URL, rawPath string, forwardAll bool) (string, error) {
+	return resolveUpstreamWithRoutes(base, rawPath, forwardAll, nil)
+}
+
+func resolveUpstreamWithRoutes(base *url.URL, rawPath string, forwardAll bool, routes []string) (string, error) {
 	if rawPath == "" {
 		rawPath = "/"
 	}
@@ -1133,13 +1273,31 @@ func resolveUpstream(base *url.URL, rawPath string, forwardAll bool) (string, er
 	// result that climbs above "/", so the cleaned path is always rooted.
 	clean := path.Clean(reqPath)
 
+	// Dynamic registrations declare one or more path-segment prefixes. Match a
+	// route itself or a child segment only: /api/v1 allows /api/v1/tools but not
+	// /api/v10. The paths were normalized at registration; repeat the strict
+	// boundary check here because this is the actual SSRF enforcement point.
+	if len(routes) > 0 {
+		allowed := false
+		for _, route := range routes {
+			route = strings.TrimRight(route, "/")
+			if route != "" && (clean == route || strings.HasPrefix(clean, route+"/")) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return "", fmt.Errorf("rejected path (outside route allowlist): %q", clean)
+		}
+	}
+
 	// Confine to the allowed prefix: the service's configured base path when one is
 	// set (e.g. service http://127.0.0.1:8000/mcp confines to /mcp), else /mcp by
 	// DEFAULT — UNLESS forwardAll is set, which opts out and forwards the whole
 	// /<app_path>/* subtree ("" prefix). When a prefix IS set the cleaned path must
 	// BE it or a child of it, so "/mcp/../admin" → "/admin" stays rejected.
 	prefix := strings.TrimRight(base.Path, "/")
-	if prefix == "" && !forwardAll {
+	if prefix == "" && !forwardAll && len(routes) == 0 {
 		prefix = "/mcp"
 	}
 	if prefix != "" && clean != prefix && !strings.HasPrefix(clean, prefix+"/") {
@@ -1304,6 +1462,13 @@ type agentState struct {
 	Service      string `json:"service"`
 	Box          string `json:"box"`
 	RefreshToken string `json:"refreshToken"`
+	// ApprovedManifest* are present on scoped Aviary device-enrollment grants.
+	// They are optional only for backward compatibility with legacy finch.yml
+	// credentials, which do not use dynamic route manifests.
+	ApprovedRoutes         []string `json:"approved_routes,omitempty"`
+	ApprovedEdgeAuth       string   `json:"approved_edge_auth,omitempty"`
+	ApprovedTenant         string   `json:"approved_tenant,omitempty"`
+	ApprovedManifestSHA256 string   `json:"approved_manifest_sha256,omitempty"`
 }
 
 // defaultStatePath is ~/.finch/agent.json (falls back to the cwd if there's no
@@ -1318,12 +1483,38 @@ func defaultStatePath() string {
 // loadState reads the persisted credential, returning (nil,nil) if the file
 // doesn't exist yet (first run).
 func loadState(path string) (*agentState, error) {
-	b, err := os.ReadFile(path)
+	before, err := os.Lstat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
 		return nil, err
+	}
+	if !before.Mode().IsRegular() || before.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("credential path %q is not a regular file", path)
+	}
+	if before.Mode().Perm()&0o077 != 0 {
+		return nil, fmt.Errorf("credential path %q has insecure mode %04o", path, before.Mode().Perm())
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil || !os.SameFile(before, opened) {
+		return nil, fmt.Errorf("credential path %q changed while opening", path)
+	}
+	b, err := io.ReadAll(io.LimitReader(file, credentialStateLimit+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(b) > credentialStateLimit {
+		return nil, fmt.Errorf("credential path %q exceeds %d bytes", path, credentialStateLimit)
+	}
+	after, err := os.Lstat(path)
+	if err != nil || !os.SameFile(before, after) {
+		return nil, fmt.Errorf("credential path %q changed while reading", path)
 	}
 	var st agentState
 	if err := json.Unmarshal(b, &st); err != nil {
@@ -1335,14 +1526,80 @@ func loadState(path string) (*agentState, error) {
 // saveState writes the credential 0600 (dir 0700). The refresh token is a
 // long-lived per-box credential, so keep it owner-only.
 func saveState(path string, st *agentState) error {
-	if dir := filepath.Dir(path); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return err
-		}
-	}
 	b, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, b, 0o600)
+	dir := filepath.Dir(path)
+	if dir == "" {
+		dir = "."
+	}
+	dirExisted := true
+	if _, err := os.Lstat(dir); os.IsNotExist(err) {
+		dirExisted = false
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
+	}
+	dirInfo, err := os.Lstat(dir)
+	if err != nil {
+		return err
+	}
+	if !dirInfo.IsDir() || dirInfo.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("credential directory %q is not a real directory", dir)
+	}
+	if !dirExisted {
+		if err := os.Chmod(dir, 0o700); err != nil {
+			return fmt.Errorf("secure credential directory: %w", err)
+		}
+	} else if filepath.Clean(dir) != "." && dirInfo.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("credential directory %q is group/world writable (mode %04o)", dir, dirInfo.Mode().Perm())
+	}
+	if existing, err := os.Lstat(path); err == nil {
+		if !existing.Mode().IsRegular() || existing.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("refusing to replace unsafe credential path %q", path)
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	cleanup := func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		cleanup()
+		return err
+	}
+	if _, err := tmp.Write(b); err != nil {
+		cleanup()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		cleanup()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	// Best-effort directory fsync makes the rename durable on Unix. Some
+	// platforms/filesystems reject Sync on directories; the file is already
+	// atomically installed, so do not turn that portability quirk into failure.
+	if dirFile, err := os.Open(dir); err == nil {
+		_ = dirFile.Sync()
+		_ = dirFile.Close()
+	}
+	return nil
 }
