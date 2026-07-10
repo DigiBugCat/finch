@@ -17,7 +17,10 @@ describe('AviaryMCP machine-readable documentation', () => {
 
     expect(page).toContain('href="/aviarymcp-llms.txt"');
     expect(page).not.toContain('github.com/DigiBugCat/aviary-mcp');
-    expect(fleetGuide).toContain('`/aviarymcp-llms.txt` on this origin');
+    expect(fleetGuide).toContain(
+      '[project-specific machine-readable guide](/aviarymcp-llms.txt)',
+    );
+    expect(projectGuide).toContain('[/llms.txt](/llms.txt)');
     expect(projectGuide).toContain('mcp = AviaryMCP("My MCP Server")');
     expect(projectGuide).toContain('@mcp.tool');
     expect(projectGuide).toContain('mcp.run(');
