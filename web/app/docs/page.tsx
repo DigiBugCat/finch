@@ -18,7 +18,7 @@ export default function Quickstart() {
         <b>Starting a new Python service?</b>{' '}
         <Link href="/docs/aviarymcp">AviaryMCP</Link> defines each tool once and
         generates MCP, REST, and OpenAPI while managing Finch registration and
-        first-run approval. It is currently available as a private release candidate.
+        first-run approval. Its public release candidate is available on PyPI.
       </div>
 
       <h2>1. Write an MCP server</h2>

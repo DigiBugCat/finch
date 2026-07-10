@@ -21,13 +21,12 @@ export default function AviaryMCPDocs() {
       </p>
 
       <div className="docs-note">
-        <b>Private release candidate.</b> Version <code>0.1.0rc1</code> is currently
-        available to the Aviary pilot through the private{' '}
-        <a href="https://github.com/DigiBugCat/aviary-mcp/releases/tag/v0.1.0rc1" target="_blank" rel="noreferrer">
-          GitHub release
+        <b>Public release candidate.</b> Version <code>0.1.0rc2</code> is available on{' '}
+        <a href="https://pypi.org/project/aviary-mcp/0.1.0rc2/" target="_blank" rel="noreferrer">
+          PyPI
         </a>{' '}
         and requires the Finch 1.6 agent. The normal Finch CLI and <code>finch.yml</code>{' '}
-        remain the supported path for everyone else until the SDK and agent are promoted.
+        remain supported for existing, non-Python, and non-SDK services.
       </div>
 
       <h2>When to use it</h2>
@@ -55,13 +54,10 @@ export default function AviaryMCPDocs() {
 
       <h2>1. Install the release candidate</h2>
       <p>
-        Pilot users with repository access can download the wheel with the GitHub CLI.
-        The release also includes <code>SHA256SUMS</code> for verification.
+        AviaryMCP is published publicly on PyPI. Pin the release candidate while
+        evaluating it so a future prerelease does not change underneath your service.
       </p>
-      <Code>{`gh release download v0.1.0rc1 \\
-  --repo DigiBugCat/aviary-mcp \\
-  --pattern 'aviary_mcp-*.whl'
-python -m pip install ./aviary_mcp-0.1.0rc1-py3-none-any.whl`}</Code>
+      <Code>{`python -m pip install 'aviary-mcp==0.1.0rc2'`}</Code>
 
       <h2>2. Define the service</h2>
       <p>Save this as <code>server.py</code>:</p>

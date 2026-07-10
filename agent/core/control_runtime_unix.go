@@ -19,10 +19,11 @@ import (
 )
 
 type controlRuntimeOptions struct {
-	SocketPath string
-	SocketMode fs.FileMode
-	GroupID    *int
-	RunRelay   relayRunFunc
+	SocketPath                 string
+	SocketMode                 fs.FileMode
+	GroupID                    *int
+	AllowedVerificationOrigins []string
+	RunRelay                   relayRunFunc
 }
 
 func runConfig(cfg *config) {
@@ -44,6 +45,9 @@ func runControlRuntime(ctx context.Context, cfg *config, options controlRuntimeO
 	if cfg.CredentialsDir == "" {
 		cfg.CredentialsDir = filepath.Dir(defaultStatePath())
 	}
+	if _, err := enrollmentVerificationOrigins(cfg.hubBase(), options.AllowedVerificationOrigins); err != nil {
+		return fmt.Errorf("configure Aviary verification origins: %w", err)
+	}
 	release, ok := lockState(filepath.Join(cfg.CredentialsDir, "finch-run"))
 	if !ok {
 		return fmt.Errorf("another finch run already serves %s — refusing to start a second relay", cfg.CredentialsDir)
@@ -53,7 +57,8 @@ func runControlRuntime(ctx context.Context, cfg *config, options controlRuntimeO
 	controlHandler := NewControlHandler(registry)
 	enrollment, err := NewServiceEnrollmentCoordinator(ServiceEnrollmentCoordinatorOptions{
 		Hub: cfg.Hub, Machine: cfg.Box, CredentialDirectory: cfg.CredentialsDir, HTTPClient: controlPlaneHTTPClient,
-		OnCredential: func(string) { registry.NotifyCredentialChanged() },
+		AllowedVerificationOrigins: options.AllowedVerificationOrigins,
+		OnCredential:               func(string) { registry.NotifyCredentialChanged() },
 	})
 	if err != nil {
 		return fmt.Errorf("configure service enrollment: %w", err)
@@ -147,6 +152,18 @@ func controlRuntimeOptionsFromEnv() (controlRuntimeOptions, error) {
 	}
 	if options.SocketMode&0o070 != 0 && options.GroupID == nil {
 		return options, fmt.Errorf("FINCH_CONTROL_SOCKET_MODE grants group access but FINCH_CONTROL_GROUP is not set")
+	}
+	if value := strings.TrimSpace(os.Getenv("FINCH_AVIARY_VERIFICATION_ORIGINS")); value != "" {
+		for _, origin := range strings.Split(value, ",") {
+			origin = strings.TrimSpace(origin)
+			if origin == "" {
+				return options, fmt.Errorf("FINCH_AVIARY_VERIFICATION_ORIGINS contains an empty origin")
+			}
+			options.AllowedVerificationOrigins = append(options.AllowedVerificationOrigins, origin)
+		}
+		if len(options.AllowedVerificationOrigins) > 8 {
+			return options, fmt.Errorf("FINCH_AVIARY_VERIFICATION_ORIGINS allows at most 8 origins")
+		}
 	}
 	return options, nil
 }

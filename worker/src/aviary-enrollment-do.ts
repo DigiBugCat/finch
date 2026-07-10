@@ -82,6 +82,44 @@ function randomHex(bytes: number): string {
   return Array.from(raw, (x) => x.toString(16).padStart(2, "0")).join("");
 }
 
+/** Resolve the canonical relay origin for a newly-approved Aviary service.
+ *
+ * An explicit deployment override wins over a tenant vanity host. Every input
+ * is treated as a complete origin rather than a URL prefix so a deployment
+ * typo can never mint a grant containing credentials, a path, query, or
+ * fragment. `undefined` means the deployment did not configure an override;
+ * an explicitly configured empty/invalid value fails closed.
+ */
+export function resolveAviaryPublicOrigin(
+  configuredOrigin: string | undefined,
+  tenantHost: string | undefined,
+  requestOrigin: string,
+): string | null {
+  const exactOrigin = (raw: string): string | null => {
+    try {
+      const parsed = new URL(raw);
+      if (
+        (parsed.protocol !== "https:" && parsed.protocol !== "http:") ||
+        parsed.username ||
+        parsed.password ||
+        parsed.pathname !== "/" ||
+        parsed.search ||
+        parsed.hash ||
+        raw !== parsed.origin
+      ) {
+        return null;
+      }
+      return parsed.origin;
+    } catch {
+      return null;
+    }
+  };
+
+  if (configuredOrigin !== undefined) return exactOrigin(configuredOrigin);
+  if (tenantHost) return exactOrigin(`https://${tenantHost}`);
+  return exactOrigin(requestOrigin);
+}
+
 function randomUserCode(): string {
   const raw = crypto.getRandomValues(new Uint8Array(8));
   let out = "";
@@ -645,6 +683,23 @@ export class AviaryEnrollmentDO extends DurableObject<Env> {
       return { ok: true, status: "pending" };
     }
 
+    // Resolve and validate the grant URL before reserving a service or moving
+    // this enrollment into the approval transaction. A bad deployment value
+    // therefore fails closed without leaving a registered service behind.
+    const state = await tenantOp<{ host?: string }>(this.env, tenant, "getState");
+    const origin = resolveAviaryPublicOrigin(
+      this.env.AVIARY_PUBLIC_ORIGIN,
+      state.host,
+      publicOrigin,
+    );
+    if (!origin) {
+      return {
+        ok: false,
+        code: "invalid_public_origin",
+        message: "Aviary public origin is not a valid HTTP(S) origin",
+      };
+    }
+
     const approvalNonce = randomHex(16);
     this.ctx.storage.sql.exec(
       "UPDATE aviary_enrollments SET state='approving',tenant=?,approver=?,public_approved=?,approval_started=?,approval_nonce=? WHERE device_code=? AND state='pending'",
@@ -725,9 +780,6 @@ export class AviaryEnrollmentDO extends DurableObject<Env> {
       },
       this.env.TICKET_SECRET,
     );
-    const state = await tenantOp<{ host?: string }>(this.env, tenant, "getState");
-    const origin = state.host ? `https://${state.host}` : publicOrigin.replace(/\/$/, "");
-    if (!origin) throw new Error("tenant has no public origin");
     const grant = {
       tenant,
       service: manifest.app_path,
