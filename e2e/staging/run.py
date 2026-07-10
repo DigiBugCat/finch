@@ -465,7 +465,7 @@ def main() -> int:
                 local_status, _ = request_json(
                     "GET", f"http://127.0.0.1:{port}/birdz"
                 )
-            except OSError:
+            except (OSError, ValueError):
                 local_status = None
             status, payload = request_json(
                 "POST", rest_url, token=token, body={"a": 19, "b": 23}
