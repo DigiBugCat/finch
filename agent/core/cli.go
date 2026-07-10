@@ -125,6 +125,8 @@ Usage:
   finch enroll <app_path> --ticket <t> Save a box-side credential from a dashboard ticket (one time)
   finch run [--config finch.yml]       Serve every ingress rule (auto-approves when logged in)
   finch approve <app_path>             Approve a service (clear the pending gate)
+  finch aviary describe <code>         Inspect a pending Aviary device enrollment
+  finch aviary approve <code> [--public]   Approve it (private by default)
   finch token [--json|--login]         Mint a fresh CLI token (provision a new box, no browser)
   finch status [--json]                Show login + what finch.yml serves
   finch fleet [--json]   (alias: ls)   List this account's services + state
@@ -293,6 +295,72 @@ func cmdApprove(args []string) {
 		}
 		fmt.Printf("finch: approved %q\n", id)
 	}
+}
+
+// cliAviaryDecision applies a tenant-admin decision to the proof-bound Aviary
+// service enrollment transaction. The short code only identifies the pending
+// request; authorization comes exclusively from the saved, revocable CLI token.
+func cliAviaryDecision(cred *cliCred, action, userCode string, publicApproved bool) (map[string]any, error) {
+	body := map[string]any{"user_code": strings.TrimSpace(userCode)}
+	if action == "approve" {
+		body["public_approved"] = publicApproved
+	}
+	return cliRequest("POST", cred.Hub, "/api/cli/aviary/"+action, cred.Token, body)
+}
+
+// cmdAviary provides the headless counterpart to the browser enrollment page.
+// Public Internet exposure is never implied: a public manifest is approved only
+// when the operator supplies the conspicuous --public capability flag.
+func cmdAviary(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "usage: finch aviary [describe <code> | approve <code> [--public] [--json]]")
+		os.Exit(2)
+	}
+	action, args := args[0], args[1:]
+	if action != "describe" && action != "approve" {
+		fmt.Fprintln(os.Stderr, "usage: finch aviary [describe <code> | approve <code> [--public] [--json]]")
+		os.Exit(2)
+	}
+	fs := flag.NewFlagSet("aviary "+action, flag.ExitOnError)
+	publicApproved := fs.Bool("public", false, "explicitly approve a public Internet endpoint")
+	asJSON := fs.Bool("json", false, "JSON output")
+	userCode := ""
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		userCode, args = args[0], args[1:]
+	}
+	_ = fs.Parse(args)
+	if userCode == "" && fs.NArg() > 0 {
+		userCode = fs.Arg(0)
+	}
+	if strings.TrimSpace(userCode) == "" {
+		fmt.Fprintf(os.Stderr, "usage: finch aviary %s <code>%s\n", action, func() string {
+			if action == "approve" {
+				return " [--public] [--json]"
+			}
+			return " [--json]"
+		}())
+		os.Exit(2)
+	}
+	if action == "describe" && *publicApproved {
+		fmt.Fprintln(os.Stderr, "finch: --public is only valid with `finch aviary approve`")
+		os.Exit(2)
+	}
+	cred, err := loadCliCred()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
+		os.Exit(1)
+	}
+	out, err := cliAviaryDecision(cred, action, userCode, *publicApproved)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "finch: Aviary enrollment %s failed: %v\n", action, err)
+		os.Exit(1)
+	}
+	if *asJSON || action == "describe" {
+		b, _ := json.MarshalIndent(out, "", "  ")
+		fmt.Println(string(b))
+		return
+	}
+	fmt.Printf("finch: Aviary enrollment %s (%s)\n", out["status"], strings.ToUpper(strings.TrimSpace(userCode)))
 }
 
 // cliSetAuth flips a service's public-relay access mode ("key" | "public").

@@ -33,6 +33,7 @@ import {
 import { signAssertion, verifyAssertionPayload } from "./auth";
 import {
   handleAviaryEnrollmentApi,
+  handleAviaryEnrollmentCliApi,
   isAviaryEnrollmentPath,
 } from "./aviary-enrollment-api";
 
@@ -324,6 +325,12 @@ export async function handleApi(
     // GET /api/cli/whoami — validate a token + report the tenant it acts as.
     if (path === "/api/cli/whoami" && method === "GET") {
       return json(200, { ok: true, tenant: cliTenant });
+    }
+    // Tenant-admin, headless approval for Aviary service-device enrollment.
+    // This is the same proof-bound transaction used by the browser flow; only
+    // the approver authentication differs (revocable CLI token vs web BFF).
+    if (path.startsWith("/api/cli/aviary/")) {
+      return handleAviaryEnrollmentCliApi(req, env, host, cliTenant);
     }
     // POST /api/cli/token — an already-authed box mints a FRESH CLI token, so a
     // new box can be provisioned with no human in the loop:

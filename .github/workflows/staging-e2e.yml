@@ -1,0 +1,71 @@
+name: staging-e2e
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 16 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: finch-staging-e2e
+  cancel-in-progress: false
+
+jobs:
+  aviary-mcp:
+    runs-on: ubuntu-latest
+    environment: staging
+    timeout-minutes: 12
+    env:
+      E2E_ROOT: ${{ runner.temp }}/finch-staging-e2e
+      AVIARY_VERSION: ${{ vars.AVIARY_MCP_E2E_VERSION || '0.1.0rc3' }}
+      FINCH_CLI_JSON: ${{ secrets.FINCH_STAGING_E2E_CLI_JSON }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.4"
+          cache-dependency-path: agent/go.sum
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Require the isolated staging login
+        run: test -n "$FINCH_CLI_JSON"
+
+      - name: Prepare isolated credentials
+        run: |
+          mkdir -p -m 700 \
+            "$E2E_ROOT/home/.finch" \
+            "$E2E_ROOT/credentials" \
+            "$E2E_ROOT/run"
+          printf '%s' "$FINCH_CLI_JSON" > "$E2E_ROOT/home/.finch/cli.json"
+          chmod 600 "$E2E_ROOT/home/.finch/cli.json"
+
+      - name: Build the Finch agent under test
+        working-directory: agent
+        run: go build -o "$E2E_ROOT/finch" .
+
+      - name: Install the public AviaryMCP release
+        run: |
+          python -m venv "$E2E_ROOT/venv"
+          "$E2E_ROOT/venv/bin/pip" install --index-url https://pypi.org/simple \
+            "aviary-mcp==$AVIARY_VERSION"
+
+      - name: Verify offline production-safety gates
+        run: "$E2E_ROOT/venv/bin/python" e2e/staging/test_safety.py
+
+      - name: Exercise AviaryMCP against Finch staging
+        env:
+          FINCH_STAGING_E2E: "1"
+          FINCH_E2E_BINARY: ${{ runner.temp }}/finch-staging-e2e/finch
+          FINCH_E2E_CLI_HOME: ${{ runner.temp }}/finch-staging-e2e/home
+          FINCH_CONTROL_SOCKET: ${{ runner.temp }}/finch-staging-e2e/run/control.sock
+          FINCH_CREDENTIALS_DIR: ${{ runner.temp }}/finch-staging-e2e/credentials
+          FINCH_E2E_EXPECTED_AVIARY_VERSION: ${{ env.AVIARY_VERSION }}
+        run: "$E2E_ROOT/venv/bin/python" e2e/staging/run.py
+
+      - name: Remove temporary credentials
+        if: always()
+        run: rm -rf "$E2E_ROOT"

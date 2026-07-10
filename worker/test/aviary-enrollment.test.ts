@@ -119,6 +119,20 @@ async function tenantHeaders(tenant = TENANT): Promise<Record<string, string>> {
   };
 }
 
+async function cliHeaders(tenant = TENANT): Promise<Record<string, string>> {
+  return {
+    Authorization: `Bearer ${await signAssertion(
+      {
+        tenant,
+        exp: Math.floor(Date.now() / 1000) + 300,
+        kind: "cli",
+        epoch: 0,
+      },
+      SERVICE_SECRET,
+    )}`,
+  };
+}
+
 async function start(
   key: KeyMaterial,
   m: Record<string, unknown>,
@@ -187,6 +201,57 @@ async function poll(
 }
 
 describe("Aviary service device enrollment", () => {
+  it("uses revocable CLI auth for headless approval and stays private by default", async () => {
+    const privateKey = await keys();
+    const privateManifest = manifest(privateKey);
+    const privateBegun = await start(privateKey, privateManifest);
+
+    const unauthenticated = await call("/api/cli/aviary/describe", {
+      user_code: privateBegun.body.user_code,
+    });
+    expect(unauthenticated.status).toBe(401);
+
+    const described = await call(
+      "/api/cli/aviary/describe",
+      { user_code: privateBegun.body.user_code },
+      await cliHeaders(),
+    );
+    expect(described.status, await described.clone().text()).toBe(200);
+    const shown = await described.json() as any;
+    expect(shown.manifest).toEqual(privateManifest);
+    expect(JSON.stringify(shown)).not.toContain(privateBegun.body.device_code);
+
+    const approved = await call(
+      "/api/cli/aviary/approve",
+      {
+        user_code: privateBegun.body.user_code,
+        public_approved: false,
+        approver: "caller-controlled",
+      },
+      await cliHeaders(),
+    );
+    expect(approved.status, await approved.clone().text()).toBe(200);
+    expect((await poll(privateKey, privateBegun.body, privateBegun.manifestSha256)).status).toBe(200);
+
+    const publicKey = await keys();
+    const publicManifest = manifest(publicKey, { edge_auth: "public" });
+    const publicBegun = await start(publicKey, publicManifest);
+    const implicitPublic = await call(
+      "/api/cli/aviary/approve",
+      { user_code: publicBegun.body.user_code, public_approved: false },
+      await cliHeaders(),
+    );
+    expect(implicitPublic.status).toBe(400);
+    expect((await implicitPublic.json() as any).error.code).toBe("public_approval_required");
+
+    const explicitPublic = await call(
+      "/api/cli/aviary/approve",
+      { user_code: publicBegun.body.user_code, public_approved: true },
+      await cliHeaders(),
+    );
+    expect(explicitPublic.status, await explicitPublic.clone().text()).toBe(200);
+  });
+
   it("binds start, describe, private approval, one refresh grant, and replay", async () => {
     const key = await keys();
     const m = manifest(key);
