@@ -139,6 +139,12 @@ application container should never mount `/data`; it receives only the
 permissioned control socket. Explicit `finch enroll --ticket` remains available
 for legacy `finch.yml` services outside this dynamic path.
 
+The enrollment page is same-origin with `FINCH_HUB` by default. A deployment
+that deliberately hosts its dashboard on a different origin must set an exact,
+comma-separated allowlist with `FINCH_AVIARY_VERIFICATION_ORIGINS`. Origins are
+validated at startup, HTTPS hubs cannot allow an HTTP downgrade, and paths,
+queries, credentials, or fragments are rejected.
+
 AviaryMCP sidecars additionally share a Unix control socket on an ephemeral
 volume. Give the app and Finch distinct UIDs and only a dedicated supplemental
 group, with a `0750` directory and `0660` socket. The app group can connect but

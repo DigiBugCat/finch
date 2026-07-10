@@ -66,6 +66,11 @@ export interface Env {
   // a different origin than the hub. WEB_URL must be the hub origin unless it
   // appears here; arbitrary response/manifest-provided origins are never used.
   AVIARY_VERIFICATION_ORIGINS?: string;
+  // Canonical public relay origin returned in Aviary enrollment grants. This
+  // lets staging use its workers.dev relay even when the tenant has a
+  // production-shaped vanity host. It must be an exact HTTP(S) origin (no
+  // path, credentials, query, or fragment); an invalid value fails approval.
+  AVIARY_PUBLIC_ORIGIN?: string;
   CLERK_ISSUER?: string; // Clerk OAuth AS base (e.g. https://<slug>.clerk.accounts.dev) — enables the MCP OAuth plane (RFC 9728 discovery + Clerk-token bearers); unset = feature off
   CLERK_USERINFO?: Fetcher; // optional service binding; tests/local deployments may avoid public userinfo fetches
   // ES256 caller assertions injected into requests after Finch authenticates
