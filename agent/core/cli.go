@@ -89,6 +89,7 @@ From a box that is already logged in:
 needed for your FIRST box.
 
 ## Inspect state
+  finch version --json    # local binary version + OS/architecture
   finch status --json     # am I logged in (which tenant)? what does finch.yml serve?
   finch fleet --json      # every service + its state (online/offline/pending)
   finch domain ls         # custom hostnames mapped to this account
@@ -117,6 +118,7 @@ func printUsage() {
 finch hub. Your box dials OUT, so nothing listens and no ports are opened.
 
 Usage:
+  finch version [--json]              Show this binary's version and platform
   finch login [--hub URL]              Log in (opens the browser to approve a code)
   finch login --headless               Log in on a screenless box over SSH: prints a link
                                           + code (approve on your phone), no local browser
@@ -125,6 +127,7 @@ Usage:
   finch enroll <app_path> --ticket <t> Save a box-side credential from a dashboard ticket (one time)
   finch run [--config finch.yml]       Serve every ingress rule (auto-approves when logged in)
   finch approve <app_path>             Approve a service (clear the pending gate)
+  finch aviary serve                   SDK-owned zero-config control runtime
   finch aviary describe <code>         Inspect a pending Aviary device enrollment
   finch aviary approve <code> [--public]   Approve it (private by default)
   finch token [--json|--login]         Mint a fresh CLI token (provision a new box, no browser)
@@ -179,6 +182,53 @@ Automation / driving finch from an agent (after the one-time 'finch login'):
 
 Run 'finch <command> -h' for a command's own flags.
 `)
+}
+
+const cliVersionSchema = 1
+
+// cliVersionInfo is the stable machine-readable identity of this binary. Keep
+// existing JSON field names and meanings backward-compatible; add fields only
+// when older consumers can safely ignore them, or increment schema_version.
+type cliVersionInfo struct {
+	SchemaVersion int    `json:"schema_version"`
+	Product       string `json:"product"`
+	Version       string `json:"version"`
+	OS            string `json:"os"`
+	Arch          string `json:"arch"`
+}
+
+func currentCLIVersionInfo() cliVersionInfo {
+	return cliVersionInfo{
+		SchemaVersion: cliVersionSchema,
+		Product:       "finch",
+		Version:       agentVersion,
+		OS:            runtime.GOOS,
+		Arch:          runtime.GOARCH,
+	}
+}
+
+func writeCLIVersion(out io.Writer, args []string, info cliVersionInfo) error {
+	fs := flag.NewFlagSet("version", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	asJSON := fs.Bool("json", false, "print stable machine-readable JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("version accepts no positional arguments")
+	}
+	if *asJSON {
+		return json.NewEncoder(out).Encode(info)
+	}
+	_, err := fmt.Fprintf(out, "%s %s (%s/%s)\n", info.Product, info.Version, info.OS, info.Arch)
+	return err
+}
+
+func cmdVersion(args []string) {
+	if err := writeCLIVersion(os.Stdout, args, currentCLIVersionInfo()); err != nil {
+		fmt.Fprintf(os.Stderr, "finch version: %v\n", err)
+		os.Exit(2)
+	}
 }
 
 // cliCred is the saved CLI login: which hub, and the tenant token for it.
@@ -313,12 +363,16 @@ func cliAviaryDecision(cred *cliCred, action, userCode string, publicApproved bo
 // when the operator supplies the conspicuous --public capability flag.
 func cmdAviary(args []string) {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: finch aviary [describe <code> | approve <code> [--public] [--json]]")
+		fmt.Fprintln(os.Stderr, "usage: finch aviary [serve | describe <code> | approve <code> [--public] [--json]]")
 		os.Exit(2)
 	}
 	action, args := args[0], args[1:]
+	if action == "serve" {
+		runAviaryServe(args)
+		return
+	}
 	if action != "describe" && action != "approve" {
-		fmt.Fprintln(os.Stderr, "usage: finch aviary [describe <code> | approve <code> [--public] [--json]]")
+		fmt.Fprintln(os.Stderr, "usage: finch aviary [serve | describe <code> | approve <code> [--public] [--json]]")
 		os.Exit(2)
 	}
 	fs := flag.NewFlagSet("aviary "+action, flag.ExitOnError)

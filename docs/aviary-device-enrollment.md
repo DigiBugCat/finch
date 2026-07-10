@@ -276,7 +276,7 @@ It must not weaken or auto-confirm the human device flow described here.
 
 ## Production gate
 
-Before enabling this in `finch run` or `app.run(expose="finch")`:
+Before enabling this in `finch aviary serve` or `app.run(expose="finch")`:
 
 - implement Worker/web routes and cross-language golden vectors;
 - wire a local enrollment coordinator into the Unix control API;

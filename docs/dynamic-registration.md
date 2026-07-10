@@ -1,8 +1,9 @@
 # Dynamic local service registration
 
-Status: implemented local pilot contract. `finch run` reconciles static
-`finch.yml` services and memory-only AviaryMCP leases without changing the
-Finch cloud protocol.
+Status: implemented local pilot contract. `finch aviary serve` runs a strictly
+dynamic, SDK-owned registry and never discovers `finch.yml` or CLI/admin state.
+Legacy `finch run` can still reconcile static `finch.yml` services alongside
+memory-only AviaryMCP leases without changing the Finch cloud protocol.
 
 ## Purpose and boundary
 

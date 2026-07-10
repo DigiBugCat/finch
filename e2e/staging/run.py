@@ -29,6 +29,7 @@ from urllib.request import Request, urlopen
 
 DEFAULT_STAGING_HUB = "https://finch-staging.pantainos.workers.dev"
 OPT_IN = "FINCH_STAGING_E2E"
+MODES = frozenset({"local", "agent"})
 
 
 class SmokeFailure(RuntimeError):
@@ -58,6 +59,12 @@ def checked_staging_hub(value: str) -> str:
 def require_opt_in(env: dict[str, str]) -> None:
     if env.get(OPT_IN) != "1":
         raise SmokeFailure(f"set {OPT_IN}=1 to authorize staging writes")
+
+
+def checked_mode(value: str) -> str:
+    if value not in MODES:
+        raise SmokeFailure("FINCH_E2E_MODE must be local or agent")
+    return value
 
 
 def find_free_port() -> int:
@@ -280,12 +287,17 @@ def approve_aviary_with_retry(binary: Path, home: Path, user_code: str) -> None:
     raise SmokeFailure("staging enrollment never became approvable")
 
 
-def credential_fingerprint(directory: Path, app_path: str) -> tuple[str, int]:
-    path = directory / f"{app_path}.json"
+def credential_fingerprint(root: Path, app_path: str) -> tuple[Path, str, int]:
+    candidates = list(root.rglob(f"{app_path}.json"))
+    if len(candidates) != 1:
+        raise SmokeFailure(
+            f"expected one project-scoped service credential, found {len(candidates)}"
+        )
+    path = candidates[0]
     mode = stat.S_IMODE(path.stat().st_mode)
     if mode & 0o077:
         raise SmokeFailure(f"service credential must be mode 0600: {path}")
-    return hashlib.sha256(path.read_bytes()).hexdigest(), mode
+    return path, hashlib.sha256(path.read_bytes()).hexdigest(), mode
 
 
 async def check_mcp(url: str, token: str) -> None:
@@ -303,6 +315,7 @@ async def check_mcp(url: str, token: str) -> None:
 def main() -> int:
     require_opt_in(os.environ)
     hub = checked_staging_hub(os.environ.get("FINCH_E2E_HUB", DEFAULT_STAGING_HUB))
+    mode = checked_mode(os.environ.get("FINCH_E2E_MODE", "local"))
     required_paths = {
         name: os.environ.get(name, "").strip()
         for name in (
@@ -330,20 +343,29 @@ def main() -> int:
 
     app_path = f"aviary-e2e-{int(time.time())}-{secrets.token_hex(3)}"
     box = f"github-e2e-{secrets.token_hex(4)}"
+    project_dir = credentials.parent
     port = find_free_port()
     env = os.environ.copy()
     env.update(
         FINCH_E2E_APP_PATH=app_path,
         FINCH_E2E_HUB=hub,
         FINCH_E2E_PORT=str(port),
+        FINCH_E2E_MODE=mode,
+        FINCH_E2E_BINARY=str(binary),
+        FINCH_E2E_BOX=box,
+        FINCH_E2E_PROJECT_DIR=str(project_dir),
         PYTHONUNBUFFERED="1",
     )
     agent: AgentProcess | None = None
     app: AppProcess | None = None
     key_id: str | None = None
     try:
-        agent = AgentProcess(binary, hub, credentials, control_socket, box)
-        print(f"[1/7] enrolling disposable service {app_path}", flush=True)
+        if mode == "agent":
+            agent = AgentProcess(binary, hub, credentials, control_socket, box)
+        print(
+            f"[1/7] enrolling disposable service {app_path} via Finch.{mode}",
+            flush=True,
+        )
         app = AppProcess(env)
         pending = app.wait_event("needs_enrollment", 30)
         verification = urlsplit(pending["authorization"]["verification_uri_complete"])
@@ -359,7 +381,8 @@ def main() -> int:
             raise SmokeFailure(
                 f"ready enrollment returned the wrong public URL: {ready.get('public_url')!r}"
             )
-        first_fingerprint = credential_fingerprint(credentials, app_path)
+        credential_root = project_dir if mode == "local" else credentials
+        first_fingerprint = credential_fingerprint(credential_root, app_path)
 
         print("[2/7] minting a service-scoped caller key", flush=True)
         minted = run_cli(
@@ -416,11 +439,15 @@ def main() -> int:
         print("[5/7] checking bearer Streamable HTTP MCP", flush=True)
         asyncio.run(check_mcp(expected_mcp, token))
 
-        print("[6/7] restarting the application and agent with saved credentials", flush=True)
+        print(
+            f"[6/7] restarting the application and {mode} Finch lifecycle",
+            flush=True,
+        )
         app.stop()
         app = None
-        agent.stop()
-        agent = AgentProcess(binary, hub, credentials, control_socket, box)
+        if agent is not None:
+            agent.stop()
+            agent = AgentProcess(binary, hub, credentials, control_socket, box)
         app = AppProcess(env)
         deadline = time.monotonic() + 30
         while True:
@@ -432,7 +459,7 @@ def main() -> int:
             if time.monotonic() >= deadline:
                 raise SmokeFailure("service did not resume after application restart")
             time.sleep(1)
-        if credential_fingerprint(credentials, app_path) != first_fingerprint:
+        if credential_fingerprint(credential_root, app_path) != first_fingerprint:
             raise SmokeFailure("saved service credential changed across app restart")
         with app._lock:
             if any(event.get("state") in {"needs_login", "needs_enrollment", "pending"} for event in app.events):
@@ -452,8 +479,9 @@ def main() -> int:
             run_cli(binary, cli_home, "rm", app_path)
         # The app path is generated by this process, so this cannot remove a
         # pre-existing service credential from the dedicated E2E directory.
-        with contextlib.suppress(FileNotFoundError):
-            (credentials / f"{app_path}.json").unlink()
+        for path in project_dir.rglob(f"{app_path}.json"):
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
 
 
 if __name__ == "__main__":

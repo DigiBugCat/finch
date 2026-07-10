@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -129,6 +130,79 @@ func TestControlRuntimeOptions_GroupSocketRequiresExplicitGroup(t *testing.T) {
 	}
 	if options.GroupID == nil || *options.GroupID != os.Getegid() || options.SocketMode != 0o660 {
 		t.Fatalf("group options=%+v", options)
+	}
+}
+
+func TestAviaryServeIgnoresCWDAndHomeManifests(t *testing.T) {
+	root := shortTempDir(t)
+	cwd := filepath.Join(root, "cwd")
+	home := filepath.Join(root, "home")
+	if err := os.MkdirAll(filepath.Join(home, ".finch"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(cwd, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	manifest := []byte("hub: https://wrong.example\nbox: wrong\ningress:\n  - app_path: must-not-start\n    service: http://127.0.0.1:9999\n")
+	if err := os.WriteFile(filepath.Join(cwd, "finch.yml"), manifest, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".finch", "finch.yml"), manifest, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A FIFO makes any accidental CLI/admin-state read block forever, turning
+	// this from a structural assertion into a runtime regression test.
+	if err := syscall.Mkfifo(filepath.Join(home, ".finch", "cli.json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldCWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(cwd); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(oldCWD) })
+	t.Setenv("HOME", home)
+	t.Setenv("FINCH_HUB", "https://expected.example")
+	t.Setenv("FINCH_BOX", "expected-box")
+	t.Setenv("FINCH_CREDENTIALS_DIR", filepath.Join(root, "credentials"))
+	t.Setenv("FINCH_CONTROL_SOCKET", filepath.Join(root, "run", "control.sock"))
+
+	if found := findManifest(); found == "" {
+		t.Fatal("test setup did not expose a discoverable finch.yml")
+	}
+	cfg, options, err := aviaryServeRuntimeFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Ingress) != 0 || cfg.Hub != "https://expected.example" || cfg.Box != "expected-box" || cfg.CredentialsDir != filepath.Join(root, "credentials") {
+		t.Fatalf("Aviary serve inherited manifest state: %+v", cfg)
+	}
+	if !options.SkipAdminState || options.SocketPath != filepath.Join(root, "run", "control.sock") {
+		t.Fatalf("Aviary serve runtime options=%+v", options)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- runControlRuntime(ctx, cfg, options) }()
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Aviary serve blocked reading manifest or CLI/admin state")
+	}
+}
+
+func TestAviaryServeDisablesHubPushedBinaryUpdates(t *testing.T) {
+	remoteUpdatesDisabled.Store(false)
+	t.Cleanup(func() { remoteUpdatesDisabled.Store(false) })
+	disableRemoteUpdatesForAviaryServe()
+	if !remoteUpdatesDisabled.Load() {
+		t.Fatal("aviary serve must disable remote binary updates")
 	}
 }
 

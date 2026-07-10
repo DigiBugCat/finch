@@ -46,6 +46,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -57,6 +58,11 @@ import (
 // truth that CI (scripts/check-versions.mjs) asserts matches the worker's
 // LATEST_AGENT and the web dashboard constant. Keep all three in sync.
 var agentVersion = "1.6.0"
+
+// The SDK-owned Aviary daemon never permits hub-triggered native-code updates.
+// Its Python parent selected and validated the absolute executable; silently
+// replacing that trust decision from a relay frame would be a downgrade.
+var remoteUpdatesDisabled atomic.Bool
 
 // connectSkew is how long before a connect-token's exp we treat it as already
 // expired and force a fresh /join, so we never dial with a token that lapses
@@ -308,6 +314,9 @@ func Main() {
 		case "update":
 			cmdUpdate(os.Args[2:])
 			return
+		case "version", "--version", "-v":
+			cmdVersion(os.Args[2:])
+			return
 		case "guide":
 			printGuide()
 			return
@@ -437,6 +446,19 @@ func dynamicCredentialsDir() string {
 		return expandHome(configured)
 	}
 	return filepath.Dir(defaultStatePath())
+}
+
+// aviaryServeConfigFromEnv is the SDK-owned zero-config runtime definition.
+// It must stay independent of findManifest/loadConfig and carries no static
+// ingress rules: only live SDK leases can populate its desired state.
+func aviaryServeConfigFromEnv() *config {
+	hostName, _ := os.Hostname()
+	return &config{
+		Hub:            agentDefaultHub(),
+		Box:            agentDefaultBox(hostName),
+		CredentialsDir: dynamicCredentialsDir(),
+		Ingress:        nil,
+	}
 }
 
 // enrollToState trades a one-shot ticket for a long-lived refresh credential via
@@ -1040,7 +1062,9 @@ func serveWithRoutesStatus(parent context.Context, wsURL string, upstream *url.U
 			// hub's /releases and re-exec in place. Runs in a goroutine so the
 			// read loop (and in-flight forwards) are never blocked; singleflight
 			// inside drops repeats. Old agents ignore this frame (default case).
-			go selfUpdateFromHub(hub)
+			if !remoteUpdatesDisabled.Load() {
+				go selfUpdateFromHub(hub)
+			}
 		}
 	}
 }
