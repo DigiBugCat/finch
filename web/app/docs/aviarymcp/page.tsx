@@ -21,8 +21,8 @@ export default function AviaryMCPDocs() {
       </p>
 
       <div className="docs-note">
-        <b>Public release candidate.</b> Version <code>0.1.0rc3</code> is available on{' '}
-        <a href="https://pypi.org/project/aviary-mcp/0.1.0rc3/" target="_blank" rel="noreferrer">
+        <b>Public release candidate.</b> Version <code>0.1.0rc4</code> is available on{' '}
+        <a href="https://pypi.org/project/aviary-mcp/0.1.0rc4/" target="_blank" rel="noreferrer">
           PyPI
         </a>{' '}
         and requires the Finch 1.6 agent. The normal Finch CLI and <code>finch.yml</code>{' '}
@@ -57,17 +57,20 @@ export default function AviaryMCPDocs() {
         AviaryMCP is published publicly on PyPI. Pin the release candidate while
         evaluating it so a future prerelease does not change underneath your service.
       </p>
-      <Code>{`python -m pip install 'aviary-mcp==0.1.0rc3'`}</Code>
+      <Code>{`python -m pip install 'aviary-mcp==0.1.0rc4'`}</Code>
 
       <h2>2. Define the service</h2>
       <p>Save this as <code>server.py</code>:</p>
-      <Code>{`from aviary_mcp import AviaryMCP, FinchAssertionAuth
+      <Code>{`from aviary_mcp import AviaryMCP, Finch
 
 service = "calculator"
 
 app = AviaryMCP(
     service,
-    auth=FinchAssertionAuth(service=service),
+    finch=Finch.local(
+        path=service,
+        binary="/usr/local/bin/finch",
+    ),
 )
 
 @app.tool
@@ -76,15 +79,30 @@ def add(a: int, b: int) -&gt; int:
     return a + b
 
 if __name__ == "__main__":
-    app.run(
-        expose="finch",
-        app_path=service,
-        edge_auth="key",
-    )`}</Code>
+    app.run()`}</Code>
       <p>
-        The tenant may be left unset on first run. AviaryMCP binds it to the account
-        that approves the device. Set <code>FINCH_TENANT</code> when a deployment must
-        be pinned to a known account before it starts.
+        <code>Finch.local</code> starts a dedicated zero-config Finch child and keeps
+        its approval scoped to this project. Pass the absolute Finch 1.6+ binary path;
+        the SDK never downloads or silently selects executable code from <code>PATH</code>.
+        The tenant is bound to the account that approves the first-run device prompt.
+      </p>
+
+      <h3>Use an existing Finch agent instead</h3>
+      <p>
+        For sidecars, system services, and shared container groups, choose the other
+        explicit mode and name the permissioned Unix socket:
+      </p>
+      <Code>{`app = AviaryMCP(
+    "calculator",
+    finch=Finch.agent(
+        path="calculator",
+        socket="/run/finch/control.sock",
+    ),
+)
+app.run()`}</Code>
+      <p>
+        Both modes publish the same application at <code>/mcp</code>, <code>/api/v1</code>,
+        and <code>/birdz</code>. Ordinary FastMCP tool decorators need no Finch route code.
       </p>
 
       <h2>3. Start and approve it</h2>
@@ -98,7 +116,7 @@ if __name__ == "__main__":
       <p>
         Open the printed URL on any signed-in device. Finch shows the exact service,
         routes, edge mode, and device-key fingerprint before you approve it. The Finch
-        agent stores the resulting service-scoped credential; your application never
+        Finch stores the resulting service-scoped credential; your application never
         receives a CLI token, device secret, or caller key. On later starts, the saved
         approval is reused and the service registers automatically.
       </p>
@@ -133,8 +151,8 @@ if __name__ == "__main__":
         A caller still authenticates to Finch with a <code>finch_</code> key or OAuth.
         Finch validates that credential at the edge, strips it, and signs a short-lived
         assertion bound to the exact method, path, query, body, tenant, and service.
-        <code>FinchAssertionAuth</code> verifies that assertion before MCP or REST can
-        invoke the tool.
+        AviaryMCP&apos;s automatically configured assertion verifier checks it before MCP
+        or REST can invoke the tool.
       </p>
 
       <h2>Compose existing FastMCP servers</h2>

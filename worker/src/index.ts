@@ -474,10 +474,11 @@ async function browserGate(
 const DEFAULT_RELEASES_BASE =
   "https://github.com/DigiBugCat/finch/releases/latest/download";
 
-// Allow-listed release asset names — gates the /releases redirect so it can
-// never be turned into an open redirect. Matches the installer's
-// `finch-${os}-${arch}` and GoReleaser's archive name_template.
-const RELEASE_ASSET_RE = /^finch-(darwin|linux)-(amd64|arm64|armv6|armv7)$/;
+// Allow-listed release asset names — gates /releases so it can never become an
+// arbitrary R2 read or open redirect. Matches the installer's platform binary
+// names plus the checksum manifest used for verified local-mode downloads.
+const RELEASE_ASSET_RE =
+  /^(?:checksums\.txt|finch-(darwin|linux)-(amd64|arm64|armv6|armv7))$/;
 
 // The OAuth scopes the MCP resource actually needs — identity only.
 // verifyClerkOAuthToken reads sub/user_id/org_id from Clerk's userinfo, so
@@ -685,12 +686,12 @@ export default {
       });
     }
 
-    // ---- GET /releases/finch-<os>-<arch> — redirect to the published agent
-    //      binary. The installer fetches $HUB/releases/finch-<os>-<arch>; we 302
-    //      to GitHub Releases (env.RELEASES_BASE) so the Worker needn't host
-    //      binaries. The asset name is allow-listed (RELEASE_ASSET_RE) so this
-    //      can never be an open redirect, and a non-matching /releases/* falls
-    //      through to normal routing. ----
+    // ---- GET /releases/<asset> — serve a published agent binary or its
+    //      checksums.txt manifest. The installer fetches the platform binary;
+    //      SDK local mode fetches both the binary and checksum manifest. Asset
+    //      names are allow-listed (RELEASE_ASSET_RE), so this cannot expose an
+    //      arbitrary R2 key or become an open redirect. A non-matching path
+    //      falls through to normal routing. ----
     if (
       req.method === "GET" &&
       parts[0] === "releases" &&
@@ -707,7 +708,10 @@ export default {
         if (!obj) return json(404, { error: "release asset not found" });
         return new Response(obj.body, {
           headers: {
-            "content-type": "application/octet-stream",
+            "content-type":
+              parts[1] === "checksums.txt"
+                ? "text/plain; charset=utf-8"
+                : "application/octet-stream",
             "content-length": String(obj.size),
             etag: obj.httpEtag,
             "cache-control": "public, max-age=300",
