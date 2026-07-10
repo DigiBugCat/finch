@@ -365,8 +365,10 @@ def main() -> int:
         rest_url = f"{hub}/{app_path}/api/v1/tools/add"
         print("[3/7] checking default-deny edge auth", flush=True)
         status, _ = request_json("POST", rest_url, body={"a": 20, "b": 22})
-        if status != 401:
-            raise SmokeFailure(f"unauthenticated REST request returned {status}, expected 401")
+        if status not in {401, 403}:
+            raise SmokeFailure(
+                f"unauthenticated REST request returned {status}, expected 401 or 403"
+            )
 
         print("[4/7] checking bearer REST and assertion-spoof stripping", flush=True)
         status, payload = request_json(

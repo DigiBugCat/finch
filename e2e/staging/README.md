@@ -6,7 +6,7 @@ This is an explicit, destructive, staging-only smoke test for the public
 - first-run app-owned enrollment, approved headlessly through `finch aviary
   approve <user_code>`, and the returned staging URLs;
 - a service-scoped `finch_` bearer key over generated REST and MCP;
-- unauthenticated default-deny behavior;
+- unauthenticated default-deny behavior (`401` or edge-level `403`);
 - stripping an attacker-supplied `X-Finch-Assertion` at the edge;
 - app and Finch-agent restart using the unchanged, mode-`0600` service
   credential; and
