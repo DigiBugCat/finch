@@ -24,6 +24,7 @@ type controlRuntimeOptions struct {
 	GroupID                    *int
 	AllowedVerificationOrigins []string
 	RunRelay                   relayRunFunc
+	SkipAdminState             bool
 }
 
 func runConfig(cfg *config) {
@@ -81,7 +82,9 @@ func runControlRuntime(ctx context.Context, cfg *config, options controlRuntimeO
 	// Preserve legacy best-effort self-approval without gating the control
 	// socket or any relay on an optional admin API call. Each service is
 	// independent so one hung legacy hub request cannot block its siblings.
-	autoApproveStaticServicesAsync(cfg)
+	if !options.SkipAdminState {
+		autoApproveStaticServicesAsync(cfg)
+	}
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -111,6 +114,39 @@ func runControlRuntime(ctx context.Context, cfg *config, options controlRuntimeO
 	default:
 	}
 	return reconcileErr
+}
+
+// runAviaryServe is the dedicated SDK daemon entrypoint. It accepts no CLI
+// configuration by design: hub, box, credentials, socket, group, and dashboard
+// origins come only from the FINCH_* environment contract and its defaults.
+func runAviaryServe(args []string) {
+	if len(args) != 0 {
+		fmt.Fprintln(os.Stderr, "usage: finch aviary serve")
+		os.Exit(2)
+	}
+	disableRemoteUpdatesForAviaryServe()
+	cfg, options, err := aviaryServeRuntimeFromEnv()
+	if err != nil {
+		log.Fatalf("finch: %v", err)
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := runControlRuntime(ctx, cfg, options); err != nil {
+		log.Fatalf("finch: %v", err)
+	}
+}
+
+func disableRemoteUpdatesForAviaryServe() {
+	remoteUpdatesDisabled.Store(true)
+}
+
+func aviaryServeRuntimeFromEnv() (*config, controlRuntimeOptions, error) {
+	options, err := controlRuntimeOptionsFromEnv()
+	if err != nil {
+		return nil, options, err
+	}
+	options.SkipAdminState = true
+	return aviaryServeConfigFromEnv(), options, nil
 }
 
 func autoApproveStaticServicesAsync(cfg *config) {

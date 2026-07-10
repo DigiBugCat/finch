@@ -10,6 +10,7 @@ A single Go binary with a few subcommands:
 
 | Command | What it does |
 |---|---|
+| `finch version [--json]` | Print this binary's version and platform; JSON is a stable SDK/automation contract. |
 | `finch login` | Log in to your tenant via the browser (like `gh auth login`). |
 | `finch add <app_path> --service <url>` | Enroll a service and append an `ingress` rule to `finch.yml`. |
 | `finch enroll <app_path> --ticket <t>` | Save a box-side credential from a dashboard ticket (one time; no CLI login needed). |
@@ -21,6 +22,7 @@ A single Go binary with a few subcommands:
 | `finch keys [list \| mint <label> --service <id> \| revoke <id>]` | Manage the client `finch_` keys callers present (grant + revoke access). |
 | `finch token` | Mint a fresh CLI token — provision a new box with no browser. |
 | `finch approve <path>` | Approve a service (clear the pending gate). Usually automatic. |
+| `finch aviary serve` | Run the SDK-owned dynamic control plane without reading any `finch.yml` or CLI/admin login. |
 | `finch aviary describe <code>` | Inspect a pending AviaryMCP device enrollment using the saved tenant-admin login. |
 | `finch aviary approve <code> [--public]` | Approve that enrollment headlessly; private/key-authenticated is the default. |
 | `finch rm <service>` | Remove a service. |
@@ -32,6 +34,17 @@ Every command is non-interactive and supports `--json`. Because the CLI token is
 a tenant-admin credential, an agent can run the whole loop — introspect, serve,
 test, and grant/revoke access — from the command line, no dashboard. Run
 `finch help` for the worked automation examples.
+
+`finch version --json` is the stable local-binary identity contract used by
+SDKs and deployment checks:
+
+```json
+{"schema_version":1,"product":"finch","version":"1.6.0","os":"linux","arch":"amd64"}
+```
+
+`version` is the stamped Finch release version without a leading `v`; `os` and
+`arch` use Go's platform names. Existing schema-1 fields will not be removed or
+change meaning.
 
 ## Provision a new box from an already-authed one (no human)
 
@@ -118,8 +131,9 @@ services, enrolled by compose DNS name — see
 [`examples/docker-compose/`](../examples/docker-compose/). Inside a container,
 upgrade by rebuilding/pulling the image, not `finch update`.
 
-For AviaryMCP, the default first run needs no bootstrap secret: `finch run`
-starts the control socket, the SDK registers in `needs_enrollment`, and the
+For AviaryMCP, the first run needs no bootstrap secret: `finch aviary serve`
+starts an SDK-owned control socket without inspecting `finch.yml` or the saved
+CLI/admin login. The SDK registers in `needs_enrollment`, and the
 scoped browser device flow installs the service credential without exposing it
 to the application container. The dynamic entrypoint deliberately does not
 consume a legacy one-shot ticket: those credentials contain no approved
@@ -127,17 +141,18 @@ routes/edge-auth manifest and therefore cannot authorize an AviaryMCP relay.
 
 ```bash
 docker run -d --restart unless-stopped \
-  -e FINCH_APP_PATH=hello \
   -e FINCH_HUB=https://finchmcp.com \
   -e FINCH_BOX=media-container \
   -e FINCH_CREDENTIALS_DIR=/data/.finch \
   -v finch-data:/data \
-  finch-agent
+  finch-agent aviary serve
 ```
 
 `FINCH_HUB`, `FINCH_BOX`, and `FINCH_CREDENTIALS_DIR` are the zero-config
-daemon defaults. `FINCH_APP_PATH` must be the final Finch service slug. The
-application container should never mount `/data`; it receives only the
+daemon inputs; socket mode/group and alternate dashboard origins use the other
+documented `FINCH_CONTROL_*` and `FINCH_AVIARY_VERIFICATION_ORIGINS` variables.
+No CLI flags or manifest values are read by `aviary serve`. The application
+container should never mount `/data`; it receives only the
 permissioned control socket. Explicit `finch enroll --ticket` remains available
 for legacy `finch.yml` services outside this dynamic path.
 
