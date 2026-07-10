@@ -27,6 +27,11 @@ export default function AviaryMCPDocs() {
         </a>{' '}
         and requires the Finch 1.6 agent. The normal Finch CLI and <code>finch.yml</code>{' '}
         remain supported for existing, non-Python, and non-SDK services.
+        {' '}Machine-readable guidance is available in the hosted{' '}
+        <a href="/llms.txt">llms.txt</a> and AviaryMCP&apos;s{' '}
+        <a href="https://github.com/DigiBugCat/aviary-mcp/blob/main/llms.txt" target="_blank" rel="noreferrer">
+          project llms.txt
+        </a>.
       </div>
 
       <h2>When to use it</h2>
@@ -65,7 +70,7 @@ export default function AviaryMCPDocs() {
 
 service = "calculator"
 
-app = AviaryMCP(
+mcp = AviaryMCP(
     service,
     finch=Finch.local(
         path=service,
@@ -73,13 +78,13 @@ app = AviaryMCP(
     ),
 )
 
-@app.tool
+@mcp.tool
 def add(a: int, b: int) -&gt; int:
     """Add two integers."""
     return a + b
 
 if __name__ == "__main__":
-    app.run()`}</Code>
+    mcp.run()`}</Code>
       <p>
         <code>Finch.local</code> starts a dedicated zero-config Finch child and keeps
         its approval scoped to this project. Pass the absolute Finch 1.6+ binary path;
@@ -92,14 +97,14 @@ if __name__ == "__main__":
         For sidecars, system services, and shared container groups, choose the other
         explicit mode and name the permissioned Unix socket:
       </p>
-      <Code>{`app = AviaryMCP(
+      <Code>{`mcp = AviaryMCP(
     "calculator",
     finch=Finch.agent(
         path="calculator",
         socket="/run/finch/control.sock",
     ),
 )
-app.run()`}</Code>
+mcp.run()`}</Code>
       <p>
         Both modes publish the same application at <code>/mcp</code>, <code>/api/v1</code>,
         and <code>/birdz</code>. Ordinary FastMCP tool decorators need no Finch route code.
@@ -115,8 +120,8 @@ app.run()`}</Code>
 <span class="o">  Edge auth: key</span>`}</Code>
       <p>
         Open the printed URL on any signed-in device. Finch shows the exact service,
-        routes, edge mode, and device-key fingerprint before you approve it. The Finch
-        Finch stores the resulting service-scoped credential; your application never
+        routes, edge mode, and device-key fingerprint before you approve it. Finch
+        stores the resulting service-scoped credential; your application never
         receives a CLI token, device secret, or caller key. On later starts, the saved
         approval is reused and the service registers automatically.
       </p>
@@ -165,8 +170,8 @@ weather = FastMCP("weather")
 def forecast(city: str) -&gt; str:
     return f"sunny in {city}"
 
-app = AviaryMCP("aviary")
-app.mount(weather, namespace="weather")`}</Code>
+mcp = AviaryMCP("aviary")
+mcp.mount(weather, namespace="weather")`}</Code>
       <p>
         The mounted tool becomes <code>weather_forecast</code> in MCP, REST, and
         OpenAPI. Namespaces keep tools from different birds from colliding.
