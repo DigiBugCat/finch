@@ -14,6 +14,13 @@ export default function Quickstart() {
         zero: write a hello-world MCP server, then put it online.
       </p>
 
+      <div className="docs-note">
+        <b>Starting a new Python service?</b>{' '}
+        <Link href="/docs/aviarymcp">AviaryMCP</Link> defines each tool once and
+        generates MCP, REST, and OpenAPI while managing Finch registration and
+        first-run approval. It is currently available as a private release candidate.
+      </div>
+
       <h2>1. Write an MCP server</h2>
       <p>
         Any MCP server works. The fastest way to get one is{' '}
@@ -111,6 +118,10 @@ finch call hello greet --args '{"name": "world"}'
         <Link className="docs-card" href="/docs/services">
           <h3>Services &amp; boxes</h3>
           <p>How services, boxes, and finch.yml fit together, and enrolling more boxes.</p>
+        </Link>
+        <Link className="docs-card" href="/docs/aviarymcp">
+          <h3>AviaryMCP</h3>
+          <p>Build one Python tool surface for MCP, REST, and OpenAPI with native Finch enrollment.</p>
         </Link>
         <Link className="docs-card" href="/docs/auth">
           <h3>Keys &amp; auth</h3>

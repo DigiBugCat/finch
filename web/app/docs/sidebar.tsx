@@ -8,6 +8,7 @@ const GROUPS: { h: string; items: [string, string][] }[] = [
     h: 'Get started',
     items: [
       ['/docs', 'Quickstart'],
+      ['/docs/aviarymcp', 'AviaryMCP'],
       ['/docs/services', 'Services & boxes'],
     ],
   },
