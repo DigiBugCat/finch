@@ -110,6 +110,11 @@ edge identity injection (`X-Finch-User`), and multi-box session affinity.
 
 ## Use it
 
+For a new Python service, the private Aviary pilot can use
+[AviaryMCP](https://finchmcp.com/docs/aviarymcp): define a tool once, expose it
+through MCP and generated REST/OpenAPI routes, and let the application register
+itself with Finch. Existing services and other languages use the CLI flow below.
+
 Three commands on the box, from a logged-in CLI (see
 [`agent/README.md`](agent/README.md) for the full reference):
 
