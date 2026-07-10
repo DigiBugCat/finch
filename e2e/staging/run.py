@@ -145,6 +145,19 @@ def result_value(payload: Any) -> Any:
     return None
 
 
+def request_after_relay_ready(
+    method: str,
+    url: str,
+    **kwargs: Any,
+) -> tuple[int, Any]:
+    deadline = time.monotonic() + 20
+    while True:
+        status, payload = request_json(method, url, **kwargs)
+        if status not in {502, 503, 504} or time.monotonic() >= deadline:
+            return status, payload
+        time.sleep(1)
+
+
 class AppProcess:
     def __init__(self, env: dict[str, str]) -> None:
         self.events: list[dict[str, Any]] = []
@@ -367,14 +380,16 @@ def main() -> int:
 
         rest_url = f"{hub}/{app_path}/api/v1/tools/add"
         print("[3/7] checking default-deny edge auth", flush=True)
-        status, _ = request_json("POST", rest_url, body={"a": 20, "b": 22})
+        status, _ = request_after_relay_ready(
+            "POST", rest_url, body={"a": 20, "b": 22}
+        )
         if status not in {401, 403}:
             raise SmokeFailure(
                 f"unauthenticated REST request returned {status}, expected 401 or 403"
             )
 
         print("[4/7] checking bearer REST and assertion-spoof stripping", flush=True)
-        status, payload = request_json(
+        status, payload = request_after_relay_ready(
             "POST",
             rest_url,
             token=token,
@@ -384,7 +399,7 @@ def main() -> int:
         if status != 200 or result_value(payload) != 42:
             raise SmokeFailure(f"authenticated REST request failed with status {status}")
         expected_version = os.environ.get("FINCH_E2E_EXPECTED_AVIARY_VERSION", "").strip()
-        status, payload = request_json(
+        status, payload = request_after_relay_ready(
             "POST",
             f"{hub}/{app_path}/api/v1/tools/package_version",
             token=token,
