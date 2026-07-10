@@ -272,6 +272,9 @@ func Main() {
 		case "approve":
 			cmdApprove(os.Args[2:])
 			return
+		case "aviary":
+			cmdAviary(os.Args[2:])
+			return
 		case "auth":
 			cmdAuth(os.Args[2:])
 			return

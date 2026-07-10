@@ -247,6 +247,98 @@ async function authenticatedTenant(req: Request, env: Env): Promise<string | nul
   return verifyAssertion(req.headers.get("X-Finch-Auth") || "", env.FINCH_SERVICE_SECRET);
 }
 
+async function handleAviaryEnrollmentDecision(
+  path: string,
+  body: Record<string, unknown>,
+  env: Env,
+  host: string,
+  tenant: string,
+): Promise<Response> {
+  if (!(await rateLimitOk(env.JOIN_LIMIT, `aviary-decision:${tenant}`))) {
+    return enrollmentError(429, "rate_limited", "too many enrollment decisions");
+  }
+  const userCode = body.user_code ?? body.userCode;
+  if (typeof userCode !== "string" || !userCode.trim()) {
+    return enrollmentError(400, "invalid_user_code", "user_code is required");
+  }
+  const approver = typeof body.approver === "string" ? body.approver : "";
+
+  if (path.endsWith("/describe")) {
+    const out = await aviaryEnrollmentOp<OpResult>(env, "describe", {
+      userCode,
+      now: Date.now(),
+    });
+    if (!out.ok) return opError(out);
+    const describedManifest = out.manifest as AviaryManifest | undefined;
+    if (
+      describedManifest?.expected_tenant &&
+      describedManifest.expected_tenant !== tenant
+    ) {
+      return enrollmentError(
+        403,
+        "tenant_mismatch",
+        "sign in to the tenant named by the approved manifest",
+      );
+    }
+    return json(200, Object.fromEntries(Object.entries(out).filter(([key]) => key !== "ok")));
+  }
+  if (path.endsWith("/approve")) {
+    const local = host.startsWith("localhost") || host.startsWith("127.");
+    const out = await aviaryEnrollmentOp<OpResult>(env, "approve", {
+      userCode,
+      tenant,
+      approver,
+      publicApproved: body.public_approved === true,
+      publicOrigin: `${local ? "http" : "https"}://${host}`,
+      now: Date.now(),
+    });
+    if (!out.ok) return opError(out);
+    return json(200, {
+      ok: true,
+      status: out.status,
+      ...(out.approved_tenant ? { approved_tenant: out.approved_tenant } : {}),
+    });
+  }
+  const out = await aviaryEnrollmentOp<OpResult>(env, "deny", {
+    userCode,
+    tenant,
+    approver,
+    reason: body.reason,
+    now: Date.now(),
+  });
+  if (!out.ok) return opError(out);
+  return json(200, { ok: true, status: out.status });
+}
+
+/** Tenant-admin CLI entrypoint. Authentication and epoch revocation are
+ * enforced by /api/cli/* before this is called; all enrollment decisions then
+ * use the exact same transaction as the browser approval flow. */
+export async function handleAviaryEnrollmentCliApi(
+  req: Request,
+  env: Env,
+  host: string,
+  tenant: string,
+): Promise<Response> {
+  if (req.method !== "POST") return enrollmentError(405, "method_not_allowed", "POST only");
+  const body = await boundedJson(req);
+  if (!body) return enrollmentError(400, "invalid_json", "request must be a JSON object under 16 KiB");
+  const path = new URL(req.url).pathname;
+  if (
+    path !== "/api/cli/aviary/describe" &&
+    path !== "/api/cli/aviary/approve" &&
+    path !== "/api/cli/aviary/deny"
+  ) {
+    return enrollmentError(404, "not_found", "unknown enrollment route");
+  }
+  return handleAviaryEnrollmentDecision(
+    path,
+    { ...body, approver: `cli:${tenant}` },
+    env,
+    host,
+    tenant,
+  );
+}
+
 export async function handleAviaryEnrollmentApi(
   req: Request,
   env: Env,
@@ -334,60 +426,7 @@ export async function handleAviaryEnrollmentApi(
   }
   const tenant = await authenticatedTenant(req, env);
   if (!tenant) return enrollmentError(401, "unauthorized", "valid Finch service and tenant assertion required");
-  if (!(await rateLimitOk(env.JOIN_LIMIT, `aviary-decision:${tenant}`))) {
-    return enrollmentError(429, "rate_limited", "too many enrollment decisions");
-  }
-  const userCode = body.user_code ?? body.userCode;
-  if (typeof userCode !== "string" || !userCode.trim()) {
-    return enrollmentError(400, "invalid_user_code", "user_code is required");
-  }
-  const approver = typeof body.approver === "string" ? body.approver : "";
-
-  if (path === "/api/aviary/device/describe") {
-    const out = await aviaryEnrollmentOp<OpResult>(env, "describe", {
-      userCode,
-      now: Date.now(),
-    });
-    if (!out.ok) return opError(out);
-    const describedManifest = out.manifest as AviaryManifest | undefined;
-    if (
-      describedManifest?.expected_tenant &&
-      describedManifest.expected_tenant !== tenant
-    ) {
-      return enrollmentError(
-        403,
-        "tenant_mismatch",
-        "sign in to the tenant named by the approved manifest",
-      );
-    }
-    return json(200, Object.fromEntries(Object.entries(out).filter(([key]) => key !== "ok")));
-  }
-  if (path === "/api/aviary/device/approve") {
-    const local = host.startsWith("localhost") || host.startsWith("127.");
-    const out = await aviaryEnrollmentOp<OpResult>(env, "approve", {
-      userCode,
-      tenant,
-      approver,
-      publicApproved: body.public_approved === true,
-      publicOrigin: `${local ? "http" : "https"}://${host}`,
-      now: Date.now(),
-    });
-    if (!out.ok) return opError(out);
-    return json(200, {
-      ok: true,
-      status: out.status,
-      ...(out.approved_tenant ? { approved_tenant: out.approved_tenant } : {}),
-    });
-  }
-  const out = await aviaryEnrollmentOp<OpResult>(env, "deny", {
-    userCode,
-    tenant,
-    approver,
-    reason: body.reason,
-    now: Date.now(),
-  });
-  if (!out.ok) return opError(out);
-  return json(200, { ok: true, status: out.status });
+  return handleAviaryEnrollmentDecision(path, body, env, host, tenant);
 }
 
 export function isAviaryEnrollmentPath(path: string): boolean {

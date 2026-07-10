@@ -21,6 +21,8 @@ A single Go binary with a few subcommands:
 | `finch keys [list \| mint <label> --service <id> \| revoke <id>]` | Manage the client `finch_` keys callers present (grant + revoke access). |
 | `finch token` | Mint a fresh CLI token — provision a new box with no browser. |
 | `finch approve <path>` | Approve a service (clear the pending gate). Usually automatic. |
+| `finch aviary describe <code>` | Inspect a pending AviaryMCP device enrollment using the saved tenant-admin login. |
+| `finch aviary approve <code> [--public]` | Approve that enrollment headlessly; private/key-authenticated is the default. |
 | `finch rm <service>` | Remove a service. |
 | `finch revoke-tokens` | De-authorize every CLI login (including this box). |
 | `finch join --ticket … --upstream …` | Legacy single-service mode straight from flags (no config file). |
@@ -144,6 +146,22 @@ that deliberately hosts its dashboard on a different origin must set an exact,
 comma-separated allowlist with `FINCH_AVIARY_VERIFICATION_ORIGINS`. Origins are
 validated at startup, HTTPS hubs cannot allow an HTTP downgrade, and paths,
 queries, credentials, or fragments are rejected.
+
+For CI or a headless staging operator that already has a revocable tenant-admin
+CLI login, the browser step has an official command-line equivalent:
+
+```bash
+finch aviary describe BIRD-DUCK --json
+finch aviary approve BIRD-DUCK --json
+```
+
+The code identifies the existing proof-bound enrollment; it is not an auth
+secret. The command authenticates with the same saved CLI token as `finch keys`
+and `finch fleet`, and the Worker executes the same approval transaction as the
+browser page. Private/key-authenticated enrollment is the default. If—and only
+if—the requested manifest is intentionally public, approval requires the
+explicit `finch aviary approve BIRD-DUCK --public` flag. There is no CI bypass
+or deployment-only backdoor.
 
 AviaryMCP sidecars additionally share a Unix control socket on an ephemeral
 volume. Give the app and Finch distinct UIDs and only a dedicated supplemental
