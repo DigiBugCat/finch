@@ -1,11 +1,19 @@
-import { describe, it, expect } from "vitest";
+import { beforeAll, describe, it, expect } from "vitest";
 import {
   env,
   createExecutionContext,
   waitOnExecutionContext,
 } from "cloudflare:test";
 import worker from "../src/index";
-import { signAssertion, signToken, signSession, genJti } from "../src/auth";
+import {
+  callerAssertionJwks,
+  signAssertion,
+  signToken,
+  signSession,
+  genJti,
+  verifyCallerAssertion,
+  type CallerAssertionJwk,
+} from "../src/auth";
 
 // LOGIN-WALL E2E — drives the REAL worker (worker.fetch) through the browser
 // login wall in front of the relay plane. The wall is the new DEFAULT for a
@@ -26,6 +34,32 @@ const SESSION = env.SESSION_SECRET; // "test-session-secret"
 const WEB_URL = env.WEB_URL!; // "https://web.test"
 
 const nowSec = () => Math.floor(Date.now() / 1000);
+
+let assertionBindings: Record<string, unknown> = {};
+let assertionPublicJwks: { keys: CallerAssertionJwk[] };
+
+// Generate an extractable TEST-ONLY signer inside workerd. Production reads a
+// private JWKS from a Worker secret; no private material is checked into git.
+beforeAll(async () => {
+  const pair = (await crypto.subtle.generateKey(
+    { name: "ECDSA", namedCurve: "P-256" },
+    true,
+    ["sign", "verify"],
+  )) as CryptoKeyPair;
+  const privateKey = {
+    ...(await crypto.subtle.exportKey("jwk", pair.privateKey)),
+    kid: "login-wall-test-2026",
+    alg: "ES256",
+    use: "sig",
+  } as CallerAssertionJwk;
+  const privateJwks = JSON.stringify({ keys: [privateKey] });
+  assertionBindings = {
+    FINCH_ASSERTION_ACTIVE_KID: privateKey.kid,
+    FINCH_ASSERTION_PRIVATE_JWKS: privateJwks,
+    FINCH_ASSERTION_ISSUER: "https://finch.test",
+  };
+  assertionPublicJwks = callerAssertionJwks({ privateJwks });
+});
 
 let seq = 0;
 /** A fresh tenant + slug pair, registered slug→tenant in the RouterDO so the
@@ -59,10 +93,104 @@ function assertion(tenant: string): Promise<string> {
 
 async function call(req: Request): Promise<Response> {
   const ctx = createExecutionContext();
-  const res = await worker.fetch(req, env as any, ctx);
+  const res = await worker.fetch(
+    req,
+    {
+      ...(env as any),
+      ...assertionBindings,
+      // Test-only service binding for Clerk userinfo. Tokens of the form
+      // oauth:<tenant> authenticate that exact tenant; the raw token is never
+      // forwarded to the agent or placed in the assertion.
+      CLERK_USERINFO: {
+        async fetch(_input: RequestInfo | URL, init?: RequestInit) {
+          const auth = new Headers(init?.headers).get("authorization") || "";
+          const token = auth.replace(/^Bearer\s+/, "");
+          return token.startsWith("oauth:")
+            ? Response.json({ sub: token.slice("oauth:".length) })
+            : Response.json({ error: "invalid token" }, { status: 401 });
+        },
+      },
+    } as any,
+    ctx,
+  );
   await waitOnExecutionContext(ctx);
   return res;
 }
+
+async function verifiedFrameAssertion(frame: any, expected: {
+  tenant: string;
+  service: string;
+  method: string;
+  upstreamPath: string;
+  publicPath: string;
+}) {
+  expect(frame.assertion).toMatch(/^[^.]+\.[^.]+\.[^.]+$/);
+  expect(frame.headers?.["x-finch-assertion"]).toBeUndefined();
+  const claims = await verifyCallerAssertion(
+    frame.assertion,
+    assertionPublicJwks,
+    {
+      issuer: "https://finch.test",
+      audience: `finch:${expected.tenant}:${expected.service}`,
+      tenant: expected.tenant,
+      service: expected.service,
+      method: expected.method,
+      upstreamPath: expected.upstreamPath,
+      publicPath: expected.publicPath,
+    },
+  );
+  expect(claims).not.toBeNull();
+  return claims!;
+}
+
+describe("caller assertion JWKS", () => {
+  it("serves the active and retiring public keys without private material", async () => {
+    const res = await call(
+      new Request("https://any-supported-host.test/.well-known/finch-jwks.json"),
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-type")).toBe("application/jwk-set+json");
+    expect(res.headers.get("cache-control")).toContain("max-age=300");
+    expect(res.headers.get("x-finch-active-kid")).toBe(
+      "login-wall-test-2026",
+    );
+    const body = (await res.json()) as { keys: CallerAssertionJwk[] };
+    expect(body.keys).toHaveLength(1);
+    expect(body.keys[0]).toMatchObject({
+      kid: "login-wall-test-2026",
+      kty: "EC",
+      crv: "P-256",
+      alg: "ES256",
+      use: "sig",
+    });
+    expect(body.keys[0].d).toBeUndefined();
+  });
+
+  it("fails closed for absent or partial signer configuration", async () => {
+    const request = () =>
+      new Request("https://jwks.test/.well-known/finch-jwks.json");
+    const absentCtx = createExecutionContext();
+    const absent = await worker.fetch(request(), env as any, absentCtx);
+    await waitOnExecutionContext(absentCtx);
+    expect(absent.status).toBe(404);
+
+    const partialCtx = createExecutionContext();
+    const partial = await worker.fetch(
+      request(),
+      {
+        ...(env as any),
+        FINCH_ASSERTION_ACTIVE_KID: "configured-without-private-secret",
+        FINCH_ASSERTION_ISSUER: "https://jwks.test",
+      },
+      partialCtx,
+    );
+    await waitOnExecutionContext(partialCtx);
+    expect(partial.status).toBe(503);
+    expect(await partial.json()).toEqual({
+      error: "caller assertion signer unavailable",
+    });
+  });
+});
 
 /** A control-plane (/api/*) request: service secret + signed tenant assertion. */
 async function api(
@@ -204,6 +332,7 @@ function mintSession(
       slug: over.slug,
       userId: over.userId ?? "user_123",
       epoch: over.epoch ?? 0,
+      jti: genJti(),
       exp: over.exp ?? nowSec() + 3600,
     } as any,
     SESSION,
@@ -270,6 +399,11 @@ describe("login wall — keyless browser hit on a private service", () => {
       }),
     );
     expect(res.status).toBe(401);
+    expect(res.headers.get("content-type")).toContain("application/json");
+    expect(res.headers.get("location")).toBeNull();
+    expect((await res.json()) as any).toMatchObject({
+      error: expect.stringContaining("bearer key"),
+    });
     agent.close(1000, "done");
   });
 
@@ -305,13 +439,34 @@ describe("login wall — keyless browser hit on a private service", () => {
     const relayP = call(
       new Request(`${base}/${service}/index.html`, {
         method: "GET",
-        headers: { host, accept: "text/html", cookie: `finch_session=${cookie}` },
+        headers: {
+          host,
+          accept: "text/html",
+          cookie: `finch_session=${cookie}`,
+          // Every spoofable identity form is discarded before auth; only the
+          // dedicated Worker-minted frame.assertion may survive.
+          "x-finch-assertion": "attacker.assertion.value",
+          "x-finch-user": "attacker",
+          "x-finch-identity-role": "admin",
+        },
         redirect: "manual",
       }),
     );
     const reqFrame = await reqSeen;
     expect(reqFrame.type).toBe("req");
     expect(reqFrame.path).toBe("/index.html");
+    const claims = await verifiedFrameAssertion(reqFrame, {
+      tenant,
+      service,
+      method: "GET",
+      upstreamPath: "/index.html",
+      publicPath: `/${service}/index.html`,
+    });
+    expect(claims.auth_method).toBe("browser");
+    expect(claims.sub).toBe("user:user_123");
+    expect(claims.session_id).toBeTruthy();
+    expect(reqFrame.headers["x-finch-user"]).toBeUndefined();
+    expect(reqFrame.headers["x-finch-identity-role"]).toBeUndefined();
     reply200(agent, reqFrame.id, "<h1>ok</h1>");
     const res = await relayP;
     expect(res.status).toBe(200);
@@ -397,6 +552,11 @@ describe("login wall — keyless browser hit on a private service", () => {
       }),
     );
     expect(wrongKey.status).toBe(403);
+    expect(wrongKey.headers.get("content-type")).toContain("application/json");
+    expect(wrongKey.headers.get("location")).toBeNull();
+    expect((await wrongKey.json()) as any).toMatchObject({
+      error: expect.any(String),
+    });
 
     // A good key still relays (Gate1 all + the locked owner ACL rule).
     const minted = (await (
@@ -414,16 +574,111 @@ describe("login wall — keyless browser hit on a private service", () => {
           host,
           "content-type": "application/json",
           authorization: `Bearer ${minted.key}`,
+          "x-finch-assertion": "spoofed",
+          "x-finch-caller": "admin",
+          "x-finch-session": "attacker-session",
         },
         body: '{"jsonrpc":"2.0","id":1,"method":"initialize"}',
         redirect: "manual",
       }),
     );
     const reqFrame = await reqSeen;
+    const keyClaims = await verifiedFrameAssertion(reqFrame, {
+      tenant,
+      service,
+      method: "POST",
+      upstreamPath: "/mcp",
+      publicPath: `/${service}/mcp`,
+    });
+    expect(keyClaims.auth_method).toBe("finch_key");
+    expect(keyClaims.sub).toMatch(/^key:k_/);
+    expect(keyClaims.actor).toBe("you");
+    expect(keyClaims.key_label).toBe("wall-key");
+    expect(reqFrame.headers.authorization).toBeUndefined();
+    expect(reqFrame.headers["x-finch-caller"]).toBeUndefined();
+    expect(reqFrame.headers["x-finch-session"]).toBeUndefined();
+    for (const value of Object.values(reqFrame.headers) as string[]) {
+      expect(value).not.toContain("finch_");
+    }
     reply200(agent, reqFrame.id, "<ok/>");
     const good = await relayP;
     expect(good.status).toBe(200);
 
+    agent.close(1000, "done");
+  });
+
+  it("injects a service assertion on a pinned dashboard relay", async () => {
+    const { host, base, tenant, service, box, agent } = await standUpService();
+    const publicPath =
+      `/${service}/${encodeURIComponent(box)}/api/v1/tools/search`;
+    const reqSeen = nextFrame(agent);
+    const relayP = call(
+      new Request(`${base}${publicPath}?limit=2`, {
+        method: "POST",
+        headers: {
+          host,
+          "content-type": "application/json",
+          "x-finch-service": SERVICE,
+          "x-finch-auth": await assertion(tenant),
+          "x-finch-principal": "spoofed-admin",
+          "x-finch-tenant": "attacker-tenant",
+        },
+        body: '{"query":"birds"}',
+      }),
+    );
+    const frame = await reqSeen;
+    expect(frame.path).toBe("/api/v1/tools/search?limit=2");
+    const claims = await verifiedFrameAssertion(frame, {
+      tenant,
+      service,
+      method: "POST",
+      upstreamPath: "/api/v1/tools/search?limit=2",
+      publicPath,
+    });
+    expect(claims.auth_method).toBe("service");
+    expect(claims.sub).toBe("service:finch-dashboard");
+    expect(frame.headers["x-finch-service"]).toBeUndefined();
+    expect(frame.headers["x-finch-auth"]).toBeUndefined();
+    expect(frame.headers["x-finch-principal"]).toBeUndefined();
+    expect(frame.headers["x-finch-tenant"]).toBeUndefined();
+    reply200(agent, frame.id, "<ok/>");
+    expect((await relayP).status).toBe(200);
+    agent.close(1000, "done");
+  });
+
+  it("injects an OAuth assertion without forwarding the access token", async () => {
+    const { host, base, tenant, service, agent } = await standUpService();
+    const oauthToken = `oauth:${tenant}`;
+    const reqSeen = nextFrame(agent);
+    const relayP = call(
+      new Request(`${base}/${service}/mcp`, {
+        method: "POST",
+        headers: {
+          host,
+          "content-type": "application/json",
+          authorization: `Bearer ${oauthToken}`,
+          "x-finch-auth-method": "service",
+          "x-finch-user": "attacker",
+        },
+        body: '{"jsonrpc":"2.0","id":1,"method":"initialize"}',
+      }),
+    );
+    const frame = await reqSeen;
+    const claims = await verifiedFrameAssertion(frame, {
+      tenant,
+      service,
+      method: "POST",
+      upstreamPath: "/mcp",
+      publicPath: `/${service}/mcp`,
+    });
+    expect(claims.auth_method).toBe("oauth");
+    expect(claims.sub).toBe(`user:${tenant}`);
+    expect(frame.headers.authorization).toBeUndefined();
+    expect(frame.headers["x-finch-auth-method"]).toBeUndefined();
+    expect(frame.headers["x-finch-user"]).toBeUndefined();
+    expect(JSON.stringify(frame)).not.toContain(oauthToken);
+    reply200(agent, frame.id, "<ok/>");
+    expect((await relayP).status).toBe(200);
     agent.close(1000, "done");
   });
 
@@ -448,6 +703,7 @@ describe("login wall — keyless browser hit on a private service", () => {
     );
     const reqFrame = await reqSeen;
     expect(reqFrame.path).toBe("/index.html");
+    expect(reqFrame.assertion).toBeUndefined();
     reply200(agent, reqFrame.id, "<pub/>");
     const res = await relayP;
     expect(res.status).toBe(200);

@@ -109,11 +109,46 @@ docker run --rm -v finch-data:/data finch-agent add hello --service http://host.
 docker run -d --restart unless-stopped -v finch-data:/data finch-agent   # = finch run
 ```
 
-The entrypoint is the binary (default command `run`), so any subcommand works
-via `docker run`. For the full sidecar pattern — agent + MCP server as compose
+The entrypoint is a minimal wrapper that dispatches to the binary (default
+command `run`), so any subcommand still works via `docker run`. For
+the full sidecar pattern — agent + MCP server as compose
 services, enrolled by compose DNS name — see
 [`examples/docker-compose/`](../examples/docker-compose/). Inside a container,
 upgrade by rebuilding/pulling the image, not `finch update`.
+
+For AviaryMCP, the default first run needs no bootstrap secret: `finch run`
+starts the control socket, the SDK registers in `needs_enrollment`, and the
+scoped browser device flow installs the service credential without exposing it
+to the application container. The dynamic entrypoint deliberately does not
+consume a legacy one-shot ticket: those credentials contain no approved
+routes/edge-auth manifest and therefore cannot authorize an AviaryMCP relay.
+
+```bash
+docker run -d --restart unless-stopped \
+  -e FINCH_APP_PATH=hello \
+  -e FINCH_HUB=https://finchmcp.com \
+  -e FINCH_BOX=media-container \
+  -e FINCH_CREDENTIALS_DIR=/data/.finch \
+  -v finch-data:/data \
+  finch-agent
+```
+
+`FINCH_HUB`, `FINCH_BOX`, and `FINCH_CREDENTIALS_DIR` are the zero-config
+daemon defaults. `FINCH_APP_PATH` must be the final Finch service slug. The
+application container should never mount `/data`; it receives only the
+permissioned control socket. Explicit `finch enroll --ticket` remains available
+for legacy `finch.yml` services outside this dynamic path.
+
+AviaryMCP sidecars additionally share a Unix control socket on an ephemeral
+volume. Give the app and Finch distinct UIDs and only a dedicated supplemental
+group, with a `0750` directory and `0660` socket. The app group can connect but
+cannot unlink or replace the socket. Membership in that group is a powerful
+local capability; use one mutually trusted application group per Finch
+sidecar (or owner-only `0600` for a same-UID process). The current pilot API is
+full-trust within that group, including lease management; do not share it
+across mutually untrusted applications. Future multi-tenant sidecars require
+SO_PEERCRED ownership checks or per-app sockets. Default host installs remain
+owner-only (`0700`/`0600`).
 
 ## Auth & credentials
 

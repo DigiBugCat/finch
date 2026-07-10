@@ -1,9 +1,15 @@
 package core
 
 import (
+	"bytes"
 	"encoding/base64"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -100,6 +106,21 @@ func TestResolveUpstream_BasePath(t *testing.T) {
 	}
 }
 
+func TestResolveUpstream_RouteAllowlistUsesSegmentBoundaries(t *testing.T) {
+	base := mustParse(t, "http://127.0.0.1:8000")
+	routes := []string{"/mcp", "/api/v1", "/birdz"}
+	for _, allowed := range []string{"/mcp", "/mcp/tools", "/api/v1", "/api/v1/tools?x=1", "/birdz"} {
+		if _, err := resolveUpstreamWithRoutes(base, allowed, false, routes); err != nil {
+			t.Errorf("allowlisted path %q rejected: %v", allowed, err)
+		}
+	}
+	for _, rejected := range []string{"/", "/api", "/api/v10", "/birdz-old", "/mcpish", "/mcp/../admin", "//evil/x", "https://evil/x"} {
+		if _, err := resolveUpstreamWithRoutes(base, rejected, false, routes); err == nil {
+			t.Errorf("non-allowlisted path %q accepted", rejected)
+		}
+	}
+}
+
 func TestTokenExp(t *testing.T) {
 	enc := func(s string) string { return base64.RawURLEncoding.EncodeToString([]byte(s)) }
 	valid := enc(`{"exp":1700000000}`) + ".sig"
@@ -116,6 +137,40 @@ func TestTokenExp(t *testing.T) {
 		if got := tokenExp(bad); !got.IsZero() {
 			t.Errorf("tokenExp(%q) = %v, want zero time", bad, got)
 		}
+	}
+}
+
+func TestReadBoundedControlResponse_RejectsOversize(t *testing.T) {
+	if _, err := readBoundedControlResponse(bytes.NewReader(make([]byte, controlPlaneResponseLimit+1))); err == nil {
+		t.Fatal("oversized hub response accepted")
+	}
+	if got, err := readBoundedControlResponse(bytes.NewReader([]byte("ok"))); err != nil || string(got) != "ok" {
+		t.Fatalf("small response=%q err=%v", got, err)
+	}
+}
+
+func TestRefresh_RejectsRedirectWithoutLeakingHubBody(t *testing.T) {
+	replayed := 0
+	destination := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		replayed++
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer destination.Close()
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", destination.URL+"/stolen")
+		w.WriteHeader(http.StatusTemporaryRedirect)
+		_, _ = w.Write([]byte("refresh-token-secret"))
+	}))
+	defer source.Close()
+	_, err := refresh(source.URL, "refresh-token-secret")
+	if err == nil || !strings.Contains(err.Error(), "HTTP 307") {
+		t.Fatalf("redirect error=%v", err)
+	}
+	if strings.Contains(err.Error(), "refresh-token-secret") {
+		t.Fatalf("hub response leaked through error: %v", err)
+	}
+	if replayed != 0 {
+		t.Fatalf("refresh credential followed cross-origin redirect %d time(s)", replayed)
 	}
 }
 
@@ -151,7 +206,99 @@ func TestState_RoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadState: %v", err)
 	}
-	if got == nil || *got != *want {
+	if got == nil || !reflect.DeepEqual(*got, *want) {
 		t.Errorf("round-trip = %+v, want %+v", got, want)
+	}
+}
+
+func TestSaveState_IsAtomicOwnerOnlyAndRejectsSymlinkTarget(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "credentials")
+	path := filepath.Join(dir, "media.json")
+	state := &agentState{Hub: "https://finchmcp.com", RefreshToken: "secret"}
+	if err := saveState(path, state); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("credential mode=%04o", got)
+	}
+	if got, _ := os.Lstat(dir); got.Mode().Perm() != 0o700 {
+		t.Fatalf("credential directory mode=%04o", got.Mode().Perm())
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadState(path); err == nil {
+		t.Fatal("world-readable credential was accepted")
+	}
+
+	target := filepath.Join(t.TempDir(), "target")
+	if err := os.WriteFile(target, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, path); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveState(path, state); err == nil {
+		t.Fatal("symlink credential target was accepted")
+	}
+	if got, _ := os.ReadFile(target); string(got) != "keep" {
+		t.Fatalf("symlink target changed: %q", got)
+	}
+}
+
+func TestSaveState_BareRelativePathDoesNotChmodWorkingDirectory(t *testing.T) {
+	originalWD, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(originalWD) })
+	if err := saveState("state.json", &agentState{Hub: "https://finchmcp.com", RefreshToken: "secret"}); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o755 {
+		t.Fatalf("working directory mode changed to %04o", got)
+	}
+}
+
+func TestLoadState_RejectsOversizedCredential(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	if err := os.WriteFile(path, bytes.Repeat([]byte("x"), credentialStateLimit+1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadState(path); err == nil {
+		t.Fatal("oversized credential state was accepted")
+	}
+}
+
+func TestZeroConfigRunDefaultsHonorContainerEnvironment(t *testing.T) {
+	t.Setenv("FINCH_HUB", "https://staging.finch.example")
+	t.Setenv("FINCH_BOX", "aviary-container")
+	t.Setenv("FINCH_CREDENTIALS_DIR", "/data/scoped-credentials")
+	if got := agentDefaultHub(); got != "https://staging.finch.example" {
+		t.Fatalf("hub default=%q", got)
+	}
+	if got := agentDefaultBox("hostname"); got != "aviary-container" {
+		t.Fatalf("box default=%q", got)
+	}
+	if got := dynamicCredentialsDir(); got != "/data/scoped-credentials" {
+		t.Fatalf("credentials default=%q", got)
 	}
 }

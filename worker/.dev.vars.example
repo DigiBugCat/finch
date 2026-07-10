@@ -11,6 +11,13 @@ FINCH_SERVICE_SECRET="REPLACE_WITH_DEV_SERVICE_SECRET"
 # HMAC key for join tickets + per-machine connect-tokens.
 TICKET_SECRET="REPLACE_WITH_DEV_TICKET_SECRET"
 
+# Optional Finch caller-assertion signer. Both signing values must be present
+# together; see CALLER_ASSERTIONS.md. Generate a throwaway dev JWKS with
+# `node scripts/generate-assertion-jwks.mjs finch-dev-local`.
+FINCH_ASSERTION_ACTIVE_KID="finch-dev-local"
+FINCH_ASSERTION_PRIVATE_JWKS='REPLACE_WITH_DEV_PRIVATE_JWKS_JSON'
+FINCH_ASSERTION_ISSUER="http://localhost:8787"
+
 # DEV-ONLY tenant fallback (consulted only when DEV=1). Never set in prod —
 # prod resolveTenant fails closed (404) on an unresolved host.
 DEFAULT_TENANT="dev-tenant"

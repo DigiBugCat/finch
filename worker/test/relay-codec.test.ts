@@ -41,6 +41,9 @@ describe("relay codec — round-trips the golden fixture", () => {
       "content-type": "application/json",
       "mcp-session-id": "sess-abc",
     });
+    expect(req.assertion).toBe(
+      "eyJhbGciOiJFUzI1NiIsImtpZCI6InRlc3QtMjAyNiIsInR5cCI6IkpXVCJ9.eyJhdWQiOiJmaW5jaDp0ZW5hbnQ6c2VydmljZSJ9.dGVzdC1zaWduYXR1cmU",
+    );
     expect(typeof req.body).toBe("string");
   });
 

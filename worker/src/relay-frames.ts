@@ -16,7 +16,10 @@
 //   either:       reset (abort an in-flight stream; message optional)
 
 /** DO -> agent. The relayed request; body is the buffered request body as a
- *  UTF-8 string. headers is a name->value map (request side stays a map). */
+ *  UTF-8 string. headers is a name->value map (request side stays a map).
+ *  `assertion`, when present, is the Worker-minted caller JWS on a dedicated
+ *  trusted channel. The agent strips reserved identity headers from `headers`
+ *  and injects only this value as X-Finch-Assertion at the local upstream. */
 export interface ReqFrame {
   id: string;
   type: "req";
@@ -24,6 +27,7 @@ export interface ReqFrame {
   path: string;
   headers: Record<string, string>;
   body: string;
+  assertion?: string;
 }
 
 /** agent -> DO. Sent the INSTANT upstream status+headers are known, BEFORE any

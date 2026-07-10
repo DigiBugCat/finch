@@ -20,7 +20,8 @@
     "bindings": [
       { "name": "BOX", "class_name": "BoxDO" },
       { "name": "TENANT", "class_name": "TenantDO" },
-      { "name": "ROUTER", "class_name": "RouterDO" }
+      { "name": "ROUTER", "class_name": "RouterDO" },
+      { "name": "AVIARY_ENROLLMENT", "class_name": "AviaryEnrollmentDO" }
     ]
   },
   // Cloudflare Rate Limiting (unsafe.bindings) is defined PER-ENV below — wrangler
@@ -50,6 +51,10 @@
     {
       "tag": "v4",
       "renamed_classes": [{ "from": "ApplianceDO", "to": "BoxDO" }]
+    },
+    {
+      "tag": "v5",
+      "new_sqlite_classes": ["AviaryEnrollmentDO"]
     }
   ],
 
@@ -69,7 +74,8 @@
         "bindings": [
           { "name": "BOX", "class_name": "BoxDO" },
           { "name": "TENANT", "class_name": "TenantDO" },
-          { "name": "ROUTER", "class_name": "RouterDO" }
+          { "name": "ROUTER", "class_name": "RouterDO" },
+          { "name": "AVIARY_ENROLLMENT", "class_name": "AviaryEnrollmentDO" }
         ]
       },
       // unsafe is NOT inherited into named envs — repeat it per env (see CLAUDE.md).
@@ -93,7 +99,8 @@
         { "tag": "v1", "new_sqlite_classes": ["ApplianceDO"] },
         { "tag": "v2", "new_sqlite_classes": ["TenantDO"] },
         { "tag": "v3", "new_sqlite_classes": ["RouterDO"] },
-        { "tag": "v4", "renamed_classes": [{ "from": "ApplianceDO", "to": "BoxDO" }] }
+        { "tag": "v4", "renamed_classes": [{ "from": "ApplianceDO", "to": "BoxDO" }] },
+        { "tag": "v5", "new_sqlite_classes": ["AviaryEnrollmentDO"] }
       ]
     },
 
@@ -118,6 +125,9 @@
         // (Prod has none of this — it fails closed and routes by slug subdomain.)
         "DEFAULT_TENANT": "user_3F74fiQzwjM6UPfl9axNpA1jgyQ",
         "CLERK_ISSUER": "https://strong-terrier-95.clerk.accounts.dev",
+        "FINCH_ASSERTION_ACTIVE_KID": "finch-staging-2026-07",
+        "FINCH_ASSERTION_ISSUER": "https://finch-staging.pantainos.workers.dev",
+        "AVIARY_VERIFICATION_ORIGINS": "https://finch-web-staging.pantainos.workers.dev",
         "DEV": "1",
         "WEB_URL": "https://finch-web-staging.pantainos.workers.dev",
         // Custom-hostname tiers, demoable on staging: the operator tenant may
@@ -141,7 +151,8 @@
         "bindings": [
           { "name": "BOX", "class_name": "BoxDO" },
           { "name": "TENANT", "class_name": "TenantDO" },
-          { "name": "ROUTER", "class_name": "RouterDO" }
+          { "name": "ROUTER", "class_name": "RouterDO" },
+          { "name": "AVIARY_ENROLLMENT", "class_name": "AviaryEnrollmentDO" }
         ]
       },
       "unsafe": {
@@ -164,7 +175,8 @@
         { "tag": "v1", "new_sqlite_classes": ["ApplianceDO"] },
         { "tag": "v2", "new_sqlite_classes": ["TenantDO"] },
         { "tag": "v3", "new_sqlite_classes": ["RouterDO"] },
-        { "tag": "v4", "renamed_classes": [{ "from": "ApplianceDO", "to": "BoxDO" }] }
+        { "tag": "v4", "renamed_classes": [{ "from": "ApplianceDO", "to": "BoxDO" }] },
+        { "tag": "v5", "new_sqlite_classes": ["AviaryEnrollmentDO"] }
       ]
     },
 
@@ -180,6 +192,8 @@
         "VANITY_SUFFIXES": "aviary.run",
         // Production Clerk instance (pk_live/sk_live) — enables the MCP OAuth plane.
         "CLERK_ISSUER": "https://clerk.finchmcp.com",
+        "FINCH_ASSERTION_ACTIVE_KID": "finch-prod-2026-07",
+        "FINCH_ASSERTION_ISSUER": "https://jwks.finchmcp.com",
         // Cloudflare-for-SaaS BYO provisioning: finchmcp.com zone.
         "CF_SAAS_ZONE_ID": "90ca5aa137cd55b8b174763a50641c00",
         // Operator tenant (Andrew on the prod Clerk instance) — the single
@@ -200,6 +214,10 @@
         { "pattern": "finchmcp.com/join*", "zone_name": "finchmcp.com" },
         { "pattern": "finchmcp.com/refresh*", "zone_name": "finchmcp.com" },
         { "pattern": "finchmcp.com/api/cli/*", "zone_name": "finchmcp.com" },
+        { "pattern": "finchmcp.com/api/aviary/*", "zone_name": "finchmcp.com" },
+        // Dedicated canonical caller-assertion issuer/JWKS origin. Keeping it
+        // off the apex avoids competing with finch-web-prod's catch-all route.
+        { "pattern": "jwks.finchmcp.com/.well-known/finch-jwks.json", "zone_name": "finchmcp.com" },
         { "pattern": "finchmcp.com/install*", "zone_name": "finchmcp.com" },
         { "pattern": "finchmcp.com/releases/*", "zone_name": "finchmcp.com" },
         { "pattern": "*.finchmcp.com/*", "zone_name": "finchmcp.com" }
@@ -221,7 +239,8 @@
         "bindings": [
           { "name": "BOX", "class_name": "BoxDO" },
           { "name": "TENANT", "class_name": "TenantDO" },
-          { "name": "ROUTER", "class_name": "RouterDO" }
+          { "name": "ROUTER", "class_name": "RouterDO" },
+          { "name": "AVIARY_ENROLLMENT", "class_name": "AviaryEnrollmentDO" }
         ]
       },
       // unsafe is NOT inherited into named envs — repeat it per env (see CLAUDE.md).
@@ -245,7 +264,8 @@
         { "tag": "v1", "new_sqlite_classes": ["ApplianceDO"] },
         { "tag": "v2", "new_sqlite_classes": ["TenantDO"] },
         { "tag": "v3", "new_sqlite_classes": ["RouterDO"] },
-        { "tag": "v4", "renamed_classes": [{ "from": "ApplianceDO", "to": "BoxDO" }] }
+        { "tag": "v4", "renamed_classes": [{ "from": "ApplianceDO", "to": "BoxDO" }] },
+        { "tag": "v5", "new_sqlite_classes": ["AviaryEnrollmentDO"] }
       ]
     }
   }
@@ -253,6 +273,7 @@
   //   wrangler secret put FINCH_SERVICE_SECRET --env production
   //   wrangler secret put TICKET_SECRET        --env production
   //   wrangler secret put SESSION_SECRET       --env production
+  //   wrangler secret put FINCH_ASSERTION_PRIVATE_JWKS --env production
   // SESSION_SECRET is the SEPARATE login-wall session-cookie signer (kind:"session")
   // — keep it distinct from TICKET_SECRET so a leaked session signer can't forge a
   // join/connect/portal grant. Set it for BOTH staging and production:
@@ -261,5 +282,10 @@
   // WEB_URL (the login-wall 302 target) is already a var for staging + production
   // above; dev relies on the same fallback. In dev, add SESSION_SECRET to
   // .dev.vars alongside FINCH_SERVICE_SECRET/TICKET_SECRET.
+  // FINCH_ASSERTION_PRIVATE_JWKS is an ES256 private JWKS. Generate it without
+  // touching disk via scripts/generate-assertion-jwks.mjs, pipe it through
+  // scripts/validate-assertion-jwks.mjs --passthrough, then into `wrangler
+  // secret put`; its active kid must match FINCH_ASSERTION_ACTIVE_KID. See
+  // CALLER_ASSERTIONS.md for the staged rotation procedure.
   // Deploy: wrangler deploy --env production  (or --env dev)
 }
