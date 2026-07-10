@@ -21,6 +21,9 @@
     // Location host without depending on prod config.
     "WEB_URL": "https://web.test",
     "AVIARY_VERIFICATION_ORIGINS": "https://web.test",
+    // Proves an environment-specific relay origin wins over the TenantDO's
+    // automatically claimed *.finchmcp.com hostname in enrollment grants.
+    "AVIARY_PUBLIC_ORIGIN": "https://relay.test",
     "VANITY_SUFFIXES": "aviary.run",
     "VANITY_TENANT": "tenant_vanity",
     "BYO_CNAME_TARGET": "finchmcp.com",

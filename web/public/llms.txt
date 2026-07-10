@@ -42,7 +42,7 @@ finch keys mint my-claude --service hello            # finch_ key, shown once
 ## Docs
 
 - [Quickstart](https://finchmcp.com/docs): install, log in, add a service, run, connect a client
-- [AviaryMCP](https://finchmcp.com/docs/aviarymcp): private Python SDK release candidate; one tool registry for MCP, REST, and OpenAPI with native Finch enrollment
+- [AviaryMCP](https://finchmcp.com/docs/aviarymcp): public Python SDK release candidate on PyPI; one tool registry for MCP, REST, and OpenAPI with native Finch enrollment
 - [Services & boxes](https://finchmcp.com/docs/services): the service/box model, finch.yml, states, enrolling more boxes
 - [Keys & auth](https://finchmcp.com/docs/auth): finch_ keys, mint/list/revoke, the CLI admin token, how auth is checked at the edge
 - [Access control](https://finchmcp.com/docs/acls): default-deny rules, granting by user, group, key, or tag; per-agent scoping
@@ -58,6 +58,6 @@ finch keys mint my-claude --service hello            # finch_ key, shown once
 - [Dashboard](https://finchmcp.com/dashboard): services, boxes, keys, access rules, users, logs
 - [Pricing](https://finchmcp.com/#pricing): free during beta; Hobby stays free for individuals and small groups
 
-## AviaryMCP private pilot
+## AviaryMCP release candidate
 
-AviaryMCP is the preferred path for a new Python service during the private pilot. It extends FastMCP and exposes the same registered tools at `/mcp`, `/api/v1/tools`, `/api/v1/tools/<tool>`, and `/api/v1/openapi.json`. `app.run(expose="finch")` registers an exact route manifest with the local Finch 1.6 agent and starts a browser device-approval flow on first run. Do not duplicate an AviaryMCP-managed app path in `finch.yml`; keep YAML for existing or non-SDK services.
+AviaryMCP 0.1.0rc2 is public on PyPI (`python -m pip install 'aviary-mcp==0.1.0rc2'`) and is the preferred path for a new Python service. It extends FastMCP and exposes the same registered tools at `/mcp`, `/api/v1/tools`, `/api/v1/tools/<tool>`, and `/api/v1/openapi.json`. `app.run(expose="finch")` registers an exact route manifest with the local Finch 1.6 agent and starts a browser device-approval flow on first run. Do not duplicate an AviaryMCP-managed app path in `finch.yml`; keep YAML for existing or non-SDK services.

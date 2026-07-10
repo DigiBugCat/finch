@@ -131,3 +131,31 @@ func TestControlRuntimeOptions_GroupSocketRequiresExplicitGroup(t *testing.T) {
 		t.Fatalf("group options=%+v", options)
 	}
 }
+
+func TestControlRuntimeOptions_ParsesAviaryVerificationOrigins(t *testing.T) {
+	t.Setenv("FINCH_AVIARY_VERIFICATION_ORIGINS", "https://one.example, https://two.example")
+	options, err := controlRuntimeOptionsFromEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := options.AllowedVerificationOrigins; len(got) != 2 || got[0] != "https://one.example" || got[1] != "https://two.example" {
+		t.Fatalf("verification origins=%q", got)
+	}
+
+	t.Setenv("FINCH_AVIARY_VERIFICATION_ORIGINS", "https://one.example,")
+	if _, err := controlRuntimeOptionsFromEnv(); err == nil {
+		t.Fatal("empty verification origin was accepted")
+	}
+}
+
+func TestControlRuntime_RejectsUnsafeAviaryVerificationOrigin(t *testing.T) {
+	cfg := &config{Hub: "https://finch.example", Box: "test-box", CredentialsDir: t.TempDir()}
+	err := runControlRuntime(context.Background(), cfg, controlRuntimeOptions{
+		SocketPath:                 filepath.Join(t.TempDir(), "control.sock"),
+		SocketMode:                 0o600,
+		AllowedVerificationOrigins: []string{"http://dashboard.example"},
+	})
+	if err == nil {
+		t.Fatal("HTTPS hub accepted a downgraded verification origin")
+	}
+}

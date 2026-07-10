@@ -7,7 +7,11 @@ import {
 } from "cloudflare:test";
 import worker from "../src/index";
 import { signAssertion, verifyToken } from "../src/auth";
-import { AVIARY_PROTOCOL, AVIARY_TTL_MS } from "../src/aviary-enrollment-do";
+import {
+  AVIARY_PROTOCOL,
+  AVIARY_TTL_MS,
+  resolveAviaryPublicOrigin,
+} from "../src/aviary-enrollment-do";
 import { aviaryVerificationBaseForTest } from "../src/aviary-enrollment-api";
 
 const TENANT = env.DEFAULT_TENANT!;
@@ -229,6 +233,9 @@ describe("Aviary service device enrollment", () => {
       machine_fingerprint: key.fingerprint,
       public_approved: false,
     });
+    expect(approved.grant.public_url).toBe(
+      `https://relay.test/${encodeURIComponent(String(m.app_path))}/mcp`,
+    );
     const token = await verifyToken(approved.grant.refresh_token, env.TICKET_SECRET);
     expect(token).toMatchObject({
       tenant: TENANT,
@@ -266,6 +273,26 @@ describe("Aviary service device enrollment", () => {
       await tenantHeaders(),
     );
     expect((await completed.json() as any).status).toBe("approved");
+  });
+
+  it("fails closed for invalid explicit public origins", () => {
+    expect(
+      resolveAviaryPublicOrigin(
+        "https://relay.test/hidden",
+        "tenant.finchmcp.com",
+        "https://hub.test",
+      ),
+    ).toBeNull();
+    expect(
+      resolveAviaryPublicOrigin(
+        "https://user:pass@relay.test",
+        "tenant.finchmcp.com",
+        "https://hub.test",
+      ),
+    ).toBeNull();
+    expect(
+      resolveAviaryPublicOrigin("", "tenant.finchmcp.com", "https://hub.test"),
+    ).toBeNull();
   });
 
   it("requires a separate, explicit public approval bit", async () => {
