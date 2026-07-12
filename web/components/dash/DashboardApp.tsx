@@ -17,6 +17,7 @@ import { LogsView } from './logs';
 import { SettingsView } from './settings';
 import { isOnline, Card } from './primitives';
 import { useFinchState } from './useFinchState';
+import type { AccessInfo } from './data';
 
 export default function DashboardApp() {
   const { user } = useUser();
@@ -180,6 +181,46 @@ export default function DashboardApp() {
     void mutate(`/api/finch/users/${encodeURIComponent(id)}`,
       { method: "DELETE" }, "teammate removed", "couldn't remove teammate");
 
+  // --- access (app sharing) -----------------------------------------
+  // The request queue + user grants live behind GET /api/finch/access (DO
+  // listAccess), not in TenantState — fetched here, refetched after every
+  // access mutation so the Access view and per-service cards stay live.
+  const [access, setAccess] = useState<AccessInfo | null>(null);
+  const refetchAccess = useCallback(async () => {
+    try {
+      const res = await fetch("/api/finch/access", { cache: "no-store" });
+      if (res.ok) setAccess(await res.json());
+    } catch (_) { /* non-fatal: the view renders empty */ }
+  }, []);
+  useEffect(() => { void refetchAccess(); }, [refetchAccess]);
+
+  // mutate() then refresh the access snapshot too (mutate only refetches state)
+  const accessMutate = useCallback(async (path: string, body: any, okMsg?: string, failMsg?: string) => {
+    const resp = await mutate(path, { method: "POST", body: JSON.stringify(body) }, okMsg, failMsg);
+    await refetchAccess();
+    return resp;
+  }, [mutate, refetchAccess]);
+
+  // Per-service Share button. A NON-member gets a pending request (approve
+  // sends the Clerk invite from the Sharing tab). An existing MEMBER needs no
+  // invite — chain request → approve so "Grant access" actually grants instead
+  // of parking a self-addressed pending row the admin must approve elsewhere.
+  const requestAccess = async (email: any, service: any, isMember?: boolean) => {
+    const resp = await accessMutate(`/api/finch/access/request`, { email, service },
+      isMember ? undefined : `✉ ${service} shared with ${email}`, `couldn't share ${service}`);
+    const id = resp?.request?.id;
+    if (isMember && id) {
+      await accessMutate(`/api/finch/access/approve`, { id },
+        `✓ ${service} shared with ${email}`, `couldn't grant ${service}`);
+    }
+  };
+  const approveAccess = (id: any) =>
+    void accessMutate(`/api/finch/access/approve`, { id }, "✓ access approved", "couldn't approve");
+  const denyAccess = (id: any) =>
+    void accessMutate(`/api/finch/access/deny`, { id }, "access denied", "couldn't deny");
+  const revokeAccess = (ids: { id?: string; ruleId?: string }) =>
+    void accessMutate(`/api/finch/access/revoke`, ids, "access revoked", "couldn't revoke");
+
   // --- access (ACL) ------------------------------------------------
   const addAcl = (src: any, dst: any) =>
     void mutate(`/api/finch/acl`,
@@ -256,7 +297,8 @@ export default function DashboardApp() {
             {view === "detail" && current && (
               <DetailView app={current} host={host} onBack={() => go("overview")}
                 onRelease={releaseDevice} onTags={setTags} onApprove={approveDevice} onDecline={declineDevice}
-                onRevokeBoxKey={revokeBoxKey} onUpdateBox={updateBox} />
+                onRevokeBoxKey={revokeBoxKey} onUpdateBox={updateBox}
+                access={access} users={users} onShareAccess={requestAccess} />
             )}
             {view === "detail" && !current && (
               <div className="view"><button className="backlink" onClick={() => go("overview")}>← Fleet</button>
@@ -273,7 +315,9 @@ export default function DashboardApp() {
             )}
             {view === "access" && (
               <AccessView services={services} groups={groups} keys={keys} acl={acl} users={users}
-                onAdd={addAcl} onRemove={removeAcl} />
+                onAdd={addAcl} onRemove={removeAcl}
+                requests={access?.requests ?? []} grants={access?.grants ?? []}
+                onApprove={approveAccess} onDeny={denyAccess} onRevoke={revokeAccess} />
             )}
             {view === "logs" && (
               <LogsView logs={logs} />

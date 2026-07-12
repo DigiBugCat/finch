@@ -141,6 +141,20 @@ export interface LogEvent {
   result?: number;
 }
 
+/** A row in the app-level access-sharing queue. Clerk stays authentication-
+ *  only; the web hub orchestrates approve/deny and reuses addAcl/removeAcl for
+ *  the actual grant — the DO just owns the queue. */
+export interface AccessRequest {
+  id: string;
+  email: string; // lowercased
+  service: string; // service id
+  requestedBy: string;
+  status: "pending" | "invited" | "granted" | "denied";
+  created: number; // epoch ms
+  resolvedBy?: string;
+  resolvedAt?: number; // epoch ms
+}
+
 export interface Group {
   name: string;
   members: string[];
@@ -180,6 +194,7 @@ export interface TenantState {
   keys: PublicKey[]; // hash/last4 only — never plaintext over the wire
   groups: Group[];
   acl: AclRule[];
+  accessRequests: AccessRequest[];
   logs: LogEvent[];
   settings: Settings;
   overview: Overview;

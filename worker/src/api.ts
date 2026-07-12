@@ -590,9 +590,24 @@ export async function handleApi(
     if (owner !== tenant) {
       return json(403, { error: "slug is not owned by this tenant" });
     }
+    // The caller's email + admin bit ride the grant into the session cookie so
+    // browserGate can enforce per-app user grants at the door: admins pass
+    // everywhere; members need a user→service ACL rule. Both come from the
+    // Clerk-authed web (portal/start), never from the browser.
+    const email = String(body.email || "").trim().toLowerCase();
+    const admin = body.admin === true;
     const exp = Math.floor(Date.now() / 1000) + PORTAL_GRANT_TTL_SECONDS;
     const grant = await signToken(
-      { kind: "portal", tenant, slug, userId, exp, jti: genJti() },
+      {
+        kind: "portal",
+        tenant,
+        slug,
+        userId,
+        ...(email ? { email } : {}),
+        ...(admin ? { admin } : {}),
+        exp,
+        jti: genJti(),
+      },
       env.TICKET_SECRET,
     );
     return json(200, { grant });
@@ -718,6 +733,76 @@ export async function handleApi(
       key: body.key,
     });
     return json(out?.ok === false ? 404 : 200, out);
+  }
+
+  // GET /api/access — access-request queue + user→service ACL grants
+  if (method === "GET" && seg.length === 1 && seg[0] === "access") {
+    return json(200, await tenantOp(env, tenant, "listAccess"));
+  }
+
+  // POST /api/access/request {email,service,requestedBy}
+  if (
+    method === "POST" &&
+    seg.length === 2 &&
+    seg[0] === "access" &&
+    seg[1] === "request"
+  ) {
+    const body = await readJson(req);
+    if (!body.email || !body.service) {
+      return json(400, { error: "email and service required" });
+    }
+    const out = await tenantOp<{ ok: boolean; error?: string }>(
+      env,
+      tenant,
+      "requestAccess",
+      {
+        email: body.email,
+        service: body.service,
+        requestedBy: body.requestedBy,
+      },
+    );
+    return json(out?.ok === false ? 400 : 200, out);
+  }
+
+  // POST /api/access/status {id,status,resolvedBy}
+  if (
+    method === "POST" &&
+    seg.length === 2 &&
+    seg[0] === "access" &&
+    seg[1] === "status"
+  ) {
+    const body = await readJson(req);
+    if (!body.id || !body.status) {
+      return json(400, { error: "id and status required" });
+    }
+    const out = await tenantOp<{ ok?: boolean; error?: string }>(
+      env,
+      tenant,
+      "setAccessStatus",
+      { id: body.id, status: body.status, resolvedBy: body.resolvedBy },
+    );
+    return json(out?.error ? 400 : 200, out);
+  }
+
+  // POST /api/access/revoke-grant {email,service} — surgically remove ONE
+  // user→service grant (multi-dst rules keep their other services); returns
+  // {removed, stillAllowed} so the BFF can refuse a false-ok revoke when a
+  // broader (all/tag/group/locked) rule still covers the user.
+  if (
+    method === "POST" &&
+    seg.length === 2 &&
+    seg[0] === "access" &&
+    seg[1] === "revoke-grant"
+  ) {
+    const body = await readJson(req);
+    if (!body.email || !body.service) {
+      return json(400, { error: "email and service required" });
+    }
+    const out = await tenantOp<{ ok: boolean }>(env, tenant, "removeUserGrant", {
+      email: body.email,
+      service: body.service,
+    });
+    return json(out?.ok === false ? 400 : 200, out);
   }
 
   // POST /api/acl {src,dst}

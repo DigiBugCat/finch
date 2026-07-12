@@ -315,12 +315,17 @@ function reply200(agent: WebSocket, id: string, body: string): void {
   agent.send(JSON.stringify({ id, type: "end" }));
 }
 
-/** Mint a session cookie exactly as /__finch/cb does. */
+/** Mint a session cookie exactly as /__finch/cb does. Defaults to an ADMIN
+ *  session (the tenant owner case): browserGate now enforces per-app user
+ *  grants, so a non-admin session also needs a matching user→service ACL rule
+ *  (pass email + admin:false to exercise the member path). */
 function mintSession(
   over: Partial<{
     tenant: string;
     slug: string;
     userId: string;
+    email: string;
+    admin: boolean;
     epoch: number;
     exp: number;
   }> & { tenant: string; slug: string },
@@ -331,6 +336,8 @@ function mintSession(
       tenant: over.tenant,
       slug: over.slug,
       userId: over.userId ?? "user_123",
+      ...(over.email ? { email: over.email } : {}),
+      admin: over.admin ?? true,
       epoch: over.epoch ?? 0,
       jti: genJti(),
       exp: over.exp ?? nowSec() + 3600,
@@ -345,6 +352,7 @@ function mintPortal(
     tenant: string;
     slug: string;
     userId: string;
+    admin: boolean;
     exp: number;
     jti: string;
   }> & { tenant: string; slug: string },
@@ -355,6 +363,7 @@ function mintPortal(
       tenant: over.tenant,
       slug: over.slug,
       userId: over.userId ?? "user_123",
+      admin: over.admin ?? true,
       exp: over.exp ?? nowSec() + 60,
       jti: over.jti ?? genJti(),
     } as any,
@@ -846,6 +855,83 @@ describe("login wall — session cookie validity", () => {
       }),
     );
     expect(res.status).toBe(302);
+    agent.close(1000, "done");
+  });
+});
+
+describe("login wall — per-app user grants (member sessions)", () => {
+  it("403s a non-admin member with no user→service grant", async () => {
+    const { host, base, slug, tenant, service, agent } = await standUpService();
+    const cookie = await mintSession({
+      tenant,
+      slug,
+      admin: false,
+      email: "member@x.com",
+    });
+    const res = await call(
+      new Request(`${base}/${service}/index.html`, {
+        method: "GET",
+        headers: { host, accept: "text/html", cookie: `finch_session=${cookie}` },
+        redirect: "manual",
+      }),
+    );
+    // Signed in but not granted: a hard 403, NOT a portal redirect (a re-login
+    // can't change the answer) and NOT a relay (the side door this closes).
+    expect(res.status).toBe(403);
+    agent.close(1000, "done");
+  });
+
+  it("relays for a non-admin member once a user→service ACL rule grants the app", async () => {
+    const { host, base, slug, tenant, service, agent } = await standUpService();
+    const add = await api(tenant, host, "POST", "/api/acl", {
+      src: { type: "user", name: "member@x.com" },
+      dst: [{ type: "service", name: service }],
+    });
+    expect(add.status).toBe(200);
+    const cookie = await mintSession({
+      tenant,
+      slug,
+      admin: false,
+      email: "member@x.com",
+    });
+    const reqSeen = nextFrame(agent);
+    const relayP = call(
+      new Request(`${base}/${service}/index.html`, {
+        method: "GET",
+        headers: { host, accept: "text/html", cookie: `finch_session=${cookie}` },
+        redirect: "manual",
+      }),
+    );
+    const f = await reqSeen;
+    reply200(agent, f.id, "<ok/>");
+    expect((await relayP).status).toBe(200);
+    agent.close(1000, "done");
+  });
+
+  it("re-bounces a pre-scheme cookie (no admin/email fields) through the portal", async () => {
+    const { host, base, slug, tenant, service, agent } = await standUpService();
+    // Simulate a cookie minted before the identity fields existed.
+    const cookie = await signSession(
+      {
+        kind: "session",
+        tenant,
+        slug,
+        userId: "user_123",
+        epoch: 0,
+        jti: genJti(),
+        exp: nowSec() + 3600,
+      } as any,
+      SESSION,
+    );
+    const res = await call(
+      new Request(`${base}/${service}/index.html`, {
+        method: "GET",
+        headers: { host, accept: "text/html", cookie: `finch_session=${cookie}` },
+        redirect: "manual",
+      }),
+    );
+    expect(res.status).toBe(302); // re-mint via the portal picks up email/admin
+    expect(res.headers.get("location")).toContain("/portal/start");
     agent.close(1000, "done");
   });
 });

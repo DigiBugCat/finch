@@ -114,6 +114,27 @@ export interface AclRule {
   locked?: boolean;
 }
 
+/** An app-access request row — mirrors the worker's AccessRequest
+ *  (worker/src/types.ts). pending → invited (Clerk invite sent) → granted
+ *  (member joined, ACL rule added), or denied. */
+export interface AccessRequest {
+  id: string;
+  email: string;
+  service: string;
+  requestedBy: string;
+  status: "pending" | "invited" | "granted" | "denied";
+  created: number;
+  resolvedBy?: string;
+  resolvedAt?: number;
+}
+
+/** What GET /api/finch/access returns (DO listAccess): the request queue plus
+ *  the ACL rules whose src is a user — i.e. the per-user grants. */
+export interface AccessInfo {
+  requests: AccessRequest[];
+  grants: AclRule[];
+}
+
 export interface LogEvent {
   ago: string;
   ts: number;

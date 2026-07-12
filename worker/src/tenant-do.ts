@@ -31,6 +31,7 @@ import {
   type PublicKey,
   type AclRule,
   type AclEntity,
+  type AccessRequest,
   type LogEvent,
   type Settings,
   type Overview,
@@ -63,6 +64,7 @@ interface StoredState {
   keys: Key[]; // full keys incl. hash — never leaves the DO as-is
   groups: Group[];
   acl: AclRule[];
+  accessRequests: AccessRequest[];
   logs: LogEvent[];
   settings: Settings;
   // Spent join-ticket ids (M1): jti -> the ticket's exp (epoch SECONDS). A jti
@@ -87,6 +89,9 @@ const ROLL_WINDOW = 50; // calls kept for the rolling p50/p95/err estimate
 // unbounded.
 const MAX_SERVICES_PER_TENANT = 200;
 const MAX_BOXES_PER_SERVICE = 100;
+// Access-request queue cap: resolved rows are evicted oldest-first to stay
+// under it; a queue full of live (pending/invited) rows refuses new ones.
+const MAX_ACCESS_REQUESTS = 200;
 
 // Box-name validation (M1): the box picks its own name, so clamp it to a
 // sane length + charset before it pollutes the registry / squats a slot.
@@ -260,6 +265,21 @@ export class TenantDO extends DurableObject<Env> {
           return ok(await this.addAcl(a.src, a.dst));
         case "removeAcl":
           return ok(await this.removeAcl(a.id));
+        case "requestAccess":
+          return ok(
+            await this.requestAccess(a.email, a.service, a.requestedBy),
+          );
+        case "setAccessStatus": {
+          const r = await this.setAccessStatus(a.id, a.status, a.resolvedBy);
+          if ("error" in r) return bad(400, r.error!);
+          return ok(r);
+        }
+        case "listAccess":
+          return ok(await this.listAccess());
+        case "removeUserGrant":
+          return ok(await this.removeUserGrant(a.email, a.service));
+        case "checkUserAccess":
+          return ok(await this.checkUserAccess(a.user, a.service));
         case "updateSetting":
           return ok(await this.updateSetting(a.key, a.val));
         case "registerBox": {
@@ -330,6 +350,9 @@ export class TenantDO extends DurableObject<Env> {
       keys: Array.isArray(stored.keys) ? stored.keys : [],
       groups: Array.isArray(stored.groups) ? stored.groups : [],
       acl: Array.isArray(stored.acl) ? stored.acl : base.acl,
+      accessRequests: Array.isArray(stored.accessRequests)
+        ? stored.accessRequests
+        : [],
       logs: Array.isArray(stored.logs) ? stored.logs : [],
       settings:
         stored.settings && typeof stored.settings === "object"
@@ -367,6 +390,7 @@ export class TenantDO extends DurableObject<Env> {
           locked: true,
         },
       ],
+      accessRequests: [],
       logs: [],
       usedTickets: {},
       cliTokenEpoch: 0,
@@ -494,6 +518,7 @@ export class TenantDO extends DurableObject<Env> {
       keys: publicKeys,
       groups: s.groups,
       acl: s.acl,
+      accessRequests: s.accessRequests,
       logs,
       settings: s.settings,
       overview: this.overview(
@@ -1267,10 +1292,24 @@ export class TenantDO extends DurableObject<Env> {
     dst: AclEntity[],
   ): Promise<{ id: string }> {
     const s = await this.load();
+    const dsts = Array.isArray(dst) ? dst : [dst];
+    // IDEMPOTENT: an identical rule (same src, same dst set) is returned, not
+    // duplicated. The dedupe lives HERE — inside the DO's serialized op — so
+    // two racing writers (e.g. the approve route and the Clerk webhook both
+    // ensuring the same user→service grant) can never create twin rules that
+    // a later revoke would only half-delete.
+    const existing = s.acl.find(
+      (r) =>
+        r.action === "allow" &&
+        entEq(r.src, src) &&
+        r.dst.length === dsts.length &&
+        dsts.every((d) => r.dst.some((rd) => entEq(rd, d))),
+    );
+    if (existing) return { id: existing.id };
     const rule: AclRule = {
       id: "r_" + crypto.randomUUID().slice(0, 8),
       src,
-      dst: Array.isArray(dst) ? dst : [dst],
+      dst: dsts,
       action: "allow",
     };
     s.acl.push(rule);
@@ -1300,6 +1339,181 @@ export class TenantDO extends DurableObject<Env> {
     });
     await this.save(s);
     return { ok: true };
+  }
+
+  // ---- mutations: access sharing -------------------------------------------
+  // The app-level access-request queue. The DO owns ONLY the queue rows; it
+  // never calls Clerk and never decides membership — the web hub orchestrates
+  // approve/deny and reuses addAcl/removeAcl for the actual grant.
+
+  /** Create a pending access request. Idempotent: an existing pending/invited
+   *  row for the same email+service is returned as-is, never duplicated. */
+  private async requestAccess(
+    email: unknown,
+    service: unknown,
+    requestedBy: unknown,
+  ): Promise<{ ok: boolean; request?: AccessRequest; error?: string }> {
+    const em = typeof email === "string" ? email.trim().toLowerCase() : "";
+    const svc = typeof service === "string" ? service.trim() : "";
+    if (!em || !svc) return { ok: false, error: "email and service required" };
+    const by = typeof requestedBy === "string" && requestedBy ? requestedBy : "you";
+
+    const s = await this.load();
+    const existing = s.accessRequests.find(
+      (r) =>
+        r.email === em &&
+        r.service === svc &&
+        (r.status === "pending" || r.status === "invited"),
+    );
+    if (existing) return { ok: true, request: existing };
+
+    // BOUNDED, like every other DO collection: evict the oldest RESOLVED
+    // (granted/denied) rows to make room; if the queue is all live rows,
+    // refuse rather than grow without bound (the full array ships in every
+    // getState snapshot).
+    if (s.accessRequests.length >= MAX_ACCESS_REQUESTS) {
+      const resolved = s.accessRequests
+        .filter((r) => r.status === "granted" || r.status === "denied")
+        .sort((x, y) => (x.resolvedAt ?? x.created) - (y.resolvedAt ?? y.created));
+      const evict = new Set(
+        resolved
+          .slice(0, s.accessRequests.length - MAX_ACCESS_REQUESTS + 1)
+          .map((r) => r.id),
+      );
+      s.accessRequests = s.accessRequests.filter((r) => !evict.has(r.id));
+      if (s.accessRequests.length >= MAX_ACCESS_REQUESTS) {
+        return { ok: false, error: "too many open access requests" };
+      }
+    }
+
+    const req: AccessRequest = {
+      id: "ar_" + crypto.randomUUID().slice(0, 8),
+      email: em,
+      service: svc,
+      requestedBy: by,
+      status: "pending",
+      created: Date.now(),
+    };
+    s.accessRequests.push(req);
+    this.log(s, {
+      cat: "access",
+      actor: by,
+      action: "requested access",
+      target: `${em} → ${svc}`,
+      ip: "",
+    });
+    await this.save(s);
+    return { ok: true, request: req };
+  }
+
+  /** Transition an access request's status, stamping who/when resolved it.
+   *  Unknown id → error (the hub must never invent rows here). */
+  private async setAccessStatus(
+    id: unknown,
+    status: unknown,
+    resolvedBy: unknown,
+  ): Promise<{ ok: boolean; request?: AccessRequest; error?: string }> {
+    if (
+      status !== "pending" &&
+      status !== "invited" &&
+      status !== "granted" &&
+      status !== "denied"
+    ) {
+      return { ok: false, error: "invalid status" };
+    }
+    const s = await this.load();
+    const req = s.accessRequests.find((r) => r.id === id);
+    if (!req) return { ok: false, error: "unknown access request id" };
+    req.status = status;
+    req.resolvedBy =
+      typeof resolvedBy === "string" && resolvedBy ? resolvedBy : "you";
+    req.resolvedAt = Date.now();
+    this.log(s, {
+      cat: "access",
+      actor: req.resolvedBy,
+      action: `access ${status}`,
+      target: `${req.email} → ${req.service}`,
+      ip: "",
+    });
+    await this.save(s);
+    return { ok: true, request: req };
+  }
+
+  /** The access lens: every queue row plus the user→service ACL grants (the
+   *  rows the dashboard's Access view renders side by side). Locked rules
+   *  (the seeded owner rule) are excluded — they aren't shareable/revocable
+   *  grants, and surfacing them gave every app a phantom "you — granted" row
+   *  plus a Revoke button that could never succeed. */
+  private async listAccess(): Promise<{
+    requests: AccessRequest[];
+    grants: AclRule[];
+  }> {
+    const s = await this.load();
+    return {
+      requests: s.accessRequests,
+      grants: s.acl.filter((r) => r.src.type === "user" && !r.locked),
+    };
+  }
+
+  /** Surgically revoke ONE user→service grant: strip the {service} dst from
+   *  every matching unlocked user rule (deleting a rule whose dst set empties).
+   *  A multi-destination rule keeps its OTHER services — revoking svcA must
+   *  never silently drop svcB. Reports `stillAllowed` when the user remains
+   *  covered by a rule this op can't surgically narrow (dst `all`/tag/group,
+   *  or a locked rule) so the caller can refuse a false-ok revoke. */
+  private async removeUserGrant(
+    email: unknown,
+    service: unknown,
+  ): Promise<{ ok: boolean; removed: boolean; stillAllowed: boolean }> {
+    const em = typeof email === "string" ? email.trim().toLowerCase() : "";
+    const svc = typeof service === "string" ? service.trim() : "";
+    if (!em || !svc) return { ok: false, removed: false, stillAllowed: false };
+
+    const s = await this.load();
+    let removed = false;
+    s.acl = s.acl.filter((r) => {
+      if (r.locked || r.action !== "allow") return true;
+      if (r.src.type !== "user") return true;
+      if ((r.src.name || "").toLowerCase() !== em) return true;
+      const rest = r.dst.filter(
+        (d) => !(d.type === "service" && (d.name || "").toLowerCase() === svc.toLowerCase()),
+      );
+      if (rest.length === r.dst.length) return true; // no service dst here
+      removed = true;
+      r.dst = rest;
+      return rest.length > 0; // dst set emptied → drop the whole rule
+    });
+
+    const stillAllowed = this.evalIdentAccess(s, this.userIdentities(s, em), svc);
+    if (removed) {
+      this.log(s, {
+        cat: "access",
+        actor: "you",
+        action: "revoked",
+        target: `user:${em} → ${svc}`,
+        ip: "",
+      });
+      await this.save(s);
+    }
+    return { ok: true, removed, stillAllowed };
+  }
+
+  /** Door-side authorization for a HUMAN caller (browser login-wall session or
+   *  OAuth token) identified by email: allowed iff the service is public or a
+   *  user/group ACL rule grants it. Admins are authorized by the CALLER (the
+   *  session/web layer knows the Clerk role); this op only evaluates the ACL. */
+  private async checkUserAccess(
+    user: unknown,
+    service: unknown,
+  ): Promise<{ allowed: boolean; public?: boolean }> {
+    const em = typeof user === "string" ? user.trim().toLowerCase() : "";
+    const svc = typeof service === "string" ? service.trim() : "";
+    if (!svc) return { allowed: false };
+    const s = await this.load();
+    const ap = this.findService(s, svc);
+    if (ap && ap.auth === "public") return { allowed: true, public: true };
+    if (!em) return { allowed: false };
+    return { allowed: this.evalIdentAccess(s, this.userIdentities(s, em), svc) };
   }
 
   // ---- mutations: settings ------------------------------------------------
@@ -1774,11 +1988,19 @@ export class TenantDO extends DurableObject<Env> {
    *  Default-deny: returns true iff at least one `allow` rule's src matches the
    *  key's identity AND its dst matches the target service. */
   private evalAccess(s: StoredState, key: Key, service: string): boolean {
+    return this.evalIdentAccess(s, this.keyIdentities(s, key), service);
+  }
+
+  /** Core ACL walk shared by the key gate (checkKey) and the human gate
+   *  (checkUserAccess): does any allow rule's src match `ident` AND its dst
+   *  match `service`? */
+  private evalIdentAccess(
+    s: StoredState,
+    ident: { keys: Set<string>; users: Set<string>; groups: Set<string> },
+    service: string,
+  ): boolean {
     const ap = this.findService(s, service);
     if (!ap) return false;
-
-    // The identities this key presents as a rule SOURCE.
-    const ident = this.keyIdentities(s, key);
 
     // The descriptors this service matches as a rule DESTINATION.
     const apTags = new Set((ap.tags || []).map((t) => t.toLowerCase()));
@@ -1827,6 +2049,24 @@ export class TenantDO extends DurableObject<Env> {
     return { keys, users, groups };
   }
 
+  /** The ACL src identities a HUMAN caller presents: their email (as a user)
+   *  plus any groups that email belongs to. No key identities — this is the
+   *  browser/OAuth plane, where there is no finch_ key. */
+  private userIdentities(
+    s: StoredState,
+    email: string,
+  ): { keys: Set<string>; users: Set<string>; groups: Set<string> } {
+    const em = email.toLowerCase();
+    const users = new Set<string>([em]);
+    const groups = new Set<string>();
+    for (const g of s.groups || []) {
+      if ((g.members || []).some((m) => m.toLowerCase() === em)) {
+        groups.add((g.name || "").toLowerCase());
+      }
+    }
+    return { keys: new Set<string>(), users, groups };
+  }
+
   /** Does a rule's src entity match one of the key's identities? */
   private srcMatches(
     src: AclEntity,
@@ -1846,6 +2086,14 @@ export class TenantDO extends DurableObject<Env> {
         return false;
     }
   }
+}
+
+// ---- ACL entity equality (for addAcl's idempotence) ------------------------
+function entEq(a: AclEntity, b: AclEntity): boolean {
+  return (
+    a.type === b.type &&
+    (a.name || "").toLowerCase() === (b.name || "").toLowerCase()
+  );
 }
 
 // ---- ACL label helper (for log targets) -----------------------------------

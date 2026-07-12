@@ -81,8 +81,9 @@ export async function GET(req: Request) {
   // resolveTenant throws HttpError(401) if somehow unauthenticated despite the
   // middleware gate — fail closed to the sign-in flow rather than 500.
   let userId: string;
+  let isAdmin: boolean;
   try {
-    ({ userId } = await resolveTenant());
+    ({ userId, isAdmin } = await resolveTenant());
   } catch {
     // Bounce to sign-in; Clerk middleware will catch the protected /portal path.
     return Response.redirect(new URL("/sign-in", req.url), 302);
@@ -101,6 +102,21 @@ export async function GET(req: Request) {
     });
   }
 
+  // The user's primary email + admin bit ride the grant into the session
+  // cookie: the worker's browserGate enforces per-app user grants off them
+  // (admin → every service; member → only ACL-granted services). Sourced from
+  // the Clerk session server-side — never from the browser.
+  let email = "";
+  try {
+    const { clerkClient } = await import("@clerk/nextjs/server");
+    const clerk = await clerkClient();
+    const u = await clerk.users.getUser(userId);
+    email = (u.primaryEmailAddress?.emailAddress ?? "").toLowerCase();
+  } catch {
+    // No email resolvable → the grant carries none; a non-admin member then
+    // fails closed at the door rather than gaining tenant-wide access.
+  }
+
   // Ask the hub to mint a single-use portal grant. The hub re-derives the
   // tenant from our SIGNED assertion (hubFetch attaches it) and refuses (403)
   // unless that tenant owns `slug`. We pass userId in the body so the grant —
@@ -109,7 +125,7 @@ export async function GET(req: Request) {
   try {
     res = await hubFetch("/api/portal-grant", {
       method: "POST",
-      body: JSON.stringify({ slug: hostKey, userId }),
+      body: JSON.stringify({ slug: hostKey, userId, email, admin: isAdmin }),
     });
   } catch (err) {
     if (err instanceof HttpError) {

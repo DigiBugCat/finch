@@ -240,6 +240,7 @@ describe("relay and login wall on custom hostnames", () => {
         tenant: ctx.tenant,
         slug: host,
         userId: "user_123",
+        admin: true, // per-app enforcement: admin sessions pass every service
         epoch: 0,
         exp: nowSec() + 3600,
       } as any,

@@ -572,6 +572,313 @@ describe("TenantDO.approve — derives liveness from connected (#12)", () => {
   });
 });
 
+describe("TenantDO access requests — queue + listAccess", () => {
+  it("requestAccess creates a pending row (email lowercased)", async () => {
+    const t = freshTenant();
+    await op(t, "enroll", { name: "Scraper" });
+    const r = await op<any>(t, "requestAccess", {
+      email: "Alice@Example.COM",
+      service: "scraper",
+      requestedBy: "you",
+    });
+    expect(r.ok).toBe(true);
+    expect(r.request.email).toBe("alice@example.com");
+    expect(r.request.service).toBe("scraper");
+    expect(r.request.status).toBe("pending");
+    expect(r.request.requestedBy).toBe("you");
+    expect(typeof r.request.created).toBe("number");
+  });
+
+  it("is idempotent: a second request for the same email+service returns the existing row", async () => {
+    const t = freshTenant();
+    const a = await op<any>(t, "requestAccess", {
+      email: "bob@x.com",
+      service: "scraper",
+      requestedBy: "you",
+    });
+    const b = await op<any>(t, "requestAccess", {
+      email: "BOB@x.com",
+      service: "scraper",
+      requestedBy: "someone-else",
+    });
+    expect(b.request.id).toBe(a.request.id);
+    const list = await op<any>(t, "listAccess");
+    expect(list.requests).toHaveLength(1);
+  });
+
+  it("dedupes against an 'invited' row too, but not a resolved one", async () => {
+    const t = freshTenant();
+    const a = await op<any>(t, "requestAccess", {
+      email: "c@x.com",
+      service: "scraper",
+      requestedBy: "you",
+    });
+    await op(t, "setAccessStatus", {
+      id: a.request.id,
+      status: "invited",
+      resolvedBy: "you",
+    });
+    const b = await op<any>(t, "requestAccess", {
+      email: "c@x.com",
+      service: "scraper",
+      requestedBy: "you",
+    });
+    expect(b.request.id).toBe(a.request.id); // invited still dedupes
+    await op(t, "setAccessStatus", {
+      id: a.request.id,
+      status: "denied",
+      resolvedBy: "you",
+    });
+    const c = await op<any>(t, "requestAccess", {
+      email: "c@x.com",
+      service: "scraper",
+      requestedBy: "you",
+    });
+    expect(c.request.id).not.toBe(a.request.id); // denied → a fresh row
+  });
+
+  it("setAccessStatus transitions and stamps resolvedBy/resolvedAt", async () => {
+    const t = freshTenant();
+    const a = await op<any>(t, "requestAccess", {
+      email: "d@x.com",
+      service: "scraper",
+      requestedBy: "you",
+    });
+    const r = await op<any>(t, "setAccessStatus", {
+      id: a.request.id,
+      status: "granted",
+      resolvedBy: "admin@x.com",
+    });
+    expect(r.ok).toBe(true);
+    expect(r.request.status).toBe("granted");
+    expect(r.request.resolvedBy).toBe("admin@x.com");
+    expect(typeof r.request.resolvedAt).toBe("number");
+  });
+
+  it("setAccessStatus rejects an unknown id", async () => {
+    const t = freshTenant();
+    const r = await op<any>(t, "setAccessStatus", {
+      id: "ar_nope",
+      status: "denied",
+      resolvedBy: "you",
+    });
+    expect(r.error).toMatch(/unknown access request/i);
+  });
+
+  it("setAccessStatus rejects an invalid status", async () => {
+    const t = freshTenant();
+    const a = await op<any>(t, "requestAccess", {
+      email: "e@x.com",
+      service: "scraper",
+      requestedBy: "you",
+    });
+    const r = await op<any>(t, "setAccessStatus", {
+      id: a.request.id,
+      status: "bogus",
+      resolvedBy: "you",
+    });
+    expect(r.error).toMatch(/invalid status/i);
+  });
+
+  it("listAccess returns requests + user→service ACL grants only", async () => {
+    const t = freshTenant();
+    await op(t, "enroll", { name: "Scraper" });
+    await op(t, "requestAccess", {
+      email: "f@x.com",
+      service: "scraper",
+      requestedBy: "you",
+    });
+    await op(t, "addAcl", {
+      src: { type: "user", name: "f@x.com" },
+      dst: [{ type: "service", name: "scraper" }],
+    });
+    await op(t, "addAcl", {
+      src: { type: "key", name: "some-key" },
+      dst: [{ type: "service", name: "scraper" }],
+    });
+    const list = await op<any>(t, "listAccess");
+    expect(list.requests).toHaveLength(1);
+    // grants = UNLOCKED user-src rules only: the key-src rule AND the seeded
+    // locked user:you owner rule are filtered out (the owner rule is not a
+    // revocable share — surfacing it gave every app a phantom granted row).
+    expect(list.grants.every((g: any) => g.src.type === "user")).toBe(true);
+    expect(list.grants.some((g: any) => g.locked)).toBe(false);
+    expect(list.grants.some((g: any) => g.src.name === "you")).toBe(false);
+    expect(
+      list.grants.some((g: any) => g.src.name === "f@x.com"),
+    ).toBe(true);
+    expect(
+      list.grants.some((g: any) => g.src.name === "some-key"),
+    ).toBe(false);
+  });
+
+  it("persists accessRequests in the state snapshot (round-trip)", async () => {
+    const t = freshTenant();
+    await op(t, "enroll", { name: "Scraper" });
+    const a = await op<any>(t, "requestAccess", {
+      email: "g@x.com",
+      service: "scraper",
+      requestedBy: "you",
+    });
+    // An unrelated mutation forces a load()+save() cycle over the stored record.
+    await op(t, "updateSetting", { key: "defaultGroup", val: "lab" });
+    const state = await op<any>(t, "getState");
+    expect(state.accessRequests).toHaveLength(1);
+    expect(state.accessRequests[0].id).toBe(a.request.id);
+    expect(state.accessRequests[0].email).toBe("g@x.com");
+  });
+
+  it("evicts oldest resolved rows at the cap instead of growing unbounded", async () => {
+    const t = freshTenant();
+    await op(t, "enroll", { name: "Scraper" });
+    // Fill to the cap (200) with resolved rows.
+    for (let i = 0; i < 200; i++) {
+      const r = await op<any>(t, "requestAccess", {
+        email: `u${i}@x.com`,
+        service: "scraper",
+        requestedBy: "you",
+      });
+      await op(t, "setAccessStatus", {
+        id: r.request.id,
+        status: "denied",
+        resolvedBy: "you",
+      });
+    }
+    const extra = await op<any>(t, "requestAccess", {
+      email: "fresh@x.com",
+      service: "scraper",
+      requestedBy: "you",
+    });
+    expect(extra.ok).toBe(true); // a resolved row was evicted to make room
+    const list = await op<any>(t, "listAccess");
+    expect(list.requests.length).toBeLessThanOrEqual(200);
+    expect(list.requests.some((r: any) => r.email === "fresh@x.com")).toBe(true);
+  });
+});
+
+describe("TenantDO addAcl/removeUserGrant — grant idempotence + surgical revoke", () => {
+  it("addAcl is idempotent: an identical rule returns the existing id", async () => {
+    const t = freshTenant();
+    await op(t, "enroll", { name: "Scraper" });
+    const a = await op<any>(t, "addAcl", {
+      src: { type: "user", name: "alice@x.com" },
+      dst: [{ type: "service", name: "scraper" }],
+    });
+    const b = await op<any>(t, "addAcl", {
+      src: { type: "user", name: "ALICE@x.com" },
+      dst: [{ type: "service", name: "scraper" }],
+    });
+    expect(b.id).toBe(a.id);
+    const list = await op<any>(t, "listAccess");
+    expect(
+      list.grants.filter((g: any) => g.src.name?.toLowerCase() === "alice@x.com"),
+    ).toHaveLength(1);
+  });
+
+  it("removeUserGrant strips ONE service from a multi-dst rule", async () => {
+    const t = freshTenant();
+    await op(t, "enroll", { name: "Scraper" });
+    await op(t, "enroll", { name: "Kestrel" });
+    await op(t, "addAcl", {
+      src: { type: "user", name: "alice@x.com" },
+      dst: [
+        { type: "service", name: "scraper" },
+        { type: "service", name: "kestrel" },
+      ],
+    });
+    const r = await op<any>(t, "removeUserGrant", {
+      email: "alice@x.com",
+      service: "scraper",
+    });
+    expect(r.removed).toBe(true);
+    expect(r.stillAllowed).toBe(false);
+    // kestrel access survives the scraper revoke.
+    const kestrel = await op<any>(t, "checkUserAccess", {
+      user: "alice@x.com",
+      service: "kestrel",
+    });
+    expect(kestrel.allowed).toBe(true);
+    const scraper = await op<any>(t, "checkUserAccess", {
+      user: "alice@x.com",
+      service: "scraper",
+    });
+    expect(scraper.allowed).toBe(false);
+  });
+
+  it("removeUserGrant deletes a single-dst rule outright", async () => {
+    const t = freshTenant();
+    await op(t, "enroll", { name: "Scraper" });
+    await op(t, "addAcl", {
+      src: { type: "user", name: "bob@x.com" },
+      dst: [{ type: "service", name: "scraper" }],
+    });
+    const r = await op<any>(t, "removeUserGrant", {
+      email: "bob@x.com",
+      service: "scraper",
+    });
+    expect(r.removed).toBe(true);
+    const list = await op<any>(t, "listAccess");
+    expect(list.grants.some((g: any) => g.src.name === "bob@x.com")).toBe(false);
+  });
+
+  it("removeUserGrant reports stillAllowed for a dst:all rule it can't narrow", async () => {
+    const t = freshTenant();
+    await op(t, "enroll", { name: "Scraper" });
+    await op(t, "addAcl", {
+      src: { type: "user", name: "carol@x.com" },
+      dst: [{ type: "all" }],
+    });
+    const r = await op<any>(t, "removeUserGrant", {
+      email: "carol@x.com",
+      service: "scraper",
+    });
+    expect(r.removed).toBe(false);
+    expect(r.stillAllowed).toBe(true);
+  });
+});
+
+describe("TenantDO.checkUserAccess — the browser/OAuth door gate", () => {
+  it("denies a member with no grant, allows one with a user→service rule", async () => {
+    const t = freshTenant();
+    await op(t, "enroll", { name: "Scraper" });
+    const before = await op<any>(t, "checkUserAccess", {
+      user: "dave@x.com",
+      service: "scraper",
+    });
+    expect(before.allowed).toBe(false); // default-deny — org membership is not enough
+    await op(t, "addAcl", {
+      src: { type: "user", name: "dave@x.com" },
+      dst: [{ type: "service", name: "scraper" }],
+    });
+    const after = await op<any>(t, "checkUserAccess", {
+      user: "DAVE@x.com",
+      service: "scraper",
+    });
+    expect(after.allowed).toBe(true);
+  });
+
+  it("allows anyone on a public service", async () => {
+    const t = freshTenant();
+    await op(t, "enroll", { name: "Scraper" });
+    await op(t, "setAuth", { service: "scraper", mode: "public" });
+    const r = await op<any>(t, "checkUserAccess", {
+      user: "",
+      service: "scraper",
+    });
+    expect(r.allowed).toBe(true);
+    expect(r.public).toBe(true);
+  });
+
+  it("denies an unknown service", async () => {
+    const t = freshTenant();
+    const r = await op<any>(t, "checkUserAccess", {
+      user: "dave@x.com",
+      service: "ghost",
+    });
+    expect(r.allowed).toBe(false);
+  });
+});
+
 describe("TenantDO.boxExists — /refresh revocation gate", () => {
   it("returns true for a registered box, false otherwise", async () => {
     const t = freshTenant();

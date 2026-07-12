@@ -47,6 +47,13 @@ async function runtimeEnv(name: string): Promise<string | undefined> {
   return typeof pv === "string" && pv.length ? pv : undefined;
 }
 
+/** Public accessor for runtimeEnv — routes that need a non-hub secret (e.g.
+ *  the Clerk webhook signing secret) read it through the same CF-or-process
+ *  fallback the hub bridge uses. */
+export async function readRuntimeEnv(name: string): Promise<string | undefined> {
+  return runtimeEnv(name);
+}
+
 /** The hub origin a box should install from and `finch login` against — the
  *  HUB_URL runtime var (trailing slash trimmed). This is the ACTUAL hub the web
  *  talks to (e.g. the staging hub on staging), unlike a tenant's stored slug
@@ -210,7 +217,21 @@ export async function hubFetch(
   init: RequestInit = {},
 ): Promise<Response> {
   const { tenant } = await resolveTenant();
+  return hubFetchAs(tenant, path, init);
+}
 
+/**
+ * Like hubFetch, but for a caller-supplied tenant instead of the Clerk
+ * session's. ONLY for server-to-server entry points that carry their own
+ * authenticated tenant identity — e.g. the Clerk webhook, where the verified
+ * Svix payload names the org and there is no session at all. Never pass a
+ * tenant taken from an unauthenticated request body.
+ */
+export async function hubFetchAs(
+  tenant: string,
+  path: string,
+  init: RequestInit = {},
+): Promise<Response> {
   const hubUrl = await runtimeEnv("HUB_URL");
   const serviceSecret = await runtimeEnv("FINCH_SERVICE_SECRET");
   if (!hubUrl) throw new HttpError(500, "HUB_URL is not configured");
@@ -234,6 +255,102 @@ export async function hubFetch(
   }
 
   return fetch(`${hubUrl}${path}`, { ...init, headers });
+}
+
+// ---- access sharing helpers -----------------------------------------------
+// Thin typed wrappers over the hub's /api/access* + /api/acl surface, shared
+// by the access routes and the Clerk webhook (which has no session, hence the
+// explicit-tenant *As shape). The DO owns the queue; these only orchestrate.
+
+/** One row of the tenant DO's accessRequests queue (worker/src/types.ts). */
+export interface AccessRow {
+  id: string;
+  email: string;
+  service: string;
+  requestedBy: string;
+  status: "pending" | "invited" | "granted" | "denied";
+  created: number;
+  resolvedBy?: string;
+  resolvedAt?: number;
+}
+
+/** A user→service ACL grant as listAccess returns it. */
+export interface AccessGrant {
+  id: string;
+  src: { type: string; name?: string };
+  dst: { type: string; name?: string }[];
+}
+
+/** Read the tenant's access lens: request rows + user→service ACL grants. */
+export async function listAccessAs(
+  tenant: string,
+): Promise<{ requests: AccessRow[]; grants: AccessGrant[] }> {
+  const res = await hubFetchAs(tenant, "/api/access", { method: "GET" });
+  if (!res.ok) throw new HttpError(res.status, "could not list access");
+  return (await res.json()) as { requests: AccessRow[]; grants: AccessGrant[] };
+}
+
+/** Transition an access-request row's status in the tenant DO. */
+export async function setAccessStatusAs(
+  tenant: string,
+  id: string,
+  status: AccessRow["status"],
+  resolvedBy: string,
+): Promise<void> {
+  const res = await hubFetchAs(tenant, "/api/access/status", {
+    method: "POST",
+    body: JSON.stringify({ id, status, resolvedBy }),
+  });
+  if (!res.ok) throw new HttpError(res.status, "could not update access request");
+}
+
+/** Ensure a user→service ACL grant exists. Idempotence lives in the DO's
+ *  addAcl (an identical rule is returned, never duplicated), so this is safe
+ *  under racing writers (approve route vs Clerk webhook) — no read-then-write. */
+export async function ensureUserGrantAs(
+  tenant: string,
+  email: string,
+  service: string,
+): Promise<{ id: string }> {
+  const res = await hubFetchAs(tenant, "/api/acl", {
+    method: "POST",
+    body: JSON.stringify({
+      src: { type: "user", name: email.toLowerCase() },
+      dst: [{ type: "service", name: service }],
+    }),
+  });
+  if (!res.ok) throw new HttpError(res.status, "could not add grant");
+  return (await res.json()) as { id: string };
+}
+
+/** Surgically revoke ONE user→service grant in the DO (multi-dst rules keep
+ *  their other services). `stillAllowed` reports coverage by a broader rule
+ *  (all/tag/group/locked) that a per-service revoke cannot narrow. */
+export async function removeUserGrantAs(
+  tenant: string,
+  email: string,
+  service: string,
+): Promise<{ removed: boolean; stillAllowed: boolean }> {
+  const res = await hubFetchAs(tenant, "/api/access/revoke-grant", {
+    method: "POST",
+    body: JSON.stringify({ email: email.toLowerCase(), service }),
+  });
+  if (!res.ok) throw new HttpError(res.status, "could not remove grant");
+  return (await res.json()) as { removed: boolean; stillAllowed: boolean };
+}
+
+/** A human-readable label for a Clerk user — their primary email, falling
+ *  back to the raw user id. Used to stamp requestedBy/resolvedBy on access
+ *  requests so the audit log names a person, not an opaque id. */
+export async function callerLabel(userId: string): Promise<string> {
+  try {
+    const { clerkClient } = await import("@clerk/nextjs/server");
+    const clerk = await clerkClient();
+    const u = await clerk.users.getUser(userId);
+    return u.primaryEmailAddress?.emailAddress ?? userId;
+  } catch {
+    return userId;
+  }
 }
 
 /** Call the hub and pass its JSON body + status straight back to the client. */

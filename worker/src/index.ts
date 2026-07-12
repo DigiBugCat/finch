@@ -402,7 +402,7 @@ async function maybeBrowserGate(
     if (env.DEV === "1") return { browserAuthed: false };
     // No host key in a non-dev build should be unreachable (resolveTenant 404s), but
     // if it happens, fail CLOSED: treat as a private service needing the wall.
-    return browserGate(req, env, tenant, hostKey, originalPathAndQuery);
+    return browserGate(req, env, tenant, hostKey, service, originalPathAndQuery);
   }
   const probe = await tenantOp<{ public?: boolean }>(env, tenant, "checkKey", {
     hash: "",
@@ -411,7 +411,7 @@ async function maybeBrowserGate(
   if (probe?.public) return { browserAuthed: false };
 
   // 4. A browser on a private service → require the session cookie.
-  return browserGate(req, env, tenant, hostKey, originalPathAndQuery);
+  return browserGate(req, env, tenant, hostKey, service, originalPathAndQuery);
 }
 
 /** browserGate — the login-wall decision for a relay request that is NOT a
@@ -427,6 +427,7 @@ async function browserGate(
   env: Env,
   tenant: string,
   hostKey: string,
+  service: string,
   originalPathAndQuery: string,
 ): Promise<GateDecision> {
   const cookie = readCookie(req, SESSION_COOKIE);
@@ -448,13 +449,41 @@ async function browserGate(
         "sessionEpoch",
       );
       if ((sess.epoch ?? 0) === (epoch ?? 0)) {
-        return {
-          browserAuthed: true,
-          browserCaller: {
-            userId: sess.userId,
-            ...(sess.jti ? { sessionId: sess.jti } : {}),
-          },
-        }; // valid cookie → relay as a web caller
+        // PER-APP AUTHORIZATION. The cookie proves who the browser is (a Clerk
+        // member of this tenant); it does NOT by itself grant every service —
+        // that was the side door around default-deny. Admins pass everywhere;
+        // members must hold a user→service ACL grant (the rules the approve
+        // flow writes). Revoking the grant cuts browser access immediately.
+        // A pre-scheme cookie (neither admin nor email) is re-minted via the
+        // portal below so it picks up the identity fields — fail closed.
+        if (sess.admin === true || sess.email) {
+          if (sess.admin !== true) {
+            const access = await tenantOp<{ allowed: boolean }>(
+              env,
+              tenant,
+              "checkUserAccess",
+              { user: sess.email, service },
+            );
+            if (!access?.allowed) {
+              return {
+                wall: new Response(
+                  "You don't have access to this app. Ask an admin to share it with you.",
+                  {
+                    status: 403,
+                    headers: { "content-type": "text/plain; charset=utf-8" },
+                  },
+                ),
+              };
+            }
+          }
+          return {
+            browserAuthed: true,
+            browserCaller: {
+              userId: sess.userId,
+              ...(sess.jti ? { sessionId: sess.jti } : {}),
+            },
+          }; // valid cookie → relay as a web caller
+        }
       }
     }
   }
@@ -490,7 +519,9 @@ const RELEASE_ASSET_RE =
 // the consent screen and overgrants the issued token. Deliberately NOT
 // filtered from the proxied AS metadata: that document must stay faithful to
 // what Clerk actually supports.
-const MCP_SCOPES = ["openid", "offline_access"];
+// `email` is needed at the door: the relay enforces per-app user grants for
+// org members by matching the token's email against the tenant's ACL.
+const MCP_SCOPES = ["openid", "email", "offline_access"];
 
 /** Percent-decode a path segment, tolerating a malformed encoding (a raw "%"
  *  in a name would make decodeURIComponent throw). Falls back to the raw value
@@ -1196,6 +1227,37 @@ async function relayMcp(
       );
       const id = who?.sub || who?.user_id;
       if (who && (id === tenant || who.org_id === tenant)) {
+        // PER-APP AUTHORIZATION (org tenants). Org membership alone must not
+        // open every private service — that was the side door around
+        // default-deny. A personal tenant (id === tenant) is its own owner.
+        // For an org tenant: an admin role (when Clerk includes it) passes
+        // everywhere; otherwise the token's email must hold a user→service
+        // ACL grant. A token without an email claim can't be authorized per
+        // app → 403 with a reconnect hint (MCP_SCOPES now requests `email`).
+        if (id !== tenant) {
+          const isOrgAdmin =
+            who.org_role === "org:admin" || who.org_role === "admin";
+          if (!isOrgAdmin) {
+            const em = (who.email || "").toLowerCase();
+            if (!em) {
+              return json(403, {
+                error:
+                  "token has no email claim — reconnect this connector so it can request the email scope",
+              });
+            }
+            const access = await tenantOp<{ allowed: boolean }>(
+              env,
+              tenant,
+              "checkUserAccess",
+              { user: em, service },
+            );
+            if (!access?.allowed) {
+              return json(403, {
+                error: "your account is not granted access to this app",
+              });
+            }
+          }
+        }
         oauthAuthed = true;
         const subject = id || who.org_id!;
         caller = `oauth:${subject}`;
@@ -1472,6 +1534,10 @@ async function handleFinchCb(
       tenant,
       slug: hostKey,
       userId: grant.userId,
+      // Carry the portal grant's identity fields into the cookie — browserGate
+      // enforces per-app user grants off them (admin bypass / email ACL match).
+      ...(grant.email ? { email: grant.email } : {}),
+      ...(grant.admin ? { admin: true } : {}),
       epoch: epoch ?? 0,
       jti: genJti(),
       exp,

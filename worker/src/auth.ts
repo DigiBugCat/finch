@@ -110,6 +110,13 @@ export interface TicketPayload {
   // The Clerk user id the portal/session grant was minted for (login-wall audit /
   // identity). Present for kind:"portal"|"session".
   userId?: string;
+  // The caller's primary email + org-admin bit, stamped by the Clerk-authed web
+  // at portal-grant time (kind:"portal"|"session" only). browserGate uses them
+  // to enforce per-app user grants at the door: admin → every service; member →
+  // only services a user→service ACL rule grants. A session cookie missing BOTH
+  // predates this scheme and is re-minted via the portal (fail closed).
+  email?: string;
+  admin?: boolean;
   // The tenant's sessionEpoch at session-mint time (kind:"session" only). The hub
   // rejects the cookie once the tenant bumps that epoch ("sign everyone out"),
   // mirroring the cliTokenEpoch revocation path. (Distinct from a join jti.)
@@ -231,6 +238,8 @@ function validateTicket(p: any): TicketPayload | null {
   if (p.box !== undefined && typeof p.box !== "string") return null;
   if (p.slug !== undefined && typeof p.slug !== "string") return null;
   if (p.userId !== undefined && typeof p.userId !== "string") return null;
+  if (p.email !== undefined && typeof p.email !== "string") return null;
+  if (p.admin !== undefined && typeof p.admin !== "boolean") return null;
   if (p.epoch !== undefined && typeof p.epoch !== "number") return null;
   if (p.jti !== undefined && typeof p.jti !== "string") return null;
   return p as TicketPayload;
@@ -762,6 +771,8 @@ export interface ClerkIdentity {
   sub?: string;      // Clerk user id (user_…)
   user_id?: string;  // some Clerk responses use user_id
   org_id?: string;   // present when the token is org-scoped
+  email?: string;    // present when the token carries the `email` scope
+  org_role?: string; // org role, when Clerk includes it for org-scoped tokens
 }
 
 export async function verifyClerkOAuthToken(

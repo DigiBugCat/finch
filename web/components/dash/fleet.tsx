@@ -3,6 +3,7 @@
 import { useState } from 'react';
 import { Avatar, Button, Card, CopyChip, InlineConfirm, MonoUrl, SectionLabel, StatePill, TagList, isOnline } from '@/components/dash/primitives';
 import { ChatPanel } from '@/components/dash/ChatPanel';
+import { AccessChip } from '@/components/dash/access';
 import { AreaChart } from '@/components/dash/charts';
 import { LATEST_AGENT } from '@/components/dash/data';
 
@@ -145,9 +146,28 @@ export function BoxesTable({ boxes, host, onOpen, query }: any) {
 }
 
 // ============ BOX DETAIL ====================================
-export function DetailView({ app, host, onBack, onRelease, onTags, onApprove, onDecline, onRevokeBoxKey, onUpdateBox }: any) {
+export function DetailView({ app, host, onBack, onRelease, onTags, onApprove, onDecline, onRevokeBoxKey, onUpdateBox, access, users, onShareAccess }: any) {
   const [tab, setTab] = useState("claude");
   const [newTag, setNewTag] = useState("");
+  const [shareEmail, setShareEmail] = useState("");
+
+  // Access — who can use THIS app: user grants (ACL rules dst'ing this
+  // service) + open request rows, from GET /api/finch/access via the shell.
+  const svcGrants = (access?.grants || []).filter((g: any) =>
+    (g.dst || []).some((d: any) => (d.type === "service" && d.name === app.id) || d.type === "all"));
+  const svcRequests = (access?.requests || []).filter((r: any) =>
+    r.service === app.id && (r.status === "pending" || r.status === "invited"));
+  const shareValid = /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(shareEmail.trim());
+  // an existing tenant member skips the invite leg → the button says so
+  const isMember = shareValid && (users || []).some((u: any) =>
+    (u.email || "").toLowerCase() === shareEmail.trim().toLowerCase());
+  const share = () => {
+    if (!shareValid) return;
+    // isMember rides along: the member path skips the invite leg entirely
+    // (request + approve in one go), so "Grant access" actually grants.
+    onShareAccess?.(shareEmail.trim().toLowerCase(), app.id, isMember);
+    setShareEmail("");
+  };
   const url = mcpUrl(host, app.id);
   const online = isOnline(app.state);
 
@@ -296,6 +316,35 @@ export function DetailView({ app, host, onBack, onRelease, onTags, onApprove, on
                 placeholder="add tag" spellCheck={false} autoCapitalize="off" />
               <button onClick={addTag} title="add tag">＋</button>
             </span>
+          </div>
+        </Card>
+
+        {/* Access — who can use this app */}
+        <Card className="access-card">
+          <SectionLabel hint="who can use this app · share by email">access</SectionLabel>
+          {svcGrants.map((g: any) => (
+            <div key={g.id} className="axs-row">
+              <span className="ent ent-user"><span className="ent-ic">👤</span>{g.src.name}</span>
+              <span className="axs-spacer" />
+              <AccessChip status="granted" />
+            </div>
+          ))}
+          {svcRequests.map((r: any) => (
+            <div key={r.id} className="axs-row">
+              <span className="ent ent-user"><span className="ent-ic">👤</span>{r.email}</span>
+              <span className="axs-spacer" />
+              <AccessChip status={r.status} />
+            </div>
+          ))}
+          {!svcGrants.length && !svcRequests.length && (
+            <div className="dim axs-empty">Only admins and keys can reach this app so far.</div>
+          )}
+          <div className="share-row">
+            <div className={`dusk-input ${shareEmail && !shareValid ? "dusk-input-err" : ""}`} style={{ flex: 1 }}>
+              <input value={shareEmail} onChange={(e) => setShareEmail(e.target.value)} placeholder="name@acme.com"
+                onKeyDown={(e) => { if (e.key === "Enter") share(); }} spellCheck={false} autoCapitalize="off" autoCorrect="off" />
+            </div>
+            <Button kind="accent" onClick={share} disabled={!shareValid}>{isMember ? "Grant access" : "Share"}</Button>
           </div>
         </Card>
 
