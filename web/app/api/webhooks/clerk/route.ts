@@ -1,68 +1,35 @@
-// POST /api/webhooks/clerk — Clerk → finch event sink (Svix-signed).
-// Closes the invite half of access sharing: when an invited user actually
-// joins the org (organizationMembership.created), promote every "invited"
-// access-request row for their email to a real user→service ACL grant. The
-// verified payload names the org, which IS the hub tenant id — there is no
-// Clerk session here, hence the explicit-tenant hub helpers.
 import type { NextRequest } from "next/server";
 import { verifyWebhook } from "@clerk/nextjs/webhooks";
-import {
-  ensureUserGrantAs,
-  listAccessAs,
-  readRuntimeEnv,
-  setAccessStatusAs,
-} from "@/lib/hub";
+import { readRuntimeEnv, userFetch } from "@/lib/hub";
+import { syncIdentity } from "@/lib/identity";
 
+const norm = (value: string) => value.trim().toLowerCase();
 export async function POST(req: NextRequest) {
-  let evt;
+  let event: any;
   try {
-    evt = await verifyWebhook(req, {
-      signingSecret: await readRuntimeEnv("CLERK_WEBHOOK_SECRET"),
-    });
-  } catch (err) {
-    console.error("clerk webhook: verification failed", err);
+    event = await verifyWebhook(req, { signingSecret: await readRuntimeEnv("CLERK_WEBHOOK_SECRET") });
+  } catch (error) {
+    console.error("clerk webhook: verification failed", error);
     return new Response("invalid signature", { status: 400 });
   }
-
   try {
-    if (evt.type === "organizationMembership.created") {
-      const tenant = evt.data.organization.id;
-      // Match invited rows against EVERY address the joining user owns, not
-      // just public_user_data.identifier (the PRIMARY identifier — which can be
-      // a personal email, a username, or a phone when an existing account
-      // accepts an invite sent to a secondary address; matching only it left
-      // rows stuck at "invited" forever).
-      const emails = new Set<string>();
-      const identifier = (evt.data.public_user_data?.identifier ?? "").toLowerCase();
-      if (identifier) emails.add(identifier);
-      const joinedUserId = evt.data.public_user_data?.user_id;
-      if (joinedUserId) {
-        try {
-          const { clerkClient } = await import("@clerk/nextjs/server");
-          const clerk = await clerkClient();
-          const u = await clerk.users.getUser(joinedUserId);
-          for (const e of u.emailAddresses) {
-            emails.add(e.emailAddress.toLowerCase());
-          }
-        } catch (err) {
-          // Fall back to the identifier alone; a transient Clerk fault will be
-          // retried by Svix via the 500 below only if nothing matched.
-          console.error("clerk webhook: could not resolve user emails", err);
-        }
-      }
-      if (emails.size) {
-        const { requests } = await listAccessAs(tenant);
-        for (const row of requests) {
-          if (row.status !== "invited" || !emails.has(row.email)) continue;
-          await ensureUserGrantAs(tenant, row.email, row.service);
-          await setAccessStatusAs(tenant, row.id, "granted", "clerk webhook");
-        }
-      }
+    if (event.type === "user.created" || event.type === "user.updated") {
+      const verified = (event.data.email_addresses ?? []).filter((row: any) => row.verification?.status === "verified");
+      const emails = [...new Set(verified.map((row: any) => norm(row.email_address)))];
+      if (!emails.length) return new Response("ok");
+      const primary = verified.find((row: any) => row.id === event.data.primary_email_address_id);
+      const res = await userFetch(event.data.id, "/api/user/sync", { method: "POST", body: JSON.stringify({ emails, ...(primary ? { primaryEmail: norm(primary.email_address) } : {}) }) });
+      if (!res.ok) throw new Error(`hub sync failed: ${res.status}`);
+    } else if (event.type === "organizationMembership.created") {
+      const userId = event.data.public_user_data?.user_id;
+      if (!userId) return new Response("ok");
+      const identity = await syncIdentity(userId);
+      const res = await userFetch(userId, "/api/adapter/org-member", { method: "POST", body: JSON.stringify({ clerkOrgId: event.data.organization.id, clerkUserId: userId, ...identity }) });
+      if (!res.ok) throw new Error(`org adapter failed: ${res.status}`);
     }
-    return new Response("ok", { status: 200 });
-  } catch (err) {
-    // 500 so Svix retries — the grant must eventually land.
-    console.error("clerk webhook: handling failed", err);
+    return new Response("ok");
+  } catch (error) {
+    console.error("clerk webhook: handling failed", error);
     return new Response("error", { status: 500 });
   }
 }

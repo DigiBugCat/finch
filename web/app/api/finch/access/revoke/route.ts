@@ -68,7 +68,7 @@ export async function POST(req: Request) {
       for (const row of requests) {
         if (row.email !== email || row.service !== service) continue;
         if (row.status === "denied") continue;
-        await setAccessStatusAs(tenant, row.id, "denied", resolvedBy);
+        await setAccessStatusAs(tenant, row.id, "denied", resolvedBy, userId);
       }
     }
     return Response.json({ ok: true }, { status: 200 });

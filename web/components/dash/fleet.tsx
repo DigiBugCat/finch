@@ -146,7 +146,7 @@ export function BoxesTable({ boxes, host, onOpen, query }: any) {
 }
 
 // ============ BOX DETAIL ====================================
-export function DetailView({ app, host, onBack, onRelease, onTags, onApprove, onDecline, onRevokeBoxKey, onUpdateBox, access, users, onShareAccess }: any) {
+export function DetailView({ app, host, onBack, onRelease, onTags, onApprove, onDecline, onRevokeBoxKey, onUpdateBox, access, users, onShareAccess, canManage = true }: any) {
   const [tab, setTab] = useState("claude");
   const [newTag, setNewTag] = useState("");
   const [shareEmail, setShareEmail] = useState("");
@@ -209,7 +209,7 @@ export function DetailView({ app, host, onBack, onRelease, onTags, onApprove, on
       </Card>
 
       <div className="detail-grid">
-        {app.state === "pending" && (
+        {canManage && app.state === "pending" && (
           <Card className="approve-card connect-card">
             <div className="update-row">
               <span className="update-ic approve-ic">⏳</span>
@@ -243,7 +243,7 @@ export function DetailView({ app, host, onBack, onRelease, onTags, onApprove, on
         </Card>
 
         {/* Test in chat */}
-        <ChatPanel service={app.id} online={online} />
+        {canManage && <ChatPanel service={app.id} online={online} />}
 
         {/* Traffic */}
         <Card className="chart-card connect-card">
@@ -285,14 +285,14 @@ export function DetailView({ app, host, onBack, onRelease, onTags, onApprove, on
                 <span className="mach-keys">
                   <span className="auth-sub dim">keys</span>
                   {m.keys.length ? m.keys.map((k: any) => (
-                    <span key={k} className="kchip mono">🔑 {k}<button className="tag-x" title="revoke" onClick={() => onRevokeBoxKey(app.id, m.name, k)}>×</button></span>
+                    <span key={k} className="kchip mono">🔑 {k}{canManage && <button className="tag-x" title="revoke" onClick={() => onRevokeBoxKey(app.id, m.name, k)}>×</button>}</span>
                   )) : <span className="dim">none</span>}
                 </span>
                 {m.outdated && (
                   // A CONNECTED box can take a hub-pushed update (relay frame →
                   // self-update → re-exec); an offline one can't receive the
                   // frame, so it keeps the copy-paste hint.
-                  isOnline(m.state) && onUpdateBox
+                  canManage && isOnline(m.state) && onUpdateBox
                     ? <span className="mach-update mono">⬆ <InlineConfirm prompt="push update?" trigger="update now" onConfirm={() => onUpdateBox(app.id, m.name)} /></span>
                     : <span className="mach-update mono">finch update <CopyChip value="finch update" /></span>
                 )}
@@ -309,13 +309,13 @@ export function DetailView({ app, host, onBack, onRelease, onTags, onApprove, on
           <div className="auth-row"><span className="dim">policy</span><span className="mono">default-deny ACL</span></div>
           <div className="auth-tags">
             <span className="auth-sub dim">tags</span>
-            <TagList tags={app.tags} onRemove={(t: any) => onTags(app.id, app.tags.filter((x: any) => x !== t))} />
-            <span className="tag-add">
+            <TagList tags={app.tags} onRemove={canManage ? (t: any) => onTags(app.id, app.tags.filter((x: any) => x !== t)) : undefined} />
+            {canManage && <span className="tag-add">
               <input value={newTag} onChange={(e) => setNewTag(e.target.value)}
                 onKeyDown={(e) => { if (e.key === "Enter") addTag(); }}
                 placeholder="add tag" spellCheck={false} autoCapitalize="off" />
               <button onClick={addTag} title="add tag">＋</button>
-            </span>
+            </span>}
           </div>
         </Card>
 
@@ -339,13 +339,13 @@ export function DetailView({ app, host, onBack, onRelease, onTags, onApprove, on
           {!svcGrants.length && !svcRequests.length && (
             <div className="dim axs-empty">Only admins and keys can reach this app so far.</div>
           )}
-          <div className="share-row">
+          {canManage && <div className="share-row">
             <div className={`dusk-input ${shareEmail && !shareValid ? "dusk-input-err" : ""}`} style={{ flex: 1 }}>
               <input value={shareEmail} onChange={(e) => setShareEmail(e.target.value)} placeholder="name@acme.com"
                 onKeyDown={(e) => { if (e.key === "Enter") share(); }} spellCheck={false} autoCapitalize="off" autoCorrect="off" />
             </div>
             <Button kind="accent" onClick={share} disabled={!shareValid}>{isMember ? "Grant access" : "Share"}</Button>
-          </div>
+          </div>}
         </Card>
 
         {/* Recent calls */}
@@ -365,7 +365,7 @@ export function DetailView({ app, host, onBack, onRelease, onTags, onApprove, on
         </Card>
 
         {/* Danger */}
-        <Card className="danger-card">
+        {canManage && <Card className="danger-card">
           <SectionLabel>danger zone</SectionLabel>
           <div className="danger-row">
             <div>
@@ -374,7 +374,7 @@ export function DetailView({ app, host, onBack, onRelease, onTags, onApprove, on
             </div>
             <InlineConfirm prompt="delete this service?" trigger="delete" onConfirm={() => onRelease(app.id)} />
           </div>
-        </Card>
+        </Card>}
       </div>
     </div>
   );

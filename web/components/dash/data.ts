@@ -189,6 +189,11 @@ export interface PublicKey {
 }
 
 /** A user shaped for the Users view (layered in from Clerk by /api/finch/state). */
+export type FinchRole = "owner" | "admin" | "member";
+export type MemberState = "invited" | "active" | "disabled";
+export interface WorkspaceMembership { tenantId: string; name?: string; kind?: "personal" | "team"; role: FinchRole; state: MemberState; }
+export interface TenantsResponse { tenants: WorkspaceMembership[]; claimable: { clerkOrgId: string; name?: string }[]; activeTenant: string; needsVerifiedEmail?: boolean; }
+
 export interface DashUser {
   id: string;
   name: string;
@@ -196,7 +201,7 @@ export interface DashUser {
   role: "Owner" | "Admin" | "Member";
   devices: number;
   lastActive: string;
-  status: string;
+  status: MemberState;
 }
 
 /** The full per-tenant state — what GET /api/finch/state returns. */
@@ -211,8 +216,9 @@ export interface TenantState {
   settings: Settings;
   overview: Overview;
   latestAgent: string;
-  // layered in by /api/finch/state from Clerk
   users: DashUser[];
+  callerRole: FinchRole;
+  workspace: { id: string; name: string; kind: "personal" | "team" };
 }
 
 /** Hub POST /api/enroll response. */

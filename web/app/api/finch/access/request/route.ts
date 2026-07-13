@@ -28,6 +28,7 @@ export async function POST(req: Request) {
         email,
         service,
         requestedBy: await callerLabel(userId),
+        requestedByUserId: userId,
       }),
     });
   } catch (err) {

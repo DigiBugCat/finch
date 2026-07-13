@@ -149,6 +149,21 @@ const aviaryMigration = (envCfg.migrations ?? []).some(
 if (!aviaryMigration) {
   fail(`[env.${env}] must include the AviaryEnrollmentDO SQLite migration.`);
 }
+const directoryBinding = (envCfg.durable_objects?.bindings ?? []).find(
+  (binding) => binding?.name === "DIRECTORY",
+);
+if (directoryBinding?.class_name !== "DirectoryDO") {
+  fail(`[env.${env}] must bind DIRECTORY to DirectoryDO.`);
+}
+const directoryMigration = (envCfg.migrations ?? []).some(
+  (migration) =>
+    migration?.tag === "v6" &&
+    Array.isArray(migration?.new_sqlite_classes) &&
+    migration.new_sqlite_classes.includes("DirectoryDO"),
+);
+if (!directoryMigration) {
+  fail(`[env.${env}] must include migration v6 for DirectoryDO.`);
+}
 
 const isProd = env === "production";
 

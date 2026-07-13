@@ -58,10 +58,7 @@ describe("GET /portal/start", () => {
     const [hubUrl, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
     expect(hubUrl).toBe("https://hub.example.com/api/portal-grant");
     expect(init.method).toBe("POST");
-    expect(JSON.parse(init.body as string)).toEqual({
-      slug: "printer",
-      userId: "user_42",
-    });
+    expect(JSON.parse(init.body as string)).toEqual({ slug: "printer" });
     // Tenant is bound cryptographically by the assertion header.
     const headers = new Headers(init.headers);
     expect(headers.get("X-Finch-Service")).toBe("test-service-secret");
@@ -161,7 +158,7 @@ describe("GET /portal/start", () => {
 
     expect(res.status).toBe(403);
     const body = await res.text();
-    expect(body).toMatch(/registered to your account/i);
+    expect(body).toMatch(/not a member|ask its admin/i);
   });
 
   it("returns a clean 502 (not a 500) when the hub's 200 body isn't JSON", async () => {

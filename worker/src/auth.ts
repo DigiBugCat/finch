@@ -110,6 +110,7 @@ export interface TicketPayload {
   // The Clerk user id the portal/session grant was minted for (login-wall audit /
   // identity). Present for kind:"portal"|"session".
   userId?: string;
+  mid?: string;
   // The caller's primary email + org-admin bit, stamped by the Clerk-authed web
   // at portal-grant time (kind:"portal"|"session" only). browserGate uses them
   // to enforce per-app user grants at the door: admin → every service; member →
@@ -238,6 +239,7 @@ function validateTicket(p: any): TicketPayload | null {
   if (p.box !== undefined && typeof p.box !== "string") return null;
   if (p.slug !== undefined && typeof p.slug !== "string") return null;
   if (p.userId !== undefined && typeof p.userId !== "string") return null;
+  if (p.mid !== undefined && typeof p.mid !== "string") return null;
   if (p.email !== undefined && typeof p.email !== "string") return null;
   if (p.admin !== undefined && typeof p.admin !== "boolean") return null;
   if (p.epoch !== undefined && typeof p.epoch !== "number") return null;

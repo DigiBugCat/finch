@@ -1,73 +1,7 @@
 "use client";
-// Roost — Users & roles: tenant members, invite, role management.
-import { useState } from 'react';
-import { Button, Card, InlineConfirm, SectionLabel } from '@/components/dash/primitives';
-
-const U_PALETTE = ["#f2b443", "#79d995", "#c4a8ef", "#e8848f", "#7fb2e8"];
-function UserAvatar({ name }: any) {
-  const ch = (name || "?")[0].toUpperCase();
-  const c = U_PALETTE[(name.charCodeAt(0) || 0) % U_PALETTE.length];
-  return <span className="uav" style={{ background: c + "22", color: c, boxShadow: `inset 0 0 0 1px ${c}55` }}>{ch}</span>;
-}
-function RolePill({ role }: any) {
-  return <span className={`role role-${role.toLowerCase()}`}>{role}</span>;
-}
-
-export function UsersView({ users, onInvite, onRole, onRemove }: any) {
-  const [email, setEmail] = useState("");
-  const [role, setRole] = useState("Member");
-  const valid = /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email.trim());
-  const invite = () => { if (!valid) return; onInvite({ email: email.trim(), role }); setEmail(""); };
-
-  return (
-    <div className="view">
-      <h1 className="page-title">Users <span className="admin-badge">admin</span></h1>
-      <p className="page-lede">Everyone in your tenant. Roles decide who can approve boxes, edit access rules, and manage keys.</p>
-
-      <Card className="invite-card">
-        <SectionLabel hint="they'll get an email to join this tenant">invite a teammate</SectionLabel>
-        <div className="invite-row">
-          <div className={`dusk-input ${email && !valid ? "dusk-input-err" : ""}`} style={{ flex: 1 }}>
-            <input value={email} onChange={(e) => setEmail(e.target.value)} placeholder="name@acme.com"
-              onKeyDown={(e) => { if (e.key === "Enter") invite(); }} spellCheck={false} autoCapitalize="off" autoCorrect="off" />
-          </div>
-          <select className="acl-select" value={role} onChange={(e) => setRole(e.target.value)}>
-            <option>Admin</option><option>Member</option>
-          </select>
-          <Button kind="accent" onClick={invite} disabled={!valid}>Send invite</Button>
-        </div>
-      </Card>
-
-      <Card className="table-card">
-        <div className="urow urow-head">
-          <span>user</span><span>role</span><span>boxes</span><span>last active</span><span></span>
-        </div>
-        {users.map((u: any) => (
-          <div key={u.id} className="urow">
-            <span className="u-user">
-              <UserAvatar name={u.name} />
-              <span className="u-id">
-                <span className="u-name">{u.name}{u.status === "invited" && <span className="u-pending">invited</span>}</span>
-                <span className="u-email dim">{u.email}</span>
-              </span>
-            </span>
-            <span className="u-role">
-              {u.role === "Owner"
-                ? <RolePill role="Owner" />
-                : <select className="role-select" value={u.role} onChange={(e) => onRole(u.id, e.target.value)}>
-                    <option>Admin</option><option>Member</option>
-                  </select>}
-            </span>
-            <span className="u-dev mono">{u.devices}</span>
-            <span className="u-seen mono dim">{u.lastActive}</span>
-            <span className="u-act">
-              {u.role === "Owner"
-                ? <span className="dim mono" style={{ fontSize: 12 }}>owner</span>
-                : <InlineConfirm prompt="remove?" trigger="remove" onConfirm={() => onRemove(u.id)} />}
-            </span>
-          </div>
-        ))}
-      </Card>
-    </div>
-  );
-}
+import { useState } from "react";
+import { Button, Card, InlineConfirm, SectionLabel } from "./primitives";
+const palette=["#f2b443","#79d995","#c4a8ef","#e8848f","#7fb2e8"];
+function Avatar({name}:{name:string}){const c=palette[(name.charCodeAt(0)||0)%palette.length];return <span className="uav" style={{background:c+"22",color:c}}>{(name||"?")[0].toUpperCase()}</span>}
+function RemoveMember({memberId,onRemove}:{memberId:string;onRemove:(id:string,revoke:boolean)=>void}){const[open,setOpen]=useState(false);const[revoke,setRevoke]=useState(false);if(!open)return <Button kind="ghost" onClick={()=>setOpen(true)}>remove</Button>;return <span className="inline-confirm"><label><input type="checkbox" checked={revoke} onChange={e=>setRevoke(e.target.checked)}/> Also revoke service grants</label><Button kind="ghost" onClick={()=>onRemove(memberId,revoke)}>confirm</Button><Button kind="ghost" onClick={()=>setOpen(false)}>cancel</Button></span>}
+export function UsersView({users,onInvite,onRole,onRemove,onEnable}:any){const[email,setEmail]=useState("");const[role,setRole]=useState("member");const valid=/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email.trim());const invite=()=>{if(valid){onInvite({email:email.trim(),role});setEmail("")}};return <div className="view"><h1 className="page-title">Users</h1><p className="page-lede">Finch workspace members and native roles.</p><Card className="invite-card"><SectionLabel hint="they activate at first verified sign-in">invite a teammate</SectionLabel><div className="invite-row"><div className="dusk-input" style={{flex:1}}><input value={email} onChange={e=>setEmail(e.target.value)} placeholder="name@acme.com" /></div><select className="acl-select" value={role} onChange={e=>setRole(e.target.value)}><option value="admin">Admin</option><option value="member">Member</option></select><Button kind="accent" onClick={invite} disabled={!valid}>Send invite</Button></div></Card><Card className="table-card"><div className="urow urow-head"><span>user</span><span>role</span><span>state</span><span>member id</span><span /></div>{users.map((u:any)=><div key={u.id} className="urow"><span className="u-user"><Avatar name={u.name}/><span className="u-id"><span className="u-name">{u.name}</span><span className="u-email dim">{u.email}</span></span></span><span>{u.role==="Owner"?<span className="role role-owner">Owner</span>:<select className="role-select" value={u.role.toLowerCase()} onChange={e=>onRole(u.id,e.target.value)} disabled={u.status!=="active"}><option value="admin">Admin</option><option value="member">Member</option></select>}</span><span className={`role role-${u.status}`}>{u.status==="invited"?"awaiting sign-in":u.status}</span><span className="mono dim">{u.id}</span><span className="u-act">{u.role==="Owner"?<span className="dim mono">owner</span>:u.status==="disabled"?<Button kind="ghost" onClick={()=>onEnable(u.id)}>Re-enable</Button>:u.status==="invited"?<><Button kind="ghost" onClick={()=>onInvite({email:u.email,role:u.role.toLowerCase()})}>Resend</Button><InlineConfirm prompt="cancel?" trigger="cancel" onConfirm={()=>onRemove(u.id,false)}/></>:<RemoveMember memberId={u.id} onRemove={onRemove}/>}</span></div>)}</Card></div>}

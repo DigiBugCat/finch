@@ -27,7 +27,7 @@ export async function POST(req: Request) {
       throw new HttpError(409, "already granted — revoke it instead");
     }
 
-    await setAccessStatusAs(tenant, id, "denied", await callerLabel(userId));
+    await setAccessStatusAs(tenant, id, "denied", await callerLabel(userId), userId);
     return Response.json({ ok: true, status: "denied" }, { status: 200 });
   } catch (err) {
     return errorResponse(err);

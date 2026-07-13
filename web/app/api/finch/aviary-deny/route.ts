@@ -1,6 +1,6 @@
 // POST /api/finch/aviary-deny {user_code} — explicitly reject one pending
 // Aviary service manifest. The browser cannot supply the approver or audit text.
-import { errorResponse, hubProxy, requireAdmin } from "@/lib/hub";
+import { errorResponse, hubFetchAs, requireAdmin } from "@/lib/hub";
 
 const MAX_USER_CODE_LENGTH = 32;
 
@@ -15,7 +15,7 @@ export async function POST(req: Request) {
       return Response.json({ error: "a valid user_code is required" }, { status: 400 });
     }
 
-    return await hubProxy("/api/aviary/device/deny", {
+    return await hubFetchAs(ctx.tenant,"/api/aviary/device/deny", {
       method: "POST",
       body: JSON.stringify({
         user_code: userCode,

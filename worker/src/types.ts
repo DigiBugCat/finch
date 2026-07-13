@@ -3,6 +3,22 @@
 // dashboard's view components consume this exact shape (it matches the former
 // mock ROOST_DATA so the UI renders unchanged).
 
+
+export type FinchRole = "owner" | "admin" | "member";
+export type MemberState = "invited" | "active" | "disabled";
+export const normalizeEmail = (raw: string): string => raw.trim().toLowerCase();
+
+export interface TenantMember {
+  id: string; tenantId: string; clerkUserId: string | null; email: string;
+  role: FinchRole; state: MemberState; invitedBy?: string; createdAt: number;
+  updatedAt: number; boundAt?: number; disabledAt?: number;
+}
+export interface TenantMeta {
+  id: string; kind: "personal" | "team"; displayName: string; createdAt: number;
+  clerkOrgId?: string; bootstrappedFrom: "fresh" | "legacy-personal" | "legacy-org";
+  membershipVersion: number;
+}
+
 export type ServiceState =
   | "in_use"
   | "online"
@@ -151,7 +167,9 @@ export interface AccessRequest {
   requestedBy: string;
   status: "pending" | "invited" | "granted" | "denied";
   created: number; // epoch ms
+  requestedByUserId?: string;
   resolvedBy?: string;
+  resolvedByUserId?: string;
   resolvedAt?: number; // epoch ms
 }
 
@@ -186,8 +204,10 @@ export interface Overview {
 }
 
 /** The full per-tenant state — exactly what GET /api/state returns and what
- *  the dashboard renders. Users are NOT stored here; they come from Clerk org. */
+ *  the dashboard renders. */
 export interface TenantState {
+  tenant?: TenantMeta;
+  members?: TenantMember[];
   host: string; // <subdomain>.finchmcp.com
   services: Service[];
   boxes: Box[]; // flattened across services (the Boxes lens)

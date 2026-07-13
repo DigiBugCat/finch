@@ -286,6 +286,8 @@ async function standUpService() {
     box,
     (m) => m.connected && m.state !== "pending",
   );
+  const tenantStub = env.TENANT.get(env.TENANT.idFromName(tenant));
+  await tenantStub.fetch("https://tenant.internal/", { method: "POST", body: JSON.stringify({ op: "bootstrapMembers", kind: "team", displayName: "Test", bootstrappedFrom: "fresh", claimantClerkUserId: "user_123", members: [{ clerkUserId: "user_123", email: "owner@example.com", role: "owner", state: "active" }, { clerkUserId: tenant, email: "oauth-owner@example.com", role: "owner", state: "active" }, { clerkUserId: "member_1", email: "member@x.com", role: "member", state: "active" }] }) });
 
   return { ...ctx, service, box, agent };
 }
@@ -601,7 +603,7 @@ describe("login wall — keyless browser hit on a private service", () => {
     });
     expect(keyClaims.auth_method).toBe("finch_key");
     expect(keyClaims.sub).toMatch(/^key:k_/);
-    expect(keyClaims.actor).toBe("you");
+    expect(keyClaims.actor).toBe("owner@example.com");
     expect(keyClaims.key_label).toBe("wall-key");
     expect(reqFrame.headers.authorization).toBeUndefined();
     expect(reqFrame.headers["x-finch-caller"]).toBeUndefined();
@@ -865,6 +867,7 @@ describe("login wall — per-app user grants (member sessions)", () => {
     const cookie = await mintSession({
       tenant,
       slug,
+      userId: "member_1",
       admin: false,
       email: "member@x.com",
     });
@@ -891,6 +894,7 @@ describe("login wall — per-app user grants (member sessions)", () => {
     const cookie = await mintSession({
       tenant,
       slug,
+      userId: "member_1",
       admin: false,
       email: "member@x.com",
     });

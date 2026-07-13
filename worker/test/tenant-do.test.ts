@@ -591,6 +591,7 @@ describe("TenantDO access requests — queue + listAccess", () => {
 
   it("is idempotent: a second request for the same email+service returns the existing row", async () => {
     const t = freshTenant();
+    await op(t, "enroll", { name: "Scraper" });
     const a = await op<any>(t, "requestAccess", {
       email: "bob@x.com",
       service: "scraper",
@@ -608,6 +609,7 @@ describe("TenantDO access requests — queue + listAccess", () => {
 
   it("dedupes against an 'invited' row too, but not a resolved one", async () => {
     const t = freshTenant();
+    await op(t, "enroll", { name: "Scraper" });
     const a = await op<any>(t, "requestAccess", {
       email: "c@x.com",
       service: "scraper",
@@ -639,6 +641,7 @@ describe("TenantDO access requests — queue + listAccess", () => {
 
   it("setAccessStatus transitions and stamps resolvedBy/resolvedAt", async () => {
     const t = freshTenant();
+    await op(t, "enroll", { name: "Scraper" });
     const a = await op<any>(t, "requestAccess", {
       email: "d@x.com",
       service: "scraper",
@@ -667,6 +670,7 @@ describe("TenantDO access requests — queue + listAccess", () => {
 
   it("setAccessStatus rejects an invalid status", async () => {
     const t = freshTenant();
+    await op(t, "enroll", { name: "Scraper" });
     const a = await op<any>(t, "requestAccess", {
       email: "e@x.com",
       service: "scraper",

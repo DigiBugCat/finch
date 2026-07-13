@@ -11,6 +11,19 @@ only.
 Public services do not receive an assertion. An open edge route must not be
 mistaken for an authenticated principal.
 
+## Bird-side enforcement gate
+
+Before a bird enforces caller assertions:
+
+- Configure it as a private, key-authenticated service. Public services
+  intentionally receive no assertion and cannot establish a caller principal.
+- Confirm signing is enabled in the target environment, including the
+  `FINCH_ASSERTION_PRIVATE_JWKS` secret, by running `npm run smoke:assertions`.
+  The non-secret variables alone do not prove the signing key is deployed.
+- Verify the assertion at the service boundary: signature and `kid`, issuer,
+  audience, tenant/service claims, request binding, expiry, and one-time `jti`.
+  Missing or invalid assertions must fail closed.
+
 ## Claims
 
 The payload contains:
@@ -24,6 +37,10 @@ The payload contains:
 - `body_sha256`: base64url SHA-256 of the raw request body.
 - `iat`, `nbf`, `exp`, and random `jti` for a short replay window.
 - `session_id`, key metadata, and actor where that auth path provides them.
+
+For browser and OAuth authentication, `sub` is the stable Clerk user identifier
+`user:<id>`, not the email address that Finch uses for app-level ACL checks.
+Birds must never derive ACL identity from assertion claims.
 
 An application must verify ES256, select a known `kid`, validate issuer,
 audience, tenant, service, expiry/clock skew, method, upstream path, body digest,

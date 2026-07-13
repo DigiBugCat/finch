@@ -19,6 +19,7 @@ import { BoxDO } from "./box-do";
 import { TenantDO } from "./tenant-do";
 import { RouterDO, routerLookup } from "./router-do";
 import { AviaryEnrollmentDO } from "./aviary-enrollment-do";
+import { DirectoryDO } from "./directory-do";
 import { handleApi, isApiPath } from "./api";
 import { handleChat } from "./chat";
 import {
@@ -41,14 +42,15 @@ import type {
   TicketPayload,
 } from "./auth";
 
-export { BoxDO, TenantDO, RouterDO, AviaryEnrollmentDO };
+export { BoxDO, TenantDO, RouterDO, AviaryEnrollmentDO, DirectoryDO };
 
 export interface Env {
   // Durable Object namespaces.
   BOX: DurableObjectNamespace; // per-box WS relay (BoxDO)
   TENANT: DurableObjectNamespace; // per-tenant control-plane state (TenantDO)
   ROUTER: DurableObjectNamespace; // singleton slug→tenantId index (RouterDO)
-  AVIARY_ENROLLMENT: DurableObjectNamespace; // proof-bound service enrollment state
+  AVIARY_ENROLLMENT: DurableObjectNamespace;
+  DIRECTORY: DurableObjectNamespace; // proof-bound service enrollment state
 
   // Secrets / vars (wrangler vars in dev via .dev.vars; secrets in prod).
   FINCH_SERVICE_SECRET: string; // web-app -> control API shared secret
@@ -440,50 +442,11 @@ async function browserGate(
       sess.slug === hostKey &&
       !!sess.userId
     ) {
-      // Stale-cookie check: the tenant can "sign everyone out" by bumping its
-      // sessionEpoch; a cookie minted under an older epoch is treated as logged
-      // out. A missing epoch on either side normalizes to 0.
-      const { epoch } = await tenantOp<{ epoch: number }>(
-        env,
-        tenant,
-        "sessionEpoch",
-      );
-      if ((sess.epoch ?? 0) === (epoch ?? 0)) {
-        // PER-APP AUTHORIZATION. The cookie proves who the browser is (a Clerk
-        // member of this tenant); it does NOT by itself grant every service —
-        // that was the side door around default-deny. Admins pass everywhere;
-        // members must hold a user→service ACL grant (the rules the approve
-        // flow writes). Revoking the grant cuts browser access immediately.
-        // A pre-scheme cookie (neither admin nor email) is re-minted via the
-        // portal below so it picks up the identity fields — fail closed.
-        if (sess.admin === true || sess.email) {
-          if (sess.admin !== true) {
-            const access = await tenantOp<{ allowed: boolean }>(
-              env,
-              tenant,
-              "checkUserAccess",
-              { user: sess.email, service },
-            );
-            if (!access?.allowed) {
-              return {
-                wall: new Response(
-                  "You don't have access to this app. Ask an admin to share it with you.",
-                  {
-                    status: 403,
-                    headers: { "content-type": "text/plain; charset=utf-8" },
-                  },
-                ),
-              };
-            }
-          }
-          return {
-            browserAuthed: true,
-            browserCaller: {
-              userId: sess.userId,
-              ...(sess.jti ? { sessionId: sess.jti } : {}),
-            },
-          }; // valid cookie → relay as a web caller
-        }
+      // Pre-scheme cookies carry neither identity field; re-mint them through the portal.
+      if (sess.admin !== undefined || sess.email) {
+        const gate = await tenantOp<{ allowed: boolean; reason?: string }>(env, tenant, "gateBrowser", { clerkUserId: sess.userId, email: sess.email, epoch: sess.epoch ?? 0, service });
+        if (gate.allowed) return { browserAuthed: true, browserCaller: { userId: sess.userId, ...(sess.jti ? { sessionId: sess.jti } : {}) } };
+        if (gate.reason !== "epoch") return { wall: new Response("You don't have access to this app. Ask an admin to share it with you.",{status:403,headers:{"content-type":"text/plain; charset=utf-8"}}) };
       }
     }
   }
@@ -1226,45 +1189,13 @@ async function relayMcp(
         env.CLERK_USERINFO,
       );
       const id = who?.sub || who?.user_id;
-      if (who && (id === tenant || who.org_id === tenant)) {
-        // PER-APP AUTHORIZATION (org tenants). Org membership alone must not
-        // open every private service — that was the side door around
-        // default-deny. A personal tenant (id === tenant) is its own owner.
-        // For an org tenant: an admin role (when Clerk includes it) passes
-        // everywhere; otherwise the token's email must hold a user→service
-        // ACL grant. A token without an email claim can't be authorized per
-        // app → 403 with a reconnect hint (MCP_SCOPES now requests `email`).
-        if (id !== tenant) {
-          const isOrgAdmin =
-            who.org_role === "org:admin" || who.org_role === "admin";
-          if (!isOrgAdmin) {
-            const em = (who.email || "").toLowerCase();
-            if (!em) {
-              return json(403, {
-                error:
-                  "token has no email claim — reconnect this connector so it can request the email scope",
-              });
-            }
-            const access = await tenantOp<{ allowed: boolean }>(
-              env,
-              tenant,
-              "checkUserAccess",
-              { user: em, service },
-            );
-            if (!access?.allowed) {
-              return json(403, {
-                error: "your account is not granted access to this app",
-              });
-            }
-          }
+      if (who && id) {
+        const gate = await tenantOp<{allowed:boolean;reason?:string}>(env,tenant,"gateOauth",{clerkUserId:id,email:(who.email||"").trim().toLowerCase(),orgIdClaim:who.org_id,service});
+        if (!gate.allowed) {
+          if ((gate.reason === "no-email" || gate.reason === "needs-email") && !who.email) return json(403,{error:"token has no email claim — reconnect this connector so it can request the email scope"});
+          return json(403,{error:"your account is not granted access to this app"});
         }
-        oauthAuthed = true;
-        const subject = id || who.org_id!;
-        caller = `oauth:${subject}`;
-        edgeCaller = {
-          sub: `user:${subject}`,
-          authMethod: "oauth",
-        };
+        oauthAuthed=true; caller=`oauth:${id}`; edgeCaller={sub:`user:${id}`,authMethod:"oauth"};
       } else if (who) {
         return json(403, { error: "token identity does not own this tenant" });
       }
@@ -1534,6 +1465,7 @@ async function handleFinchCb(
       tenant,
       slug: hostKey,
       userId: grant.userId,
+      ...(grant.mid ? { mid: grant.mid } : {}),
       // Carry the portal grant's identity fields into the cookie — browserGate
       // enforces per-app user grants off them (admin bypass / email ACL match).
       ...(grant.email ? { email: grant.email } : {}),

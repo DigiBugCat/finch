@@ -38,6 +38,10 @@ import {
   type Group,
   type RecentCall,
   type ServiceState,
+  type TenantMember,
+  type TenantMeta,
+  type FinchRole,
+  normalizeEmail,
   isOnline,
   normalizeState,
   LATEST_AGENT,
@@ -79,6 +83,8 @@ interface StoredState {
   // rejects a cookie whose epoch != this. Absent == 0 (legacy state). Mirrors
   // cliTokenEpoch exactly.
   sessionEpoch?: number;
+  tenantMeta?: TenantMeta;
+  members: TenantMember[];
 }
 
 const MAX_LOGS = 500;
@@ -92,6 +98,7 @@ const MAX_BOXES_PER_SERVICE = 100;
 // Access-request queue cap: resolved rows are evicted oldest-first to stay
 // under it; a queue full of live (pending/invited) rows refuses new ones.
 const MAX_ACCESS_REQUESTS = 200;
+const MAX_MEMBERS = 200;
 
 // Box-name validation (M1): the box picks its own name, so clamp it to a
 // sane length + charset before it pollutes the registry / squats a slot.
@@ -204,6 +211,19 @@ export class TenantDO extends DurableObject<Env> {
       switch (op) {
         case "getState":
           return ok(await this.getState());
+        case "memberContext": return ok(await this.memberContext(a.clerkUserId, a.email));
+        case "ensureOwner": return ok(await this.ensureOwner(a.clerkUserId, a.email));
+        case "inviteMember": return this.opResponse(await this.inviteMember(a.email,a.role,a.actor));
+        case "bindIdentity": return this.opResponse(await this.bindIdentity(a.clerkUserId,a.emails,a.source));
+        case "adapterOrgMember": return this.opResponse(await this.adapterOrgMember(a.clerkUserId,a.emails,a.primaryEmail));
+        case "approveAccess": return this.opResponse(await this.approveAccess(a.id,a.actor));
+        case "setMemberRole": return this.opResponse(await this.setMemberRole(a.memberId,a.role,a.actor));
+        case "setMemberState": return this.opResponse(await this.setMemberState(a.memberId,a.state,a.revokeGrants,a.actor));
+        case "removeMember": return this.opResponse(await this.removeMember(a.memberId,a.revokeGrants,a.actor));
+        case "bootstrapMembers": return this.opResponse(await this.bootstrapMembers(a));
+        case "gateBrowser": return ok(await this.gateBrowser(a));
+        case "gateOauth": return ok(await this.gateOauth(a));
+        case "legacyClaimStatus": return ok(await this.legacyClaimStatus());
         case "enroll":
           return ok(await this.enroll(a.name, a.group));
         case "registerAviaryService": {
@@ -267,10 +287,10 @@ export class TenantDO extends DurableObject<Env> {
           return ok(await this.removeAcl(a.id));
         case "requestAccess":
           return ok(
-            await this.requestAccess(a.email, a.service, a.requestedBy),
+            await this.requestAccess(a.email, a.service, a.requestedBy, a.requestedByUserId),
           );
         case "setAccessStatus": {
-          const r = await this.setAccessStatus(a.id, a.status, a.resolvedBy);
+          const r = await this.setAccessStatus(a.id, a.status, a.resolvedBy, a.resolvedByUserId);
           if ("error" in r) return bad(400, r.error!);
           return ok(r);
         }
@@ -366,6 +386,8 @@ export class TenantDO extends DurableObject<Env> {
         typeof stored.cliTokenEpoch === "number" ? stored.cliTokenEpoch : 0,
       sessionEpoch:
         typeof stored.sessionEpoch === "number" ? stored.sessionEpoch : 0,
+      members: Array.isArray(stored.members) ? stored.members : [],
+      tenantMeta: stored.tenantMeta && typeof stored.tenantMeta === "object" ? stored.tenantMeta : undefined,
     };
   }
 
@@ -395,6 +417,7 @@ export class TenantDO extends DurableObject<Env> {
       usedTickets: {},
       cliTokenEpoch: 0,
       sessionEpoch: 0,
+      members: [],
       settings: {
         org: id,
         subdomain: "",
@@ -406,6 +429,8 @@ export class TenantDO extends DurableObject<Env> {
       },
     };
   }
+
+  private opResponse(r: any): Response { return r?.error ? bad(r.status ?? 400, r.error) : ok(r); }
 
   private async save(s: StoredState): Promise<void> {
     await this.ctx.storage.put("state", s);
@@ -513,6 +538,8 @@ export class TenantDO extends DurableObject<Env> {
 
     return {
       host: s.host,
+      tenant: s.tenantMeta,
+      members: s.members,
       services,
       boxes,
       keys: publicKeys,
@@ -1161,6 +1188,7 @@ export class TenantDO extends DurableObject<Env> {
     const normScope = this.normalizeScope(s, scope);
     if ("error" in normScope) return { error: normScope.error };
 
+    if (s.tenantMeta && (!owner || owner === "you")) owner = this.activeOwners(s)[0]?.email ?? owner;
     const plaintext = genFinchKey();
     const hash = await hashKey(plaintext);
     const now = Date.now();
@@ -1352,6 +1380,7 @@ export class TenantDO extends DurableObject<Env> {
     email: unknown,
     service: unknown,
     requestedBy: unknown,
+    requestedByUserId?: unknown,
   ): Promise<{ ok: boolean; request?: AccessRequest; error?: string }> {
     const em = typeof email === "string" ? email.trim().toLowerCase() : "";
     const svc = typeof service === "string" ? service.trim() : "";
@@ -1359,6 +1388,7 @@ export class TenantDO extends DurableObject<Env> {
     const by = typeof requestedBy === "string" && requestedBy ? requestedBy : "you";
 
     const s = await this.load();
+    if (!this.findService(s, svc)) return { ok: false, error: "unknown service" };
     const existing = s.accessRequests.find(
       (r) =>
         r.email === em &&
@@ -1391,6 +1421,7 @@ export class TenantDO extends DurableObject<Env> {
       email: em,
       service: svc,
       requestedBy: by,
+      ...(typeof requestedByUserId === "string" ? { requestedByUserId } : {}),
       status: "pending",
       created: Date.now(),
     };
@@ -1412,6 +1443,7 @@ export class TenantDO extends DurableObject<Env> {
     id: unknown,
     status: unknown,
     resolvedBy: unknown,
+    resolvedByUserId?: unknown,
   ): Promise<{ ok: boolean; request?: AccessRequest; error?: string }> {
     if (
       status !== "pending" &&
@@ -1427,6 +1459,7 @@ export class TenantDO extends DurableObject<Env> {
     req.status = status;
     req.resolvedBy =
       typeof resolvedBy === "string" && resolvedBy ? resolvedBy : "you";
+    if (typeof resolvedByUserId === "string") req.resolvedByUserId = resolvedByUserId;
     req.resolvedAt = Date.now();
     this.log(s, {
       cat: "access",
@@ -1515,6 +1548,116 @@ export class TenantDO extends DurableObject<Env> {
     if (!em) return { allowed: false };
     return { allowed: this.evalIdentAccess(s, this.userIdentities(s, em), svc) };
   }
+
+
+  // ---- native membership --------------------------------------------------
+  private actorMember(s: StoredState, actor: any): TenantMember | undefined {
+    return s.members.find(m => m.id === actor?.memberId && m.clerkUserId === actor?.clerkUserId && m.state === "active");
+  }
+  private activeOwners(s: StoredState): TenantMember[] { return s.members.filter(m=>m.role==="owner"&&m.state==="active"); }
+  private bump(s: StoredState): void { if(s.tenantMeta) s.tenantMeta.membershipVersion++; }
+  private rewriteYou(s: StoredState, email: string): void {
+    const owner=s.acl.find(r=>r.id==="r_owner"&&r.locked); if(owner) owner.src={type:"user",name:email};
+    for(const k of s.keys) if(!k.owner||k.owner==="you") k.owner=email;
+    for(const g of s.groups) g.members=[...new Set(g.members.map(x=>x==="you"?email:x))];
+  }
+  private async ensureOwner(clerkUserId: unknown, email: unknown): Promise<any> {
+    const uid=typeof clerkUserId==="string"?clerkUserId:"", em=typeof email==="string"?normalizeEmail(email):"";
+    const s=await this.load(); if(s.tenantMeta) return this.memberContext(uid);
+    if(!uid||!em||uid!==this.tenantId()) return {error:"personal workspace owner mismatch",status:403};
+    const now=Date.now(), member:TenantMember={id:"m_"+crypto.randomUUID().slice(0,8),tenantId:this.tenantId(),clerkUserId:uid,email:em,role:"owner",state:"active",createdAt:now,updatedAt:now,boundAt:now};
+    s.tenantMeta={id:this.tenantId(),kind:"personal",displayName:this.tenantId(),createdAt:now,bootstrappedFrom:"legacy-personal",membershipVersion:1}; s.members=[member]; this.rewriteYou(s,em);
+    this.log(s,{cat:"access",actor:member.id,action:"bootstrapped workspace",target:em,ip:""}); await this.save(s); return {member,tenantMeta:s.tenantMeta};
+  }
+  private async memberContext(clerkUserId: unknown, email?: unknown): Promise<any> {
+    const uid=typeof clerkUserId==="string"?clerkUserId:""; const s=await this.load();
+    if(!s.tenantMeta&&uid===this.tenantId()) { if(typeof email==="string"&&email) return this.ensureOwner(uid,email); return {member:null,tenantMeta:null,needsBootstrap:true}; }
+    const m=s.members.find(x=>x.clerkUserId===uid); return {member:m?{id:m.id,role:m.role,state:m.state,email:m.email}:null,tenantMeta:s.tenantMeta??null};
+  }
+  private async inviteMember(email:unknown,role:unknown,actor:any):Promise<any>{
+    const em=typeof email==="string"?normalizeEmail(email):""; if(!em||!['admin','member'].includes(String(role))) return {error:"invalid email or role",status:400};
+    const s=await this.load(), am=this.actorMember(s,actor); if(!am||am.role==="member") return {error:"admin role required",status:403};
+    const old=s.members.find(m=>normalizeEmail(m.email)===em); if(old){if(old.state==="disabled") return {error:"member is disabled; re-enable instead",status:409}; return {ok:true,member:old};}
+    if(s.members.length>=MAX_MEMBERS)return {error:"member limit reached",status:409}; const now=Date.now(); const member:TenantMember={id:"m_"+crypto.randomUUID().slice(0,8),tenantId:this.tenantId(),clerkUserId:null,email:em,role:role as FinchRole,state:"invited",invitedBy:am.id,createdAt:now,updatedAt:now}; s.members.push(member);this.bump(s);this.log(s,{cat:"access",actor:am.id,action:"invited member",target:em,ip:""});await this.save(s);return {ok:true,member};
+  }
+  private addAclState(s:StoredState,email:string,service:string):void{const src={type:"user",name:normalizeEmail(email)} as AclEntity,dst={type:"service",name:service} as AclEntity;if(!s.acl.some(r=>!r.locked&&entEq(r.src,src)&&r.dst.some(d=>entEq(d,dst))))s.acl.push({id:"r_"+crypto.randomUUID().slice(0,8),src,dst:[dst],action:"allow"});}
+  private bindIdentityState(s:StoredState,uid:string,list:string[],source:unknown):any{
+    if(s.members.some(m=>m.state==="disabled"&&(m.clerkUserId===uid||list.includes(normalizeEmail(m.email)))))return {error:"member is disabled",status:409,save:false};
+    const conflict=s.members.find(m=>m.clerkUserId&&m.clerkUserId!==uid&&list.includes(normalizeEmail(m.email)));if(conflict){this.log(s,{cat:"access",actor:uid,action:"bind-conflict",target:`${conflict.id} <${conflict.email}>`,ip:""});return {error:"email belongs to another identity",status:409,save:true};}
+    let member=s.members.find(m=>m.clerkUserId===uid); const matches=s.members.filter(m=>m.state==="invited"&&list.includes(normalizeEmail(m.email))); let changed=false; const consumed:string[]=[];
+    if(!member&&matches[0]) member=matches[0]; if(member){for(const dup of matches){if(dup!==member){s.members=s.members.filter(m=>m!==dup);changed=true;consumed.push(dup.email);}} if(member.clerkUserId!==uid||member.state!=="active"){member.clerkUserId=uid;member.state="active";member.boundAt=Date.now();member.updatedAt=Date.now();changed=true;consumed.push(member.email);} for(const r of s.accessRequests.filter(r=>r.status==="invited"&&list.includes(normalizeEmail(r.email)))){this.addAclState(s,member.email,r.service);r.status="granted";r.resolvedBy="identity-bind";r.resolvedAt=Date.now();changed=true;}}
+    if(changed){this.bump(s);this.log(s,{cat:"access",actor:uid,action:"bound identity",target:member?`${member.id} <${member.email}>`:String(source??"sync"),ip:""});} return {ok:true,changed,member,consumedEmails:[...new Set(consumed)],staleInviteEmails:list.filter(e=>!matches.some(m=>normalizeEmail(m.email)===e)),save:changed};
+  }
+  private async bindIdentity(clerkUserId:unknown,emails:unknown,source:unknown):Promise<any>{
+    const uid=typeof clerkUserId==="string"?clerkUserId:"", list=Array.isArray(emails)?[...new Set(emails.filter((x):x is string=>typeof x==="string").map(normalizeEmail))]:[]; const s=await this.load();
+    const out=this.bindIdentityState(s,uid,list,source);if(out.save)await this.save(s);delete out.save;return out;
+  }
+  private async adapterOrgMember(clerkUserId:unknown,emails:unknown,primaryEmail:unknown):Promise<any>{
+    const uid=typeof clerkUserId==="string"?clerkUserId:"";
+    const list=Array.isArray(emails)?[...new Set(emails.filter((x):x is string=>typeof x==="string").map(normalizeEmail))]:[];
+    const preferred=typeof primaryEmail==="string"&&list.includes(normalizeEmail(primaryEmail))?normalizeEmail(primaryEmail):list[0];
+    if(!uid||!preferred)return {error:"verified identity required",status:400};
+    const s=await this.load();
+    if(!s.tenantMeta?.clerkOrgId)return {error:"organization adapter is not mapped",status:409};
+    if(s.members.some(m=>m.state==="disabled"&&(m.clerkUserId===uid||list.includes(normalizeEmail(m.email)))))return {ok:true,skipped:"disabled"};
+    let member=s.members.find(m=>m.clerkUserId===uid||list.includes(normalizeEmail(m.email)));
+    let created=false;if(!member){if(s.members.length>=MAX_MEMBERS)return {error:"member limit reached",status:409};const now=Date.now();member={id:"m_"+crypto.randomUUID().slice(0,8),tenantId:this.tenantId(),clerkUserId:null,email:preferred,role:"member",state:"invited",createdAt:now,updatedAt:now};s.members.push(member);created=true;}
+    const out=this.bindIdentityState(s,uid,list,"clerk-org-adapter");if(out.error){if(out.save)await this.save(s);delete out.save;return out;}if(created&&!out.changed){this.bump(s);this.log(s,{cat:"access",actor:uid,action:"added organization member",target:`${member.id} <${member.email}>`,ip:""});out.changed=true;}if(created||out.save)await this.save(s);delete out.save;return out;
+  }
+  private async approveAccess(id:unknown,actor:any):Promise<any>{const s=await this.load(),am=this.actorMember(s,actor);if(!am||am.role==="member")return {error:"admin role required",status:403};const r=s.accessRequests.find(x=>x.id===id);if(!r)return {error:"unknown access request id",status:404};const em=normalizeEmail(r.email);if(r.status==="granted")return {ok:true,status:"granted",email:em};if(s.members.some(x=>normalizeEmail(x.email)===em&&x.state==="disabled"))return {error:"member is disabled; re-enable instead",status:409};let m=s.members.find(x=>normalizeEmail(x.email)===em);if(m?.state==="active"){this.addAclState(s,m.email,r.service);r.status="granted";}else{if(!m){if(s.members.length>=MAX_MEMBERS)return {error:"member limit reached",status:409};const now=Date.now();m={id:"m_"+crypto.randomUUID().slice(0,8),tenantId:this.tenantId(),clerkUserId:null,email:em,role:"member",state:"invited",invitedBy:am.id,createdAt:now,updatedAt:now};s.members.push(m);this.bump(s);}r.status="invited";}r.resolvedBy=actor?.label??am.email;r.resolvedByUserId=am.clerkUserId??undefined;r.resolvedAt=Date.now();this.log(s,{cat:"access",actor:am.id,action:`access ${r.status}`,target:`${r.email} → ${r.service}`,ip:""});await this.save(s);return {ok:true,status:r.status,email:em,member:m,memberCreated:m?.createdAt===m?.updatedAt};}
+  private authority(s:StoredState,actor:any,target?:TenantMember,ownerEdge=false):TenantMember|any{const am=this.actorMember(s,actor);if(!am||am.role==="member")return {error:"admin role required",status:403};if((ownerEdge||target?.role==="owner")&&am.role!=="owner")return {error:"owner role required",status:403};return am;}
+  private async setMemberRole(memberId:unknown,role:unknown,actor:any):Promise<any>{if(!['owner','admin','member'].includes(String(role)))return {error:"invalid role",status:400};const s=await this.load(),t=s.members.find(m=>m.id===memberId);if(!t)return {error:"member not found",status:404};const am=this.authority(s,actor,t,t.role==="owner"||role==="owner");if(am.error)return am;if(t.role===role)return {ok:true,member:t};if(am.id===t.id&&!(t.role==="owner"&&role!=="owner"&&this.activeOwners(s).length>1))return {error:"cannot change own role",status:409};if(t.role==="owner"&&role!=="owner"&&this.activeOwners(s).length<=1)return {error:"last active owner",status:409};const prior=t.role;t.role=role as FinchRole;t.updatedAt=Date.now();this.bump(s);this.log(s,{cat:"access",actor:am.id,action:`changed member role ${prior} → ${t.role}`,target:`${t.id} <${t.email}>`,ip:""});await this.save(s);return {ok:true,member:t};}
+  private stripGrants(s: StoredState, email: string): void {
+    const principal = normalizeEmail(email);
+    s.acl = s.acl.flatMap((rule) => {
+      if (rule.locked || rule.src.type !== "user" || normalizeEmail(rule.src.name ?? "") !== principal) return [rule];
+      // Membership removal revokes only service grants. Keep tag/group/all
+      // destinations and unrelated services intact.
+      const dst = rule.dst.filter((entry) => entry.type !== "service");
+      return dst.length ? [{ ...rule, dst }] : [];
+    });
+  }
+  private async setMemberState(memberId:unknown,state:unknown,revoke:boolean,actor:any):Promise<any>{if(state!=="active"&&state!=="disabled")return {error:"invalid state",status:400};const s=await this.load(),t=s.members.find(m=>m.id===memberId);if(!t)return {error:"member not found",status:404};if(t.state==="invited")return {error:"invited member must be canceled",status:409};const am=this.authority(s,actor,t);if(am.error)return am;if(t.state===state)return {ok:true,member:t};if(am.id===t.id)return {error:"cannot change own membership",status:409};if(state==="disabled"&&t.role==="owner"&&t.state==="active"&&this.activeOwners(s).length<=1)return {error:"last active owner",status:409};const prior=t.state;t.state=state;t.updatedAt=Date.now();if(state==="disabled")t.disabledAt=Date.now();else delete t.disabledAt;if(revoke)this.stripGrants(s,t.email);this.bump(s);this.log(s,{cat:"access",actor:am.id,action:`changed member state ${prior} → ${t.state}${revoke?" and revoked grants":""}`,target:`${t.id} <${t.email}>`,ip:""});await this.save(s);return {ok:true,member:t};}
+  private async removeMember(memberId:unknown,revoke:boolean,actor:any):Promise<any>{const s=await this.load(),t=s.members.find(m=>m.id===memberId);if(!t)return {error:"member not found",status:404};const am=this.authority(s,actor,t);if(am.error)return am;if(am.id===t.id)return {error:"cannot change own membership",status:409};if(t.role==="owner"&&t.state==="active"&&this.activeOwners(s).length<=1)return {error:"last active owner",status:409};let removed="disabled";if(t.state==="invited"){s.members=s.members.filter(m=>m!==t);removed="canceled";}else{t.state="disabled";t.disabledAt=Date.now();t.updatedAt=Date.now();}if(revoke)this.stripGrants(s,t.email);this.bump(s);this.log(s,{cat:"access",actor:am.id,action:`${removed==="canceled"?"canceled invitation":"disabled member"}${revoke?" and revoked grants":""}`,target:`${t.id} <${t.email}>`,ip:""});await this.save(s);return {ok:true,removed,member:t};}
+  private async bootstrapMembers(a: any): Promise<any> {
+    const s = await this.load();
+    if (s.tenantMeta) {
+      if (a.clerkOrgId && s.tenantMeta.clerkOrgId === a.clerkOrgId) return { ok: true, already: true, members: s.members };
+      return { error: "tenant already bootstrapped", status: 409 };
+    }
+    const input = Array.isArray(a.members) ? a.members : [];
+    if (!input.length) return { error: "at least one member required", status: 400 };
+    if (input.length > MAX_MEMBERS) return { error: "member limit reached", status: 409 };
+    const seenEmails = new Set<string>();
+    const seenUsers = new Set<string>();
+    for (const member of input) {
+      const email = typeof member?.email === "string" ? normalizeEmail(member.email) : "";
+      const userId = typeof member?.clerkUserId === "string" ? member.clerkUserId : null;
+      if (!email || !["owner", "admin", "member"].includes(member?.role) || !["active", "invited"].includes(member?.state)) return { error: "invalid member", status: 400 };
+      if (member.state === "active" && !userId) return { error: "active member requires identity", status: 400 };
+      if (seenEmails.has(email) || (userId && seenUsers.has(userId))) return { error: "duplicate member identity", status: 409 };
+      seenEmails.add(email);
+      if (userId) seenUsers.add(userId);
+    }
+    const now = Date.now();
+    const members: TenantMember[] = input.map((member: any) => ({
+      id: "m_" + crypto.randomUUID().slice(0, 8), tenantId: this.tenantId(),
+      clerkUserId: member.clerkUserId ?? null, email: normalizeEmail(member.email),
+      role: member.role, state: member.state, createdAt: now, updatedAt: now,
+      ...(member.state === "active" ? { boundAt: now } : {}),
+    }));
+    const owner = members.find((member) => member.role === "owner" && member.state === "active" && member.clerkUserId === a.claimantClerkUserId);
+    if (!owner) return { error: "claimant must be active owner", status: 403 };
+    s.tenantMeta = { id: this.tenantId(), kind: "team", displayName: String(a.displayName || this.tenantId()), createdAt: now, clerkOrgId: a.clerkOrgId, bootstrappedFrom: a.bootstrappedFrom, membershipVersion: 1 };
+    s.members = members;
+    this.rewriteYou(s, owner.email);
+    this.log(s,{cat:"access",actor:owner.id,action:"bootstrapped workspace",target:`${this.tenantId()} (${members.map(m=>`${m.id} <${m.email}>`).join(", ")})`,ip:""});
+    await this.save(s);
+    return { ok: true, members, tenantMeta: s.tenantMeta };
+  }
+  private async gateBrowser(a:any):Promise<any>{const s=await this.load();if((a.epoch??0)!==(s.sessionEpoch??0))return {allowed:false,reason:"epoch"};const svc=this.findService(s,String(a.service||""));if(svc?.auth==="public")return {allowed:true,public:true};if(s.tenantMeta){const m=s.members.find(x=>x.clerkUserId===a.clerkUserId&&x.state==="active");if(!m)return {allowed:false,reason:"membership"};if(m.role!=="member")return {allowed:true,role:m.role};return {allowed:this.evalIdentAccess(s,this.userIdentities(s,m.email),a.service),reason:"acl",role:m.role};}if(a.clerkUserId===this.tenantId())return {allowed:true};return a.email?{allowed:this.evalIdentAccess(s,this.userIdentities(s,normalizeEmail(a.email)),a.service),reason:"acl"}:{allowed:false,reason:"needs-email"};}
+  private async gateOauth(a:any):Promise<any>{const s=await this.load();const svc=this.findService(s,String(a.service||""));if(svc?.auth==="public")return {allowed:true,public:true};if(s.tenantMeta){const m=s.members.find(x=>x.clerkUserId===a.clerkUserId&&x.state==="active");if(!m)return {allowed:false,reason:"membership"};if(m.role!=="member")return {allowed:true,role:m.role};return {allowed:this.evalIdentAccess(s,this.userIdentities(s,m.email),a.service),reason:"acl",role:m.role};}if(a.clerkUserId===this.tenantId())return {allowed:true};if(a.orgIdClaim===this.tenantId())return a.email?{allowed:this.evalIdentAccess(s,this.userIdentities(s,normalizeEmail(a.email)),a.service),reason:"acl"}:{allowed:false,reason:"no-email"};return {allowed:false,reason:"membership"};}
+  private async legacyClaimStatus():Promise<any>{const s=await this.load();return {migrated:!!s.tenantMeta,hasState:s.services.length>0||s.keys.length>0||!!s.settings.subdomain};}
 
   // ---- mutations: settings ------------------------------------------------
 

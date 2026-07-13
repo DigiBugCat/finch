@@ -21,7 +21,7 @@ import type { AccessInfo } from './data';
 
 export default function DashboardApp() {
   const { user } = useUser();
-  const { state, loading, error, refetch } = useFinchState();
+  const { state, tenants, loading, error, refetch } = useFinchState();
 
   const [view, setView] = useState("overview");
   const [openId, setOpenId] = useState<any>(null);
@@ -155,10 +155,8 @@ export default function DashboardApp() {
   //     org the picked owner is sent verbatim (the admin scopes ACL per user),
   //     so this never silently widens a multi-user tenant's access.
   const mintKey = ({ label, owner, scope }: any) => {
-    const soleOwner = users.length <= 1;
-    const ownerIdentity = soleOwner ? "you" : owner;
     return mutate(`/api/finch/keys`,
-      { method: "POST", body: JSON.stringify({ label, owner: ownerIdentity, scope: scope ?? { all: true } }) },
+      { method: "POST", body: JSON.stringify({ label, owner, scope: scope ?? { all: true } }) },
       `🔑 key minted — ${label}`, `couldn't mint ${label}`);
   };
 
@@ -168,18 +166,24 @@ export default function DashboardApp() {
       "🔑 key revoked", "couldn't revoke key");
 
   // --- user actions (Clerk-backed via the bridge) ------------------
-  const inviteUser = ({ email, role }: any) =>
-    void mutate(`/api/finch/users/invite`,
+  const inviteUser = async ({ email, role }: any) => {
+    const resp = await mutate(`/api/finch/users/invite`,
       { method: "POST", body: JSON.stringify({ email, role }) },
-      `✉ invite sent to ${email}`, `couldn't invite ${email}`);
+      undefined, `couldn't invite ${email}`);
+    if (!resp) return;
+    if (resp.delivery === "sent") flash(`invite sent to ${email}`);
+    else if (resp.delivery === "failed") flash(`${email} was added, but invitation delivery failed — use Resend`);
+    else flash(`${email} was added and can sign in`);
+  };
 
   const setUserRole = (id: any, role: any) =>
     void mutate(`/api/finch/users/${encodeURIComponent(id)}/role`,
       { method: "POST", body: JSON.stringify({ role }) }, undefined, "couldn't set role");
 
-  const removeUser = (id: any) =>
+  const removeUser = (id: any, revokeGrants = false) =>
     void mutate(`/api/finch/users/${encodeURIComponent(id)}`,
-      { method: "DELETE" }, "teammate removed", "couldn't remove teammate");
+      { method: "DELETE", body: JSON.stringify({ revokeGrants }) }, "teammate removed", "couldn't remove teammate");
+  const enableUser = (id: any) => void mutate(`/api/finch/users/${encodeURIComponent(id)}/enable`, { method: "POST", body: "{}" }, "teammate re-enabled");
 
   // --- access (app sharing) -----------------------------------------
   // The request queue + user grants live behind GET /api/finch/access (DO
@@ -192,7 +196,7 @@ export default function DashboardApp() {
       if (res.ok) setAccess(await res.json());
     } catch (_) { /* non-fatal: the view renders empty */ }
   }, []);
-  useEffect(() => { void refetchAccess(); }, [refetchAccess]);
+  useEffect(() => { if (state?.callerRole === "owner" || state?.callerRole === "admin") void refetchAccess(); }, [refetchAccess, state?.callerRole]);
 
   // mutate() then refresh the access snapshot too (mutate only refetches state)
   const accessMutate = useCallback(async (path: string, body: any, okMsg?: string, failMsg?: string) => {
@@ -238,10 +242,31 @@ export default function DashboardApp() {
   const current = services.find((a: any) => a.id === openId);
   const online = services.filter((a: any) => isOnline(a.state)).length;
 
-  const nav = [
+  const isAdmin = state?.callerRole !== "member";
+  const nav = isAdmin ? [
     ["overview", "Fleet"], ["home", "Observability"], ["keys", "Keys"],
     ["users", "Users"], ["access", "Access"], ["logs", "Logs"], ["settings", "Settings"],
-  ];
+  ] : [["overview", "Fleet"], ["home", "Observability"], ["logs", "Logs"]];
+  useEffect(() => { if (!isAdmin && !["overview","home","detail","logs"].includes(view)) setView("overview"); }, [isAdmin, view]);
+  const selectWorkspace = async (tenantId:string) => { const res=await fetch("/api/finch/tenants/select",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({tenantId})});if(res.ok)window.location.reload();else flash("couldn't switch workspace"); };
+  const createWorkspace = async () => {
+    const name = window.prompt("Workspace name")?.trim();
+    if (!name) return;
+    const res = await fetch("/api/finch/tenants/create", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name }) });
+    const body = await res.json().catch(() => ({}));
+    if (res.ok) window.location.reload(); else flash(body.error || "couldn't create workspace");
+  };
+  const claimWorkspace = async (clerkOrgId: string) => {
+    if (!window.confirm("Import this legacy Clerk organization into Finch? Roles become a Finch-owned snapshot.")) return;
+    const res = await fetch("/api/finch/tenants/claim", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ clerkOrgId }) });
+    const body = await res.json().catch(() => ({}));
+    if (res.ok) window.location.reload(); else flash(body.error || "couldn't claim workspace");
+  };
+  const chooseWorkspace = (value: string) => {
+    if (value === "__create") void createWorkspace();
+    else if (value.startsWith("__claim:")) void claimWorkspace(value.slice("__claim:".length));
+    else void selectWorkspace(value);
+  };
 
   // ----- loading / error gate --------------------------------------
   const showLoading = loading && !state;
@@ -256,7 +281,12 @@ export default function DashboardApp() {
             {host && <span className="host-chip mono">{host}</span>}
           </a>
           <div className="user">
-            <span className="admin-badge">admin</span>
+            <select aria-label="Workspace" className="role-select" value={tenants?.activeTenant ?? state?.workspace.id ?? ""} onChange={(e)=>chooseWorkspace(e.target.value)}>
+              {(tenants?.tenants ?? []).map((t)=><option key={t.tenantId} value={t.tenantId} disabled={t.state!=="active"}>{t.name ?? t.tenantId} · {t.kind ?? "workspace"}</option>)}
+              <option value="__create">Create workspace…</option>
+              {(tenants?.claimable ?? []).map((claim)=><option key={claim.clerkOrgId} value={`__claim:${claim.clerkOrgId}`}>Claim {claim.name ?? claim.clerkOrgId}…</option>)}
+            </select>
+            <span className="admin-badge">{state?.callerRole ?? "member"}</span>
             <span className="user-name">{user?.firstName || user?.username || 'you'}</span>
             <UserButton />
           </div>
@@ -279,26 +309,29 @@ export default function DashboardApp() {
         {showLoading && (
           <div className="view"><Card><p className="dim" style={{ padding: 20 }}>Loading your services…</p></Card></div>
         )}
-        {!showLoading && error && !state && (
+        {!showLoading && tenants?.needsVerifiedEmail && (
+          <div className="view"><Card><p className="dim" style={{ padding: 20 }}>Verify an email address to finish setting up your workspace.</p></Card></div>
+        )}
+        {!showLoading && error && !state && !tenants?.needsVerifiedEmail && (
           <div className="view"><Card><p className="dim" style={{ padding: 20 }}>Couldn’t load services: {error}</p></Card></div>
         )}
 
-        {!showLoading && state && (
+        {!showLoading && state && !tenants?.needsVerifiedEmail && (
           <>
             {view === "home" && (
               <HomeView services={services} boxes={boxes} overview={overview} host={host}
-                onOpen={openDevice} onApprove={approveDevice} onAddDevice={onAddDevice} />
+                onOpen={openDevice} onApprove={approveDevice} onAddDevice={onAddDevice} canManage={isAdmin} />
             )}
             {view === "overview" && (
               <FleetView services={services} boxes={boxes} overview={overview} host={host}
-                groups={groups} onOpen={openDevice} onRelease={releaseDevice} onAddDevice={onAddDevice}
-                layout={layout} setLayout={setLayout} />
+                groups={groups} onOpen={openDevice} onRelease={isAdmin ? releaseDevice : undefined} onAddDevice={onAddDevice}
+                layout={layout} setLayout={setLayout} canManage={isAdmin} />
             )}
             {view === "detail" && current && (
               <DetailView app={current} host={host} onBack={() => go("overview")}
                 onRelease={releaseDevice} onTags={setTags} onApprove={approveDevice} onDecline={declineDevice}
                 onRevokeBoxKey={revokeBoxKey} onUpdateBox={updateBox}
-                access={access} users={users} onShareAccess={requestAccess} />
+                access={access} users={users} onShareAccess={requestAccess} canManage={isAdmin} />
             )}
             {view === "detail" && !current && (
               <div className="view"><button className="backlink" onClick={() => go("overview")}>← Fleet</button>
@@ -311,7 +344,7 @@ export default function DashboardApp() {
               <KeysView keys={keys} users={users} onMint={mintKey} onRevoke={revokeKey} />
             )}
             {view === "users" && (
-              <UsersView users={users} onInvite={inviteUser} onRole={setUserRole} onRemove={removeUser} />
+              <UsersView users={users} onInvite={inviteUser} onRole={setUserRole} onRemove={removeUser} onEnable={enableUser} />
             )}
             {view === "access" && (
               <AccessView services={services} groups={groups} keys={keys} acl={acl} users={users}
