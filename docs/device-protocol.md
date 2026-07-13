@@ -155,8 +155,9 @@ This is deliberately tiny — an ESP32 in C:
 5. Send `ping` at `ping_interval`; reconnect with backoff on drop.
 
 Everything else — MCP `initialize`, session-id, SSE, capability negotiation,
-auth at the door, identity (`X-Finch-User`), the public URL — is the **hub's**
-job. The device only ever sees `{tool, args} → {result}`.
+auth at the door, and signed caller assertions (`X-Finch-Assertion` for
+assertion-aware proxy services) — is the **hub's** job. The device only ever
+sees `{tool, args} → {result}`.
 
 ## Provisioning (the genuinely hard part — flagged, not solved)
 

@@ -33,8 +33,9 @@ export async function signAssertion(
   tenant: string,
   secret: string,
   nowSeconds: number = Math.floor(Date.now() / 1000),
+  kind?: string,
 ): Promise<string> {
-  const payload = { tenant, exp: nowSeconds + ASSERTION_TTL_SECONDS };
+  const payload = { tenant, exp: nowSeconds + ASSERTION_TTL_SECONDS, ...(kind ? { kind } : {}) };
   const body = bytesToB64url(te.encode(JSON.stringify(payload)));
   const key = await crypto.subtle.importKey(
     "raw",

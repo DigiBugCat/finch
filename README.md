@@ -105,8 +105,10 @@ single-box service — server-initiated sampling/elicitation. Pause/resume
 - ✅ One-tag release pipeline (GoReleaser) + a `curl | sh` installer
 - ✅ Full-stack e2e + CI gates on all three packages (`go test -race`, vitest, typecheck/lint)
 
-**Roadmap (v1.1+):** a stdio↔Streamable-HTTP bridge (host non-HTTP servers),
-edge identity injection (`X-Finch-User`), and multi-box session affinity.
+**Roadmap (v1.1+):** a stdio↔Streamable-HTTP bridge (host non-HTTP servers) and
+multi-box session affinity. Authenticated caller identity already travels as a
+signed `X-Finch-Assertion` for assertion-aware services; see
+[`worker/CALLER_ASSERTIONS.md`](worker/CALLER_ASSERTIONS.md).
 
 ## Use it
 

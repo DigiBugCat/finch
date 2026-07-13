@@ -1,98 +1,17 @@
 "use client";
-// useFinchState — client hook that loads the live TenantState from the Next
-// bridge (/api/finch/state -> hub /api/state + Clerk users). Returns the state
-// plus loading/error flags and a `refetch` the dashboard calls after every
-// mutation so the UI reflects real hub state.
-
 import { useCallback, useEffect, useRef, useState } from "react";
-import type { TenantState } from "@/components/dash/data";
+import type { TenantState, TenantsResponse } from "./data";
 
-export interface UseFinchState {
-  state: TenantState | null;
-  loading: boolean;
-  error: string | null;
-  refetch: () => Promise<void>;
-}
-
-export function useFinchState(): UseFinchState {
-  const [state, setState] = useState<TenantState | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  // guards against setState after unmount (StrictMode double-mount / nav away)
-  const alive = useRef(true);
-
-  const refetch = useCallback(async () => {
-    try {
-      const res = await fetch("/api/finch/state", {
-        headers: { accept: "application/json" },
-        cache: "no-store",
-      });
-      const body = (await res.json().catch(() => ({}))) as
-        | TenantState
-        | { error?: string };
-      if (!res.ok) {
-        const msg = (body as { error?: string })?.error || `HTTP ${res.status}`;
-        if (alive.current) setError(msg);
-        return;
-      }
-      if (alive.current) {
-        setState(body as TenantState);
-        setError(null);
-      }
-    } catch (e) {
-      if (alive.current) {
-        setError(e instanceof Error ? e.message : "failed to load state");
-      }
-    } finally {
-      if (alive.current) setLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    alive.current = true;
-    void refetch();
-    return () => {
-      alive.current = false;
-    };
-  }, [refetch]);
-
-  // Live polling so box-phones-home, online/offline flips, approvals and call
-  // counts surface without the user acting — backing the "appears the moment it
-  // connects" copy. The refetch is idempotent; we pause it while the tab is
-  // hidden (no point polling a backgrounded tab) and resume on focus, firing an
-  // immediate refetch so a tab that's been away catches up at once.
-  useEffect(() => {
-    const PERIOD_MS = 7000;
-    let timer: ReturnType<typeof setInterval> | undefined;
-
-    const stop = () => {
-      if (timer !== undefined) {
-        clearInterval(timer);
-        timer = undefined;
-      }
-    };
-    const start = () => {
-      if (timer === undefined) {
-        timer = setInterval(() => void refetch(), PERIOD_MS);
-      }
-    };
-
-    const onVisibility = () => {
-      if (document.hidden) {
-        stop();
-      } else {
-        void refetch(); // catch up immediately on return
-        start();
-      }
-    };
-
-    if (!document.hidden) start();
-    document.addEventListener("visibilitychange", onVisibility);
-    return () => {
-      document.removeEventListener("visibilitychange", onVisibility);
-      stop();
-    };
-  }, [refetch]);
-
-  return { state, loading, error, refetch };
+export function useFinchState() {
+  const [state,setState]=useState<TenantState|null>(null);
+  const [tenants,setTenants]=useState<TenantsResponse|null>(null);
+  const [loading,setLoading]=useState(true);
+  const [error,setError]=useState<string|null>(null);
+  const alive=useRef(true);
+  const verificationBlocked=useRef(false);
+  const bootstrap=useCallback(async()=>{const res=await fetch("/api/finch/tenants",{cache:"no-store"});const body=await res.json().catch(()=>({}));if(!res.ok)throw new Error(body.error||`HTTP ${res.status}`);verificationBlocked.current=body.needsVerifiedEmail===true;if(alive.current)setTenants(body);return body as TenantsResponse;},[]);
+  const refetch=useCallback(async()=>{if(verificationBlocked.current){if(alive.current){setError(null);setLoading(false);}return;}try{const res=await fetch("/api/finch/state",{headers:{accept:"application/json"},cache:"no-store"});const body=await res.json().catch(()=>({}));if(!res.ok){if(res.status===403){const refreshed=await bootstrap();const personal=refreshed.tenants.find(t=>t.kind==="personal"&&t.state==="active")?.tenantId;if(personal){const selected=await fetch("/api/finch/tenants/select",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({tenantId:personal})});if(selected.ok){window.location.reload();return;}}}throw new Error(body.error||`HTTP ${res.status}`);}if(alive.current){setState(body);setError(null);}}catch(e){if(alive.current)setError(e instanceof Error?e.message:"failed to load state");}finally{if(alive.current)setLoading(false);}},[bootstrap]);
+  useEffect(()=>{alive.current=true;(async()=>{try{const initial=await bootstrap();if(initial.needsVerifiedEmail){if(alive.current){setError(null);setLoading(false);}return;}await refetch();}catch(e){if(alive.current){setError(e instanceof Error?e.message:"failed to bootstrap");setLoading(false);}}})();return()=>{alive.current=false};},[bootstrap,refetch]);
+  useEffect(()=>{const timer=setInterval(()=>{if(!document.hidden&&!verificationBlocked.current)void refetch()},7000);return()=>clearInterval(timer);},[refetch]);
+  return {state,tenants,loading,error,refetch,refetchTenants:bootstrap};
 }

@@ -23,7 +23,7 @@ function GroupHead({ name, apps, meta }: any) {
   );
 }
 
-export function FleetView({ services, boxes, overview, host, groups, onOpen, onRelease, onAddDevice, layout, setLayout }: any) {
+export function FleetView({ services, boxes, overview, host, groups, onOpen, onRelease, onAddDevice, layout, setLayout, canManage = true }: any) {
   const [lens, setLens] = useState("services"); // services | boxes
   const [groupFilter, setGroupFilter] = useState("all");
   const [search, setSearch] = useState("");
@@ -74,7 +74,7 @@ export function FleetView({ services, boxes, overview, host, groups, onOpen, onR
           <h1 className="page-title">Fleet</h1>
           <p className="page-lede">All your services, organized into groups. Switch to <b>Boxes</b> for the box-level view.</p>
         </div>
-        <Button kind="accent" onClick={onAddDevice}>＋ Add box</Button>
+        {canManage && <Button kind="accent" onClick={onAddDevice}>＋ Add box</Button>}
       </div>
 
       {/* lens toggle */}
@@ -109,7 +109,7 @@ export function FleetView({ services, boxes, overview, host, groups, onOpen, onR
                 {name} <span className="ct">{(byGroupAll[name] || []).length}</span>
               </button>
             ))}
-            {newOpen ? (
+            {canManage && (newOpen ? (
               <span className="group-new">
                 <DuskInput value={newName} onChange={setNewName} placeholder="group name" mono={false} autoFocus />
                 <Button kind="accent" size="md" onClick={addGroup}>Add</Button>
@@ -117,7 +117,7 @@ export function FleetView({ services, boxes, overview, host, groups, onOpen, onR
               </span>
             ) : (
               <button className="group-chip group-chip-new" onClick={() => setNewOpen(true)}>＋ New group</button>
-            )}
+            ))}
           </div>
 
           <div className="fleet-toolbar">
@@ -140,7 +140,7 @@ export function FleetView({ services, boxes, overview, host, groups, onOpen, onR
                     ? renderRows(list)
                     : <Card className="group-empty">
                         <div className="dim">{q ? "No matches in this group." : "No services in this group yet."}</div>
-                        {!q && <Button kind="ghost" size="md" onClick={onAddDevice}>＋ Add one</Button>}
+                        {!q && canManage && <Button kind="ghost" size="md" onClick={onAddDevice}>＋ Add one</Button>}
                       </Card>}
                 </div>
               );

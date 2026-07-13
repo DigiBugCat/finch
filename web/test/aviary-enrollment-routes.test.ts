@@ -11,6 +11,8 @@ process.env.FINCH_SERVICE_SECRET = "test-service-secret";
 import { POST as describeEnrollment } from "@/app/api/finch/aviary-describe/route";
 import { POST as approveEnrollment } from "@/app/api/finch/aviary-approve/route";
 import { POST as denyEnrollment } from "@/app/api/finch/aviary-deny/route";
+let currentUser = ""; let userSeq = 0;
+const ownerContext = () => Response.json({ member: { id: "m_owner", role: "owner", state: "active", email: "owner@example.com" }, tenantMeta: { id: currentUser } });
 
 function request(path: string, body: unknown): Request {
   return new Request(`https://app.example.com${path}`, {
@@ -23,8 +25,9 @@ function request(path: string, body: unknown): Request {
 beforeEach(() => {
   authMock.mockReset();
   vi.restoreAllMocks();
+  currentUser = `user_approver_${userSeq++}`;
   authMock.mockResolvedValue({
-    userId: "user_approver",
+    userId: currentUser,
     orgId: "org_aviary",
     orgRole: "org:admin",
   });
@@ -37,7 +40,7 @@ describe("Aviary service enrollment BFF", () => {
       orgId: "org_aviary",
       orgRole: "org:member",
     });
-    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(Response.json({ member: { id: "m_member", role: "member", state: "active", email: "member@example.com" }, tenantMeta: { id: "user_member" } }));
 
     const response = await describeEnrollment(request(
       "/api/finch/aviary-describe",
@@ -45,7 +48,7 @@ describe("Aviary service enrollment BFF", () => {
     ));
 
     expect(response.status).toBe(403);
-    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
   });
 
   it("normalizes and forwards the short code without adding secrets", async () => {
@@ -62,7 +65,7 @@ describe("Aviary service enrollment BFF", () => {
       },
       manifest_sha256: "sha256",
     };
-    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(ownerContext()).mockResolvedValueOnce(
       Response.json(hubBody),
     );
 
@@ -72,7 +75,7 @@ describe("Aviary service enrollment BFF", () => {
     ));
 
     expect(response.status).toBe(200);
-    const [url, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    const [url, init] = fetchSpy.mock.calls[1] as [string, RequestInit];
     expect(url).toBe("https://hub.example.com/api/aviary/device/describe");
     expect(JSON.parse(init.body as string)).toEqual({ user_code: "WXYZ-2K7Q" });
     const headers = new Headers(init.headers);
@@ -82,7 +85,7 @@ describe("Aviary service enrollment BFF", () => {
   });
 
   it("injects the Clerk actor and only accepts literal true for public approval", async () => {
-    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(ownerContext()).mockResolvedValueOnce(
       Response.json({ ok: true, status: "approved" }),
     );
 
@@ -96,11 +99,11 @@ describe("Aviary service enrollment BFF", () => {
     ));
 
     expect(response.status).toBe(200);
-    const [url, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    const [url, init] = fetchSpy.mock.calls[1] as [string, RequestInit];
     expect(url).toBe("https://hub.example.com/api/aviary/device/approve");
     expect(JSON.parse(init.body as string)).toEqual({
       user_code: "WXYZ-2K7Q",
-      approver: "user_approver",
+      approver: currentUser,
       public_approved: false,
     });
   });
@@ -112,7 +115,7 @@ describe("Aviary service enrollment BFF", () => {
         message: "that app path is already owned",
       },
     };
-    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(ownerContext()).mockResolvedValueOnce(
       Response.json(collision, { status: 409 }),
     );
 
@@ -122,13 +125,13 @@ describe("Aviary service enrollment BFF", () => {
     ));
 
     expect(response.status).toBe(409);
-    const [, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    const [, init] = fetchSpy.mock.calls[1] as [string, RequestInit];
     expect(JSON.parse(init.body as string).public_approved).toBe(true);
     expect(await response.json()).toEqual(collision);
   });
 
   it("denies with a server-owned actor and reason", async () => {
-    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(ownerContext()).mockResolvedValueOnce(
       Response.json({ ok: true, status: "denied" }),
     );
 
@@ -142,11 +145,11 @@ describe("Aviary service enrollment BFF", () => {
     ));
 
     expect(response.status).toBe(200);
-    const [url, init] = fetchSpy.mock.calls[0] as [string, RequestInit];
+    const [url, init] = fetchSpy.mock.calls[1] as [string, RequestInit];
     expect(url).toBe("https://hub.example.com/api/aviary/device/deny");
     expect(JSON.parse(init.body as string)).toEqual({
       user_code: "WXYZ-2K7Q",
-      approver: "user_approver",
+      approver: currentUser,
       reason: "Denied from the Finch Aviary authorization page",
     });
   });

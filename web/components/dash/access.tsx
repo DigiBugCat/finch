@@ -1,5 +1,6 @@
 "use client";
-// Roost — Access: ACL rules (by tag / group / key) + generated raw policy.
+// Roost — Access: app sharing (request queue + user grants), ACL rules
+// (by tag / group / key), and the generated raw policy.
 import { useState } from 'react';
 import { Button, Card, CopyChip, EntityChip, InlineConfirm, SectionLabel } from '@/components/dash/primitives';
 
@@ -16,8 +17,71 @@ function tokenDst(d: any) {
   return d.name; // service
 }
 
-export function AccessView({ services, groups, keys, acl, users, onAdd, onRemove }: any) {
-  const [mode, setMode] = useState("rules"); // rules | policy
+// status → chip class (Sharing tables + per-service card in fleet.tsx)
+export function AccessChip({ status }: any) {
+  return <span className={`axs-chip axs-${status}`}>{status}</span>;
+}
+
+// ---- Sharing — pending requests + per-user grants ----------------
+function SharingTab({ requests, grants, onApprove, onDeny, onRevoke }: any) {
+  const open = requests.filter((r: any) => r.status === "pending" || r.status === "invited");
+  return (
+    <>
+      <Card className="table-card">
+        <SectionLabel hint="approve to grant the app — non-members get a Clerk invite first">pending requests</SectionLabel>
+        {open.length ? (
+          <>
+            <div className="arow arow-head">
+              <span>who</span><span>app</span><span>requested by</span><span>status</span><span></span>
+            </div>
+            {open.map((r: any) => (
+              <div key={r.id} className="arow">
+                <span className="mono">{r.email}</span>
+                <span><EntityChip ent={{ type: "service", name: r.service }} /></span>
+                <span className="mono dim">{r.requestedBy}</span>
+                <span>
+                  <AccessChip status={r.status} />
+                  {r.status === "invited" && <span className="dim axs-note">awaiting join</span>}
+                </span>
+                <span className="a-act">
+                  {r.status === "pending"
+                    ? <>
+                        <Button kind="accent" size="sm" onClick={() => onApprove?.(r.id)}>Approve</Button>
+                        <Button kind="ghost" size="sm" onClick={() => onDeny?.(r.id)}>Deny</Button>
+                      </>
+                    : <InlineConfirm prompt="revoke?" trigger="revoke" onConfirm={() => onRevoke?.({ id: r.id })} />}
+                </span>
+              </div>
+            ))}
+          </>
+        ) : <div className="dim group-empty-pad">No pending requests.</div>}
+      </Card>
+
+      <Card className="table-card">
+        <SectionLabel hint="per-user app grants — enforced at the door">grants</SectionLabel>
+        {grants.length ? (
+          <>
+            <div className="arow arow-grant arow-head">
+              <span>who</span><span>app</span><span></span>
+            </div>
+            {grants.map((g: any) => (
+              <div key={g.id} className="arow arow-grant">
+                <span><EntityChip ent={g.src} /></span>
+                <span className="rule-dsts">{g.dst.map((d: any, i: number) => <EntityChip key={i} ent={d} />)}</span>
+                <span className="a-act">
+                  <InlineConfirm prompt="revoke?" trigger="revoke" onConfirm={() => onRevoke?.({ ruleId: g.id })} />
+                </span>
+              </div>
+            ))}
+          </>
+        ) : <div className="dim group-empty-pad">No user grants yet — share an app from its detail page.</div>}
+      </Card>
+    </>
+  );
+}
+
+export function AccessView({ services, groups, keys, acl, users, onAdd, onRemove, requests = [], grants = [], onApprove, onDeny, onRevoke }: any) {
+  const [mode, setMode] = useState("sharing"); // sharing | rules | policy
   const [dst, setDst] = useState<any[]>([]);
 
   const allTags = [...new Set(services.flatMap((a: any) => a.tags || []))];
@@ -59,12 +123,16 @@ export function AccessView({ services, groups, keys, acl, users, onAdd, onRemove
       <p className="page-lede">Who can reach what. Every rule is enforced at the door — before a request ever touches a box. Tag your services, then grant access by tag, group, or key.</p>
 
       <div className="client-tabs" style={{ margin: "4px 0 0" }}>
-        {[["rules", "Rules"], ["policy", "Raw policy"]].map(([k, l]) => (
+        {[["sharing", "Sharing"], ["rules", "Rules"], ["policy", "Raw policy"]].map(([k, l]) => (
           <button key={k} className={`ctab ${mode === k ? "ctab-on" : ""}`} onClick={() => setMode(k)}>{l}</button>
         ))}
       </div>
 
-      {mode === "rules" ? (
+      {mode === "sharing" && (
+        <SharingTab requests={requests} grants={grants} onApprove={onApprove} onDeny={onDeny} onRevoke={onRevoke} />
+      )}
+
+      {mode === "rules" && (
         <>
           <Card className="rule-builder">
             <select className="acl-select" value={srcVal} onChange={(e) => setSrcVal(e.target.value)}>
@@ -98,7 +166,9 @@ export function AccessView({ services, groups, keys, acl, users, onAdd, onRemove
             ))}
           </Card>
         </>
-      ) : (
+      )}
+
+      {mode === "policy" && (
         <Card className="policy-card">
           <SectionLabel hint="generated from your rules — the source of truth at the door">policy.json</SectionLabel>
           <div className="snippet">
