@@ -1,0 +1,6 @@
+import "server-only";
+import { clerkClient } from "@clerk/nextjs/server";
+const norm=(s:string)=>s.trim().toLowerCase();
+export interface SyncedIdentity { emails:string[]; primaryEmail?:string; adminOrgIds:string[]; }
+export function organizationsUnavailable(err:any):boolean{const code=String(err?.errors?.[0]?.code??err?.code??"");return code==="organization_not_enabled_in_instance"||code.includes("not_found");}
+export async function syncIdentity(clerkUserId:string,{includeOrgs=false}:{includeOrgs?:boolean}={}):Promise<SyncedIdentity>{const clerk=await clerkClient();const user=await clerk.users.getUser(clerkUserId);const verified=user.emailAddresses.filter(e=>e.verification?.status==="verified");const emails=[...new Set(verified.map(e=>norm(e.emailAddress)))];const primary=verified.find(e=>e.id===user.primaryEmailAddressId)??verified[0];const adminOrgIds:string[]=[];if(includeOrgs)try{let offset=0;for(;;){const page=await clerk.users.getOrganizationMembershipList({userId:clerkUserId,limit:100,offset});for(const m of page.data)if(m.role==="org:admin"||m.role==="admin")adminOrgIds.push(m.organization.id);if(page.data.length<100)break;offset+=100;}}catch(e){if(!organizationsUnavailable(e))throw e;}return {emails,...(primary?{primaryEmail:norm(primary.emailAddress)}:{}),adminOrgIds};}

@@ -30,14 +30,15 @@
     // Activates the OAuth plane (RFC 9728 discovery, AS-metadata proxy, 401
     // scope hint, Clerk-bearer verification) so tests can assert its shapes.
     // A fake origin — upstream fetches to it are stubbed with fetchMock.
-    "CLERK_ISSUER": "https://clerk.test"
+    "CLERK_ISSUER": "http://127.0.0.1:1"
   },
   "durable_objects": {
     "bindings": [
       { "name": "BOX", "class_name": "BoxDO" },
       { "name": "TENANT", "class_name": "TenantDO" },
       { "name": "ROUTER", "class_name": "RouterDO" },
-      { "name": "AVIARY_ENROLLMENT", "class_name": "AviaryEnrollmentDO" }
+      { "name": "AVIARY_ENROLLMENT", "class_name": "AviaryEnrollmentDO" },
+          { "name": "DIRECTORY", "class_name": "DirectoryDO" }
     ]
   },
   "migrations": [
@@ -45,6 +46,7 @@
     { "tag": "v2", "new_sqlite_classes": ["TenantDO"] },
     { "tag": "v3", "new_sqlite_classes": ["RouterDO"] },
     { "tag": "v4", "renamed_classes": [{ "from": "ApplianceDO", "to": "BoxDO" }] },
-    { "tag": "v5", "new_sqlite_classes": ["AviaryEnrollmentDO"] }
+    { "tag": "v5", "new_sqlite_classes": ["AviaryEnrollmentDO"] },
+        { "tag": "v6", "new_sqlite_classes": ["DirectoryDO"] }
   ]
 }

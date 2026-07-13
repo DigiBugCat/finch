@@ -114,6 +114,27 @@ export interface AclRule {
   locked?: boolean;
 }
 
+/** An app-access request row — mirrors the worker's AccessRequest
+ *  (worker/src/types.ts). pending → invited (Clerk invite sent) → granted
+ *  (member joined, ACL rule added), or denied. */
+export interface AccessRequest {
+  id: string;
+  email: string;
+  service: string;
+  requestedBy: string;
+  status: "pending" | "invited" | "granted" | "denied";
+  created: number;
+  resolvedBy?: string;
+  resolvedAt?: number;
+}
+
+/** What GET /api/finch/access returns (DO listAccess): the request queue plus
+ *  the ACL rules whose src is a user — i.e. the per-user grants. */
+export interface AccessInfo {
+  requests: AccessRequest[];
+  grants: AclRule[];
+}
+
 export interface LogEvent {
   ago: string;
   ts: number;
@@ -168,6 +189,11 @@ export interface PublicKey {
 }
 
 /** A user shaped for the Users view (layered in from Clerk by /api/finch/state). */
+export type FinchRole = "owner" | "admin" | "member";
+export type MemberState = "invited" | "active" | "disabled";
+export interface WorkspaceMembership { tenantId: string; name?: string; kind?: "personal" | "team"; role: FinchRole; state: MemberState; }
+export interface TenantsResponse { tenants: WorkspaceMembership[]; claimable: { clerkOrgId: string; name?: string }[]; activeTenant: string; needsVerifiedEmail?: boolean; }
+
 export interface DashUser {
   id: string;
   name: string;
@@ -175,7 +201,7 @@ export interface DashUser {
   role: "Owner" | "Admin" | "Member";
   devices: number;
   lastActive: string;
-  status: string;
+  status: MemberState;
 }
 
 /** The full per-tenant state — what GET /api/finch/state returns. */
@@ -190,8 +216,9 @@ export interface TenantState {
   settings: Settings;
   overview: Overview;
   latestAgent: string;
-  // layered in by /api/finch/state from Clerk
   users: DashUser[];
+  callerRole: FinchRole;
+  workspace: { id: string; name: string; kind: "personal" | "team" };
 }
 
 /** Hub POST /api/enroll response. */

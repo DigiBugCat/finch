@@ -1,7 +1,7 @@
 // POST /api/finch/aviary-approve {user_code,public_approved} — approve one
 // exact Aviary service manifest. The approver identity comes only from Clerk;
 // the client cannot choose or spoof the audit actor.
-import { errorResponse, hubProxy, requireAdmin } from "@/lib/hub";
+import { errorResponse, hubFetchAs, requireAdmin } from "@/lib/hub";
 
 const MAX_USER_CODE_LENGTH = 32;
 
@@ -16,7 +16,7 @@ export async function POST(req: Request) {
       return Response.json({ error: "a valid user_code is required" }, { status: 400 });
     }
 
-    return await hubProxy("/api/aviary/device/approve", {
+    return await hubFetchAs(ctx.tenant,"/api/aviary/device/approve", {
       method: "POST",
       body: JSON.stringify({
         user_code: userCode,

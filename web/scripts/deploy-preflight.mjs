@@ -73,11 +73,13 @@ if (isProd && envCfg.workers_dev === true) {
 
 // Prod must be built against a Clerk LIVE instance, never a dev (pk_test/sk_test).
 if (isProd) {
-  const pk = process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
+  const devVarsPath = join(root, ".dev.vars");
+  const devVars = existsSync(devVarsPath) ? readDotenv(devVarsPath) : {};
+  const pk = process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY ?? devVars.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
   if (pk && pk.startsWith("pk_test_")) {
     fail("NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY is a Clerk DEV key (pk_test_) — prod build must use pk_live_.");
   }
-  const sk = process.env.CLERK_SECRET_KEY;
+  const sk = process.env.CLERK_SECRET_KEY ?? devVars.CLERK_SECRET_KEY;
   if (sk && sk.startsWith("sk_test_")) {
     fail("CLERK_SECRET_KEY in the build env is a Clerk DEV key (sk_test_) — prod must use sk_live_ via `wrangler secret put`.");
   }

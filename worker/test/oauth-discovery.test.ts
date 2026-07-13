@@ -109,7 +109,7 @@ describe("401 WWW-Authenticate challenge", () => {
       `/.well-known/oauth-protected-resource/${enroll.id}/mcp"`,
     );
     // The scope hint is the client's priority-1 source — identity only.
-    expect(chal).toContain(`scope="openid offline_access"`);
+    expect(chal).toContain(`scope="openid email offline_access"`);
     agent.close();
   });
 });
@@ -133,7 +133,7 @@ describe("RFC 9728 protected-resource metadata", () => {
     // the proxy happy-path can't run in this pool-workers build — see header).
     expect(doc.authorization_servers).toEqual([`https://${HOST}`]);
     expect(doc.bearer_methods_supported).toEqual(["header"]);
-    expect(doc.scopes_supported).toEqual(["openid", "offline_access"]);
+    expect(doc.scopes_supported).toEqual(["openid", "email", "offline_access"]);
   });
 });
 

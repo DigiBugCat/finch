@@ -178,14 +178,14 @@ export function EnrollView({ host, existingIds, groups, onEnrolled, onWatch }: a
 // key's stable id (not its mutable label). `users` are the real Clerk members.
 export function KeysView({ keys, users, onMint, onRevoke }: any) {
   const [label, setLabel] = useState("");
-  // Default the owner to the signed-in user (first member is the owner row).
-  const ownerOptions: string[] = (users || []).map((u: any) => u.name).filter(Boolean);
-  const [owner, setOwner] = useState(ownerOptions[0] || "you");
+  const ownerOptions: string[] = (users || []).filter((u:any)=>u.status==="active").map((u: any) => u.email).filter(Boolean);
+  const [owner, setOwner] = useState("");
+  useEffect(()=>{if(!ownerOptions.includes(owner))setOwner(ownerOptions[0]||"");},[owner,ownerOptions.join("|")]);
   const [revealed, setRevealed] = useState<any>(null); // { label, value }
   const [busy, setBusy] = useState(false);
 
   const clean = label.trim().toLowerCase().replace(/\s+/g, "-");
-  const canMint = !!clean && /^[a-z0-9-]+$/.test(clean) && !busy;
+  const canMint = !!clean && /^[a-z0-9-]+$/.test(clean) && !!owner && ownerOptions.includes(owner) && !busy;
 
   const mint = async () => {
     if (!canMint) return;

@@ -39,7 +39,7 @@ what finch is.
 ```
 MCP client ──HTTPS (streamable-http)──▶ Worker (finchmcp.com/<id>/mcp)
                                           │ Clerk auth + finch_ key + ACL
-                                          │ inject X-Finch-User; route by <id>
+                                          │ sign caller assertion; route by <id>
                                           ▼
                                         Durable Object (one per service)
                                           ▲ hibernatable outbound WS
@@ -65,9 +65,13 @@ MCP/OAuth support. Two credential types:
 - **Clerk** — owner/human identity, dashboard login, OAuth for agent clients.
 - **`finch_` keys** — agent/tool-call auth minted per service (hashed at rest).
 
-The Worker terminates both at the edge and injects `X-Finch-User`. The service
-app authenticates nothing — it reads the header (Sandstorm's "auth at the
-proxy" lesson).
+The Worker terminates both at the edge. For authenticated callers, it signs a
+short-lived ES256 caller assertion and sends it through the relay's dedicated
+assertion field; the agent sets `X-Finch-Assertion` from that field only after
+stripping caller-supplied `X-Finch-*` identity headers. A service that needs
+caller identity must verify this assertion (signature and request binding)
+before authorizing; it must never trust an unsigned identity header. Public
+services intentionally receive no assertion.
 
 ## Cost model (Cloudflare, with hibernation)
 
@@ -96,7 +100,7 @@ proxy" lesson).
 
 1. ✅ Request/response relay end-to-end (Worker DO ↔ agent ↔ local server), hibernation-correct, **streaming**.
 2. ✅ Service registry (TenantDO): id → owner, `finch_` key hashes, online state.
-3. ✅ Clerk auth + `finch_` key check at the edge. (Edge `X-Finch-User` injection: still planned.)
+3. ✅ Clerk auth + `finch_` key check at the edge; signed caller assertions for assertion-aware services.
 4. ✅ `finch` CLI: `login` (browser approval) / `add` / `run` / `approve`; CLI tokens; one-paste install.
 5. ✅ Manifest runtime (`finch.toml` — one process fronts many local servers as separate services, cloudflared-style ingress).
 6. ✅ Dashboard (fleet, keys, settings, audit log, "test in chat").

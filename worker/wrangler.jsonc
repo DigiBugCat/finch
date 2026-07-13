@@ -21,7 +21,8 @@
       { "name": "BOX", "class_name": "BoxDO" },
       { "name": "TENANT", "class_name": "TenantDO" },
       { "name": "ROUTER", "class_name": "RouterDO" },
-      { "name": "AVIARY_ENROLLMENT", "class_name": "AviaryEnrollmentDO" }
+      { "name": "AVIARY_ENROLLMENT", "class_name": "AviaryEnrollmentDO" },
+          { "name": "DIRECTORY", "class_name": "DirectoryDO" }
     ]
   },
   // Cloudflare Rate Limiting (unsafe.bindings) is defined PER-ENV below — wrangler
@@ -55,7 +56,8 @@
     {
       "tag": "v5",
       "new_sqlite_classes": ["AviaryEnrollmentDO"]
-    }
+    },
+    { "tag": "v6", "new_sqlite_classes": ["DirectoryDO"] }
   ],
 
   "env": {
@@ -75,7 +77,8 @@
           { "name": "BOX", "class_name": "BoxDO" },
           { "name": "TENANT", "class_name": "TenantDO" },
           { "name": "ROUTER", "class_name": "RouterDO" },
-          { "name": "AVIARY_ENROLLMENT", "class_name": "AviaryEnrollmentDO" }
+          { "name": "AVIARY_ENROLLMENT", "class_name": "AviaryEnrollmentDO" },
+          { "name": "DIRECTORY", "class_name": "DirectoryDO" }
         ]
       },
       // unsafe is NOT inherited into named envs — repeat it per env (see CLAUDE.md).
@@ -100,7 +103,8 @@
         { "tag": "v2", "new_sqlite_classes": ["TenantDO"] },
         { "tag": "v3", "new_sqlite_classes": ["RouterDO"] },
         { "tag": "v4", "renamed_classes": [{ "from": "ApplianceDO", "to": "BoxDO" }] },
-        { "tag": "v5", "new_sqlite_classes": ["AviaryEnrollmentDO"] }
+        { "tag": "v5", "new_sqlite_classes": ["AviaryEnrollmentDO"] },
+        { "tag": "v6", "new_sqlite_classes": ["DirectoryDO"] }
       ]
     },
 
@@ -155,7 +159,8 @@
           { "name": "BOX", "class_name": "BoxDO" },
           { "name": "TENANT", "class_name": "TenantDO" },
           { "name": "ROUTER", "class_name": "RouterDO" },
-          { "name": "AVIARY_ENROLLMENT", "class_name": "AviaryEnrollmentDO" }
+          { "name": "AVIARY_ENROLLMENT", "class_name": "AviaryEnrollmentDO" },
+          { "name": "DIRECTORY", "class_name": "DirectoryDO" }
         ]
       },
       "unsafe": {
@@ -179,7 +184,8 @@
         { "tag": "v2", "new_sqlite_classes": ["TenantDO"] },
         { "tag": "v3", "new_sqlite_classes": ["RouterDO"] },
         { "tag": "v4", "renamed_classes": [{ "from": "ApplianceDO", "to": "BoxDO" }] },
-        { "tag": "v5", "new_sqlite_classes": ["AviaryEnrollmentDO"] }
+        { "tag": "v5", "new_sqlite_classes": ["AviaryEnrollmentDO"] },
+        { "tag": "v6", "new_sqlite_classes": ["DirectoryDO"] }
       ]
     },
 
@@ -243,7 +249,8 @@
           { "name": "BOX", "class_name": "BoxDO" },
           { "name": "TENANT", "class_name": "TenantDO" },
           { "name": "ROUTER", "class_name": "RouterDO" },
-          { "name": "AVIARY_ENROLLMENT", "class_name": "AviaryEnrollmentDO" }
+          { "name": "AVIARY_ENROLLMENT", "class_name": "AviaryEnrollmentDO" },
+          { "name": "DIRECTORY", "class_name": "DirectoryDO" }
         ]
       },
       // unsafe is NOT inherited into named envs — repeat it per env (see CLAUDE.md).
@@ -268,7 +275,8 @@
         { "tag": "v2", "new_sqlite_classes": ["TenantDO"] },
         { "tag": "v3", "new_sqlite_classes": ["RouterDO"] },
         { "tag": "v4", "renamed_classes": [{ "from": "ApplianceDO", "to": "BoxDO" }] },
-        { "tag": "v5", "new_sqlite_classes": ["AviaryEnrollmentDO"] }
+        { "tag": "v5", "new_sqlite_classes": ["AviaryEnrollmentDO"] },
+        { "tag": "v6", "new_sqlite_classes": ["DirectoryDO"] }
       ]
     }
   }

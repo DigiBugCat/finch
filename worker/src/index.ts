@@ -19,6 +19,7 @@ import { BoxDO } from "./box-do";
 import { TenantDO } from "./tenant-do";
 import { RouterDO, routerLookup } from "./router-do";
 import { AviaryEnrollmentDO } from "./aviary-enrollment-do";
+import { DirectoryDO } from "./directory-do";
 import { handleApi, isApiPath } from "./api";
 import { handleChat } from "./chat";
 import {
@@ -41,14 +42,15 @@ import type {
   TicketPayload,
 } from "./auth";
 
-export { BoxDO, TenantDO, RouterDO, AviaryEnrollmentDO };
+export { BoxDO, TenantDO, RouterDO, AviaryEnrollmentDO, DirectoryDO };
 
 export interface Env {
   // Durable Object namespaces.
   BOX: DurableObjectNamespace; // per-box WS relay (BoxDO)
   TENANT: DurableObjectNamespace; // per-tenant control-plane state (TenantDO)
   ROUTER: DurableObjectNamespace; // singleton slug→tenantId index (RouterDO)
-  AVIARY_ENROLLMENT: DurableObjectNamespace; // proof-bound service enrollment state
+  AVIARY_ENROLLMENT: DurableObjectNamespace;
+  DIRECTORY: DurableObjectNamespace; // proof-bound service enrollment state
 
   // Secrets / vars (wrangler vars in dev via .dev.vars; secrets in prod).
   FINCH_SERVICE_SECRET: string; // web-app -> control API shared secret
@@ -402,7 +404,7 @@ async function maybeBrowserGate(
     if (env.DEV === "1") return { browserAuthed: false };
     // No host key in a non-dev build should be unreachable (resolveTenant 404s), but
     // if it happens, fail CLOSED: treat as a private service needing the wall.
-    return browserGate(req, env, tenant, hostKey, originalPathAndQuery);
+    return browserGate(req, env, tenant, hostKey, service, originalPathAndQuery);
   }
   const probe = await tenantOp<{ public?: boolean }>(env, tenant, "checkKey", {
     hash: "",
@@ -411,7 +413,7 @@ async function maybeBrowserGate(
   if (probe?.public) return { browserAuthed: false };
 
   // 4. A browser on a private service → require the session cookie.
-  return browserGate(req, env, tenant, hostKey, originalPathAndQuery);
+  return browserGate(req, env, tenant, hostKey, service, originalPathAndQuery);
 }
 
 /** browserGate — the login-wall decision for a relay request that is NOT a
@@ -427,6 +429,7 @@ async function browserGate(
   env: Env,
   tenant: string,
   hostKey: string,
+  service: string,
   originalPathAndQuery: string,
 ): Promise<GateDecision> {
   const cookie = readCookie(req, SESSION_COOKIE);
@@ -439,22 +442,11 @@ async function browserGate(
       sess.slug === hostKey &&
       !!sess.userId
     ) {
-      // Stale-cookie check: the tenant can "sign everyone out" by bumping its
-      // sessionEpoch; a cookie minted under an older epoch is treated as logged
-      // out. A missing epoch on either side normalizes to 0.
-      const { epoch } = await tenantOp<{ epoch: number }>(
-        env,
-        tenant,
-        "sessionEpoch",
-      );
-      if ((sess.epoch ?? 0) === (epoch ?? 0)) {
-        return {
-          browserAuthed: true,
-          browserCaller: {
-            userId: sess.userId,
-            ...(sess.jti ? { sessionId: sess.jti } : {}),
-          },
-        }; // valid cookie → relay as a web caller
+      // Pre-scheme cookies carry neither identity field; re-mint them through the portal.
+      if (sess.admin !== undefined || sess.email) {
+        const gate = await tenantOp<{ allowed: boolean; reason?: string }>(env, tenant, "gateBrowser", { clerkUserId: sess.userId, email: sess.email, epoch: sess.epoch ?? 0, service });
+        if (gate.allowed) return { browserAuthed: true, browserCaller: { userId: sess.userId, ...(sess.jti ? { sessionId: sess.jti } : {}) } };
+        if (gate.reason !== "epoch") return { wall: new Response("You don't have access to this app. Ask an admin to share it with you.",{status:403,headers:{"content-type":"text/plain; charset=utf-8"}}) };
       }
     }
   }
@@ -490,7 +482,9 @@ const RELEASE_ASSET_RE =
 // the consent screen and overgrants the issued token. Deliberately NOT
 // filtered from the proxied AS metadata: that document must stay faithful to
 // what Clerk actually supports.
-const MCP_SCOPES = ["openid", "offline_access"];
+// `email` is needed at the door: the relay enforces per-app user grants for
+// org members by matching the token's email against the tenant's ACL.
+const MCP_SCOPES = ["openid", "email", "offline_access"];
 
 /** Percent-decode a path segment, tolerating a malformed encoding (a raw "%"
  *  in a name would make decodeURIComponent throw). Falls back to the raw value
@@ -1195,14 +1189,13 @@ async function relayMcp(
         env.CLERK_USERINFO,
       );
       const id = who?.sub || who?.user_id;
-      if (who && (id === tenant || who.org_id === tenant)) {
-        oauthAuthed = true;
-        const subject = id || who.org_id!;
-        caller = `oauth:${subject}`;
-        edgeCaller = {
-          sub: `user:${subject}`,
-          authMethod: "oauth",
-        };
+      if (who && id) {
+        const gate = await tenantOp<{allowed:boolean;reason?:string}>(env,tenant,"gateOauth",{clerkUserId:id,email:(who.email||"").trim().toLowerCase(),orgIdClaim:who.org_id,service});
+        if (!gate.allowed) {
+          if ((gate.reason === "no-email" || gate.reason === "needs-email") && !who.email) return json(403,{error:"token has no email claim — reconnect this connector so it can request the email scope"});
+          return json(403,{error:"your account is not granted access to this app"});
+        }
+        oauthAuthed=true; caller=`oauth:${id}`; edgeCaller={sub:`user:${id}`,authMethod:"oauth"};
       } else if (who) {
         return json(403, { error: "token identity does not own this tenant" });
       }
@@ -1472,6 +1465,11 @@ async function handleFinchCb(
       tenant,
       slug: hostKey,
       userId: grant.userId,
+      ...(grant.mid ? { mid: grant.mid } : {}),
+      // Carry the portal grant's identity fields into the cookie — browserGate
+      // enforces per-app user grants off them (admin bypass / email ACL match).
+      ...(grant.email ? { email: grant.email } : {}),
+      ...(grant.admin ? { admin: true } : {}),
       epoch: epoch ?? 0,
       jti: genJti(),
       exp,
