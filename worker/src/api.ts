@@ -37,6 +37,17 @@ import {
   isAviaryEnrollmentPath,
 } from "./aviary-enrollment-api";
 
+
+async function tenantOpRaw(env: Env, tenant: string, op: string, args: Record<string, unknown> = {}): Promise<Response> {
+  const id = env.TENANT.idFromName(tenant);
+  return env.TENANT.get(id).fetch("https://tenant.internal/", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ op, ...args }) });
+}
+async function directoryOp<T=any>(env: Env, op: string, args: Record<string, unknown> = {}): Promise<T> {
+  const id=env.DIRECTORY.idFromName("global"); const res=await env.DIRECTORY.get(id).fetch("https://directory.internal/",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({op,...args})});
+  if(!res.ok) throw new Error(`directory ${op} failed: ${res.status}`); return res.json<T>();
+}
+function cloneResponse(res: Response): Promise<Response> { return res.text().then(text=>new Response(text,{status:res.status,headers:{"content-type":res.headers.get("content-type")??"application/json"}})); }
+
 // A CLI token is a long-lived tenant assertion, distinguished from a per-call
 // assertion by kind:"cli" + an epoch the tenant can bump to revoke. 30 days.
 const CLI_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
@@ -449,6 +460,68 @@ export async function handleApi(
     return json(401, { error: "bad or missing X-Finch-Service" });
   }
   const assertion = req.headers.get("X-Finch-Auth") || "";
+  const userScoped = ["/api/user/sync","/api/tenant-create","/api/tenant-bootstrap","/api/adapter/org-member","/api/portal-grant"].includes(path);
+  if (userScoped) {
+    const clerkUserId=await verifyAssertion(assertion,env.FINCH_SERVICE_SECRET,"user");
+    if(!clerkUserId&&path!=="/api/portal-grant")return json(401,{error:"invalid user assertion"});
+    if(clerkUserId){
+    const body=await readJson(req); const emails=Array.isArray(body.emails)?body.emails.map((x:any)=>String(x).trim().toLowerCase()):[];
+    if(body.primaryEmail&&!emails.includes(String(body.primaryEmail).trim().toLowerCase()))return json(400,{error:"primaryEmail must be verified"});
+    if(path==="/api/portal-grant"){
+      const slug=String(body.slug||"").trim().toLowerCase();
+      if(!slug)return json(400,{error:"slug required"});
+      const owner=await routerLookup(env,slug);
+      if(!owner)return json(404,{error:"unknown service host"});
+      const ctxRes=await tenantOpRaw(env,owner,"memberContext",{clerkUserId});
+      if(!ctxRes.ok)return cloneResponse(ctxRes);
+      const ctx:any=await ctxRes.json();
+      let email="",admin=true,mid:string|undefined;
+      if(ctx.tenantMeta){if(!ctx.member||ctx.member.state!=="active")return json(403,{error:"not an active member of this workspace"});email=ctx.member.email;admin=ctx.member.role!=="member";mid=ctx.member.id;}
+      else if(owner!==clerkUserId)return json(403,{error:"not a member of this workspace"});
+      const exp=Math.floor(Date.now()/1000)+PORTAL_GRANT_TTL_SECONDS;
+      const grant=await signToken({kind:"portal",tenant:owner,slug,userId:clerkUserId,...(email?{email}:{}),...(admin?{admin:true}:{}),...(mid?{mid}:{}),exp,jti:genJti()},env.TICKET_SECRET);
+      return json(200,{grant});
+    }
+    if(path==="/api/user/sync"){
+      if(body.primaryEmail){const r=await tenantOpRaw(env,clerkUserId,"memberContext",{clerkUserId,email:body.primaryEmail});if(!r.ok)return cloneResponse(r);}
+      const invites=await directoryOp<any>(env,"invitesForEmails",{emails});
+      for(const tenantId of invites.tenantIds??[]){const r=await tenantOpRaw(env,tenantId,"bindIdentity",{clerkUserId,emails,source:"sync"});if(!r.ok){if(r.status===409)continue;return cloneResponse(r);}const out:any=await r.json();if(out.member)await directoryOp(env,"upsertMembership",{clerkUserId,tenantId,memberId:out.member.id,role:out.member.role,state:out.member.state});for(const email of [...(out.consumedEmails??[]),...(out.staleInviteEmails??[])])await directoryOp(env,"clearInvitePointer",{email,tenantId});}
+      const listed=await directoryOp<any>(env,"listForUser",{clerkUserId});
+      if(!(listed.memberships??[]).some((m:any)=>m.tenantId===clerkUserId))listed.memberships=[{tenantId:clerkUserId,role:"owner",state:body.primaryEmail?"active":"invited"},...(listed.memberships??[])];
+      const memberships=[];
+      for(const indexed of listed.memberships??[]){
+        const tenantId=String(indexed.tenantId), contextRes=await tenantOpRaw(env,tenantId,"memberContext",{clerkUserId});
+        if(!contextRes.ok)continue;
+        const context:any=await contextRes.json();
+        const personalPending=tenantId===clerkUserId&&context.needsBootstrap===true;
+        if(context.member?.state!=="active"&&!personalPending)continue;
+        memberships.push({...indexed,...(context.member??{}),tenantId,name:context.tenantMeta?.displayName??tenantId,kind:context.tenantMeta?.kind??(tenantId===clerkUserId?"personal":"team"),...(personalPending?{state:"invited"}:{})});
+      }
+      const claimable:any[]=[];
+      for(const clerkOrgId of Array.isArray(body.adminOrgIds)?body.adminOrgIds:[]){const probe=await tenantOpRaw(env,String(clerkOrgId),"legacyClaimStatus");if(probe.ok){const status:any=await probe.json();if(!status.migrated&&status.hasState)claimable.push({clerkOrgId:String(clerkOrgId)});}}
+      return json(200,{tenants:memberships,claimable});
+    }
+    if(path==="/api/tenant-create"){if(!body.email||!emails.includes(String(body.email).trim().toLowerCase()))return json(400,{error:"email must be verified"});const tenantId="ft_"+crypto.randomUUID().slice(0,8);const r=await tenantOpRaw(env,tenantId,"bootstrapMembers",{kind:"team",displayName:body.name,bootstrappedFrom:"fresh",members:[{clerkUserId,email:body.email,role:"owner",state:"active"}],claimantClerkUserId:clerkUserId});if(!r.ok)return cloneResponse(r);const out:any=await r.json();await directoryOp(env,"reindexTenant",{tenantId,members:out.members}).catch(error=>console.error("tenant directory reindex failed",{tenantId,error}));return json(200,{tenantId});}
+    if(path==="/api/tenant-bootstrap"){const owner=(body.members??[]).find((m:any)=>m.role==="owner"&&m.state==="active");if(owner?.clerkUserId!==clerkUserId)return json(403,{error:"claimant must be owner"});const r=await tenantOpRaw(env,body.tenantId,"bootstrapMembers",{...body,claimantClerkUserId:clerkUserId});if(!r.ok)return cloneResponse(r);const out:any=await r.json();if(body.clerkOrgId)await directoryOp(env,"mapOrg",{clerkOrgId:body.clerkOrgId,tenantId:body.tenantId});await directoryOp(env,"reindexTenant",{tenantId:body.tenantId,members:out.members});return json(200,out);}
+    if(path==="/api/adapter/org-member"){
+      const map=await directoryOp<any>(env,"orgLookup",{clerkOrgId:body.clerkOrgId});
+      if(!map.tenantId)return json(200,{ok:true,mapped:false});
+      const tenantId=String(map.tenantId);
+      const context=await tenantOpRaw(env,tenantId,"memberContext",{clerkUserId});
+      if(context.ok){const current:any=await context.json();if(current.member?.state==="disabled")return json(200,{ok:true,mapped:true,skipped:"disabled"});}
+      const email=body.primaryEmail||emails[0];
+      if(!email)return json(200,{ok:true,mapped:true,skipped:"no-verified-email"});
+      const bound=await tenantOpRaw(env,tenantId,"adapterOrgMember",{clerkUserId,emails,primaryEmail:email});
+      if(!bound.ok)return cloneResponse(bound);
+      const out:any=await bound.json();
+      if(out.skipped)return json(200,{ok:true,mapped:true,skipped:out.skipped});
+      if(out.member)await directoryOp(env,"upsertMembership",{clerkUserId,tenantId,memberId:out.member.id,role:out.member.role,state:out.member.state});
+      for(const em of [...(out.consumedEmails??[]),...(out.staleInviteEmails??[])])await directoryOp(env,"clearInvitePointer",{email:em,tenantId});
+      return json(200,{ok:true,mapped:true});
+    }
+    return json(404,{error:"unknown user-scoped route"});
+    }
+  }
   const tenant = await verifyAssertion(assertion, env.FINCH_SERVICE_SECRET);
   if (!tenant) {
     return json(401, {
@@ -461,6 +534,44 @@ export async function handleApi(
 
   if (seg.length === 1 && seg[0] === "hostnames") {
     return handleHostnames(req, env, tenant, method);
+  }
+
+
+  const membershipOps: Record<string,string>={"member-context":"memberContext","members/invite":"inviteMember","members/role":"setMemberRole","members/state":"setMemberState","members/remove":"removeMember","access/approve":"approveAccess"};
+  const membershipKey=seg.join("/");
+  if (method === "POST" && membershipOps[membershipKey]) {
+    const body = await readJson(req);
+    const res = await tenantOpRaw(env, tenant, membershipOps[membershipKey], body);
+    if (!res.ok) {
+      if (membershipKey === "members/remove" && res.status === 404) {
+        const stateRes = await tenantOpRaw(env, tenant, "getState");
+        if (stateRes.ok) {
+          const state: any = await stateRes.json();
+          await directoryOp(env, "reindexTenant", { tenantId: tenant, members: state.members ?? [] }).catch(() => undefined);
+        }
+      }
+      return cloneResponse(res);
+    }
+    const out: any = await res.clone().json();
+    if (membershipKey === "members/invite" && out.member?.state === "invited" && !out.member.clerkUserId) {
+      await directoryOp(env, "addInvitePointer", { email: out.member.email, tenantId: tenant });
+    }
+    if (membershipKey === "access/approve") {
+      if (out.status === "invited" && out.member && !out.member.clerkUserId) await directoryOp(env, "addInvitePointer", { email: out.member.email, tenantId: tenant });
+      if (out.status === "granted" && (out.email || out.member?.email)) await directoryOp(env, "clearInvitePointer", { email: out.email ?? out.member.email, tenantId: tenant }).catch(() => undefined);
+    }
+    if (["members/role", "members/state"].includes(membershipKey) && out.member?.clerkUserId) {
+      await directoryOp(env, "upsertMembership", { clerkUserId: out.member.clerkUserId, tenantId: tenant, memberId: out.member.id, role: out.member.role, state: out.member.state });
+    }
+    if (membershipKey === "members/remove" && out.member) {
+      if (out.removed === "canceled") {
+        await directoryOp(env, "clearInvitePointer", { email: out.member.email, tenantId: tenant });
+        if (out.member.clerkUserId) await directoryOp(env, "removeMembership", { clerkUserId: out.member.clerkUserId, tenantId: tenant });
+      } else if (out.member.clerkUserId) {
+        await directoryOp(env, "upsertMembership", { clerkUserId: out.member.clerkUserId, tenantId: tenant, memberId: out.member.id, role: out.member.role, state: out.member.state });
+      }
+    }
+    return cloneResponse(res);
   }
 
   // GET /api/state
@@ -590,9 +701,24 @@ export async function handleApi(
     if (owner !== tenant) {
       return json(403, { error: "slug is not owned by this tenant" });
     }
+    // The caller's email + admin bit ride the grant into the session cookie so
+    // browserGate can enforce per-app user grants at the door: admins pass
+    // everywhere; members need a user→service ACL rule. Both come from the
+    // Clerk-authed web (portal/start), never from the browser.
+    const email = String(body.email || "").trim().toLowerCase();
+    const admin = body.admin === true;
     const exp = Math.floor(Date.now() / 1000) + PORTAL_GRANT_TTL_SECONDS;
     const grant = await signToken(
-      { kind: "portal", tenant, slug, userId, exp, jti: genJti() },
+      {
+        kind: "portal",
+        tenant,
+        slug,
+        userId,
+        ...(email ? { email } : {}),
+        ...(admin ? { admin } : {}),
+        exp,
+        jti: genJti(),
+      },
       env.TICKET_SECRET,
     );
     return json(200, { grant });
@@ -718,6 +844,77 @@ export async function handleApi(
       key: body.key,
     });
     return json(out?.ok === false ? 404 : 200, out);
+  }
+
+  // GET /api/access — access-request queue + user→service ACL grants
+  if (method === "GET" && seg.length === 1 && seg[0] === "access") {
+    return json(200, await tenantOp(env, tenant, "listAccess"));
+  }
+
+  // POST /api/access/request {email,service,requestedBy}
+  if (
+    method === "POST" &&
+    seg.length === 2 &&
+    seg[0] === "access" &&
+    seg[1] === "request"
+  ) {
+    const body = await readJson(req);
+    if (!body.email || !body.service) {
+      return json(400, { error: "email and service required" });
+    }
+    const out = await tenantOp<{ ok: boolean; error?: string }>(
+      env,
+      tenant,
+      "requestAccess",
+      {
+        email: body.email,
+        service: body.service,
+        requestedBy: body.requestedBy,
+        requestedByUserId: body.requestedByUserId,
+      },
+    );
+    return json(out?.ok === false ? 400 : 200, out);
+  }
+
+  // POST /api/access/status {id,status,resolvedBy}
+  if (
+    method === "POST" &&
+    seg.length === 2 &&
+    seg[0] === "access" &&
+    seg[1] === "status"
+  ) {
+    const body = await readJson(req);
+    if (!body.id || !body.status) {
+      return json(400, { error: "id and status required" });
+    }
+    const out = await tenantOp<{ ok?: boolean; error?: string }>(
+      env,
+      tenant,
+      "setAccessStatus",
+      { id: body.id, status: body.status, resolvedBy: body.resolvedBy, resolvedByUserId: body.resolvedByUserId },
+    );
+    return json(out?.error ? 400 : 200, out);
+  }
+
+  // POST /api/access/revoke-grant {email,service} — surgically remove ONE
+  // user→service grant (multi-dst rules keep their other services); returns
+  // {removed, stillAllowed} so the BFF can refuse a false-ok revoke when a
+  // broader (all/tag/group/locked) rule still covers the user.
+  if (
+    method === "POST" &&
+    seg.length === 2 &&
+    seg[0] === "access" &&
+    seg[1] === "revoke-grant"
+  ) {
+    const body = await readJson(req);
+    if (!body.email || !body.service) {
+      return json(400, { error: "email and service required" });
+    }
+    const out = await tenantOp<{ ok: boolean }>(env, tenant, "removeUserGrant", {
+      email: body.email,
+      service: body.service,
+    });
+    return json(out?.ok === false ? 400 : 200, out);
   }
 
   // POST /api/acl {src,dst}

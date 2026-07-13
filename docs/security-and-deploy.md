@@ -313,3 +313,42 @@ vars, and secrets), separate Clerk instances, and `DEFAULT_TENANT` confined to d
 - `worker`: `wrangler dev` reads `worker/.dev.vars` (incl. `DEFAULT_TENANT=dev-tenant`) in local Miniflare — separate from any deployed DO state.
 - `web`: `next dev` / `opennextjs-cloudflare preview` reads `web/.dev.vars` (`pk_test`/`sk_test`, local `HUB_URL`).
 - Both `.dev.vars` are gitignored; commit `.dev.vars.example` stubs (M4) so a new clone knows what to fill in without inheriting real values.
+
+---
+
+## 5. Native Finch tenancy migration
+
+`TenantDO.tenantMeta` is the per-tenant migration marker. Its absence preserves
+the narrow legacy door behavior; its presence means `TenantDO.members` is the
+only membership and role authority. Existing tenant IDs and every dependent DO
+name remain unchanged. Personal workspaces migrate lazily when their authenticated
+Clerk subject supplies a server-verified email. Legacy organization-shaped
+workspaces migrate only through the explicit, server-verified org-admin claim
+flow. The one-time bootstrap rewrites the locked `user:you` owner principal,
+key owners, and group members atomically to the owner's normalized email.
+
+`DirectoryDO` (binding `DIRECTORY`, migration `v6`) is a disposable discovery
+index only. Every directory write follows a successful TenantDO commit;
+authorization never reads the directory. `reindexTenant` is the repair operation
+for missing workspace or invite pointers.
+
+| Door | tenantMeta absent | tenantMeta present |
+| --- | --- | --- |
+| Dashboard | personal subject may bootstrap; org tenant must be claimed | active native member required |
+| Browser | subject==tenant, otherwise email ACL | active member; owners/admins bypass ACL, members require ACL |
+| OAuth | subject==tenant, or org-id equality plus email ACL | active member; owners/admins bypass ACL, members require ACL |
+
+The active-workspace cookie is an unsigned pointer, not a capability, and is
+revalidated against live TenantDO membership on every privileged request. Clerk
+supplies identity and currently verified emails only. Clerk organization roles
+never authorize. `user.created`, `user.updated`, and
+`organizationMembership.created` are the configured webhook events; login-time
+identity sync remains the correctness path when webhooks are delayed or absent.
+
+Rollback anchors must be recorded from `wrangler deployments list --env
+production` immediately before release. Deploy worker before web. Migration v6
+is additive; rolling back code leaves DirectoryDO dormant and old TenantDO code
+preserves unknown `tenantMeta`/`members` fields through its state spread. On
+roll-forward, reindex the affected tenant. The legacy portal-grant body is kept
+only for the worker-before-web deployment window and removed after live
+acceptance.

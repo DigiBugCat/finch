@@ -76,3 +76,11 @@ slow, an operator may use Cloudflare's version rollback as an emergency action.
 That is a break-glass procedure: record the selected Worker version, incident,
 and operator, then immediately reconcile the `production` branch through the
 normal PR path so Git and the deployed state agree again.
+
+## Native-tenancy cutover
+
+The native Finch tenancy cutover is developed on the unpushed `app-level-access`
+branch and uses the direct, preflight-gated Wrangler path for its controlled
+staging rehearsal and production release. This does not change the normal
+branch-promotion lanes above. The hard order is worker first (including migration
+v6), then web; the new web must never run against the old worker.

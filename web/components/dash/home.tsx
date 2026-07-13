@@ -21,7 +21,7 @@ function Kpi({ label, value, unit, delta, sub, spark, color, extra }: any) {
   );
 }
 
-export function HomeView({ services, boxes, overview, host, onOpen, onApprove, onAddDevice }: any) {
+export function HomeView({ services, boxes, overview, host, onOpen, onApprove, onAddDevice, canManage = true }: any) {
   const ov = overview;
   const online = services.filter((a: any) => isOnline(a.state));
   const resting = services.filter((a: any) => a.state === "offline" || a.state === "resting");
@@ -29,7 +29,7 @@ export function HomeView({ services, boxes, overview, host, onOpen, onApprove, o
   const pending = services.filter((a: any) => a.state === "pending");
 
   const issues: any[] = [];
-  pending.forEach((a: any) => issues.push({ tone: "green", ic: "⏳", title: `${a.id} is waiting for approval`, sub: `Connected from ${a.box}, owned by ${a.owner}. Approve to let traffic through.`, cta: ["Approve", () => onApprove(a.id)] }));
+  pending.forEach((a: any) => issues.push({ tone: "green", ic: "⏳", title: `${a.id} is waiting for approval`, sub: `Connected from ${a.box}, owned by ${a.owner}.`, cta: canManage ? ["Approve", () => onApprove(a.id)] : ["Inspect", () => onOpen(a.id)] }));
   online.filter((a: any) => a.err >= 1).forEach((a: any) => issues.push({ tone: "red", ic: "⚠", title: `${a.id} · ${a.err}% errors`, sub: `p95 ${a.p95}ms · above your 1% comfort line over the last 24h.`, cta: ["Inspect", () => onOpen(a.id)] }));
   services.filter((a: any) => a.outdated).forEach((a: any) => issues.push({ tone: "amber", ic: "⬆", title: `${a.id} has a box out of date`, sub: `One or more boxes are behind v${ov.latest}. Open it for the update command.`, cta: ["Update", () => onOpen(a.id)] }));
   invited.forEach((a: any) => issues.push({ tone: "amber", ic: "🎟", title: `${a.id} hasn't connected yet`, sub: "Ticket is waiting. Run the install command on the box.", cta: ["Open", () => onOpen(a.id)] }));
@@ -51,7 +51,7 @@ export function HomeView({ services, boxes, overview, host, onOpen, onApprove, o
             <PerchMeter items={services} big />
             <span className="perch-cap">status</span>
           </div>
-          <Button kind="accent" size="md" onClick={onAddDevice}>＋ Add box</Button>
+          {canManage && <Button kind="accent" size="md" onClick={onAddDevice}>＋ Add box</Button>}
         </div>
       </Card>
 

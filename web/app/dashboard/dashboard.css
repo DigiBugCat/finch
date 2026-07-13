@@ -683,3 +683,23 @@ body::before{
 .chatd-send:hover{background:var(--amber2,#f6c66a)}.chatd-send:disabled{opacity:.4;box-shadow:none;cursor:default}
 .chatd-dots::after{content:'';animation:chatddots 1.2s steps(4,end) infinite}
 @keyframes chatddots{0%{content:''}25%{content:'.'}50%{content:'..'}75%{content:'...'}}
+
+/* ---- Access · app sharing (Access view + per-service card) ------- */
+.axs-chip{font-size:10px; font-weight:800; text-transform:uppercase; letter-spacing:.05em; padding:1px 7px; border-radius:999px}
+.axs-pending,.axs-invited{color:var(--amber); background:var(--amber-soft)}
+.axs-granted{color:var(--green); background:var(--green-soft)}
+.axs-denied{color:var(--dim); background:var(--line)}
+.axs-note{font-size:11px; margin-left:6px}
+.arow{display:grid; grid-template-columns:1fr 150px 150px 130px 150px; gap:14px; align-items:center; padding:13px 20px; border-bottom:1px solid var(--line)}
+.arow:last-child{border-bottom:none}
+.arow-head{font-size:11px; font-weight:800; text-transform:uppercase; letter-spacing:.07em; color:var(--dim)}
+.arow-grant{grid-template-columns:220px 1fr 150px}
+.a-act{display:flex; gap:8px; justify-content:flex-end; align-items:center}
+.group-empty-pad{padding:16px 20px}
+.access-card{padding:20px 22px}
+.axs-row{display:flex; align-items:center; gap:10px; padding:8px 0; border-bottom:1px solid var(--line)}
+.axs-row:last-of-type{border-bottom:none}
+.axs-spacer{flex:1}
+.axs-empty{padding:8px 0}
+.share-row{display:flex; gap:10px; align-items:stretch; margin-top:12px}
+.share-row .dusk-input{min-width:180px}

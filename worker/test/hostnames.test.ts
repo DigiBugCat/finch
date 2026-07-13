@@ -234,12 +234,14 @@ describe("relay and login wall on custom hostnames", () => {
     await api(ctx.tenant, "PUT", `/api/services/${encodeURIComponent(ctx.service)}/auth`, {
       mode: "key",
     });
+    await env.TENANT.get(env.TENANT.idFromName(ctx.tenant)).fetch("https://tenant.internal/", { method: "POST", body: JSON.stringify({ op: "bootstrapMembers", kind: "team", displayName: "Test", bootstrappedFrom: "fresh", claimantClerkUserId: "user_123", members: [{ clerkUserId: "user_123", email: "owner@example.com", role: "owner", state: "active" }] }) });
     const cookie = await signSession(
       {
         kind: "session",
         tenant: ctx.tenant,
         slug: host,
         userId: "user_123",
+        admin: true, // per-app enforcement: admin sessions pass every service
         epoch: 0,
         exp: nowSec() + 3600,
       } as any,
