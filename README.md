@@ -74,6 +74,29 @@ SSE, progress notifications, long-running "thinking" tools, and — on a
 single-box service — server-initiated sampling/elicitation. Pause/resume
 **WINDOW** backpressure keeps a fast box from overrunning a slow client.
 
+## Privacy boundary
+
+Production client connections use HTTPS (TLS), and the box agent's outbound
+tunnel uses WSS (WebSocket over TLS). No inbound port needs to be exposed on the
+box. The agent permits plaintext HTTP to the final local service only on a
+literal loopback address; any upstream on another host must use HTTPS.
+
+Finch is **not end-to-end encrypted**. Cloudflare terminates the public TLS and
+WSS connections, so the Cloudflare-hosted Finch relay necessarily processes
+request and response payloads as plaintext while forwarding them. The ordinary
+MCP relay does not log or persist those bodies and does not send them to an LLM.
+It retains only operational call metadata: timestamp, tenant/service/route,
+caller label, response status, duration, and aggregate traffic/latency/error
+statistics. Account, service, box, key-hash/scope, ACL, settings, and audit
+records are retained separately as control-plane state.
+
+Dashboard **Test in chat** is a separate, explicit processing path. When used,
+Finch sends the chat history, service tool names/descriptions/input schemas,
+selected tool arguments, and tool results to Cloudflare Workers AI so the model
+can choose tools and answer. The ordinary relay's no-body-retention guarantee
+does not mean that this data is hidden from Workers AI. See
+[`docs/privacy.md`](docs/privacy.md) for the complete boundary and terminology.
+
 ## Layout
 
 | Path | What |
@@ -179,4 +202,4 @@ cd web    && npm run typecheck && npm test
 
 ## License
 
-TBD.
+[MIT](LICENSE).
