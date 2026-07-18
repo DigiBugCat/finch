@@ -78,8 +78,10 @@ single-box service — server-initiated sampling/elicitation. Pause/resume
 
 Production client connections use HTTPS (TLS), and the box agent's outbound
 tunnel uses WSS (WebSocket over TLS). No inbound port needs to be exposed on the
-box. The agent permits plaintext HTTP to the final local service only on a
-literal loopback address; any upstream on another host must use HTTPS.
+box. The agent-to-upstream hop is the operator's choice, like cloudflared: it
+accepts a plaintext `http://` upstream to any host (loopback or another host on
+your network), so a non-loopback `http://` service is relayed in the clear over
+your LAN. Use `https://` for the upstream if that hop must be encrypted.
 
 Finch is **not end-to-end encrypted**. Cloudflare terminates the public TLS and
 WSS connections, so the Cloudflare-hosted Finch relay necessarily processes
