@@ -294,6 +294,44 @@ describe("settings route contract", () => {
       key: "subdomain", val: "Finch-Team",
     });
   });
+
+  // REGRESSION: a DOTTED subdomain registered an arbitrary host key in the
+  // shared RouterDO, routing around everything /api/finch/hostnames enforces --
+  // the vanity-tier gate (VANITY_TENANT), the CF-for-SaaS provisioning that
+  // ties a BYO name to a validated owner, and the JOIN_LIMIT throttle. It also
+  // produced a nonsense host ("ops.aviary.run" -> ops.aviary.run.finchmcp.com).
+  it.each([
+    "ops.aviary.run",
+    "app.somecustomer.com",
+    "a.b",
+    "-leading",
+    "trailing-",
+    "has space",
+  ])("rejects %s as a subdomain without calling the hub", async (val) => {
+    const userId = `user_settings_slug_${userSequence++}`;
+    authMock.mockResolvedValue({ userId });
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(ownerContext(userId));
+
+    const response = await settings(
+      jsonRequest("/api/finch/settings", "PUT", { key: "subdomain", val }),
+    );
+
+    expect(response.status).toBe(400);
+    // Only the member-context call — the mutation never reached the hub.
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["demo", "Finch-Team", "a", "a1-b2"])(
+    "still accepts the valid label %s",
+    async (val) => {
+      const fetchSpy = mockOwnerThen(Response.json({ ok: true }));
+      const response = await settings(
+        jsonRequest("/api/finch/settings", "PUT", { key: "subdomain", val }),
+      );
+      expect(response.status).toBe(200);
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
+    },
+  );
 });
 
 describe("state route upstream corruption handling", () => {

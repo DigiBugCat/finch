@@ -99,6 +99,11 @@ const MAX_SERVICE_ID = 63;
 // Shared contract with the Go agent and web service routes: one ASCII URL
 // segment, with punctuation allowed only between alphanumeric endpoints.
 const SERVICE_ID_RE = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,61}[A-Za-z0-9])?$/;
+// A tenant subdomain is a single DNS label — no dots. Deliberately stricter
+// than router-do's isValidHostKey, which also accepts dotted host keys for the
+// BYO-hostname flow; that flow has its own authorization (vanity gate + CF DV
+// provisioning) which the settings path does not perform.
+const SUBDOMAIN_LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 // Access-request queue cap: resolved rows are evicted oldest-first to stay
 // under it; a queue full of live (pending/invited) rows refuses new ones.
 const MAX_ACCESS_REQUESTS = 200;
@@ -1909,6 +1914,18 @@ export class TenantDO extends DurableObject<Env> {
     if (key === "subdomain") {
       const slug =
         typeof val === "string" ? val.trim().toLowerCase() : "";
+      // A subdomain is a BARE DNS LABEL — `${slug}.finchmcp.com` below only
+      // makes sense for one. isValidHostKey (router-do) accepts any dotted name
+      // outside the finchmcp.com/workers.dev families, so without this check a
+      // dotted value registered an arbitrary HOST KEY in the shared RouterDO,
+      // routing around everything /api/hostnames enforces: the vanity-tier gate
+      // (VANITY_TENANT), the Cloudflare-for-SaaS provisioning that ties a BYO
+      // name to a validated owner, and the JOIN_LIMIT throttle. Registrations
+      // are first-come and non-owners cannot unregister, so a squat was durable.
+      // Mirrors SLUG_RE in web/app/api/finch/slug-check.
+      if (slug && !SUBDOMAIN_LABEL_RE.test(slug)) {
+        return { ok: false, error: "invalid subdomain" };
+      }
       if (slug) {
         let res: { ok: boolean; reason?: string; owner?: string };
         try {

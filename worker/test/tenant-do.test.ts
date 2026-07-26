@@ -1045,4 +1045,41 @@ describe("TenantDO.boxExists — /refresh revocation gate", () => {
     expect(await op<{ exists: boolean }>(t, "boxExists", { service: "scraper", box: "ghost" })).toEqual({ exists: false });
     expect(await op<{ exists: boolean }>(t, "boxExists", { service: "nope", box: "box-1" })).toEqual({ exists: false });
   });
+
+  // REGRESSION: updateSetting lowercased/trimmed the subdomain and handed it
+  // straight to routerRegister. slugify() exists but was not applied here, and
+  // router-do's isValidHostKey accepts ANY dotted name outside the
+  // finchmcp.com/workers.dev families -- so a dotted value claimed an arbitrary
+  // host key in the shared RouterDO, bypassing the vanity-tier gate and the
+  // CF-for-SaaS provisioning that /api/hostnames performs. Registrations are
+  // first-come and non-owners cannot unregister, so the squat was durable.
+  it("rejects a dotted subdomain instead of registering a host key", async () => {
+    const t = freshTenant();
+    const before = await op<any>(t, "getState");
+    for (const val of ["ops.aviary.run", "app.somecustomer.com", "a.b"]) {
+      const res = await op<{ ok: boolean; error?: string }>(t, "updateSetting", {
+        key: "subdomain",
+        val,
+      });
+      expect(res.ok).toBe(false);
+      expect(res.error).toBe("invalid subdomain");
+    }
+    // Nothing was persisted, and no dotted host was advertised.
+    const after = await op<any>(t, "getState");
+    expect(after.settings.subdomain).toBe(before.settings.subdomain);
+    expect(after.host).toBe(before.host);
+    expect(after.host).not.toContain("aviary.run");
+  });
+
+  it("still accepts a bare label subdomain", async () => {
+    const t = freshTenant();
+    const res = await op<{ ok: boolean }>(t, "updateSetting", {
+      key: "subdomain",
+      val: "  Demo-Team  ",
+    });
+    expect(res.ok).toBe(true);
+    const state = await op<any>(t, "getState");
+    expect(state.settings.subdomain).toBe("demo-team");
+    expect(state.host).toBe("demo-team.finchmcp.com");
+  });
 });
