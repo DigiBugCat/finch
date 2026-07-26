@@ -27,10 +27,27 @@ export class DirectoryDO extends DurableObject<Env> {
       case "mapOrg": await this.ctx.storage.put(`org:${a.clerkOrgId}`,a.tenantId); return response({ok:true});
       case "orgLookup": return response({tenantId:await get<string|null>(`org:${a.clerkOrgId}`,null)});
       case "reindexTenant": {
-        const listed=await this.ctx.storage.list();
-        for(const [key,value] of listed) {
-          if(key.startsWith("u:")) await this.ctx.storage.put(key,(value as Membership[]).filter(x=>x.tenantId!==a.tenantId));
-          if(key.startsWith("e:")) await this.ctx.storage.put(key,(value as string[]).filter(x=>x!==a.tenantId));
+        // Scan the two indexes by PREFIX and only write rows that actually
+        // reference this tenant. This previously listed the entire keyspace and
+        // put() every u:/e: key unconditionally, so one tenant-create -- where
+        // by definition no existing row can mention the brand-new id -- cost
+        // O(total platform users + invited emails) writes against the single
+        // global DO that every sign-in contends for (listForUser /
+        // invitesForEmails / orgLookup). Nothing here ever deletes keys, so
+        // that keyspace only grows and each new key taxed every future reindex.
+        for (const prefix of ["u:", "e:"] as const) {
+          const listed = await this.ctx.storage.list({ prefix });
+          for (const [key, value] of listed) {
+            if (prefix === "u:") {
+              const rows = value as Membership[];
+              const next = rows.filter(x => x.tenantId !== a.tenantId);
+              if (next.length !== rows.length) await this.ctx.storage.put(key, next);
+            } else {
+              const rows = value as string[];
+              const next = rows.filter(x => x !== a.tenantId);
+              if (next.length !== rows.length) await this.ctx.storage.put(key, next);
+            }
+          }
         }
         for(const m of (a.members??[]) as TenantMember[]) {
           if(m.clerkUserId) { const key=`u:${m.clerkUserId}`; const rows=await get<Membership[]>(key,[]); const row={tenantId:a.tenantId,memberId:m.id,role:m.role,state:m.state}; await this.ctx.storage.put(key,[...rows.filter(x=>x.tenantId!==a.tenantId),row]); }

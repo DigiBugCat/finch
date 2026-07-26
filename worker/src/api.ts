@@ -564,7 +564,17 @@ async function handleApiInner(
       for(const clerkOrgId of Array.isArray(body.adminOrgIds)?body.adminOrgIds:[]){const probe=await tenantOpRaw(env,String(clerkOrgId),"legacyClaimStatus");if(probe.ok){const status:any=await probe.json();if(!status.migrated&&status.hasState)claimable.push({clerkOrgId:String(clerkOrgId)});}}
       return json(200,{tenants:memberships,claimable});
     }
-    if(path==="/api/tenant-create"){if(!body.email||!emails.includes(String(body.email).trim().toLowerCase()))return json(400,{error:"email must be verified"});const tenantId="ft_"+crypto.randomUUID().slice(0,8);const r=await tenantOpRaw(env,tenantId,"bootstrapMembers",{kind:"team",displayName:body.name,bootstrappedFrom:"fresh",members:[{clerkUserId,email:body.email,role:"owner",state:"active"}],claimantClerkUserId:clerkUserId});if(!r.ok)return cloneResponse(r);const out:any=await r.json();await directoryOp(env,"reindexTenant",{tenantId,members:out.members}).catch(error=>console.error("tenant directory reindex failed",{tenantId,error}));return json(200,{tenantId});}
+    if(path==="/api/tenant-create"){
+      // THROTTLE WORKSPACE CREATION. This branch had no limiter at all, unlike
+      // /join, /refresh, device-approve, box-update and hostnames. Each create
+      // persists a TenantDO and reindexes the single global DirectoryDO that
+      // every sign-in reads, and each workspace can then hold 200 invited
+      // members whose e: pointers permanently enlarge that DO's keyspace --
+      // so unbounded creation was an availability lever against other users,
+      // not just self-inflicted resource growth. Keyed per user AND per IP so
+      // neither a single account nor a single host can spin freely.
+      if(!(await rateLimitOk(env.JOIN_LIMIT,`tcreate:${clerkUserId}`))||!(await rateLimitOk(env.JOIN_LIMIT,`tcreate:${clientIp(req)}`)))return json(429,{error:"rate limited"});
+      if(!body.email||!emails.includes(String(body.email).trim().toLowerCase()))return json(400,{error:"email must be verified"});const tenantId="ft_"+crypto.randomUUID().slice(0,8);const r=await tenantOpRaw(env,tenantId,"bootstrapMembers",{kind:"team",displayName:body.name,bootstrappedFrom:"fresh",members:[{clerkUserId,email:body.email,role:"owner",state:"active"}],claimantClerkUserId:clerkUserId});if(!r.ok)return cloneResponse(r);const out:any=await r.json();await directoryOp(env,"reindexTenant",{tenantId,members:out.members}).catch(error=>console.error("tenant directory reindex failed",{tenantId,error}));return json(200,{tenantId});}
     if(path==="/api/tenant-bootstrap"){const owner=(body.members??[]).find((m:any)=>m.role==="owner"&&m.state==="active");if(owner?.clerkUserId!==clerkUserId)return json(403,{error:"claimant must be owner"});const r=await tenantOpRaw(env,body.tenantId,"bootstrapMembers",{...body,claimantClerkUserId:clerkUserId});if(!r.ok)return cloneResponse(r);const out:any=await r.json();if(body.clerkOrgId)await directoryOp(env,"mapOrg",{clerkOrgId:body.clerkOrgId,tenantId:body.tenantId});await directoryOp(env,"reindexTenant",{tenantId:body.tenantId,members:out.members});return json(200,out);}
     if(path==="/api/adapter/org-member"){
       const map=await directoryOp<any>(env,"orgLookup",{clerkOrgId:body.clerkOrgId});
