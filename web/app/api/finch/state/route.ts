@@ -58,6 +58,51 @@ function parseMembers(value: unknown): {
   });
 }
 
+// Server-side role projection.
+//
+// `member` is a deliberately fenced-in principal: approveAccess mints exactly
+// that role for an OUTSIDER granted a single service, and the DO refuses admin
+// operations for it. Every sibling control-plane route sits behind
+// requireAdmin()/requireSharing() -- keys, acl, access, settings, hostnames,
+// users. This route cannot simply join them, because the member dashboard
+// (overview / home / detail / logs) reads it. So project instead of gate.
+//
+// This has to happen here: hubFetchAs sends only a signed {tenant} assertion and
+// getState() takes no actor, so the hub has no idea who is asking.
+//
+// Collections are emptied rather than deleted so the client's shape expectations
+// (and requireStateShape's own contract) still hold.
+const EMPTY_COLLECTIONS = ["keys", "acl", "accessRequests", "groups", "members"] as const;
+
+/** Key labels reveal which credentials reach which service; address/relay are
+ *  box infrastructure. Neither is needed by the views a member can open. */
+function stripServiceDetail(service: Record<string, unknown>): Record<string, unknown> {
+  const out = { ...service, keys: [] as string[] };
+  if (Array.isArray(out.boxes)) {
+    out.boxes = out.boxes.map((box) =>
+      isJsonObject(box) ? { ...box, keys: [], address: "", relay: "" } : box,
+    );
+  }
+  return out;
+}
+
+function projectForMember(state: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = { ...state };
+  for (const field of EMPTY_COLLECTIONS) out[field] = [];
+  out.settings = {};
+  if (Array.isArray(out.services)) {
+    out.services = out.services.map((service) =>
+      isJsonObject(service) ? stripServiceDetail(service) : service,
+    );
+  }
+  if (Array.isArray(out.boxes)) {
+    out.boxes = out.boxes.map((box) =>
+      isJsonObject(box) ? { ...box, keys: [], address: "", relay: "" } : box,
+    );
+  }
+  return out;
+}
+
 export async function GET() {
   try {
     const ctx = await resolveTenant();
@@ -101,9 +146,12 @@ export async function GET() {
       lastActive: "—",
       status: member.state,
     }));
+    // isAdmin is role !== "member" (lib/hub.ts). The roster goes with it: it
+    // carries every member's email and clerkUserId.
+    const visibleState = ctx.isAdmin ? state : projectForMember(state);
     return Response.json({
-      ...state,
-      users,
+      ...visibleState,
+      users: ctx.isAdmin ? users : [],
       callerRole: ctx.role,
       workspace: {
         id: ctx.tenant,

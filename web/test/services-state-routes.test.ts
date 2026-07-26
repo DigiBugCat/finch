@@ -39,6 +39,46 @@ function mockOwnerThen(response: Response) {
     .mockResolvedValueOnce(response);
 }
 
+function memberContext(userId: string): Response {
+  return Response.json({
+    member: { id: "member_plain", role: "member", state: "active", email: "member@example.com" },
+    tenantMeta: { id: userId },
+  });
+}
+
+function mockMemberThen(response: Response) {
+  const userId = `user_routes_${userSequence++}`;
+  authMock.mockResolvedValue({ userId });
+  return vi.spyOn(globalThis, "fetch")
+    .mockResolvedValueOnce(memberContext(userId))
+    .mockResolvedValueOnce(response);
+}
+
+/** State whose admin-only collections are all populated, so a projection
+ *  regression shows up as real data crossing the role boundary. */
+function sensitiveState(): Record<string, unknown> {
+  return validState({
+    keys: [
+      { id: "k1", label: "prod", owner: "owner@example.com", scope: "svc", last4: "ab12" },
+    ],
+    acl: [
+      { id: "a1", src: { type: "user", id: "m2" }, dst: [{ type: "service", id: "svc" }], action: "allow" },
+    ],
+    accessRequests: [{ id: "r1", email: "outsider@example.com", service: "svc" }],
+    settings: { org: "Fallback", subdomain: "demo" },
+    logs: [{ ago: "1m", ts: 1, cat: "request", actor: "owner@example.com", action: "GET", target: "svc", ip: "203.0.113.7" }],
+    services: [
+      {
+        id: "svc",
+        label: "Service",
+        keys: ["prod"],
+        boxes: [{ name: "b1", keys: ["prod"], address: "100.64.0.1", relay: "iad" }],
+      },
+    ],
+    boxes: [{ name: "b1", keys: ["prod"], address: "100.64.0.1", relay: "iad" }],
+  });
+}
+
 function validState(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     host: "demo.finchmcp.com",
@@ -298,5 +338,56 @@ describe("state route upstream corruption handling", () => {
     expect(response.status).toBe(503);
     expect(response.headers.get("content-type")).toBe("text/plain; charset=utf-8");
     expect(await response.text()).toBe("temporarily unavailable");
+  });
+
+  // REGRESSION: /api/finch/state gated only on resolveTenant() and returned the
+  // hub's getState() verbatim, so any active `member` -- the role approveAccess
+  // mints for an OUTSIDER granted a single service -- read the whole workspace.
+  // It was a strict superset of the requireSharing()-gated /api/finch/access,
+  // and the boundary existed only in the browser (DashboardApp hid the tabs).
+  it("withholds admin-only workspace data from a member", async () => {
+    mockMemberThen(Response.json(sensitiveState()));
+
+    const response = await state();
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as Record<string, any>;
+
+    expect(body.callerRole).toBe("member");
+    expect(body.keys).toEqual([]);
+    expect(body.acl).toEqual([]);
+    expect(body.accessRequests).toEqual([]);
+    expect(body.members).toEqual([]);
+    expect(body.users).toEqual([]);
+    expect(body.settings).toEqual({});
+
+    // Per-object operator detail is stripped too: key labels say which
+    // credential reaches which service; address/relay are box infrastructure.
+    expect(body.services[0].keys).toEqual([]);
+    expect(body.services[0].boxes[0].keys).toEqual([]);
+    expect(body.services[0].boxes[0].address).toBe("");
+    expect(body.boxes[0].relay).toBe("");
+
+    // Nothing from the roster or the ACL survives anywhere in the payload.
+    const serialized = JSON.stringify(body);
+    expect(serialized).not.toContain("invited@example.com");
+    expect(serialized).not.toContain("outsider@example.com");
+    expect(serialized).not.toContain("ab12");
+  });
+
+  it("still returns the full workspace to an admin", async () => {
+    mockOwnerThen(Response.json(sensitiveState()));
+
+    const response = await state();
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as Record<string, any>;
+
+    expect(body.callerRole).toBe("owner");
+    expect(body.keys).toHaveLength(1);
+    expect(body.acl).toHaveLength(1);
+    expect(body.accessRequests).toHaveLength(1);
+    expect(body.users).toHaveLength(2);
+    expect(body.settings).toMatchObject({ subdomain: "demo" });
+    expect(body.services[0].keys).toEqual(["prod"]);
+    expect(body.boxes[0].address).toBe("100.64.0.1");
   });
 });
