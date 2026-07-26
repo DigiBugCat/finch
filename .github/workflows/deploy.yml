@@ -159,11 +159,15 @@ jobs:
             --retry 5 --retry-all-errors --retry-delay 3 \
             --max-time 20 "$url" >/dev/null
       - name: Record deployment summary
+        env:
+          DEPLOY_ENV: ${{ needs.target.outputs.env }}
+          DEPLOY_SHA: ${{ needs.target.outputs.sha }}
+          CI_RUN_URL: ${{ github.event.workflow_run.html_url }}
         run: |
           {
             echo '### Finch deployment'
             echo ''
-            echo '- Environment: `${{ needs.target.outputs.env }}`'
-            echo '- Commit: `${{ needs.target.outputs.sha }}`'
-            echo '- CI run: `${{ github.event.workflow_run.html_url }}`'
+            printf '%s\n' "- Environment: \`$DEPLOY_ENV\`"
+            printf '%s\n' "- Commit: \`$DEPLOY_SHA\`"
+            printf '%s\n' "- CI run: \`$CI_RUN_URL\`"
           } >> "$GITHUB_STEP_SUMMARY"

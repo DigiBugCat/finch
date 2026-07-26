@@ -1,5 +1,6 @@
 import { clerkMiddleware, createRouteMatcher } from "@clerk/nextjs/server";
 import { NextResponse } from "next/server";
+import { isSecurePublicRequest } from "@/lib/secure-transport";
 
 // Only the dashboard (and future app routes) require auth. The marketing
 // landing, sign-in, and sign-up are public — don't gate the front door.
@@ -12,9 +13,14 @@ import { NextResponse } from "next/server";
 const isProtectedRoute = createRouteMatcher([
   "/dashboard(.*)",
   "/cli(.*)",
-  "/aviary(.*)",
   "/portal(.*)",
 ]);
+
+// Device enrollment links are opened directly from the Finch CLI. Clerk's
+// default protection response is an intentionally opaque 404, which makes a
+// valid approval link look broken when the browser has no session. Send the
+// user through sign-in explicitly and preserve the complete approval URL.
+const isAviaryRoute = createRouteMatcher(["/aviary(.*)"]);
 
 // All cookie-authed bridge handlers live under /api/finch/*.
 const isFinchApiRoute = createRouteMatcher(["/api/finch(.*)"]);
@@ -44,6 +50,19 @@ function isSameOrigin(request: Request): boolean {
 }
 
 export default clerkMiddleware(async (auth, request) => {
+  // Reject an insecure request before Clerk authentication or any route handler
+  // can read a credential/body. Do not redirect mutations: the caller must fix
+  // its URL rather than transmit sensitive data once over plaintext and retry.
+  if (!isSecurePublicRequest(request.url)) {
+    return NextResponse.json(
+      { error: "HTTPS is required" },
+      {
+        status: 426,
+        headers: { "cache-control": "no-store" },
+      },
+    );
+  }
+
   if (
     isFinchApiRoute(request) &&
     !SAFE_METHODS.has(request.method) &&
@@ -55,7 +74,14 @@ export default clerkMiddleware(async (auth, request) => {
     );
   }
 
-  if (isProtectedRoute(request)) {
+  if (isAviaryRoute(request)) {
+    const { userId } = await auth();
+    if (!userId) {
+      const signInUrl = new URL("/sign-in", request.url);
+      signInUrl.searchParams.set("redirect_url", request.url);
+      return NextResponse.redirect(signInUrl);
+    }
+  } else if (isProtectedRoute(request)) {
     await auth.protect();
   }
 });

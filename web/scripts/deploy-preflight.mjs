@@ -17,6 +17,7 @@
 import { readFileSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { readJsonc } from "./jsonc.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..");
@@ -24,14 +25,6 @@ const root = join(here, "..");
 const env = process.argv[2];
 if (!env) {
   fail("missing --env target. Usage: deploy-preflight <env> (e.g. production)");
-}
-
-function readJsonc(path) {
-  const raw = readFileSync(path, "utf8");
-  const noComments = raw
-    .replace(/\/\*[\s\S]*?\*\//g, "")
-    .replace(/(^|[^:])\/\/.*$/gm, "$1");
-  return JSON.parse(noComments);
 }
 
 function readDotenv(path) {
@@ -66,6 +59,28 @@ if (!envCfg) {
 }
 
 const isProd = env === "production";
+
+// Privacy posture is deployment configuration, not a dashboard convention.
+// Staging/production persist no Worker logs or traces at all. Local dev may
+// retain explicit application logs, but automatic invocation logs and traces
+// stay off so request URLs/metadata are never captured implicitly.
+if (env === "staging" || env === "production") {
+  if (envCfg.observability?.enabled !== false) {
+    fail(`[env.${env}].observability.enabled must be false (no persisted Worker telemetry).`);
+  }
+} else {
+  const logs = envCfg.observability?.logs;
+  if (
+    envCfg.observability?.enabled !== true ||
+    logs?.invocation_logs !== false ||
+    envCfg.observability?.traces?.enabled !== false
+  ) {
+    fail(`[env.${env}] must disable automatic invocation logs and traces.`);
+  }
+}
+if (envCfg.logpush !== false) {
+  fail(`[env.${env}].logpush must be false.`);
+}
 
 if (isProd && envCfg.workers_dev === true) {
   fail("[env.production].workers_dev is true — prod must not expose a workers.dev origin.");

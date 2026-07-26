@@ -24,8 +24,12 @@ and staging dashboard origins. It is intentionally absent from ordinary CI.
 
 Use a dedicated temporary home and agent credential directory. Log the CLI into
 staging once and install the exact public release candidate in a disposable
-virtual environment. The runner starts and restarts its own staging-configured
-agent, including the dashboard's split-origin allowlist.
+virtual environment. The temporary root, login home, credential directory, and
+socket directory must be real (not symlinked), mode-`0700` directories; the
+login JSON must be a regular mode-`0600` file. The control-socket path must fit
+within 100 encoded bytes and must not already exist. The runner starts and
+restarts its own staging-configured agent, including the dashboard's
+split-origin allowlist, and removes only the socket inode that agent created.
 
 ```bash
 export E2E_ROOT="$(mktemp -d)"
@@ -60,12 +64,13 @@ external-agent `Finch.agent(...)` path. The checked-in workflow runs both modes
 with identical enrollment, bearer, restart, and cleanup assertions.
 
 The runner never prints CLI credentials or minted caller keys. For scheduled
-CI, `.github/workflows/staging-e2e.yml` injects a dedicated login from the
-`FINCH_STAGING_E2E_CLI_JSON` repository secret. Finch CLI logins currently
-expire after about 30 days, so rotate that isolated secret before expiry. The
-workflow runs weekly and can also be dispatched manually. Set the optional
-`AVIARY_MCP_E2E_VERSION` repository variable to move the public package version
-under test without editing the workflow.
+CI, `.github/workflows/staging-e2e.yml` exposes the dedicated
+`FINCH_STAGING_E2E_CLI_JSON` repository secret only to the credential-writing
+step. Finch CLI logins currently expire after about 30 days, so rotate that
+isolated secret before expiry. The workflow runs weekly and can also be
+dispatched manually. Set the optional `AVIARY_MCP_E2E_VERSION` repository
+variable to move the public package version under test without editing the
+workflow.
 
 The safety gates have no network or staging dependency:
 

@@ -6,6 +6,7 @@
 //
 // We mock Clerk's auth() and global fetch so no network/session is required.
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { setupTestEnv } from "./test-env";
 
 const authMock = vi.fn();
 vi.mock("@clerk/nextjs/server", () => ({
@@ -13,8 +14,7 @@ vi.mock("@clerk/nextjs/server", () => ({
 }));
 
 // lib/hub reads these (runtimeEnv falls back to process.env under test).
-process.env.HUB_URL = "https://hub.example.com";
-process.env.FINCH_SERVICE_SECRET = "test-service-secret";
+setupTestEnv({ HUB_URL: "https://hub.example.com", FINCH_SERVICE_SECRET: "test-service-secret" });
 
 import { GET } from "@/app/portal/start/route";
 
@@ -190,6 +190,36 @@ describe("GET /portal/start", () => {
 
     expect(res.status).toBe(502);
     expect(await res.text()).toMatch(/could not start the service session/i);
+  });
+
+  it("rejects malformed or resource-exhausting grant values from the hub", async () => {
+    for (const grant of [{ token: "object" }, "x".repeat(4_097), "has a space"]) {
+      vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(Response.json({ grant }));
+      const res = await GET(startReq("?slug=printer&rd=%2F"));
+      expect(res.status, `grant=${typeof grant}`).toBe(502);
+    }
+  });
+
+  it("collapses an oversized return path so it cannot create an oversized redirect", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({ grant: "G" }));
+    const rd = "/" + "a".repeat(2_048);
+    const res = await GET(startReq("?slug=printer&rd=" + encodeURIComponent(rd)));
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toContain("&rd=" + encodeURIComponent("/"));
+  });
+
+  it("fails closed on an invalid BOX_DOMAIN configuration", async () => {
+    const previous = process.env.BOX_DOMAIN;
+    process.env.BOX_DOMAIN = "evil.example/path";
+    try {
+      vi.spyOn(globalThis, "fetch").mockResolvedValue(Response.json({ grant: "G" }));
+      const res = await GET(startReq("?slug=printer&rd=%2F"));
+      expect(res.status).toBe(500);
+      expect(await res.text()).toMatch(/not configured/i);
+    } finally {
+      if (previous === undefined) delete process.env.BOX_DOMAIN;
+      else process.env.BOX_DOMAIN = previous;
+    }
   });
 
   it("redirects to /sign-in when unauthenticated", async () => {

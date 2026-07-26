@@ -27,6 +27,20 @@ recorded here so the ambition isn't mistaken for a backlog:
 bridge so boxes can host MCP servers that speak stdio instead of HTTP. Until
 then, `service` is an HTTP URL.
 
+## Privacy boundary
+
+The production public hop is HTTPS/TLS and the agent's outbound WebSocket is
+WSS/TLS. These are transport-encryption boundaries, not E2EE: Cloudflare
+terminates the connections and the relay processes payload plaintext while
+forwarding it. Ordinary request and response bytes must remain transient and
+must never be placed in application logs, Durable Object storage, call history,
+traces, or metrics. Retained per-call state is restricted to the operational
+metadata documented in [`privacy.md`](privacy.md).
+
+Dashboard **Test in chat** is not part of this ordinary relay guarantee. It
+explicitly sends chat history, tool definitions, tool arguments, and tool
+results to Cloudflare Workers AI as described in the privacy document.
+
 The wire-format reference below stands; treat the OPEN.route / SessionDO /
 binary-frame sections as the original v2 ambition, superseded as noted above.
 

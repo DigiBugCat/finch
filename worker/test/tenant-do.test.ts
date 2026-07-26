@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { env } from "cloudflare:test";
+import { env, runInDurableObject } from "cloudflare:test";
 import { hashKey } from "../src/auth";
 
 // Drive the REAL TenantDO op logic through its fetch() RPC — exactly how
@@ -481,45 +481,135 @@ describe("TenantDO.checkKey — expiry gate (#11)", () => {
 });
 
 describe("TenantDO.revokeBoxKey — revoke by id (#10)", () => {
-  it("revoking by Key.id makes the hash lookup stop matching", async () => {
+  it("detaches a key from exactly one box without revoking it or its other assignments", async () => {
     const t = freshTenant();
     await op(t, "enroll", { name: "Scraper" });
+    await op(t, "enroll", { name: "Printer" });
+    for (const [service, box] of [
+      ["scraper", "scraper-a"],
+      ["scraper", "scraper-b"],
+      ["printer", "printer-a"],
+    ]) {
+      await op(t, "registerBox", {
+        service,
+        box,
+        os: "linux",
+        version: "1.4.0",
+      });
+    }
     const minted = await op<{ plaintext: string; key: { id: string } }>(
       t,
       "mintKey",
       { label: "live", scope: { all: true } },
     );
-    // Sanity: the key authorizes before revoke.
-    const before = await op<{ allowed: boolean }>(t, "checkKey", {
+
+    const detached = await op<{ ok: boolean }>(t, "revokeBoxKey", {
+      service: "scraper",
+      box: "scraper-a",
+      key: minted.key.id,
+    });
+    expect(detached.ok).toBe(true);
+
+    const state = await op<any>(t, "getState");
+    const scraper = state.services.find((service: any) => service.id === "scraper");
+    const printer = state.services.find((service: any) => service.id === "printer");
+    expect(state.keys.map((key: any) => key.id)).toContain(minted.key.id);
+    expect(scraper.keys).toContain(minted.key.id);
+    expect(printer.keys).toContain(minted.key.id);
+    expect(scraper.boxes.find((box: any) => box.name === "scraper-a").keys)
+      .not.toContain(minted.key.id);
+    expect(scraper.boxes.find((box: any) => box.name === "scraper-b").keys)
+      .toContain(minted.key.id);
+    expect(printer.boxes.find((box: any) => box.name === "printer-a").keys)
+      .toContain(minted.key.id);
+
+    const stillAuthorized = await op<{ allowed: boolean }>(t, "checkKey", {
       hash: await hashKey(minted.plaintext),
       service: "scraper",
     });
-    expect(before.allowed).toBe(true);
-    // Revoke by id.
-    const rev = await op<{ ok: boolean }>(t, "revokeBoxKey", {
+    expect(stillAuthorized.allowed).toBe(true);
+
+    // A malformed half-scope is neither a box detach nor permission to widen
+    // the operation into a tenant-global revoke.
+    const partial = await op<{ ok: boolean }>(t, "revokeBoxKey", {
       service: "scraper",
-      box: "—",
+      box: "",
       key: minted.key.id,
     });
-    expect(rev.ok).toBe(true);
+    expect(partial.ok).toBe(false);
+    expect((await op<any>(t, "getState")).keys.map((key: any) => key.id))
+      .toContain(minted.key.id);
+  });
+
+  it("globally revokes only when scope is absent", async () => {
+    const t = freshTenant();
+    await op(t, "enroll", { name: "Scraper" });
+    await op(t, "registerBox", {
+      service: "scraper",
+      box: "box-a",
+      os: "linux",
+      version: "1.4.0",
+    });
+    const minted = await op<{ plaintext: string; key: { id: string } }>(t, "mintKey", {
+      label: "global",
+      scope: { all: true },
+    });
+
+    const revoked = await op<{ ok: boolean }>(t, "revokeBoxKey", {
+      service: "",
+      box: "",
+      key: minted.key.id,
+    });
+    expect(revoked.ok).toBe(true);
+    const state = await op<any>(t, "getState");
+    const scraper = state.services.find((service: any) => service.id === "scraper");
+    expect(state.keys.map((key: any) => key.id)).not.toContain(minted.key.id);
+    expect(scraper.keys).not.toContain(minted.key.id);
+    expect(scraper.boxes[0].keys).not.toContain(minted.key.id);
     const after = await op<{ allowed: boolean; reason?: string }>(t, "checkKey", {
       hash: await hashKey(minted.plaintext),
       service: "scraper",
     });
-    expect(after.allowed).toBe(false);
-    expect(after.reason).toBe("no-key");
+    expect(after).toMatchObject({ allowed: false, reason: "no-key" });
+  });
+});
+
+describe("TenantDO.enroll — DNS-safe canonical id boundaries", () => {
+  it("caps ids at 63 characters and keeps collision suffixes inside the cap", async () => {
+    const t = freshTenant();
+    const name63 = "a".repeat(63);
+    const first = await op<{ id: string }>(t, "enroll", { name: name63 });
+    const over = await op<{ id: string }>(t, "enroll", { name: `${name63}z` });
+    const overAgain = await op<{ id: string }>(t, "enroll", { name: `${name63}other` });
+    expect(first.id).toBe(name63);
+    expect(over.id).toBe(`${"a".repeat(61)}-2`);
+    expect(overAgain.id).toBe(`${"a".repeat(61)}-3`);
+    for (const id of [first.id, over.id, overAgain.id]) {
+      expect(id).toMatch(/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/);
+      expect(id.length).toBeLessThanOrEqual(63);
+    }
   });
 
-  it("populates the service key display list at mint (scoped)", async () => {
+  it("rejects a 64-character service id before registerBox can create it", async () => {
     const t = freshTenant();
-    await op(t, "enroll", { name: "Scraper" });
-    const minted = await op<{ key: { id: string } }>(t, "mintKey", {
-      label: "scoped",
-      scope: { services: ["scraper"] },
-    });
+    const boundary = "b".repeat(63);
+    expect((await op<{ ok: boolean }>(t, "registerBox", {
+      service: boundary,
+      box: "box-63",
+      os: "linux",
+      version: "1.4.0",
+    })).ok).toBe(true);
+
+    const oversized = `${boundary}b`;
+    expect(await op(t, "registerBox", {
+      service: oversized,
+      box: "box-64",
+      os: "linux",
+      version: "1.4.0",
+    })).toEqual({ error: "invalid service id" });
     const state = await op<any>(t, "getState");
-    const ap = state.services.find((a: any) => a.id === "scraper");
-    expect(ap.keys).toContain(minted.key.id);
+    expect(state.services.map((service: any) => service.id)).toContain(boundary);
+    expect(state.services.map((service: any) => service.id)).not.toContain(oversized);
   });
 });
 
@@ -880,6 +970,64 @@ describe("TenantDO.checkUserAccess — the browser/OAuth door gate", () => {
       service: "ghost",
     });
     expect(r.allowed).toBe(false);
+  });
+});
+
+describe("TenantDO.recordCall — metadata-only persistence", () => {
+  it("drops request/response payload fields before public and raw durable state", async () => {
+    const t = freshTenant();
+    await op(t, "enroll", { name: "Scraper" });
+
+    const requestMarker = `PRIVATE_REQUEST_${crypto.randomUUID()}`;
+    const responseMarker = `PRIVATE_RESPONSE_${crypto.randomUUID()}`;
+    await op(t, "recordCall", {
+      service: "scraper",
+      box: "box-1",
+      status: 201,
+      ms: 37,
+      caller: "privacy-test",
+      route: "/mcp",
+      // Deliberately emulate a future caller accidentally attaching payloads.
+      // The recordCall boundary must select its six metadata fields and discard
+      // every unknown property rather than spreading the RPC object into state.
+      requestBody: requestMarker,
+      responseBody: responseMarker,
+      payload: { requestMarker, responseMarker },
+      headers: { authorization: requestMarker },
+    });
+
+    const publicState = await op<any>(t, "getState");
+    const service = publicState.services.find((item: any) => item.id === "scraper");
+    expect(service.recentCalls).toHaveLength(1);
+    expect(service.recentCalls[0]).toMatchObject({
+      route: "/mcp",
+      caller: "privacy-test",
+      status: 201,
+      ms: 37,
+    });
+    expect(Object.keys(service.recentCalls[0]).sort()).toEqual(
+      ["ago", "caller", "ms", "route", "status", "ts"].sort(),
+    );
+    const requestLog = publicState.logs.find((item: any) => item.cat === "request");
+    expect(Object.keys(requestLog).sort()).toEqual(
+      ["action", "actor", "ago", "cat", "ip", "result", "target", "ts"].sort(),
+    );
+    expect(JSON.stringify(publicState)).not.toContain(requestMarker);
+    expect(JSON.stringify(publicState)).not.toContain(responseMarker);
+
+    // Inspect the real stored object too: getState is a projection and could
+    // otherwise hide a payload that was still written to Durable Object state.
+    const stub = env.TENANT.get(env.TENANT.idFromName(t));
+    const runInDO = runInDurableObject as unknown as (
+      target: typeof stub,
+      callback: (instance: any) => unknown,
+    ) => Promise<any>;
+    const stored = await runInDO(stub, (instance) =>
+      instance.ctx.storage.get("state"),
+    );
+    const serialized = JSON.stringify(stored);
+    expect(serialized).not.toContain(requestMarker);
+    expect(serialized).not.toContain(responseMarker);
   });
 });
 

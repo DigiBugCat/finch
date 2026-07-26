@@ -4,6 +4,11 @@
   "name": "finch-web",
   "compatibility_date": "2025-09-23",
   "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  // Privacy default: do not persist automatic Worker invocation logs, traces,
+  // or Logpush events. The application keeps its explicitly documented
+  // metadata in Finch itself; request bodies must never become telemetry.
+  "observability": { "enabled": false },
+  "logpush": false,
   "assets": {
     "directory": ".open-next/assets",
     "binding": "ASSETS"
@@ -19,6 +24,16 @@
     "dev": {
       "name": "finch-web-dev",
       "workers_dev": true,
+      "observability": {
+        "enabled": true,
+        "logs": {
+          "enabled": true,
+          "invocation_logs": false,
+          "persist": true
+        },
+        "traces": { "enabled": false }
+      },
+      "logpush": false,
       "services": [
         { "binding": "WORKER_SELF_REFERENCE", "service": "finch-web-dev" },
         { "binding": "FINCH_HUB", "service": "finch-dev" }
@@ -32,6 +47,8 @@
     "staging": {
       "name": "finch-web-staging",
       "workers_dev": true,
+      "observability": { "enabled": false },
+      "logpush": false,
       "services": [
         { "binding": "WORKER_SELF_REFERENCE", "service": "finch-web-staging" },
         { "binding": "FINCH_HUB", "service": "finch-staging" }
@@ -53,6 +70,8 @@
     "production": {
       "name": "finch-web-prod",
       "workers_dev": false,
+      "observability": { "enabled": false },
+      "logpush": false,
       "services": [
         { "binding": "WORKER_SELF_REFERENCE", "service": "finch-web-prod" },
         { "binding": "FINCH_HUB", "service": "finch-prod" }

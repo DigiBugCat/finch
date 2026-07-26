@@ -48,6 +48,8 @@ interface SockMeta {
  *  every head/chunk for this id; on fire it 504s a head-less stream or errors a
  *  streaming one (and sends `reset` to the agent). */
 interface Stream {
+  /** Exact socket generation this request was dispatched through. */
+  agent: WebSocket;
   /** ReadableStream controller, set once the head arrives and the body stream
    *  has been started. Undefined while we're still awaiting head. */
   controller?: ReadableStreamDefaultController<Uint8Array>;
@@ -117,11 +119,21 @@ const RELAY_WINDOW_BYTES = 1 * 1024 * 1024; // 1 MiB
 // notify the agent). 8 MiB = 8× the advisory HWM, so a well-behaved agent that
 // pauses promptly (≤ HWM + in-flight wire chunks) never comes near it.
 export const RELAY_STREAM_HARD_CAP_BYTES = 8 * 1024 * 1024; // 8 MiB
+export const RELAY_TOTAL_BUFFER_HARD_CAP_BYTES = 32 * 1024 * 1024; // 32 MiB
 
 // Max relay body we'll buffer (#16 / L9). Mirrors index.ts's pre-stub cap; we
-// enforce by STRING LENGTH after req.text() because content-length is
-// client-controlled and absent for chunked requests.
-const MAX_RELAY_BODY_BYTES = 4 * 1024 * 1024; // 4 MiB
+// enforce on the actual body bytes because content-length is client-controlled
+// and UTF-16 string length undercounts multibyte UTF-8.
+export const MAX_RELAY_BODY_BYTES = 4 * 1024 * 1024; // 4 MiB
+// Reserve the full per-request allowance before reading a body. A chunked
+// request has no trustworthy length up front, so reserving less would let many
+// concurrent slow uploads each grow to MAX_RELAY_BODY_BYTES and exhaust the
+// Durable Object heap. Two worst-case reads (8 MiB raw total) leave ample room
+// for UTF-8 decoding, JSON framing, response queues, and runtime overhead.
+export const MAX_PENDING_RELAY_BODY_BYTES = 8 * 1024 * 1024; // 8 MiB
+const MAX_AGENT_FRAME_CHARS =
+  Math.ceil(RELAY_STREAM_HARD_CAP_BYTES / 3) * 4 + 64 * 1024;
+const MAX_RESPONSE_HEADER_BYTES = 64 * 1024;
 
 // Hop-by-hop / recomputed headers we never re-emit from the upstream response.
 // Everything else (notably Mcp-Session-Id) IS forwarded so stateful MCP works.
@@ -141,6 +153,16 @@ export class BoxDO extends DurableObject<Env> {
   // relay. It's only ever empty when we hibernate (no streams open), so nothing
   // is lost. See the Stream interface for the per-id lifecycle.
   private streams = new Map<string, Stream>();
+  private pendingBodyReads = 0;
+  private reservedRequestBodyBytes = 0;
+  private currentAgent?: WebSocket;
+
+  private agent(): WebSocket | undefined {
+    if (this.currentAgent?.readyState === 1) return this.currentAgent;
+    const live = this.ctx.getWebSockets("agent").find((ws) => ws.readyState === 1);
+    this.currentAgent = live;
+    return live;
+  }
 
   async fetch(req: Request): Promise<Response> {
     const url = new URL(req.url);
@@ -177,6 +199,7 @@ export class BoxDO extends DurableObject<Env> {
       const { 0: client, 1: server } = new WebSocketPair();
       // Hibernation-aware accept; tag it so getWebSockets("agent") finds it.
       this.ctx.acceptWebSocket(server, ["agent"]);
+      this.currentAgent = server;
       // Persist identity so close/error handlers survive hibernation.
       server.serializeAttachment(meta);
       // Auto-pong NAT keepalives without waking the DO.
@@ -205,7 +228,7 @@ export class BoxDO extends DurableObject<Env> {
         return json(404, { error: "not found" });
       }
       if (req.method !== "POST") return json(405, { error: "POST only" });
-      const live = this.ctx.getWebSockets("agent")[0];
+      const live = this.agent();
       if (!live) {
         return json(
           503,
@@ -215,13 +238,22 @@ export class BoxDO extends DurableObject<Env> {
       }
       // "_ctl" is a reserved out-of-band id: request ids are crypto-random hex
       // (never "_ctl"), and the agent's update handler ignores id entirely.
-      live.send(JSON.stringify({ id: "_ctl", type: "update" }));
+      try {
+        live.send(JSON.stringify({ id: "_ctl", type: "update" }));
+      } catch {
+        if (this.currentAgent === live) this.currentAgent = undefined;
+        try { live.close(1011, "send failed"); } catch { /* already closed */ }
+        return json(
+          503,
+          { error: "box offline", id: parts[0] },
+          { "X-Finch-Offline": "1" },
+        );
+      }
       return json(200, { ok: true });
     }
 
     // ---- Public request: relay it to the connected agent. ----
-    const agent = this.ctx.getWebSockets("agent")[0];
-    if (!agent) {
+    if (!this.agent()) {
       // No live agent socket for this box — a stale pick. Tag the 503 with
       // X-Finch-Offline so the relay (which knows the tenant; the public relay
       // path doesn't carry it down to this DO) can fail over to a sibling AND
@@ -237,7 +269,7 @@ export class BoxDO extends DurableObject<Env> {
     // buffering the request body or registering a stream. 429 is terminal —
     // deliberately NO X-Finch-Offline header, so the LB path never "fails over"
     // a saturated box's load onto a sibling or marks it offline.
-    if (this.streams.size >= MAX_STREAMS_PER_BOX) {
+    if (this.streams.size + this.pendingBodyReads >= MAX_STREAMS_PER_BOX) {
       return json(
         429,
         { error: "too many concurrent requests for this box" },
@@ -245,48 +277,114 @@ export class BoxDO extends DurableObject<Env> {
       );
     }
 
-    const body = await req.text();
-    if (body.length > MAX_RELAY_BODY_BYTES) {
-      return json(413, { error: "request body too large" });
+    // A stream slot alone is not a memory budget: MAX_STREAMS_PER_BOX bodies at
+    // MAX_RELAY_BODY_BYTES would reserve roughly the entire DO heap before
+    // framing/response overhead. Chunked bodies have no reliable declared
+    // length, so reserve the full allowance atomically before the first await.
+    if (
+      this.reservedRequestBodyBytes + MAX_RELAY_BODY_BYTES >
+      MAX_PENDING_RELAY_BODY_BYTES
+    ) {
+      return json(
+        429,
+        { error: "too many request bytes in flight for this box" },
+        { "retry-after": "1" },
+      );
     }
 
-    const id = crypto.randomUUID();
-    const forwardedHeaders = new Headers(req.headers);
-    const assertion = forwardedHeaders.get("x-finch-assertion") || "";
-    forwardedHeaders.delete("x-finch-assertion");
-    const frame: ReqFrame = {
-      id,
-      type: "req",
-      method: req.method,
-      path: relPath,
-      headers: Object.fromEntries(forwardedHeaders),
-      body,
-      ...(assertion ? { assertion } : {}),
-    };
-
-    // Register the stream and arm the idle timer BEFORE sending, so a head/chunk
-    // that lands synchronously (or a same-tick reset) finds its entry. Await the
-    // FIRST frame for this id: `head` -> a streaming Response; `err` -> a plain
-    // error Response; idle timeout with no head -> 504.
-    const first = await new Promise<AgentFrame>((resolve) => {
-      // Initial (pre-head) timer is the TIGHTER RELAY_HEAD_TIMEOUT_MS; rearm()
-      // switches to the longer RELAY_IDLE_MS once frames start flowing. (S1)
-      const timer = setTimeout(() => this.onIdle(id), RELAY_HEAD_TIMEOUT_MS);
-      this.streams.set(id, { resolveHead: resolve, timer, headSettled: false });
+    this.pendingBodyReads++;
+    this.reservedRequestBodyBytes += MAX_RELAY_BODY_BYTES;
+    let firstPromise!: Promise<AgentFrame>;
+    let sendFailed = false;
+    try {
+      let bodyBytes: Uint8Array | undefined;
       try {
-        agent.send(JSON.stringify(frame));
-      } catch (e) {
-        // Couldn't even hand the request to the agent — fail this stream fast as
-        // a 502 (BEFORE head, so index.ts may still fail over). Synthesize an
-        // err frame and tear the entry down.
-        this.settleHead(id, {
-          id,
-          type: "err",
-          status: 502,
-          message: `relay failed: ${e}`,
-        });
+        bodyBytes = await readBoundedBody(req, MAX_RELAY_BODY_BYTES);
+      } catch {
+        return json(400, { error: "relay request body could not be read" });
       }
-    });
+      if (!bodyBytes) {
+        return json(413, { error: "request body too large" });
+      }
+
+      let body: string;
+      try {
+        // RELAY v2 carries a JSON string, not arbitrary bytes. Fail closed on
+        // invalid UTF-8 instead of silently replacing bytes with U+FFFD.
+        body = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bodyBytes);
+      } catch {
+        return json(400, { error: "relay request body must be valid UTF-8" });
+      }
+
+      // The socket may have been replaced while a slow request body was being
+      // read. Re-select the current generation immediately before dispatch.
+      const agent = this.agent();
+      if (!agent) {
+        return json(
+          503,
+          { error: "service offline", id: parts[0] },
+          { "X-Finch-Offline": "1" },
+        );
+      }
+
+      const id = crypto.randomUUID();
+      const forwardedHeaders = new Headers(req.headers);
+      const assertion = forwardedHeaders.get("x-finch-assertion") || "";
+      forwardedHeaders.delete("x-finch-assertion");
+      const frame: ReqFrame = {
+        id,
+        type: "req",
+        method: req.method,
+        path: relPath,
+        headers: Object.fromEntries(forwardedHeaders),
+        body,
+        ...(assertion ? { assertion } : {}),
+      };
+
+      // Register the stream and arm the idle timer BEFORE sending, so a
+      // head/chunk that lands synchronously (or a same-tick reset) finds its
+      // entry. Do not hold the request-body reservation while awaiting the
+      // upstream response; send() has copied the frame by then.
+      firstPromise = new Promise<AgentFrame>((resolve) => {
+        const timer = setTimeout(() => this.onIdle(id), RELAY_HEAD_TIMEOUT_MS);
+        this.streams.set(id, {
+          agent,
+          resolveHead: resolve,
+          timer,
+          headSettled: false,
+        });
+        try {
+          agent.send(JSON.stringify(frame));
+        } catch {
+          // A socket can remain in getWebSockets/currentAgent briefly after its
+          // transport dies. This is the same stale-liveness condition as having
+          // no socket, so preserve index.ts's failover contract exactly.
+          sendFailed = true;
+          if (this.currentAgent === agent) this.currentAgent = undefined;
+          try { agent.close(1011, "send failed"); } catch { /* already closed */ }
+          this.settleHead(id, {
+            id,
+            type: "err",
+            status: 503,
+            message: "service offline",
+          });
+        }
+      });
+    } finally {
+      this.pendingBodyReads--;
+      this.reservedRequestBodyBytes -= MAX_RELAY_BODY_BYTES;
+    }
+    const first = await firstPromise;
+
+    if (sendFailed) {
+      return json(
+        503,
+        { error: "service offline", id: parts[0] },
+        { "X-Finch-Offline": "1" },
+      );
+    }
+
+    const id = first.id;
 
     if (first.type === "err") {
       // Error before head. Return the message as a plain body with the agent's
@@ -308,6 +406,15 @@ export class BoxDO extends DurableObject<Env> {
     // when no headers survive the hop-by-hop filter) — iterating undefined throws.
     for (const [k, v] of first.headers ?? []) {
       if (!HOP_BY_HOP.has(k.toLowerCase())) headers.append(k, v);
+    }
+
+    // Fetch forbids a body on these otherwise-valid upstream statuses. Retire
+    // the stream immediately; late end/chunk frames are ignored by id.
+    if (first.status === 204 || first.status === 205 || first.status === 304) {
+      const s = this.streams.get(id);
+      if (s) clearTimeout(s.timer);
+      this.streams.delete(id);
+      return new Response(null, { status: first.status, headers });
     }
 
     // The ReadableStream is fed by chunk frames (base64-decoded) and closed on
@@ -371,60 +478,77 @@ export class BoxDO extends DurableObject<Env> {
 
   // Hibernatable handler — fires when the agent sends a frame down the socket:
   // head / chunk / end / err / reset, all keyed by the relayed request id.
-  async webSocketMessage(_ws: WebSocket, message: string | ArrayBuffer) {
-    let frame: AgentFrame;
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
+    let raw: unknown;
     try {
-      const text =
-        typeof message === "string"
-          ? message
-          : new TextDecoder().decode(message);
-      frame = JSON.parse(text);
+      const text = typeof message === "string"
+        ? message
+        : new TextDecoder().decode(message);
+      if (text.length > MAX_AGENT_FRAME_CHARS) {
+        this.resetOwned(ws, "agent frame too large");
+        try { ws.close(1009, "frame too large"); } catch { /* already closed */ }
+        return;
+      }
+      raw = JSON.parse(text);
     } catch {
       return;
     }
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return;
+    const frame = raw as Record<string, unknown>;
+    if (typeof frame.id !== "string") return;
     const s = this.streams.get(frame.id);
-    if (!s) return; // unknown / already-torn-down id — ignore.
+    if (!s || s.agent !== ws) return;
+    if (typeof frame.type !== "string") {
+      this.resetStream(frame.id, "invalid relay frame type", true);
+      return;
+    }
 
     switch (frame.type) {
       case "head":
-        // First frame: re-arm idle, settle the awaiting fetch() with the head.
+        if (s.headSettled || !this.validHead(frame)) {
+          this.resetStream(frame.id, "invalid relay head", true);
+          return;
+        }
         this.rearm(s, frame.id);
-        this.settleHead(frame.id, frame);
+        this.settleHead(frame.id, frame as unknown as AgentFrame);
         return;
       case "err":
-        // Error before head: settle the fetch() with the err (turns into a plain
-        // error Response). If head was already sent this is a protocol violation
-        // (agent must not err after head); treat it as a reset of the body.
-        if (s.headSettled && s.controller) {
-          this.resetStream(frame.id, frame.message, false);
+        if (!this.validErr(frame)) {
+          this.resetStream(frame.id, "invalid relay error", true);
+          return;
+        }
+        if (s.headSettled) {
+          this.resetStream(frame.id, String(frame.message), true);
         } else {
           this.rearm(s, frame.id);
-          this.settleHead(frame.id, frame);
+          this.settleHead(frame.id, frame as unknown as AgentFrame);
         }
         return;
       case "chunk": {
+        if (!s.headSettled || typeof frame.data !== "string") {
+          this.resetStream(frame.id, "chunk before head or invalid chunk", true);
+          return;
+        }
+        if (frame.data.length > Math.ceil(RELAY_STREAM_HARD_CAP_BYTES / 3) * 4) {
+          this.resetStream(frame.id, "stream buffer overflow", true);
+          return;
+        }
         this.rearm(s, frame.id);
         let bytes: Uint8Array;
         try {
           bytes = decodeChunk(frame.data);
         } catch {
-          this.resetStream(frame.id, "bad chunk encoding", false);
+          this.resetStream(frame.id, "bad chunk encoding", true);
           return;
         }
         if (s.controller) {
           try {
             s.controller.enqueue(bytes);
           } catch {
-            // Controller already closed/errored — drop and tear down.
-            this.resetStream(frame.id, "enqueue failed", false);
+            this.resetStream(frame.id, "enqueue failed", true);
             return;
           }
-          // Post-enqueue backpressure: if this chunk pushed the in-memory queue
-          // to/over the HWM and we haven't already paused, tell the agent to stop.
           this.maybePause(frame.id);
-          // HARD CAP (S2): the pause above is advisory. desiredSize is
-          // HWM - buffered, so buffered = HWM - desiredSize; a peer that keeps
-          // flooding past the cap gets reset instead of OOMing the DO.
           const desired = s.controller.desiredSize;
           if (
             desired !== null &&
@@ -434,41 +558,79 @@ export class BoxDO extends DurableObject<Env> {
             return;
           }
         } else {
-          // head settled but start() hasn't captured the controller yet — buffer
-          // (the input gate normally prevents this; flushed in start()).
           (s.pending ??= []).push(bytes);
-          // HARD CAP (S2) also guards this pre-controller path — a flood that
-          // races start() must not accumulate unbounded in `pending` either.
           s.pendingBytes = (s.pendingBytes ?? 0) + bytes.byteLength;
           if (s.pendingBytes > RELAY_STREAM_HARD_CAP_BYTES) {
             this.resetStream(frame.id, "stream buffer overflow", true);
             return;
           }
         }
+        if (this.totalBufferedBytes() > RELAY_TOTAL_BUFFER_HARD_CAP_BYTES) {
+          this.resetStream(frame.id, "relay aggregate buffer overflow", true);
+        }
         return;
       }
       case "end":
-        // Upstream body fully read -> close the readable and retire the stream.
+        if (!s.headSettled) {
+          this.resetStream(frame.id, "end before head", true);
+          return;
+        }
         clearTimeout(s.timer);
         if (s.controller) {
           this.streams.delete(frame.id);
-          try {
-            s.controller.close();
-          } catch {
-            /* already closed */
-          }
+          try { s.controller.close(); } catch { /* already closed */ }
         } else {
-          // `end` won the race against start(): keep the entry so start() can
-          // flush any buffered chunks and then close.
           s.ended = true;
         }
         return;
       case "reset":
-        // Agent aborted its side. Error the readable (if streaming) or resolve
-        // the pending head 502; do NOT echo a reset back (agent initiated it).
+        if (frame.message !== undefined && typeof frame.message !== "string") {
+          this.resetStream(frame.id, "invalid reset frame", true);
+          return;
+        }
         this.resetStream(frame.id, frame.message ?? "stream reset", false);
         return;
+      default:
+        this.resetStream(frame.id, "unknown relay frame", true);
     }
+  }
+
+  private validHead(frame: Record<string, unknown>): boolean {
+    if (!Number.isInteger(frame.status) || (frame.status as number) < 200 ||
+      (frame.status as number) > 599) return false;
+    if (frame.headers === undefined) return true;
+    if (!Array.isArray(frame.headers) || frame.headers.length > 256) return false;
+    let bytes = 0;
+    try {
+      const probe = new Headers();
+      for (const pair of frame.headers) {
+        if (!Array.isArray(pair) || pair.length !== 2 ||
+          typeof pair[0] !== "string" || typeof pair[1] !== "string") return false;
+        bytes += pair[0].length + pair[1].length;
+        if (bytes > MAX_RESPONSE_HEADER_BYTES) return false;
+        probe.append(pair[0], pair[1]);
+      }
+    } catch {
+      return false;
+    }
+    return true;
+  }
+
+  private validErr(frame: Record<string, unknown>): boolean {
+    return Number.isInteger(frame.status) && (frame.status as number) >= 400 &&
+      (frame.status as number) <= 599 && typeof frame.message === "string" &&
+      frame.message.length <= 4096;
+  }
+
+  private totalBufferedBytes(): number {
+    let total = 0;
+    for (const s of this.streams.values()) {
+      const desired = s.controller?.desiredSize;
+      total += desired === null || desired === undefined
+        ? s.pendingBytes ?? 0
+        : Math.max(0, RELAY_WINDOW_BYTES - desired);
+    }
+    return total;
   }
 
   /** Settle the fetch()'s await-first-frame promise exactly once and mark the
@@ -533,9 +695,8 @@ export class BoxDO extends DurableObject<Env> {
     }
     if (notifyAgent) {
       const reset: ResetFrame = { id, type: "reset", message };
-      const agent = this.ctx.getWebSockets("agent")[0];
       try {
-        agent?.send(JSON.stringify(reset));
+        s.agent.send(JSON.stringify(reset));
       } catch {
         /* socket gone — nothing to abort */
       }
@@ -571,7 +732,7 @@ export class BoxDO extends DurableObject<Env> {
    *  socket just means there's nothing left to pause/resume. */
   private sendWindow(id: string, credits: number): void {
     const frame: WindowFrame = { id, type: "window", credits };
-    const agent = this.ctx.getWebSockets("agent")[0];
+    const agent = this.streams.get(id)?.agent;
     try {
       agent?.send(JSON.stringify(frame));
     } catch {
@@ -583,12 +744,15 @@ export class BoxDO extends DurableObject<Env> {
     // A dead link must NOT leave in-flight callers hanging — reset ALL in-flight
     // streams now (error their readables / resolve pending heads 502) so they
     // unblock immediately.
-    this.resetAll("service link closed");
-    // Code 1012 means we superseded this socket with a fresh agent connection
-    // (single-agent eviction above). The newer socket is the live one, so do NOT
-    // mark the box offline — that would flap a connected box to offline.
+    this.resetOwned(ws, "service link closed");
+    // Generation ownership, not the peer-controlled close code, determines
+    // liveness. A stale superseded socket must not flap a replacement offline;
+    // the current socket must mark offline even if it chooses close code 1012.
     const meta = ws.deserializeAttachment() as SockMeta | null;
-    if (meta && code !== 1012) await this.markBox(meta, false);
+    const live = this.agent();
+    const wasCurrent = live === ws || !live;
+    if (this.currentAgent === ws) this.currentAgent = undefined;
+    if (meta && wasCurrent) await this.markBox(meta, false);
     try {
       ws.close(code, reason);
     } catch {
@@ -599,17 +763,20 @@ export class BoxDO extends DurableObject<Env> {
   async webSocketError(ws: WebSocket, _error: unknown) {
     // Agent link errored — reset all in-flight streams fast and flag the box
     // offline.
-    this.resetAll("service link errored");
+    this.resetOwned(ws, "service link errored");
     const meta = ws.deserializeAttachment() as SockMeta | null;
-    if (meta) await this.markBox(meta, false);
+    const live = this.agent();
+    const wasCurrent = live === ws || !live;
+    if (this.currentAgent === ws) this.currentAgent = undefined;
+    if (meta && wasCurrent) await this.markBox(meta, false);
   }
 
   /** Reset EVERY in-flight stream: error its readable (or resolve its pending
    *  head 502) and clear the map. Called on socket close/error so a dead link
    *  surfaces immediately. We do NOT notify the agent — the socket is gone. */
-  private resetAll(reason: string): void {
-    for (const id of [...this.streams.keys()]) {
-      this.resetStream(id, reason, false);
+  private resetOwned(ws: WebSocket, reason: string): void {
+    for (const [id, stream] of [...this.streams.entries()]) {
+      if (stream.agent === ws) this.resetStream(id, reason, false);
     }
   }
 
@@ -636,6 +803,44 @@ export class BoxDO extends DurableObject<Env> {
       /* control-plane write failed; liveness will reconcile on next event */
     }
   }
+}
+
+/** Read an incoming relay body without allowing arrayBuffer()/text() to consume
+ * an unbounded chunked upload before the limit is checked. `undefined` means
+ * the byte limit was exceeded; read failures still throw so fetch() can return
+ * a distinct malformed-request response. */
+async function readBoundedBody(
+  req: Request,
+  maxBytes: number,
+): Promise<Uint8Array | undefined> {
+  if (!req.body) return new Uint8Array();
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value?.byteLength) continue;
+      if (value.byteLength > maxBytes - total) {
+        try { await reader.cancel("relay request body too large"); } catch { /* already failed */ }
+        return undefined;
+      }
+      chunks.push(value);
+      total += value.byteLength;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  if (chunks.length === 0) return new Uint8Array();
+  if (chunks.length === 1) return chunks[0];
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body;
 }
 
 function json(

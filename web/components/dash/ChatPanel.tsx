@@ -9,6 +9,10 @@ type Item =
   | { kind: 'msg'; role: 'user' | 'assistant'; content: string; err?: boolean }
   | { kind: 'tool'; tool: string; args: any; result: string };
 
+const MAX_HISTORY_MESSAGES = 30;
+// Keep complete user/assistant pairs and reserve space for the next turn.
+const MAX_RETAINED_COMPLETE_TURN_MESSAGES = MAX_HISTORY_MESSAGES - 2;
+
 export function ChatPanel({ service, online }: { service: string; online: boolean }) {
   const [items, setItems] = useState<Item[]>([]);
   const [input, setInput] = useState('');
@@ -26,7 +30,10 @@ export function ChatPanel({ service, online }: { service: string; online: boolea
     if (!t || busy) return;
     setInput('');
     setItems((m) => [...m, { kind: 'msg', role: 'user', content: t }]);
-    hist.current.push({ role: 'user', content: t });
+    hist.current = [
+      ...hist.current.slice(-MAX_RETAINED_COMPLETE_TURN_MESSAGES),
+      { role: 'user', content: t },
+    ];
     setBusy(true);
     try {
       const r = await fetch('/api/finch/chat', {
@@ -40,7 +47,10 @@ export function ChatPanel({ service, online }: { service: string; online: boolea
         add.push({ kind: 'msg', role: 'assistant', content: '⚠️ ' + j.error, err: true });
       } else {
         add.push({ kind: 'msg', role: 'assistant', content: j.reply || '(no reply)' });
-        hist.current.push({ role: 'assistant', content: j.reply || '' });
+        hist.current = [
+          ...hist.current,
+          { role: 'assistant', content: j.reply || '' },
+        ].slice(-MAX_RETAINED_COMPLETE_TURN_MESSAGES);
       }
       setItems((m) => [...m, ...add]);
     } catch (e: any) {
@@ -52,6 +62,12 @@ export function ChatPanel({ service, online }: { service: string; online: boolea
   return (
     <Card className="connect-card chatd-card">
       <SectionLabel hint="ask an LLM to use this service's tools — a live check it works">test in chat</SectionLabel>
+      <div className="chatd-privacy" role="note">
+        <strong>Cloudflare Workers AI processes this chat.</strong>{' '}
+        Test Chat is separate from ordinary relay traffic. Your chat messages,
+        service tool schemas, tool arguments, and tool results are sent to Workers
+        AI for model processing. Don&apos;t use Test Chat with sensitive data.
+      </div>
 
       {!online ? (
         <div className="url-pending mono big-pending">offline. start the box to chat with its tools.</div>

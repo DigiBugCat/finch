@@ -135,6 +135,10 @@ finch call hello greet --args '{"name": "world"}'
           <h3>CLI reference</h3>
           <p>Every command, with JSON output for scripting.</p>
         </Link>
+        <Link className="docs-card" href="/docs/privacy">
+          <h3>Privacy &amp; data handling</h3>
+          <p>Transport encryption, the relay non-retention guarantee, retained metadata, and Test Chat.</p>
+        </Link>
       </div>
     </>
   );

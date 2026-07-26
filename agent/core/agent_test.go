@@ -3,6 +3,7 @@ package core
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -62,6 +63,28 @@ func TestResolveUpstream(t *testing.T) {
 		}
 		if got != c.want {
 			t.Errorf("%s: resolveUpstream(%q) = %q, want %q", c.comment, c.path, got, c.want)
+		}
+	}
+}
+
+func TestValidateRelayCommandArgRejectsUnknownPositional(t *testing.T) {
+	for _, accepted := range []string{"join", "run", "--hub", "-v"} {
+		if err := validateRelayCommandArg(accepted); err != nil {
+			t.Errorf("valid relay invocation %q rejected: %v", accepted, err)
+		}
+	}
+	if err := validateRelayCommandArg("typo"); err == nil {
+		t.Fatal("unknown positional command would silently start a relay")
+	}
+}
+
+func TestValidateRelayPositionalsRejectsArgumentsAfterFlagsOrDoubleDash(t *testing.T) {
+	if err := validateRelayPositionals(nil); err != nil {
+		t.Fatalf("empty trailing arguments rejected: %v", err)
+	}
+	for _, args := range [][]string{{"typo"}, {"typo", "extra"}} {
+		if err := validateRelayPositionals(args); err == nil {
+			t.Fatalf("trailing positionals accepted: %q", args)
 		}
 	}
 }
@@ -174,6 +197,21 @@ func TestRefresh_RejectsRedirectWithoutLeakingHubBody(t *testing.T) {
 	}
 }
 
+func TestJoinRejectsMismatchedOrUnsafeAssignment(t *testing.T) {
+	for _, jr := range []joinResp{
+		{OK: true, Service: "media", Box: "other-box", ConnectToken: "token"},
+		{OK: true, Service: "../../escape", Box: "requested-box", ConnectToken: "token"},
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(jr)
+		}))
+		if _, err := joinContext(t.Context(), srv.URL, "ticket", "requested-box"); err == nil {
+			t.Errorf("unsafe join assignment accepted: %+v", jr)
+		}
+		srv.Close()
+	}
+}
+
 func TestRelayURL(t *testing.T) {
 	cases := []struct{ hub, want string }{
 		{"http://localhost:8787", "ws://localhost:8787/app/box/_connect"},
@@ -275,6 +313,22 @@ func TestSaveState_BareRelativePathDoesNotChmodWorkingDirectory(t *testing.T) {
 	}
 	if got := info.Mode().Perm(); got != 0o755 {
 		t.Fatalf("working directory mode changed to %04o", got)
+	}
+}
+
+func TestSaveState_RejectsCredentialItCannotReload(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "agent.json")
+	original := &agentState{Hub: "https://hub.example", RefreshToken: "valid"}
+	if err := saveState(p, original); err != nil {
+		t.Fatal(err)
+	}
+	oversized := &agentState{Hub: "https://hub.example", RefreshToken: strings.Repeat("x", credentialStateLimit)}
+	if err := saveState(p, oversized); err == nil {
+		t.Fatal("saved credential larger than loadState can read")
+	}
+	got, err := loadState(p)
+	if err != nil || got.RefreshToken != original.RefreshToken {
+		t.Fatalf("oversized save damaged prior credential: state=%+v err=%v", got, err)
 	}
 }
 

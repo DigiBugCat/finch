@@ -25,8 +25,8 @@ export default function Safety() {
           </div>
           <div className="safety">
             <div className="safety-ic">🏡</div>
-            <h4>Private by design</h4>
-            <p>Your data stays on your box. Finch routes the request. It never sees or stores what flows through.</p>
+            <h4>Payloads aren&apos;t retained</h4>
+            <p>Requests are encrypted in transit and handled in memory while Finch relays them. Ordinary request and response bodies aren&apos;t logged or stored; only documented operational metadata is retained.</p>
           </div>
         </div>
       </div>

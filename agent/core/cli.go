@@ -13,18 +13,19 @@ package core
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -273,12 +274,17 @@ func saveCliCred(c *cliCred) error {
 
 // cliGET/cliPOST hit /api/cli/* with the bearer token.
 func cliRequest(method, hub, path, token string, body any) (map[string]any, error) {
+	validatedHub, err := validateHubTransportURL(hub)
+	if err != nil {
+		return nil, err
+	}
+	hub = validatedHub
 	var rdr io.Reader
 	if body != nil {
 		b, _ := json.Marshal(body)
 		rdr = bytes.NewReader(b)
 	}
-	req, err := http.NewRequest(method, strings.TrimRight(hub, "/")+path, rdr)
+	req, err := http.NewRequest(method, hub+path, rdr)
 	if err != nil {
 		return nil, err
 	}
@@ -449,6 +455,12 @@ func cmdLogin(args []string) {
 	tokenFlag := fs.String("token", "", "CLI token (or pass as a positional argument)")
 	headless := fs.Bool("headless", false, "no local browser: print the link + code (open it on any device, e.g. your phone) and poll — for a screenless box reached over SSH")
 	_ = fs.Parse(args)
+	validatedHub, err := validateHubTransportURL(*hub)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "finch: login failed: %v\n", err)
+		os.Exit(1)
+	}
+	*hub = validatedHub
 
 	token := *tokenFlag
 	if token == "" && fs.NArg() > 0 {
@@ -859,6 +871,10 @@ func cmdRm(args []string) {
 		fmt.Fprintln(os.Stderr, "usage: finch rm <service>")
 		os.Exit(2)
 	}
+	if err := validateServiceID(args[0]); err != nil {
+		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
+		os.Exit(2)
+	}
 	cred, err := loadCliCred()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
@@ -1022,13 +1038,17 @@ func cmdAdd(args []string) {
 		fmt.Fprintln(os.Stderr, "  <app_path> becomes the public URL segment: https://<your-slug>.finchmcp.com/<app_path>/")
 		os.Exit(2)
 	}
-	if strings.ContainsAny(wantPath, "/ ") {
-		fmt.Fprintf(os.Stderr, "finch: <app_path> %q must be a single URL segment (no slashes or spaces)\n", wantPath)
+	if err := validateServiceID(wantPath); err != nil {
+		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
 		os.Exit(2)
 	}
-	if u, err := url.Parse(strings.TrimRight(*service, "/")); err != nil || u.Scheme == "" || u.Host == "" {
-		fmt.Fprintf(os.Stderr, "finch: --service %q is not a valid absolute URL\n", *service)
+	if _, err := parseUpstreamTransportURL(*service); err != nil {
+		fmt.Fprintf(os.Stderr, "finch: --service %q has invalid transport: %v\n", *service, err)
 		os.Exit(2)
+	}
+	if err := validateManifestMutationTarget(*configPath); err != nil {
+		fmt.Fprintf(os.Stderr, "finch: cannot safely update manifest: %v\n", err)
+		os.Exit(1)
 	}
 
 	cred, err := loadCliCred()
@@ -1049,6 +1069,10 @@ func cmdAdd(args []string) {
 	pubURL, _ := out["url"].(string)
 	if id == "" || ticket == "" {
 		fmt.Fprintf(os.Stderr, "finch: unexpected enroll response: %v\n", out)
+		os.Exit(1)
+	}
+	if err := validateServiceID(id); err != nil {
+		fmt.Fprintf(os.Stderr, "finch: unsafe service id returned by hub: %v\n", err)
 		os.Exit(1)
 	}
 	if id != wantPath {
@@ -1139,8 +1163,8 @@ func cmdEnroll(args []string) {
 		fmt.Fprintln(os.Stderr, "  keep it off argv/history: 'echo <t> | finch enroll <app_path> --ticket -' or set FINCH_TICKET")
 		os.Exit(2)
 	}
-	if strings.ContainsAny(appPath, "/ ") {
-		fmt.Fprintf(os.Stderr, "finch: <app_path> %q must be a single URL segment (no slashes or spaces)\n", appPath)
+	if err := validateServiceID(appPath); err != nil {
+		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
 		os.Exit(2)
 	}
 
@@ -1153,6 +1177,10 @@ func cmdEnroll(args []string) {
 		os.Exit(1)
 	}
 	id := jr.Service
+	if err := validateServiceID(id); err != nil {
+		fmt.Fprintf(os.Stderr, "finch: unsafe service id returned by hub: %v\n", err)
+		os.Exit(1)
+	}
 	statePath := filepath.Join(expandHome(*credDir), id+".json")
 	if _, err := persistJoin(*hub, jr, statePath); err != nil {
 		fmt.Fprintf(os.Stderr, "finch: enroll failed: %v\n", err)
@@ -1205,6 +1233,32 @@ func addPaths(configPath, host string) (box, credDir string) {
 	return box, credDir
 }
 
+var manifestMutationMu sync.Mutex
+
+func validateManifestMutationTarget(configPath string) error {
+	b, err := os.ReadFile(configPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal(b, &doc); err != nil {
+		return fmt.Errorf("parsing %s: %w", configPath, err)
+	}
+	if doc.Kind == 0 || (doc.Kind == yaml.DocumentNode && len(doc.Content) == 0) {
+		return nil
+	}
+	if doc.Kind != yaml.DocumentNode || len(doc.Content) == 0 || doc.Content[0].Kind != yaml.MappingNode {
+		return fmt.Errorf("%s: top-level YAML is not a mapping", configPath)
+	}
+	if seq := yamlMapValue(doc.Content[0], "ingress"); seq != nil && seq.Kind != yaml.SequenceNode {
+		return fmt.Errorf("%s: ingress must be a sequence", configPath)
+	}
+	return nil
+}
+
 // appendIngress adds (or updates) one ingress rule in finch.yml WITHOUT clobbering
 // user comments or keys finch doesn't model: it edits an existing file through a
 // yaml.Node (yaml.v3 preserves comments + unknown content across a Node round-trip)
@@ -1213,6 +1267,15 @@ func addPaths(configPath, host string) (box, credDir string) {
 // only when absent. A missing file is created from the managed header + a minimal
 // struct marshal. No ticket is written — the credential is saved separately by enroll.
 func appendIngress(configPath, hub, appPath, service, box string) error {
+	manifestMutationMu.Lock()
+	defer manifestMutationMu.Unlock()
+	return appendIngressLocked(configPath, hub, appPath, service, box)
+}
+
+func appendIngressLocked(configPath, hub, appPath, service, box string) error {
+	if err := validateManifestMutationTarget(configPath); err != nil {
+		return err
+	}
 	b, err := os.ReadFile(configPath)
 	if err != nil {
 		if !os.IsNotExist(err) {
@@ -1227,7 +1290,7 @@ func appendIngress(configPath, hub, appPath, service, box string) error {
 		if merr != nil {
 			return merr
 		}
-		return os.WriteFile(configPath, append([]byte("# finch.yml — managed by `finch add`\n"), out...), 0o600)
+		return atomicManifestWrite(configPath, append([]byte("# finch.yml — managed by `finch add`\n"), out...))
 	}
 
 	// Existing file: edit through a yaml.Node so comments + unmodeled keys survive.
@@ -1261,7 +1324,7 @@ func appendIngress(configPath, hub, appPath, service, box string) error {
 
 	// Locate (or create) the ingress sequence.
 	seq := yamlMapValue(root, "ingress")
-	if seq == nil || seq.Kind != yaml.SequenceNode {
+	if seq == nil {
 		seq = &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
 		yamlMapSet(root, "ingress", seq)
 	}
@@ -1321,14 +1384,46 @@ func yamlWriteFile(configPath string, doc *yaml.Node) error {
 	if err != nil {
 		return err
 	}
-	// A fresh manifest may target ~/.finch/finch.yml before anything else has
-	// created the dotfile dir (defaultManifestPath).
+	return atomicManifestWrite(configPath, out)
+}
+
+func atomicManifestWrite(configPath string, out []byte) error {
 	if dir := filepath.Dir(configPath); dir != "." {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return err
 		}
 	}
-	return os.WriteFile(configPath, out, 0o600)
+	dir := filepath.Dir(configPath)
+	tmp, err := os.CreateTemp(dir, ".finch-yaml-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	cleanup := func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		cleanup()
+		return err
+	}
+	if _, err := tmp.Write(out); err != nil {
+		cleanup()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		cleanup()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Rename(tmpPath, configPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return nil
 }
 
 // cmdUpdate: finch update [--hub URL] [--force] [--restart=auto|service|self|none]
@@ -1354,6 +1449,11 @@ func cmdUpdate(args []string) {
 	force := fs.Bool("force", false, "reinstall even if already on the latest version")
 	restart := fs.String("restart", "auto", "how to restart the running serve: auto|service|self|none")
 	_ = fs.Parse(args)
+	mode, err := resolveUpdateRestartMode(*restart, finchTunnelActive(), runningAsServe())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
+		os.Exit(2)
+	}
 
 	// Hub: explicit flag, else the logged-in cli.json hub, else the prod default.
 	hub := *hubFlag
@@ -1378,14 +1478,6 @@ func cmdUpdate(args []string) {
 	fmt.Printf("finch: installed new binary at %s\n", self)
 
 	// Bring the running serve onto the new binary.
-	mode := *restart
-	if mode == "auto" {
-		if finchTunnelActive() {
-			mode = "service"
-		} else {
-			mode = "self"
-		}
-	}
 	switch mode {
 	case "none":
 		fmt.Println("finch: binary swapped — restart your serve to apply.")
@@ -1412,9 +1504,28 @@ func cmdUpdate(args []string) {
 			fmt.Fprintf(os.Stderr, "finch: re-exec failed: %v (binary is updated; restart manually)\n", eerr)
 			os.Exit(1)
 		}
+	}
+}
+
+func resolveUpdateRestartMode(requested string, tunnelActive, currentProcessServes bool) (string, error) {
+	switch requested {
+	case "auto":
+		if tunnelActive {
+			return "service", nil
+		}
+		if currentProcessServes {
+			return "self", nil
+		}
+		return "none", nil
+	case "service", "none":
+		return requested, nil
+	case "self":
+		if !currentProcessServes {
+			return "", fmt.Errorf("--restart=self requires the current process to be serving; use service or none from a separate updater")
+		}
+		return "self", nil
 	default:
-		fmt.Fprintf(os.Stderr, "finch: unknown --restart mode %q (use auto|service|self|none)\n", mode)
-		os.Exit(1)
+		return "", fmt.Errorf("unknown --restart mode %q (use auto|service|self|none)", requested)
 	}
 }
 
@@ -1426,7 +1537,10 @@ func cmdUpdate(args []string) {
 // download source is ALWAYS the box's own hub — never caller-supplied — so a
 // forged trigger can at worst cause a re-download of the pinned release.
 func performUpdate(hub string, force bool) (self string, updated bool, err error) {
-	hub = strings.TrimRight(hub, "/")
+	hub, err = validateHubTransportURL(hub)
+	if err != nil {
+		return "", false, err
+	}
 	if !force {
 		if latest, verr := hubLatestVersion(hub); verr == nil && latest != "" && latest == agentVersion {
 			return "", false, nil
@@ -1496,11 +1610,18 @@ func updateArch() string {
 // can no-op when already current. Best-effort: any error → "" (caller updates
 // anyway). The hub exposes it at /api/version (public, unauthenticated).
 func hubLatestVersion(hub string) (string, error) {
-	req, err := http.NewRequest(http.MethodGet, hub+"/api/version", nil)
+	validatedHub, err := validateHubTransportURL(hub)
 	if err != nil {
 		return "", err
 	}
-	res, err := http.DefaultClient.Do(req)
+	hub = validatedHub
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, hub+"/api/version", nil)
+	if err != nil {
+		return "", err
+	}
+	res, err := secureRedirectHTTPClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -1508,27 +1629,59 @@ func hubLatestVersion(hub string) (string, error) {
 	if res.StatusCode != 200 {
 		return "", fmt.Errorf("hub %d", res.StatusCode)
 	}
+	payload, err := io.ReadAll(io.LimitReader(res.Body, maxVersionResponseBytes+1))
+	if err != nil {
+		return "", err
+	}
+	if int64(len(payload)) > maxVersionResponseBytes {
+		return "", fmt.Errorf("version response exceeded %d bytes", maxVersionResponseBytes)
+	}
 	var body struct {
 		Latest string `json:"latest"`
 	}
-	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+	if err := json.Unmarshal(payload, &body); err != nil {
 		return "", err
 	}
 	return body.Latest, nil
 }
+
+const (
+	maxVersionResponseBytes int64 = 64 << 10
+	maxAgentDownloadBytes   int64 = 256 << 20
+	agentDownloadTimeout          = 10 * time.Minute
+)
 
 // downloadAndSwap fetches url to a temp file NEXT TO dst (same dir → atomic
 // rename), makes it executable, then renames it over dst. Downloading to a temp
 // first means a failed/partial download never bricks the running binary; the
 // rename is atomic on POSIX so there's no torn-write window.
 func downloadAndSwap(url, dst string) error {
-	res, err := http.Get(url)
+	ctx, cancel := context.WithTimeout(context.Background(), agentDownloadTimeout)
+	defer cancel()
+	return downloadAndSwapWithLimit(ctx, url, dst, maxAgentDownloadBytes)
+}
+
+func downloadAndSwapWithLimit(ctx context.Context, url, dst string, limit int64) error {
+	if limit <= 0 {
+		return fmt.Errorf("invalid Finch update size limit")
+	}
+	if err := validateHTTPTransportURL(url); err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	res, err := secureRedirectHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer res.Body.Close()
 	if res.StatusCode != 200 {
 		return fmt.Errorf("download %s: hub %d", url, res.StatusCode)
+	}
+	if res.ContentLength > limit {
+		return fmt.Errorf("download %s exceeds %d bytes", url, limit)
 	}
 	dir := filepath.Dir(dst)
 	tmp, err := os.CreateTemp(dir, ".finch-update-*")
@@ -1537,9 +1690,18 @@ func downloadAndSwap(url, dst string) error {
 	}
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName) // no-op after a successful rename
-	if _, err := io.Copy(tmp, res.Body); err != nil {
+	written, err := io.Copy(tmp, io.LimitReader(res.Body, limit+1))
+	if err != nil {
 		tmp.Close()
 		return err
+	}
+	if written == 0 {
+		tmp.Close()
+		return fmt.Errorf("download %s was empty", url)
+	}
+	if written > limit {
+		tmp.Close()
+		return fmt.Errorf("download %s exceeds %d bytes", url, limit)
 	}
 	if err := tmp.Close(); err != nil {
 		return err

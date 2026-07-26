@@ -1,77 +1,48 @@
 // POST /api/finch/access/revoke {id | ruleId} -> pull a user's service grant.
-// Accepts either the access-request row id or the ACL rule id. Removal is
+// Accepts either the access-request row id or a single-destination ACL rule id. Removal is
 // SURGICAL (DO removeUserGrant): only the {user, service} destination comes
 // out, so a multi-dst rule keeps its other services. If a broader rule
 // (all/tag/group/locked) still covers the user we FAIL with 409 rather than
 // report a revoke that changed nothing at the door.
 import {
-  callerLabel,
   errorResponse,
   HttpError,
-  listAccessAs,
-  removeUserGrantAs,
+  hubFetchAs,
   requireSharing,
-  setAccessStatusAs,
 } from "@/lib/hub";
+import { readJsonObject } from "@/lib/request-body";
+import { readHubJsonObject, requiredString } from "../_contracts";
 
 export async function POST(req: Request) {
   try {
-    const { tenant, userId } = await requireSharing();
-    const body = (await req.json().catch(() => ({}))) as {
-      id?: string;
-      ruleId?: string;
-      service?: string;
-    };
-    const id = (body?.id ?? "").trim();
-    const ruleId = (body?.ruleId ?? "").trim();
+    const { tenant, userId, memberId, email: actorEmail } = await requireSharing();
+    const body = await readJsonObject(req);
+    const id = body.id === undefined ? "" : requiredString(body, "id", "valid id or ruleId required");
+    const ruleId = body.ruleId === undefined
+      ? ""
+      : requiredString(body, "ruleId", "valid id or ruleId required");
     if (!id && !ruleId) throw new HttpError(400, "id or ruleId required");
+    if (id && ruleId) throw new HttpError(400, "provide id or ruleId, not both");
 
-    const { requests, grants } = await listAccessAs(tenant);
-
-    // Resolve the {email, service} pairs to revoke from whichever handle the
-    // caller gave us; the DO then removes exactly those pairs. A ruleId (a
-    // grants-table row) covers EVERY service the rule dst's; a request-row id
-    // covers just that row's service.
-    let email: string;
-    let services: string[];
-    if (ruleId) {
-      const rule = grants.find((r) => r.id === ruleId);
-      if (!rule) throw new HttpError(404, "unknown grant");
-      const svcs = rule.dst
-        .filter((d) => d.type === "service" && d.name)
-        .map((d) => d.name as string);
-      if (rule.src.type !== "user" || !rule.src.name || !svcs.length) {
-        throw new HttpError(400, "not a revocable user→service grant");
-      }
-      email = rule.src.name.toLowerCase();
-      services = svcs;
-    } else {
-      const row = requests.find((r) => r.id === id);
-      if (!row) throw new HttpError(404, "unknown access request");
-      email = row.email;
-      services = [row.service];
+    const response = await hubFetchAs(tenant, "/api/access/revoke", {
+      method: "POST",
+      body: JSON.stringify({
+        ...(id ? { id } : { ruleId }),
+        actor: { clerkUserId: userId, memberId, label: actorEmail },
+      }),
+    });
+    const out = await readHubJsonObject(response);
+    if (!response.ok) return Response.json(out, { status: response.status });
+    if (
+      out.ok !== true ||
+      typeof out.removed !== "boolean" ||
+      typeof out.denied !== "number" ||
+      !Number.isSafeInteger(out.denied) ||
+      out.denied < 0
+    ) {
+      throw new HttpError(502, "invalid response from hub");
     }
-
-    const resolvedBy = await callerLabel(userId);
-    for (const service of services) {
-      const { stillAllowed } = await removeUserGrantAs(tenant, email, service);
-      if (stillAllowed) {
-        // The user still reaches the service via a rule this op can't narrow —
-        // surface that instead of a false ok (the chip would say revoked while
-        // the door still lets them in).
-        throw new HttpError(
-          409,
-          "access is still granted by a broader rule — edit it in the Rules tab",
-        );
-      }
-      // Close every request row for the pair so the queue reflects the door.
-      for (const row of requests) {
-        if (row.email !== email || row.service !== service) continue;
-        if (row.status === "denied") continue;
-        await setAccessStatusAs(tenant, row.id, "denied", resolvedBy, userId);
-      }
-    }
-    return Response.json({ ok: true }, { status: 200 });
+    return Response.json(out);
   } catch (err) {
     return errorResponse(err);
   }

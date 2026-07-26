@@ -95,6 +95,10 @@ const ROLL_WINDOW = 50; // calls kept for the rolling p50/p95/err estimate
 // unbounded.
 const MAX_SERVICES_PER_TENANT = 200;
 const MAX_BOXES_PER_SERVICE = 100;
+const MAX_SERVICE_ID = 63;
+// Shared contract with the Go agent and web service routes: one ASCII URL
+// segment, with punctuation allowed only between alphanumeric endpoints.
+const SERVICE_ID_RE = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,61}[A-Za-z0-9])?$/;
 // Access-request queue cap: resolved rows are evicted oldest-first to stay
 // under it; a queue full of live (pending/invited) rows refuses new ones.
 const MAX_ACCESS_REQUESTS = 200;
@@ -113,6 +117,14 @@ function cleanBoxName(raw: unknown): string | null {
   if (!name || name.length > MAX_BOX_NAME) return null;
   if (!BOX_NAME_RE.test(name)) return null;
   return name;
+}
+
+function isValidServiceId(raw: unknown): raw is string {
+  return (
+    typeof raw === "string" &&
+    raw.length <= MAX_SERVICE_ID &&
+    SERVICE_ID_RE.test(raw)
+  );
 }
 
 const MS_PER_HOUR = 3_600_000;
@@ -217,6 +229,8 @@ export class TenantDO extends DurableObject<Env> {
         case "bindIdentity": return this.opResponse(await this.bindIdentity(a.clerkUserId,a.emails,a.source));
         case "adapterOrgMember": return this.opResponse(await this.adapterOrgMember(a.clerkUserId,a.emails,a.primaryEmail));
         case "approveAccess": return this.opResponse(await this.approveAccess(a.id,a.actor));
+        case "denyAccess": return this.opResponse(await this.denyAccess(a.id,a.actor));
+        case "revokeAccess": return this.opResponse(await this.revokeAccess(a.id,a.ruleId,a.actor));
         case "setMemberRole": return this.opResponse(await this.setMemberRole(a.memberId,a.role,a.actor));
         case "setMemberState": return this.opResponse(await this.setMemberState(a.memberId,a.state,a.revokeGrants,a.actor));
         case "removeMember": return this.opResponse(await this.removeMember(a.memberId,a.revokeGrants,a.actor));
@@ -291,7 +305,7 @@ export class TenantDO extends DurableObject<Env> {
           );
         case "setAccessStatus": {
           const r = await this.setAccessStatus(a.id, a.status, a.resolvedBy, a.resolvedByUserId);
-          if ("error" in r) return bad(400, r.error!);
+          if ("error" in r) return bad(r.status ?? 400, r.error!);
           return ok(r);
         }
         case "listAccess":
@@ -623,12 +637,13 @@ export class TenantDO extends DurableObject<Env> {
   /** Lowercase a string into a host-safe slug; `fallback` if it reduces empty.
    *  Used for both service ids (from name) and the default subdomain (from id). */
   private slugify(raw: string, fallback: string): string {
-    return (
+    const slug = (
       raw
         .toLowerCase()
         .replace(/[^a-z0-9]+/g, "-")
         .replace(/^-+|-+$/g, "") || fallback
     );
+    return slug.slice(0, MAX_SERVICE_ID).replace(/-+$/g, "") || fallback;
   }
 
   /** Every tenant gets a hub domain BY DEFAULT — no claim step. Called from
@@ -815,8 +830,15 @@ export class TenantDO extends DurableObject<Env> {
     // de-dupe id within the tenant
     if (this.findService(s, id)) {
       let n = 2;
-      while (this.findService(s, `${id}-${n}`)) n++;
-      id = `${id}-${n}`;
+      let candidate = id;
+      do {
+        const suffix = `-${n++}`;
+        const base = id
+          .slice(0, MAX_SERVICE_ID - suffix.length)
+          .replace(/-+$/g, "") || "service";
+        candidate = `${base}${suffix}`;
+      } while (this.findService(s, candidate));
+      id = candidate;
     }
     const g = group || s.settings.defaultGroup;
     s.services.push(this.newService(id, name, g));
@@ -1277,39 +1299,44 @@ export class TenantDO extends DurableObject<Env> {
     key: string,
   ): Promise<{ ok: boolean }> {
     const s = await this.load();
-    // `key` is the Key.id (the dashboard sends the id). REVOKE BY ID so the
-    // change actually takes effect: checkKey authorizes by sha-256(plaintext)
-    // hash, so dropping the Key whose id matches removes the only record the
-    // hash lookup can hit. (The old label-match could over-revoke on duplicate
-    // labels and, worse, leave the authorizing Key in place if labels drifted.)
-    const before = s.keys.length;
     const target = s.keys.find((k) => k.id === key);
-    s.keys = s.keys.filter((k) => k.id !== key);
-    let touched = s.keys.length !== before;
+    if (!target) return { ok: false };
+    let touched = false;
+    const scopeAbsent =
+      (service === undefined || service === "") &&
+      (box === undefined || box === "");
 
-    // Drop the id from the display lists everywhere it appears so the per-box
-    // / per-service key chips stop rendering a now-dead key.
-    for (const a of s.services) {
-      if (a.keys.includes(key)) {
-        a.keys = a.keys.filter((k) => k !== key);
+    if (typeof service === "string" && service && typeof box === "string" && box) {
+      // A box row is only a presentation/assignment edge. Removing it must not
+      // destroy the tenant key or revoke the same credential from sibling boxes.
+      const stored = this.findService(s, service)?.boxes.find((m) => m.name === box);
+      if (stored?.keys.includes(key)) {
+        stored.keys = stored.keys.filter((id) => id !== key);
         touched = true;
       }
-      for (const m of a.boxes) {
-        if (m.keys.includes(key)) {
-          m.keys = m.keys.filter((k) => k !== key);
-          touched = true;
+    } else if (scopeAbsent) {
+      // Only a wholly absent scope is an explicit tenant-global revoke. A
+      // partially specified scope must never broaden into global deletion.
+      s.keys = s.keys.filter((k) => k.id !== key);
+      touched = true;
+      for (const a of s.services) {
+        if (a.keys.includes(key)) a.keys = a.keys.filter((id) => id !== key);
+        for (const m of a.boxes) {
+          if (m.keys.includes(key)) m.keys = m.keys.filter((id) => id !== key);
         }
       }
     }
 
-    this.log(s, {
-      cat: "key",
-      actor: "you",
-      action: "revoked key",
-      target: `${target?.label ?? key} @ ${service}/${box}`,
-      ip: "",
-    });
-    await this.save(s);
+    if (touched) {
+      this.log(s, {
+        cat: "key",
+        actor: "you",
+        action: service && box ? "detached key" : "revoked key",
+        target: `${target.label} @ ${service}/${box}`,
+        ip: "",
+      });
+      await this.save(s);
+    }
     return { ok: touched };
   }
 
@@ -1444,7 +1471,7 @@ export class TenantDO extends DurableObject<Env> {
     status: unknown,
     resolvedBy: unknown,
     resolvedByUserId?: unknown,
-  ): Promise<{ ok: boolean; request?: AccessRequest; error?: string }> {
+  ): Promise<{ ok: boolean; request?: AccessRequest; error?: string; status?: number }> {
     if (
       status !== "pending" &&
       status !== "invited" &&
@@ -1456,6 +1483,22 @@ export class TenantDO extends DurableObject<Env> {
     const s = await this.load();
     const req = s.accessRequests.find((r) => r.id === id);
     if (!req) return { ok: false, error: "unknown access request id" };
+    // This legacy low-level transition remains for compatibility, but terminal
+    // decisions must never be resurrected by a stale caller. Deny/revoke use
+    // the actor-checked atomic operations below.
+    if (req.status === "denied" && status !== "denied") {
+      return { ok: false, error: "access request is denied", status: 409 };
+    }
+    if (req.status === "granted" && status !== "granted") {
+      return { ok: false, error: "granted access must be revoked atomically", status: 409 };
+    }
+    if (
+      status === "denied" &&
+      this.evalIdentAccess(s, this.userIdentities(s, normalizeEmail(req.email)), req.service)
+    ) {
+      return { ok: false, error: "access is still granted; revoke it instead", status: 409 };
+    }
+    if (req.status === status) return { ok: true, request: req };
     req.status = status;
     req.resolvedBy =
       typeof resolvedBy === "string" && resolvedBy ? resolvedBy : "you";
@@ -1503,20 +1546,7 @@ export class TenantDO extends DurableObject<Env> {
     if (!em || !svc) return { ok: false, removed: false, stillAllowed: false };
 
     const s = await this.load();
-    let removed = false;
-    s.acl = s.acl.filter((r) => {
-      if (r.locked || r.action !== "allow") return true;
-      if (r.src.type !== "user") return true;
-      if ((r.src.name || "").toLowerCase() !== em) return true;
-      const rest = r.dst.filter(
-        (d) => !(d.type === "service" && (d.name || "").toLowerCase() === svc.toLowerCase()),
-      );
-      if (rest.length === r.dst.length) return true; // no service dst here
-      removed = true;
-      r.dst = rest;
-      return rest.length > 0; // dst set emptied → drop the whole rule
-    });
-
+    const removed = this.stripUserServiceGrantState(s, em, svc);
     const stillAllowed = this.evalIdentAccess(s, this.userIdentities(s, em), svc);
     if (removed) {
       this.log(s, {
@@ -1529,6 +1559,32 @@ export class TenantDO extends DurableObject<Env> {
       await this.save(s);
     }
     return { ok: true, removed, stillAllowed };
+  }
+
+  /** Mutate an already-loaded state by removing every exact user→service
+   * destination. Keeping this pure state helper lets revokeAccess evaluate
+   * broader coverage before committing either the ACL or queue transition. */
+  private stripUserServiceGrantState(
+    s: StoredState,
+    email: string,
+    service: string,
+  ): boolean {
+    let removed = false;
+    const em = normalizeEmail(email);
+    const svc = service.toLowerCase();
+    s.acl = s.acl.filter((r) => {
+      if (r.locked || r.action !== "allow") return true;
+      if (r.src.type !== "user") return true;
+      if (normalizeEmail(r.src.name || "") !== em) return true;
+      const rest = r.dst.filter(
+        (d) => !(d.type === "service" && (d.name || "").toLowerCase() === svc),
+      );
+      if (rest.length === r.dst.length) return true; // no service dst here
+      removed = true;
+      r.dst = rest;
+      return rest.length > 0; // dst set emptied → drop the whole rule
+    });
+    return removed;
   }
 
   /** Door-side authorization for a HUMAN caller (browser login-wall session or
@@ -1604,7 +1660,185 @@ export class TenantDO extends DurableObject<Env> {
     let created=false;if(!member){if(s.members.length>=MAX_MEMBERS)return {error:"member limit reached",status:409};const now=Date.now();member={id:"m_"+crypto.randomUUID().slice(0,8),tenantId:this.tenantId(),clerkUserId:null,email:preferred,role:"member",state:"invited",createdAt:now,updatedAt:now};s.members.push(member);created=true;}
     const out=this.bindIdentityState(s,uid,list,"clerk-org-adapter");if(out.error){if(out.save)await this.save(s);delete out.save;return out;}if(created&&!out.changed){this.bump(s);this.log(s,{cat:"access",actor:uid,action:"added organization member",target:`${member.id} <${member.email}>`,ip:""});out.changed=true;}if(created||out.save)await this.save(s);delete out.save;return out;
   }
-  private async approveAccess(id:unknown,actor:any):Promise<any>{const s=await this.load(),am=this.actorMember(s,actor);if(!am||am.role==="member")return {error:"admin role required",status:403};const r=s.accessRequests.find(x=>x.id===id);if(!r)return {error:"unknown access request id",status:404};const em=normalizeEmail(r.email);if(r.status==="granted")return {ok:true,status:"granted",email:em};if(s.members.some(x=>normalizeEmail(x.email)===em&&x.state==="disabled"))return {error:"member is disabled; re-enable instead",status:409};let m=s.members.find(x=>normalizeEmail(x.email)===em);if(m?.state==="active"){this.addAclState(s,m.email,r.service);r.status="granted";}else{if(!m){if(s.members.length>=MAX_MEMBERS)return {error:"member limit reached",status:409};const now=Date.now();m={id:"m_"+crypto.randomUUID().slice(0,8),tenantId:this.tenantId(),clerkUserId:null,email:em,role:"member",state:"invited",invitedBy:am.id,createdAt:now,updatedAt:now};s.members.push(m);this.bump(s);}r.status="invited";}r.resolvedBy=actor?.label??am.email;r.resolvedByUserId=am.clerkUserId??undefined;r.resolvedAt=Date.now();this.log(s,{cat:"access",actor:am.id,action:`access ${r.status}`,target:`${r.email} → ${r.service}`,ip:""});await this.save(s);return {ok:true,status:r.status,email:em,member:m,memberCreated:m?.createdAt===m?.updatedAt};}
+  private async approveAccess(id: unknown, actor: any): Promise<any> {
+    const s = await this.load();
+    const am = this.actorMember(s, actor);
+    if (!am || am.role === "member") return { error: "admin role required", status: 403 };
+    const r = s.accessRequests.find((x) => x.id === id);
+    if (!r) return { error: "unknown access request id", status: 404 };
+    const em = normalizeEmail(r.email);
+    if (r.status === "granted") return { ok: true, status: "granted", email: em };
+    // A deny is terminal for this request id. A later request creates a fresh
+    // row; allowing a stale approval to resurrect this one is the losing side
+    // of the deny/approve race.
+    if (r.status === "denied") {
+      return { error: "access request is denied", status: 409 };
+    }
+    if (s.members.some((x) => normalizeEmail(x.email) === em && x.state === "disabled")) {
+      return { error: "member is disabled; re-enable instead", status: 409 };
+    }
+    let m = s.members.find((x) => normalizeEmail(x.email) === em);
+    if (m?.state === "active") {
+      this.addAclState(s, m.email, r.service);
+      r.status = "granted";
+    } else {
+      if (!m) {
+        if (s.members.length >= MAX_MEMBERS) {
+          return { error: "member limit reached", status: 409 };
+        }
+        const now = Date.now();
+        m = {
+          id: "m_" + crypto.randomUUID().slice(0, 8),
+          tenantId: this.tenantId(),
+          clerkUserId: null,
+          email: em,
+          role: "member",
+          state: "invited",
+          invitedBy: am.id,
+          createdAt: now,
+          updatedAt: now,
+        };
+        s.members.push(m);
+        this.bump(s);
+      }
+      r.status = "invited";
+    }
+    r.resolvedBy = actor?.label ?? am.email;
+    r.resolvedByUserId = am.clerkUserId ?? undefined;
+    r.resolvedAt = Date.now();
+    this.log(s, {
+      cat: "access",
+      actor: am.id,
+      action: `access ${r.status}`,
+      target: `${r.email} → ${r.service}`,
+      ip: "",
+    });
+    await this.save(s);
+    return {
+      ok: true,
+      status: r.status,
+      email: em,
+      member: m,
+      memberCreated: m?.createdAt === m?.updatedAt,
+    };
+  }
+
+  /** Deny one request as a single DO mutation. If approval or identity binding
+   * already won and installed an effective grant, the caller gets a conflict
+   * and neither the queue nor ACL is changed. */
+  private async denyAccess(id: unknown, actor: any): Promise<any> {
+    const s = await this.load();
+    const am = this.actorMember(s, actor);
+    if (!am || am.role === "member") return { error: "admin role required", status: 403 };
+    if (typeof id !== "string" || !id || id.length > 256) {
+      return { error: "valid access request id required", status: 400 };
+    }
+    const r = s.accessRequests.find((candidate) => candidate.id === id);
+    if (!r) return { error: "unknown access request id", status: 404 };
+    if (r.status === "denied") return { ok: true, status: "denied" };
+    const allowed = this.evalIdentAccess(
+      s,
+      this.userIdentities(s, normalizeEmail(r.email)),
+      r.service,
+    );
+    if (r.status === "granted" || allowed) {
+      return { error: "already granted — revoke it instead", status: 409 };
+    }
+    r.status = "denied";
+    r.resolvedBy = actor?.label ?? am.email;
+    r.resolvedByUserId = am.clerkUserId ?? undefined;
+    r.resolvedAt = Date.now();
+    this.log(s, {
+      cat: "access",
+      actor: am.id,
+      action: "access denied",
+      target: `${r.email} → ${r.service}`,
+      ip: "",
+    });
+    await this.save(s);
+    return { ok: true, status: "denied" };
+  }
+
+  /** Resolve an access-row or rule handle, remove its exact user→service
+   * grants, and close every matching request row in one load/save cycle. A
+   * broader rule makes the whole operation fail without committing a partial
+   * direct-rule removal. */
+  private async revokeAccess(id: unknown, ruleId: unknown, actor: any): Promise<any> {
+    const s = await this.load();
+    const am = this.actorMember(s, actor);
+    if (!am || am.role === "member") return { error: "admin role required", status: 403 };
+    const requestId = typeof id === "string" ? id.trim() : "";
+    const grantId = typeof ruleId === "string" ? ruleId.trim() : "";
+    if ((!requestId && !grantId) || (requestId && grantId)) {
+      return { error: "provide id or ruleId, not both", status: 400 };
+    }
+    if (requestId.length > 256 || grantId.length > 256) {
+      return { error: "valid id or ruleId required", status: 400 };
+    }
+
+    let email: string;
+    let service: string;
+    if (requestId) {
+      const r = s.accessRequests.find((candidate) => candidate.id === requestId);
+      if (!r) return { error: "unknown access request", status: 404 };
+      email = normalizeEmail(r.email);
+      service = r.service;
+    } else {
+      const rule = s.acl.find((candidate) => candidate.id === grantId);
+      if (!rule) return { error: "unknown grant", status: 404 };
+      const dst = Array.isArray(rule.dst) ? rule.dst : [rule.dst];
+      if (
+        rule.locked ||
+        rule.action !== "allow" ||
+        rule.src.type !== "user" ||
+        !rule.src.name ||
+        dst.length !== 1 ||
+        dst[0].type !== "service" ||
+        !dst[0].name
+      ) {
+        return {
+          error: "multi-service or broader grants must be edited atomically in the Rules tab",
+          status: 409,
+        };
+      }
+      email = normalizeEmail(rule.src.name);
+      service = dst[0].name;
+    }
+
+    const removed = this.stripUserServiceGrantState(s, email, service);
+    if (this.evalIdentAccess(s, this.userIdentities(s, email), service)) {
+      // `s` is only an in-memory loaded snapshot until save(); returning here
+      // rolls back the tentative direct-rule removal as well as queue changes.
+      return {
+        error: "access is still granted by a broader rule — edit it in the Rules tab",
+        status: 409,
+      };
+    }
+
+    let denied = 0;
+    const resolvedAt = Date.now();
+    for (const r of s.accessRequests) {
+      if (normalizeEmail(r.email) !== email || r.service !== service || r.status === "denied") {
+        continue;
+      }
+      r.status = "denied";
+      r.resolvedBy = actor?.label ?? am.email;
+      r.resolvedByUserId = am.clerkUserId ?? undefined;
+      r.resolvedAt = resolvedAt;
+      denied++;
+    }
+    if (removed || denied) {
+      this.log(s, {
+        cat: "access",
+        actor: am.id,
+        action: "revoked access",
+        target: `user:${email} → ${service}`,
+        ip: "",
+      });
+      await this.save(s);
+    }
+    return { ok: true, removed, denied };
+  }
   private authority(s:StoredState,actor:any,target?:TenantMember,ownerEdge=false):TenantMember|any{const am=this.actorMember(s,actor);if(!am||am.role==="member")return {error:"admin role required",status:403};if((ownerEdge||target?.role==="owner")&&am.role!=="owner")return {error:"owner role required",status:403};return am;}
   private async setMemberRole(memberId:unknown,role:unknown,actor:any):Promise<any>{if(!['owner','admin','member'].includes(String(role)))return {error:"invalid role",status:400};const s=await this.load(),t=s.members.find(m=>m.id===memberId);if(!t)return {error:"member not found",status:404};const am=this.authority(s,actor,t,t.role==="owner"||role==="owner");if(am.error)return am;if(t.role===role)return {ok:true,member:t};if(am.id===t.id&&!(t.role==="owner"&&role!=="owner"&&this.activeOwners(s).length>1))return {error:"cannot change own role",status:409};if(t.role==="owner"&&role!=="owner"&&this.activeOwners(s).length<=1)return {error:"last active owner",status:409};const prior=t.role;t.role=role as FinchRole;t.updatedAt=Date.now();this.bump(s);this.log(s,{cat:"access",actor:am.id,action:`changed member role ${prior} → ${t.role}`,target:`${t.id} <${t.email}>`,ip:""});await this.save(s);return {ok:true,member:t};}
   private stripGrants(s: StoredState, email: string): void {
@@ -1840,6 +2074,9 @@ export class TenantDO extends DurableObject<Env> {
     os: string,
     version: string,
   ): Promise<{ ok: boolean; state?: ServiceState; error?: string }> {
+    if (!isValidServiceId(service)) {
+      return { ok: false, error: "invalid service id" };
+    }
     // Validate/clamp the box name at the DATA layer too (defense-in-depth;
     // api.ts also clamps at the /join door). (security M1)
     const cleaned = cleanBoxName(box);

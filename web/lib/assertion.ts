@@ -15,6 +15,8 @@
  *  fresh one; this only bounds clock-skew tolerance / replay window. */
 export const ASSERTION_TTL_SECONDS = 120;
 
+const TENANT_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
 const te = new TextEncoder();
 
 function bytesToB64url(bytes: Uint8Array): string {
@@ -33,8 +35,27 @@ export async function signAssertion(
   tenant: string,
   secret: string,
   nowSeconds: number = Math.floor(Date.now() / 1000),
-  kind?: string,
+  kind?: "user",
 ): Promise<string> {
+  // The hub treats this payload as an authorization identity, so refuse to
+  // mint ambiguous or resource-amplifying assertions even when a caller passes
+  // an upstream value without first going through the tenant-cookie validator.
+  if (typeof tenant !== "string" || !TENANT_RE.test(tenant)) {
+    throw new TypeError("invalid assertion tenant");
+  }
+  if (typeof secret !== "string" || !secret) {
+    throw new TypeError("assertion secret is required");
+  }
+  if (
+    !Number.isSafeInteger(nowSeconds) ||
+    nowSeconds < 0 ||
+    nowSeconds > Number.MAX_SAFE_INTEGER - ASSERTION_TTL_SECONDS
+  ) {
+    throw new TypeError("invalid assertion timestamp");
+  }
+  if (kind !== undefined && kind !== "user") {
+    throw new TypeError("invalid assertion kind");
+  }
   const payload = { tenant, exp: nowSeconds + ASSERTION_TTL_SECONDS, ...(kind ? { kind } : {}) };
   const body = bytesToB64url(te.encode(JSON.stringify(payload)));
   const key = await crypto.subtle.importKey(

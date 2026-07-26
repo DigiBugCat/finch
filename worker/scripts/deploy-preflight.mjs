@@ -21,6 +21,7 @@ import { readFileSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { checkPrivacyInvariants } from "./check-privacy-invariants.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..");
@@ -110,6 +111,11 @@ function fail(msg) {
 }
 
 const cfg = readJsonc(join(root, "wrangler.jsonc"));
+try {
+  checkPrivacyInvariants();
+} catch (error) {
+  fail(error instanceof Error ? error.message : String(error));
+}
 const envCfg = cfg.env?.[env];
 if (!envCfg) {
   fail(`no [env.${env}] block in wrangler.jsonc — refusing implicit top-level deploy.`);

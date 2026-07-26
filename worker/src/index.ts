@@ -63,6 +63,10 @@ export interface Env {
   SESSION_SECRET: string;
   DEFAULT_TENANT?: string; // DEV-ONLY tenant fallback when no slug resolves
   DEV?: string; // "1" in the dev env; gates the DEFAULT_TENANT fallback
+  // Explicit local-test escape hatch for plain HTTP. It is effective only when
+  // DEV=1 as well; production and staging intentionally omit both values, so
+  // the public hub fails closed before reading an unencrypted request body.
+  ALLOW_INSECURE_HTTP?: string;
   WEB_URL?: string; // dashboard base URL — the `finch login` device page lives at <WEB_URL>/cli
   // Comma-separated HTTPS origins permitted when Aviary verification lives on
   // a different origin than the hub. WEB_URL must be the hub origin unless it
@@ -137,6 +141,25 @@ export function clientIp(req: Request): string {
     req.headers.get("x-forwarded-for") ||
     "unknown"
   );
+}
+
+/** Finch's public transport boundary. Cloudflare normally presents production
+ * requests as HTTPS/WSS, but enforcing that assumption here prevents a route,
+ * zone, or client misconfiguration from silently turning plain HTTP into an
+ * accepted relay path. The escape hatch exists only for local dev and isolated
+ * tests; deploy preflight forbids it in staging/production. */
+export function secureTransport(req: Request, env: Env): boolean {
+  const url = new URL(req.url);
+  if (url.protocol === "https:") return true;
+  if (
+    url.hostname === "localhost" ||
+    url.hostname === "127.0.0.1" ||
+    url.hostname === "[::1]" ||
+    url.hostname === "::1"
+  ) {
+    return true;
+  }
+  return env.DEV === "1" && env.ALLOW_INSECURE_HTTP === "1";
 }
 
 // Max relay request body we'll buffer into a DO (#16 / security L9). The DO
@@ -602,6 +625,23 @@ export default {
     env: Env,
     ctx: ExecutionContext,
   ): Promise<Response> {
+    // Reject insecure requests before authentication and, critically, before
+    // any handler reads or buffers a request body. We do not redirect POSTs:
+    // doing so could encourage a client to send a credential or payload over
+    // plaintext once before retrying securely.
+    if (!secureTransport(req, env)) {
+      return new Response(
+        JSON.stringify({ error: "HTTPS is required" }),
+        {
+          status: 426,
+          headers: {
+            "content-type": "application/json",
+            "cache-control": "no-store",
+          },
+        },
+      );
+    }
+
     const url = new URL(req.url);
     const host = req.headers.get("host") || url.host;
     const path = url.pathname;

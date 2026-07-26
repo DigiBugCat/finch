@@ -15,7 +15,7 @@ import (
 
 func TestServiceEnrollmentControl_EndToEndAndWake(t *testing.T) {
 	var started serviceEnrollmentStartRequest
-	polls := 0
+	polls, ackAttempts := 0, 0
 	worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
@@ -28,7 +28,6 @@ func TestServiceEnrollmentControl_EndToEndAndWake(t *testing.T) {
 				ExpiresIn:               600, Interval: 3, ManifestSHA256: started.ManifestSHA256,
 			})
 		case serviceEnrollmentPollPath:
-			polls++
 			var poll serviceEnrollmentPollRequest
 			_ = json.NewDecoder(r.Body).Decode(&poll)
 			publicKey, _ := base64.RawURLEncoding.DecodeString(poll.Proof.PublicKey)
@@ -41,9 +40,15 @@ func TestServiceEnrollmentControl_EndToEndAndWake(t *testing.T) {
 				t.Fatal("invalid device proof")
 			}
 			if poll.AckDelivery != "" {
+				ackAttempts++
+				if ackAttempts == 1 {
+					http.Error(w, "response lost after consume", http.StatusServiceUnavailable)
+					return
+				}
 				json.NewEncoder(w).Encode(ServiceEnrollmentPoll{Status: "consumed"})
 				return
 			}
+			polls++
 			json.NewEncoder(w).Encode(ServiceEnrollmentPoll{Status: "approved", DeliveryID: "delivery-1", Grant: &ServiceEnrollmentGrant{
 				Tenant: "tenant", Service: "media", Box: "aviary-test", RefreshToken: "scoped-refresh",
 				PublicURL: serverURL(r) + "/media/mcp", ManifestSHA256: started.ManifestSHA256,
@@ -103,14 +108,22 @@ func TestServiceEnrollmentControl_EndToEndAndWake(t *testing.T) {
 	now = now.Add(4 * time.Second)
 	w = httptest.NewRecorder()
 	handler.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v1/enrollments/local-safe-id", nil))
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("lost ACK response status=%d body=%s", w.Code, w.Body.String())
+	}
+	if coordinator.byID["local-safe-id"].status.State != "ack_pending" || woke != "" || polls != 1 || ackAttempts != 1 {
+		t.Fatalf("ambiguous ACK was not retained safely: status=%+v woke=%q polls=%d acks=%d", coordinator.byID["local-safe-id"].status, woke, polls, ackAttempts)
+	}
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/v1/enrollments/local-safe-id", nil))
 	if w.Code != http.StatusOK {
-		t.Fatalf("poll status=%d body=%s", w.Code, w.Body.String())
+		t.Fatalf("ACK retry status=%d body=%s", w.Code, w.Body.String())
 	}
 	var ready LocalServiceEnrollmentStatus
 	if err := json.Unmarshal(w.Body.Bytes(), &ready); err != nil {
 		t.Fatal(err)
 	}
-	if ready.State != "ready" || ready.PublicURL == "" || ready.ApprovedTenant != "tenant" || woke != "media" {
+	if ready.State != "ready" || ready.PublicURL == "" || ready.ApprovedTenant != "tenant" || woke != "media" || polls != 1 || ackAttempts != 2 {
 		t.Fatalf("completion did not wake reconciler: status=%+v woke=%q", ready, woke)
 	}
 	state, err := loadState(filepath.Join(stateDir, "media.json"))
@@ -170,5 +183,24 @@ func TestServiceEnrollmentControl_RejectsTrailingJSON(t *testing.T) {
 	)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestServiceEnrollmentCoordinator_RejectsOpaqueIDCollision(t *testing.T) {
+	c, err := NewServiceEnrollmentCoordinator(ServiceEnrollmentCoordinatorOptions{
+		Hub: "https://finch.example", Machine: "box", CredentialDirectory: t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.byID["duplicate"] = &localPendingEnrollment{request: LocalServiceEnrollmentRequest{AppPath: "incumbent"}}
+	c.byPath["incumbent"] = "duplicate"
+	c.newID = func() (string, error) { return "duplicate", nil }
+	_, err = c.Start(t.Context(), LocalServiceEnrollmentRequest{AppPath: "new", Routes: []string{"/mcp"}, EdgeAuth: "key"})
+	if err == nil {
+		t.Fatal("duplicate enrollment ID was accepted")
+	}
+	if c.byPath["incumbent"] != "duplicate" || c.byID["duplicate"] == nil || c.byPath["new"] != "" {
+		t.Fatalf("collision corrupted coordinator maps: byPath=%v byID=%v", c.byPath, c.byID)
 	}
 }

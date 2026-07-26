@@ -3,11 +3,13 @@ package core
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -26,6 +28,29 @@ func TestUpdateArch(t *testing.T) {
 		}
 	default:
 		t.Skipf("unpublished GOARCH %s", runtime.GOARCH)
+	}
+}
+
+func TestResolveUpdateRestartModePreventsUpdaterFromStartingBareRelay(t *testing.T) {
+	tests := []struct {
+		name, requested string
+		tunnel, serving bool
+		want            string
+		wantErr         bool
+	}{
+		{name: "managed auto", requested: "auto", tunnel: true, want: "service"},
+		{name: "separate updater auto", requested: "auto", want: "none"},
+		{name: "serving auto", requested: "auto", serving: true, want: "self"},
+		{name: "separate updater self", requested: "self", wantErr: true},
+		{name: "unknown", requested: "typo", wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := resolveUpdateRestartMode(tc.requested, tc.tunnel, tc.serving)
+			if (err != nil) != tc.wantErr || got != tc.want {
+				t.Fatalf("mode=%q err=%v, want mode=%q wantErr=%v", got, err, tc.want, tc.wantErr)
+			}
+		})
 	}
 }
 
@@ -62,6 +87,56 @@ func TestDownloadAndSwap(t *testing.T) {
 	}
 	if fi, _ := os.Stat(dst); fi.Mode()&0o111 == 0 {
 		t.Fatalf("dst not executable: %v", fi.Mode())
+	}
+}
+
+func TestDownloadAndSwap_RejectsResourceExhaustionWithoutTouchingDestination(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		handler http.Handler
+	}{
+		{name: "declared oversize", handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Length", "9")
+			_, _ = w.Write([]byte("123456789"))
+		})},
+		{name: "chunked oversize", handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.(http.Flusher).Flush()
+			_, _ = w.Write([]byte("123456789"))
+		})},
+		{name: "empty", handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			dst := filepath.Join(dir, "finch")
+			if err := os.WriteFile(dst, []byte("OLD"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			srv := httptest.NewServer(tc.handler)
+			defer srv.Close()
+			if err := downloadAndSwapWithLimit(t.Context(), srv.URL, dst, 8); err == nil {
+				t.Fatal("unsafe download accepted")
+			}
+			if b, _ := os.ReadFile(dst); string(b) != "OLD" {
+				t.Fatalf("failed download replaced destination with %q", b)
+			}
+			matches, _ := filepath.Glob(filepath.Join(dir, ".finch-update-*"))
+			if len(matches) != 0 {
+				t.Fatalf("failed download leaked temp files: %v", matches)
+			}
+		})
+	}
+}
+
+func TestHubLatestVersion_RejectsOversizedOrMalformedResponse(t *testing.T) {
+	for _, body := range []string{
+		`{"latest":"` + strings.Repeat("x", int(maxVersionResponseBytes)) + `"}`,
+		`{"latest":"v1"}{"latest":"v2"}`,
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, body) }))
+		if _, err := hubLatestVersion(srv.URL); err == nil {
+			t.Errorf("unsafe version response accepted (length %d)", len(body))
+		}
+		srv.Close()
 	}
 }
 

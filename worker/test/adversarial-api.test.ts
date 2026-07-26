@@ -1,0 +1,151 @@
+import { describe, expect, it } from "vitest";
+import { createExecutionContext, env } from "cloudflare:test";
+import worker from "../src/index";
+import { hashKey, signAssertion, signToken } from "../src/auth";
+
+const BASE = "http://hub.test";
+const now = () => Math.floor(Date.now() / 1000);
+
+async function call(path: string, body: BodyInit | null, headers: Record<string, string> = {}) {
+  const ctx = createExecutionContext();
+  return worker.fetch(new Request(`${BASE}${path}`, {
+    method: "POST",
+    headers: { "content-type": "application/json", host: "hub.test", ...headers },
+    body,
+  }), env as any, ctx);
+}
+
+async function tenantOp<T>(tenant: string, op: string, args: Record<string, unknown> = {}): Promise<T> {
+  const stub = env.TENANT.get(env.TENANT.idFromName(tenant));
+  const res = await stub.fetch("https://tenant/op", {
+    method: "POST",
+    body: JSON.stringify({ op, ...args }),
+  });
+  return await res.json() as T;
+}
+
+describe("public credential endpoints fail closed on hostile bodies", () => {
+  it.each([
+    ["/join", "null", 400],
+    ["/join", JSON.stringify({ ticket: {}, box: "box-1" }), 400],
+    ["/refresh", "null", 400],
+    ["/refresh", JSON.stringify({ refreshToken: {} }), 400],
+  ])("%s rejects %s without throwing", async (path, body, status) => {
+    expect((await call(path, body)).status).toBe(status);
+  });
+
+  it("stops an undeclared oversized body while streaming it", async () => {
+    const oversized = JSON.stringify({ ticket: "x".repeat(256 * 1024), box: "b" });
+    const res = await call("/join", oversized);
+    expect(res.status).toBe(413);
+    expect(await res.json()).toEqual({ error: "request body too large" });
+  });
+
+  it("rejects dot-segment box names and overlong UTF-8 metadata before burning a ticket", async () => {
+    const secret = env.TICKET_SECRET;
+    const ticket = await signToken({
+      tenant: env.DEFAULT_TENANT!, service: "svc", kind: "join",
+      jti: crypto.randomUUID(), exp: now() + 60,
+    }, secret);
+    expect((await call("/join", JSON.stringify({ ticket, box: ".." }))).status).toBe(400);
+    expect((await call("/join", JSON.stringify({
+      ticket, box: "box-1", version: "💥".repeat(65),
+    }))).status).toBe(400);
+  });
+
+  it("rejects legacy join tickets that have no single-use jti", async () => {
+    const ticket = await signToken({
+      tenant: env.DEFAULT_TENANT!, service: "svc", kind: "join", exp: now() + 60,
+    }, env.TICKET_SECRET);
+    expect((await call("/join", JSON.stringify({ ticket, box: "box-1" }))).status).toBe(401);
+  });
+});
+
+describe("portal grants require a user-scoped assertion", () => {
+  it("does not accept a tenant assertion with body-controlled admin identity", async () => {
+    const assertion = await signAssertion({
+      tenant: env.DEFAULT_TENANT!, kind: "assertion", exp: now() + 60,
+    }, env.FINCH_SERVICE_SECRET);
+    const res = await call("/api/portal-grant", JSON.stringify({
+      slug: "victim", userId: "attacker", email: "attacker@example.test", admin: true,
+    }), {
+      "X-Finch-Service": env.FINCH_SERVICE_SECRET,
+      "X-Finch-Auth": assertion,
+    });
+    expect(res.status).toBe(401);
+    expect(await res.json()).toEqual({ error: "invalid user assertion" });
+  });
+});
+
+describe("box-scoped key detach semantics", () => {
+  it("API detach removes only the selected box edge and preserves global authorization", async () => {
+    const tenant = `tenant-detach-${crypto.randomUUID()}`;
+    const { id: service } = await tenantOp<{ id: string }>(tenant, "enroll", { name: "Scraper" });
+    await tenantOp(tenant, "registerBox", {
+      service, box: "box-1", os: "test", version: "1",
+    });
+    const minted = await tenantOp<{ plaintext: string; key: { id: string } }>(tenant, "mintKey", {
+      label: "shared", scope: { all: true },
+    });
+    const assertion = await signAssertion({ tenant, exp: now() + 60 }, env.FINCH_SERVICE_SECRET);
+    const res = await call("/api/boxes/box-1/keys/revoke", JSON.stringify({
+      service, key: minted.key.id,
+    }), {
+      "X-Finch-Service": env.FINCH_SERVICE_SECRET,
+      "X-Finch-Auth": assertion,
+    });
+    expect(res.status).toBe(200);
+
+    const state = await tenantOp<any>(tenant, "getState");
+    expect(state.keys.map((key: any) => key.id)).toContain(minted.key.id);
+    const box = state.services.find((item: any) => item.id === service).boxes
+      .find((item: any) => item.name === "box-1");
+    expect(box.keys).not.toContain(minted.key.id);
+    const auth = await tenantOp<{ allowed: boolean }>(tenant, "checkKey", {
+      hash: await hashKey(minted.plaintext), service,
+    });
+    expect(auth.allowed).toBe(true);
+  });
+
+  it("API revokes globally only when the service scope is absent", async () => {
+    const tenant = `tenant-revoke-${crypto.randomUUID()}`;
+    const { id: service } = await tenantOp<{ id: string }>(tenant, "enroll", {
+      name: "Printer",
+    });
+    const minted = await tenantOp<{ plaintext: string; key: { id: string } }>(
+      tenant,
+      "mintKey",
+      { label: "global", scope: { all: true } },
+    );
+    const assertion = await signAssertion(
+      { tenant, exp: now() + 60 },
+      env.FINCH_SERVICE_SECRET,
+    );
+    const headers = {
+      "X-Finch-Service": env.FINCH_SERVICE_SECRET,
+      "X-Finch-Auth": assertion,
+    };
+
+    const partial = await call(
+      `/api/boxes/${minted.key.id}/keys/revoke`,
+      JSON.stringify({ service: "", key: minted.key.id }),
+      headers,
+    );
+    expect(partial.status).toBe(400);
+    expect((await tenantOp<any>(tenant, "getState")).keys)
+      .toEqual(expect.arrayContaining([expect.objectContaining({ id: minted.key.id })]));
+
+    const revoked = await call(
+      `/api/boxes/${minted.key.id}/keys/revoke`,
+      JSON.stringify({ key: minted.key.id }),
+      headers,
+    );
+    expect(revoked.status).toBe(200);
+    expect((await tenantOp<any>(tenant, "getState")).keys)
+      .not.toEqual(expect.arrayContaining([expect.objectContaining({ id: minted.key.id })]));
+    expect(await tenantOp(tenant, "checkKey", {
+      hash: await hashKey(minted.plaintext),
+      service,
+    })).toMatchObject({ allowed: false, reason: "no-key" });
+  });
+});
