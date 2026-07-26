@@ -291,6 +291,61 @@ func TestSaveState_IsAtomicOwnerOnlyAndRejectsSymlinkTarget(t *testing.T) {
 	}
 }
 
+// The tenant-admin CLI token (cli.json) drives `finch keys mint`, `finch token`,
+// `finch domain` and `finch rm` — strictly more privileged than the per-box
+// refresh token in agent.json. It used to be written with os.WriteFile, which
+// follows an existing symlink and applies its mode only on creation, and read
+// with os.ReadFile, which checks nothing. It now shares agent.json's hardened
+// path; this pins that so the weaker handling cannot come back.
+func TestSaveCliCred_MatchesAgentStateHardening(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home) // os.UserHomeDir on Windows
+
+	cred := &cliCred{Hub: "https://finchmcp.com", Token: "tenant-admin-secret"}
+	if err := saveCliCred(cred); err != nil {
+		t.Fatal(err)
+	}
+	path := cliCredPath()
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("cli credential mode=%04o, want 0600", got)
+	}
+	if got, _ := os.Lstat(filepath.Dir(path)); got.Mode().Perm() != 0o700 {
+		t.Fatalf("cli credential directory mode=%04o, want 0700", got.Mode().Perm())
+	}
+
+	// A loosened credential must not be read back.
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadCliCred(); err == nil {
+		t.Fatal("world-readable cli credential was accepted")
+	}
+
+	// A pre-planted symlink must not be written through — that is how another
+	// local account would capture the token on a shared box.
+	target := filepath.Join(t.TempDir(), "captured")
+	if err := os.WriteFile(target, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, path); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveCliCred(cred); err == nil {
+		t.Fatal("symlinked cli credential path was accepted")
+	}
+	if got, _ := os.ReadFile(target); string(got) != "keep" {
+		t.Fatalf("symlink target was written through: %q", got)
+	}
+}
+
 func TestSaveState_BareRelativePathDoesNotChmodWorkingDirectory(t *testing.T) {
 	originalWD, err := os.Getwd()
 	if err != nil {

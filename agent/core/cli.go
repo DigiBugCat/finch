@@ -246,13 +246,23 @@ func cliCredPath() string {
 	return ".finch-cli.json"
 }
 
+// cli.json holds the ~30-day TENANT-ADMIN token (finch keys mint, finch token,
+// finch domain, finch rm). It is strictly more privileged than the per-box
+// refresh token in agent.json, so it goes through the same hardened credential
+// path — lstat/symlink/mode checks on read, atomic 0600 write in a 0700
+// directory that is refused if group/world-writable.
+//
+// Previously this used os.ReadFile / os.WriteFile, which follow an existing
+// symlink and apply the mode only on creation: a pre-planted ~/.finch/cli.json
+// symlink would have been written through, and a loose-mode file read without
+// complaint — while the LESS privileged agent.json rejected both.
 func loadCliCred() (*cliCred, error) {
-	b, err := os.ReadFile(cliCredPath())
+	b, err := readCredentialFile(cliCredPath(), credentialStateLimit)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("not logged in — run `finch login <token>` first (get a token from the dashboard → Settings → CLI access)")
-		}
 		return nil, err
+	}
+	if b == nil {
+		return nil, fmt.Errorf("not logged in — run `finch login <token>` first (get a token from the dashboard → Settings → CLI access)")
 	}
 	var c cliCred
 	if err := json.Unmarshal(b, &c); err != nil {
@@ -262,14 +272,14 @@ func loadCliCred() (*cliCred, error) {
 }
 
 func saveCliCred(c *cliCred) error {
-	p := cliCredPath()
-	if dir := filepath.Dir(p); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return err
-		}
+	b, err := json.MarshalIndent(c, "", "  ")
+	if err != nil {
+		return err
 	}
-	b, _ := json.MarshalIndent(c, "", "  ")
-	return os.WriteFile(p, b, 0o600)
+	if len(b) > credentialStateLimit {
+		return fmt.Errorf("credential state exceeds %d bytes", credentialStateLimit)
+	}
+	return writeCredentialFile(cliCredPath(), b)
 }
 
 // cliGET/cliPOST hit /api/cli/* with the bearer token.

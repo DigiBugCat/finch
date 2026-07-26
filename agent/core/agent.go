@@ -1645,7 +1645,16 @@ func defaultStatePath() string {
 
 // loadState reads the persisted credential, returning (nil,nil) if the file
 // doesn't exist yet (first run).
-func loadState(path string) (*agentState, error) {
+// readCredentialFile reads an on-disk credential with the checks a credential
+// deserves: refuse anything that is not a regular file (a symlink planted by
+// another local account would otherwise be followed), refuse group/world-
+// readable modes, and verify via SameFile that the path did not change under us
+// between stat, open and read. Returns (nil, nil) when the file does not exist.
+//
+// Shared by the per-box refresh token (loadState) and the tenant-admin CLI
+// token (loadCliCred) — the latter is the MORE privileged of the two, so it
+// must not get weaker handling.
+func readCredentialFile(path string, limit int64) ([]byte, error) {
 	before, err := os.Lstat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -1668,34 +1677,29 @@ func loadState(path string) (*agentState, error) {
 	if err != nil || !os.SameFile(before, opened) {
 		return nil, fmt.Errorf("credential path %q changed while opening", path)
 	}
-	b, err := io.ReadAll(io.LimitReader(file, credentialStateLimit+1))
+	b, err := io.ReadAll(io.LimitReader(file, limit+1))
 	if err != nil {
 		return nil, err
 	}
-	if len(b) > credentialStateLimit {
-		return nil, fmt.Errorf("credential path %q exceeds %d bytes", path, credentialStateLimit)
+	if int64(len(b)) > limit {
+		return nil, fmt.Errorf("credential path %q exceeds %d bytes", path, limit)
 	}
 	after, err := os.Lstat(path)
 	if err != nil || !os.SameFile(before, after) {
 		return nil, fmt.Errorf("credential path %q changed while reading", path)
 	}
-	var st agentState
-	if err := json.Unmarshal(b, &st); err != nil {
-		return nil, err
-	}
-	return &st, nil
+	return b, nil
 }
 
-// saveState writes the credential 0600 (dir 0700). The refresh token is a
-// long-lived per-box credential, so keep it owner-only.
-func saveState(path string, st *agentState) error {
-	b, err := json.MarshalIndent(st, "", "  ")
-	if err != nil {
-		return err
-	}
-	if len(b) > credentialStateLimit {
-		return fmt.Errorf("credential state exceeds %d bytes", credentialStateLimit)
-	}
+// writeCredentialFile installs a credential atomically at 0600 in a 0700
+// directory: it refuses a symlinked or group/world-writable directory, refuses
+// to replace a non-regular target (so a pre-planted symlink cannot redirect the
+// write into another account's tree), writes a temp file and renames.
+//
+// os.WriteFile would be wrong here on both counts: it follows an existing
+// symlink, and its mode argument applies only on creation, so a pre-existing
+// loose-mode file stays loose.
+func writeCredentialFile(path string, b []byte) error {
 	dir := filepath.Dir(path)
 	if dir == "" {
 		dir = "."
@@ -1768,4 +1772,32 @@ func saveState(path string, st *agentState) error {
 		_ = dirFile.Close()
 	}
 	return nil
+}
+
+func loadState(path string) (*agentState, error) {
+	b, err := readCredentialFile(path, credentialStateLimit)
+	if err != nil {
+		return nil, err
+	}
+	if b == nil {
+		return nil, nil
+	}
+	var st agentState
+	if err := json.Unmarshal(b, &st); err != nil {
+		return nil, err
+	}
+	return &st, nil
+}
+
+// saveState writes the credential 0600 (dir 0700). The refresh token is a
+// long-lived per-box credential, so keep it owner-only.
+func saveState(path string, st *agentState) error {
+	b, err := json.MarshalIndent(st, "", "  ")
+	if err != nil {
+		return err
+	}
+	if len(b) > credentialStateLimit {
+		return fmt.Errorf("credential state exceeds %d bytes", credentialStateLimit)
+	}
+	return writeCredentialFile(path, b)
 }
