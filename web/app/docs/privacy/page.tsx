@@ -17,9 +17,13 @@ export default function PrivacyAndDataHandling() {
         A client connects to Finch over HTTPS. Finch authenticates the caller and
         relays the request to your box over its outbound WSS connection. Responses
         return over the same encrypted network legs. Your box does not open an
-        inbound port or expose its IP address to the caller. From the box agent to
-        the service, plaintext HTTP is allowed only on a loopback address; an
-        upstream on another host must use HTTPS.
+        inbound port or expose its IP address to the caller. The final hop, from
+        the box agent to your service, is your configuration choice: the agent
+        allows plaintext HTTP to a loopback address and to single-label hosts
+        (such as a Docker Compose service name). Single-label names can resolve
+        off the box, and when they do that hop crosses your network in the clear
+        — so use <code>https://</code> for any upstream that is not on the box
+        itself.
       </p>
       <div className="docs-note">
         <b>The guarantee:</b> Finch handles ordinary MCP request and response bodies

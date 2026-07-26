@@ -44,14 +44,23 @@ the HTTP request and response to forward them. The box agent also necessarily
 handles plaintext before calling the local service.
 
 The production web and relay entry points reject plaintext HTTP before
-authentication or body handling. The box agent refuses non-loopback HTTP hub
-and upstream URLs, non-loopback WS relay URLs, and TLS-to-plaintext redirects.
-Plain HTTP/WS is permitted only for literal loopback development addresses.
+authentication or body handling. The box agent refuses non-loopback HTTP **hub**
+URLs, non-loopback WS relay URLs, and TLS-to-plaintext redirects.
 
-The agent-to-local-service connection is chosen by the box operator. Loopback
-HTTP (for example, `http://127.0.0.1:8000`) does not leave the box. If an
-upstream is on another host, the agent requires HTTPS, so the final network hop
-cannot be configured as plaintext HTTP.
+The agent-to-local-service connection is different, and is chosen by the box
+operator. Loopback HTTP (for example, `http://127.0.0.1:8000`) does not leave
+the box. But the agent also accepts a plaintext `http://` upstream whose host is
+a **single DNS label** (for example `http://nas:8000` or a Docker Compose
+service name like `http://hello-mcp:8000`), because container networks address
+services that way. Such names are not necessarily on-box: they routinely resolve
+elsewhere via `/etc/hosts`, a DNS search domain, or LLMNR. When one does, that
+final hop is relayed **in the clear across your network**, carrying request and
+response bodies and the hub-signed `X-Finch-Assertion` caller-identity header.
+
+Only dotted names (`http://host.example`) and non-loopback IP literals are
+refused over plaintext. So Finch does **not** guarantee the final hop is
+encrypted — that is the operator's configuration decision. Use `https://` for
+any upstream that is not genuinely on the box.
 
 Cloudflare's underlying platform may process network and security telemetry
 under the deployment's Cloudflare configuration and terms. Finch's guarantee

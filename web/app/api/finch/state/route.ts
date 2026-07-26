@@ -74,6 +74,34 @@ function parseMembers(value: unknown): {
 // (and requireStateShape's own contract) still hold.
 const EMPTY_COLLECTIONS = ["keys", "acl", "accessRequests", "groups", "members"] as const;
 
+// Emptying the collections above is not sufficient on its own: the AUDIT LOG
+// re-supplies the same data in prose, and members legitimately see the Logs
+// view. Each excluded category embeds precisely what was stripped —
+//   access — invitee emails, `id <email>` roster pairs, ACL grant topology
+//   key    — key labels and their owners
+//   admin  — setting values (re-supplying `settings`), group and tag topology
+// so the category filter, not the collection emptying, is what actually holds
+// the boundary. Kept: `device` (enrollment/join/online-offline, whose actor and
+// target are service and box ids) and `request` (the latency-and-errors feed).
+const MEMBER_LOG_CATEGORIES = new Set(["device", "request"]);
+
+function projectLogsForMember(logs: unknown): unknown {
+  if (!Array.isArray(logs)) return logs;
+  return logs
+    .filter(
+      (entry) =>
+        isJsonObject(entry) &&
+        typeof entry.cat === "string" &&
+        MEMBER_LOG_CATEGORIES.has(entry.cat),
+    )
+    .map((entry) => {
+      const row = entry as Record<string, unknown>;
+      // A `request` actor is the finch_ KEY LABEL — the same identifier removed
+      // from services[].keys, so leaving it would hand it straight back.
+      return row.cat === "request" ? { ...row, actor: "" } : row;
+    });
+}
+
 /** Key labels reveal which credentials reach which service; address/relay are
  *  box infrastructure. Neither is needed by the views a member can open. */
 function stripBoxDetail(box: unknown): unknown {
@@ -83,6 +111,14 @@ function stripBoxDetail(box: unknown): unknown {
 function stripServiceDetail(service: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = { ...service, keys: [] };
   if (Array.isArray(out.boxes)) out.boxes = out.boxes.map(stripBoxDetail);
+  // recentCalls[].caller is resolved at the relay to the finch_ key LABEL —
+  // strictly more revealing than services[].keys, which holds key IDs. The feed
+  // (route, status, ms, timestamp) survives; only the caller identity goes.
+  if (Array.isArray(out.recentCalls)) {
+    out.recentCalls = out.recentCalls.map((call) =>
+      isJsonObject(call) ? { ...call, caller: "" } : call,
+    );
+  }
   return out;
 }
 
@@ -90,6 +126,7 @@ function projectForMember(state: Record<string, unknown>): Record<string, unknow
   const out: Record<string, unknown> = { ...state };
   for (const field of EMPTY_COLLECTIONS) out[field] = [];
   out.settings = {};
+  out.logs = projectLogsForMember(out.logs);
   if (Array.isArray(out.services)) {
     out.services = out.services.map((service) =>
       isJsonObject(service) ? stripServiceDetail(service) : service,

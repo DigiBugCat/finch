@@ -66,12 +66,23 @@ function sensitiveState(): Record<string, unknown> {
     ],
     accessRequests: [{ id: "r1", email: "outsider@example.com", service: "svc" }],
     settings: { org: "Fallback", subdomain: "demo" },
-    logs: [{ ago: "1m", ts: 1, cat: "request", actor: "owner@example.com", action: "GET", target: "svc", ip: "203.0.113.7" }],
+    // The audit log re-supplies in PROSE exactly what the collections above
+    // carry. A fixture whose only entry names nobody lets a leak pass unnoticed,
+    // so every category that embeds an identity is represented here.
+    logs: [
+      { ago: "1m", ts: 6, cat: "access", actor: "m1", action: "invited member", target: "invited@example.com", ip: "" },
+      { ago: "2m", ts: 5, cat: "access", actor: "m1", action: "granted", target: "user:invited@example.com → svc", ip: "" },
+      { ago: "3m", ts: 4, cat: "key", actor: "owner@example.com", action: "minted key", target: "prod", ip: "" },
+      { ago: "4m", ts: 3, cat: "admin", actor: "you", action: "changed setting", target: "subdomain → demo", ip: "" },
+      { ago: "5m", ts: 2, cat: "device", actor: "svc", action: "box online", target: "svc/b1", ip: "" },
+      { ago: "6m", ts: 1, cat: "request", actor: "prod", action: "GET", target: "/mcp", ip: "", result: 200 },
+    ],
     services: [
       {
         id: "svc",
         label: "Service",
         keys: ["prod"],
+        recentCalls: [{ ts: 1, route: "/mcp", status: 200, ms: 12, caller: "prod" }],
         boxes: [{ name: "b1", keys: ["prod"], address: "100.64.0.1", relay: "iad" }],
       },
     ],
@@ -405,11 +416,27 @@ describe("state route upstream corruption handling", () => {
     expect(body.services[0].boxes[0].address).toBe("");
     expect(body.boxes[0].relay).toBe("");
 
-    // Nothing from the roster or the ACL survives anywhere in the payload.
+    // The audit log must not re-supply what the collections above strip.
+    // Members keep the device/request narrative; access/key/admin entries embed
+    // emails, key labels + owners, ACL edges, and setting values.
+    const cats = body.logs.map((l: any) => l.cat);
+    expect(new Set(cats)).toEqual(new Set(["device", "request"]));
+    // A request actor is the finch_ key label — the identifier removed above.
+    expect(body.logs.find((l: any) => l.cat === "request").actor).toBe("");
+    // ...and so is recentCalls[].caller, which is strictly more revealing than
+    // services[].keys (labels vs ids).
+    expect(body.services[0].recentCalls[0].caller).toBe("");
+    expect(body.services[0].recentCalls[0].status).toBe(200); // feed still useful
+
+    // Nothing from the roster, the ACL, the key set, or settings survives
+    // anywhere in the payload — including inside log prose.
     const serialized = JSON.stringify(body);
     expect(serialized).not.toContain("invited@example.com");
     expect(serialized).not.toContain("outsider@example.com");
+    expect(serialized).not.toContain("owner@example.com");
     expect(serialized).not.toContain("ab12");
+    expect(serialized).not.toContain("prod"); // key label, via any channel
+    expect(serialized).not.toContain("subdomain → demo");
   });
 
   it("still returns the full workspace to an admin", async () => {
