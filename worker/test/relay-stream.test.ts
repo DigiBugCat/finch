@@ -61,8 +61,11 @@ function relayUrl(
   return `https://hub/${m.service}/${encodeURIComponent(m.box)}/${rest}`;
 }
 
-/** Register a fake agent over a real WS upgrade to the DO's _connect (the DO
- *  itself does no auth; index.ts gates that). Returns the agent's client end. */
+/** Register a fake agent over a real WS upgrade to the DO's _connect. index.ts
+ *  verifies the per-box connect token and then proves provenance to the DO with
+ *  X-Finch-Service; the DO fails closed without it, so a request the public
+ *  relay forwarded can never claim the agent socket. Returns the agent's client
+ *  end. */
 async function connectAgent(
   stub: Stub,
   m: { tenant: string; service: string; box: string },
@@ -70,7 +73,12 @@ async function connectAgent(
   const url =
     `https://hub/${m.service}/${encodeURIComponent(m.box)}/_connect` +
     `?tenant=${m.tenant}&service=${m.service}&box=${encodeURIComponent(m.box)}`;
-  const res = await stub.fetch(url, { headers: { Upgrade: "websocket" } });
+  const res = await stub.fetch(url, {
+    headers: {
+      Upgrade: "websocket",
+      "X-Finch-Service": env.FINCH_SERVICE_SECRET,
+    },
+  });
   expect(res.status).toBe(101);
   const client = res.webSocket!;
   client.accept();

@@ -402,4 +402,116 @@ describe("full-stack worker E2E — enroll → join → refresh → connect → 
 
     agent.close(1000, "public e2e done");
   });
+
+  // REGRESSION: agent-socket hijack via the two-segment reserved path.
+  // The edge connect-token gate keys on `parts[2] === "_connect"`, but `parts`
+  // is built with .filter(Boolean) — no leading empty element — so for
+  // /<service>/_connect parts[2] is undefined and the gate (with its
+  // fail-closed 401) was skipped entirely. The request fell through to the
+  // load-balanced relay, whose upstream became "_connect"; relayMcp rebuilt it
+  // as /<service>/<pickedBox>/_connect and forwarded it with Upgrade intact,
+  // and BoxDO — which authenticated nothing — evicted the real agent and handed
+  // the caller its socket. On a PUBLIC service that needed no credential at all.
+  it("does NOT hand the agent socket to an unauthenticated /<service>/_connect", async () => {
+    const boxName = `box-hijack-${Date.now()}`;
+
+    const enroll = (await (await api("POST", "/api/enroll", {
+      name: "Hijack Target",
+    })).json()) as { id: string; ticket: string };
+    const service = enroll.id;
+
+    const join = (await (await call(
+      new Request(`${BASE}/join`, {
+        method: "POST",
+        headers: { "content-type": "application/json", host: HOST },
+        body: JSON.stringify({
+          ticket: enroll.ticket,
+          box: boxName,
+          os: "linux",
+          version: "1.4.0",
+        }),
+      }),
+    )).json()) as { connectToken: string };
+
+    // The legitimate agent connects with a valid connect token and stays live.
+    const legit = await call(
+      new Request(
+        `${BASE}/${service}/${encodeURIComponent(boxName)}/_connect` +
+          `?ct=${encodeURIComponent(join.connectToken)}`,
+        { headers: { Upgrade: "websocket", host: HOST } },
+      ),
+    );
+    expect(legit.status).toBe(101);
+    const agent = legit.webSocket!;
+    agent.accept();
+    await waitForBox(service, boxName, (m) => m.connected === true);
+    await api("POST", `/api/services/${encodeURIComponent(service)}/approve`);
+    await waitForBox(
+      service,
+      boxName,
+      (m) => m.connected === true && m.state !== "pending",
+    );
+
+    // Make it public — the worst case, where the relay needs no credential.
+    expect(
+      (await api("PUT", `/api/services/${encodeURIComponent(service)}/auth`, {
+        mode: "public",
+      })).status,
+    ).toBe(200);
+
+    // THE ATTACK: two segments, no connect token, no key, no session.
+    const hijack = await call(
+      new Request(
+        `${BASE}/${service}/_connect` +
+          `?tenant=${TENANT}&service=${service}&box=${encodeURIComponent(boxName)}`,
+        { headers: { Upgrade: "websocket", host: HOST } },
+      ),
+    );
+    expect(hijack.status).not.toBe(101);
+    expect(hijack.webSocket).toBeFalsy();
+
+    // A prefixed variant must not slip through either (/_connect/x → relPath
+    // "/_connect/x", which startsWith("/_connect")).
+    const hijackPrefixed = await call(
+      new Request(`${BASE}/${service}/_connect/x`, {
+        headers: { Upgrade: "websocket", host: HOST },
+      }),
+    );
+    expect(hijackPrefixed.status).not.toBe(101);
+    expect(hijackPrefixed.webSocket).toBeFalsy();
+
+    // The reserved control surface is equally unreachable through the relay.
+    const control = await call(
+      new Request(`${BASE}/${service}/_control`, {
+        method: "POST",
+        headers: { host: HOST },
+      }),
+    );
+    expect(control.status).toBe(404);
+
+    // Decisive: the real agent was never evicted — it still serves the relay.
+    const reqSeen = nextFrame(agent);
+    const relayPromise = call(
+      new Request(`${BASE}/${service}/index.html`, { headers: { host: HOST } }),
+    );
+    const frame = await reqSeen;
+    expect(frame.type).toBe("req");
+    agent.send(
+      JSON.stringify({
+        id: frame.id,
+        type: "head",
+        status: 200,
+        headers: [["content-type", "text/html"]],
+      }),
+    );
+    agent.send(
+      JSON.stringify({ id: frame.id, type: "chunk", data: btoa("<h1>ok</h1>") }),
+    );
+    agent.send(JSON.stringify({ id: frame.id, type: "end" }));
+    const relayRes = await relayPromise;
+    expect(relayRes.status).toBe(200);
+    expect(await relayRes.text()).toBe("<h1>ok</h1>");
+
+    agent.close(1000, "hijack regression done");
+  });
 });

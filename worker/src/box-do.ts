@@ -173,7 +173,20 @@ export class BoxDO extends DurableObject<Env> {
     const relPath = "/" + parts.slice(2).join("/") + (url.search || "");
 
     // ---- Agent registration: the box dials in here with a WS upgrade. ----
+    // PATH ALONE IS NOT TRUST (same reasoning as /_control below). The public
+    // relay forwards ARBITRARY client paths into this DO, so /<service>/_connect
+    // arrives here as relPath /_connect having never passed the edge's
+    // connect-token check — that check keys on parts[2], which is undefined for
+    // a two-segment path. Without the secret below, any caller who could reach
+    // the relay (unauthenticated, for a public service) would evict the real
+    // agent and take over the box's socket. Only index.ts's authenticated
+    // _connect branch sets this header, and relayMcp strips caller-supplied
+    // copies. Fail closed (404) so the surface isn't advertised.
     if (relPath.startsWith("/_connect")) {
+      const connectSecret = this.env.FINCH_SERVICE_SECRET;
+      if (!connectSecret || req.headers.get("X-Finch-Service") !== connectSecret) {
+        return json(404, { error: "not found" });
+      }
       if (req.headers.get("Upgrade") !== "websocket") {
         return new Response("expected websocket upgrade", { status: 426 });
       }

@@ -193,6 +193,20 @@ const RESERVED_CALLER_IDENTITY_HEADERS = new Set([
   "x-finch-principal",
 ]);
 
+// Reserved BoxDO surfaces. The DO strips two path segments, so ANY relayed
+// upstream whose first segment is one of these lands on a control surface
+// instead of the hosted app. The authenticated _connect branch is the only
+// legitimate way onto that surface; anything arriving at the generic relay with
+// one of these as its upstream head is probing, so it 404s at the edge.
+// (A two-segment /<service>/_connect used to slip past the parts[2] === "_connect"
+// check — parts has no leading empty element — and hijack the agent socket.)
+const RESERVED_BOX_UPSTREAM = new Set(["_connect", "_control"]);
+
+function isReservedUpstream(upstream: string): boolean {
+  const head = upstream.split("/").filter(Boolean)[0];
+  return !!head && RESERVED_BOX_UPSTREAM.has(head);
+}
+
 function stripUntrustedCallerIdentity(headers: Headers): void {
   for (const name of [...headers.keys()]) {
     if (
@@ -980,8 +994,20 @@ export default {
       connectUrl.searchParams.set("tenant", tenant);
       connectUrl.searchParams.set("service", service);
       connectUrl.searchParams.set("box", box);
+      // PROVE PROVENANCE TO THE DO. BoxDO cannot tell an upgrade that came
+      // through this authenticated branch from one the public relay forwarded
+      // (the relay carries ARBITRARY client paths, and /<service>/_connect
+      // reaches the DO as relPath /_connect). Present the service secret, which
+      // relayMcp strips from caller headers — same trust model as /_control.
+      const connectHeaders = new Headers(req.headers);
+      connectHeaders.set("X-Finch-Service", env.FINCH_SERVICE_SECRET);
       const stub = boxStub(env, tenant, service, box);
-      return stub.fetch(new Request(connectUrl.toString(), req));
+      return stub.fetch(
+        new Request(connectUrl.toString(), {
+          method: req.method,
+          headers: connectHeaders,
+        }),
+      );
     }
 
     // Generic public relay: forward ANY path under the service to the box —
@@ -1057,6 +1083,7 @@ export default {
       if (pinned) {
         // Specific box: upstream = everything after <service>/<box>.
         const upstream = parts.slice(2).join("/");
+        if (isReservedUpstream(upstream)) return json(404, { error: "not found" });
         const allowed = await tenantOp<{ exists: boolean; allowed: boolean }>(
           env,
           tenant,
@@ -1073,6 +1100,7 @@ export default {
       // WHOLE healthy pool (shuffled) and FAIL OVER inside relayMcp on a
       // stale-pick "service offline" 503. (code-review #12)
       const upstream = parts.slice(1).join("/");
+      if (isReservedUpstream(upstream)) return json(404, { error: "not found" });
       const allowed = await tenantOp<{ exists: boolean; allowed: boolean }>(
         env,
         tenant,
