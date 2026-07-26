@@ -76,13 +76,13 @@ const EMPTY_COLLECTIONS = ["keys", "acl", "accessRequests", "groups", "members"]
 
 /** Key labels reveal which credentials reach which service; address/relay are
  *  box infrastructure. Neither is needed by the views a member can open. */
+function stripBoxDetail(box: unknown): unknown {
+  return isJsonObject(box) ? { ...box, keys: [], address: "", relay: "" } : box;
+}
+
 function stripServiceDetail(service: Record<string, unknown>): Record<string, unknown> {
-  const out = { ...service, keys: [] as string[] };
-  if (Array.isArray(out.boxes)) {
-    out.boxes = out.boxes.map((box) =>
-      isJsonObject(box) ? { ...box, keys: [], address: "", relay: "" } : box,
-    );
-  }
+  const out: Record<string, unknown> = { ...service, keys: [] };
+  if (Array.isArray(out.boxes)) out.boxes = out.boxes.map(stripBoxDetail);
   return out;
 }
 
@@ -95,11 +95,7 @@ function projectForMember(state: Record<string, unknown>): Record<string, unknow
       isJsonObject(service) ? stripServiceDetail(service) : service,
     );
   }
-  if (Array.isArray(out.boxes)) {
-    out.boxes = out.boxes.map((box) =>
-      isJsonObject(box) ? { ...box, keys: [], address: "", relay: "" } : box,
-    );
-  }
+  if (Array.isArray(out.boxes)) out.boxes = out.boxes.map(stripBoxDetail);
   return out;
 }
 
