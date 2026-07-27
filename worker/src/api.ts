@@ -658,13 +658,20 @@ async function handleApiInner(
       // tenantId before appending — so re-running it is always safe, including
       // when a previous attempt actually committed and only its response was
       // lost.
+      // The log carries only the sanitized error message — the same reviewed
+      // shape as every other console site. The tenant id deliberately does NOT
+      // go to the log: it is now derived from the client's idempotency key
+      // (request data), and rather than teaching the privacy gate which
+      // derivations launder and which do not, the id travels in the 503
+      // RESPONSE below — where it reaches the one party who can act on it, and
+      // where the idempotent retry makes the orphan self-repairing anyway.
       let indexed=false;
       for(let attempt=0;attempt<3&&!indexed;attempt++){
         try{
           await directoryOp(env,"upsertMembership",{clerkUserId,tenantId,memberId:owner.id,role:owner.role,state:owner.state});
           indexed=true;
         }catch(error){
-          if(attempt===2)console.error("tenant directory index failed",{tenantId,error});
+          if(attempt===2)console.error("tenant directory index failed",error instanceof Error?error.message:String(error));
         }
       }
       // Still failing after retries: report it, and hand back the id so the

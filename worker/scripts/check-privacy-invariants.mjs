@@ -104,22 +104,9 @@ const SAFE_CONSOLE_MESSAGES = new Set([
   "caller assertion signing failed",
   // Renamed from "tenant directory reindex failed" when /api/tenant-create
   // stopped calling reindexTenant (the whole-keyspace scan) in favour of a
-  // single upsertMembership. Reviewed: the arguments are { tenantId, error } —
-  // a tenant id and a DO failure, no member email, no request body.
+  // single upsertMembership. Same sanitized-error-only shape as the others;
+  // the tenant id goes in the route's 503 response, never the log.
   "tenant directory index failed",
-]);
-const SENSITIVE_LOG_IDENTIFIERS = new Set([
-  "body",
-  "bodyBytes",
-  "data",
-  "frame",
-  "headers",
-  "payload",
-  "raw",
-  "req",
-  "request",
-  "res",
-  "response",
 ]);
 
 function bindingIdentifiers(name) {
@@ -242,76 +229,6 @@ function isReviewedErrorReference(reference, call, bindings) {
   return binding.kind === "catch" || (binding.kind === "parameter" && isCatchCallback(binding.owner));
 }
 
-/** A direct `crypto.subtle.digest(...)` call — and nothing looser: bracket
- * access or an aliased `crypto` does not match, so the carve-out below cannot
- * be smuggled around. */
-function isDigestCall(part) {
-  return (
-    ts.isCallExpression(part) &&
-    ts.isPropertyAccessExpression(part.expression) &&
-    part.expression.name.text === "digest" &&
-    ts.isPropertyAccessExpression(part.expression.expression) &&
-    part.expression.expression.name.text === "subtle" &&
-    ts.isIdentifier(part.expression.expression.expression) &&
-    part.expression.expression.expression.text === "crypto"
-  );
-}
-
-function originatesFromSensitiveValue(node, bindings, seen = new Set()) {
-  let sensitive = false;
-  const visit = (part) => {
-    if (sensitive) return;
-    // REVIEWED CARVE-OUT: a value that reaches the log only THROUGH a
-    // cryptographic digest cannot reproduce its input, so the digest call's
-    // own argument subtree is not traced. Everything AROUND the call still is
-    // — a raw body logged next to a digest stays banned. This is what lets the
-    // tenant-create idempotency key (request data) contribute 128 one-way bits
-    // to a logged tenant id without opening the door to logging request data.
-    if (isDigestCall(part)) return;
-    check(part);
-    part.forEachChild(visit);
-  };
-  const check = (part) => {
-    if (
-      ts.isPropertyAccessExpression(part) &&
-      SENSITIVE_LOG_IDENTIFIERS.has(part.name.text)
-    ) {
-      sensitive = true;
-      return;
-    }
-    if (
-      ts.isElementAccessExpression(part) &&
-      ts.isStringLiteral(part.argumentExpression) &&
-      SENSITIVE_LOG_IDENTIFIERS.has(part.argumentExpression.text)
-    ) {
-      sensitive = true;
-      return;
-    }
-    if (!ts.isIdentifier(part)) return;
-    if (
-      (ts.isPropertyAccessExpression(part.parent) && part.parent.name === part) ||
-      (ts.isPropertyAssignment(part.parent) && part.parent.name === part)
-    ) {
-      return;
-    }
-    if (SENSITIVE_LOG_IDENTIFIERS.has(part.text)) {
-      sensitive = true;
-      return;
-    }
-    const binding = resolveBinding(part, bindings);
-    if (
-      binding?.kind === "variable" &&
-      binding.initializer &&
-      !seen.has(binding) &&
-      originatesFromSensitiveValue(binding.initializer, bindings, new Set([...seen, binding]))
-    ) {
-      sensitive = true;
-    }
-  };
-  visit(node);
-  return sensitive;
-}
-
 function sanitizedErrorReference(node) {
   if (
     ts.isConditionalExpression(node) &&
@@ -337,40 +254,16 @@ function sanitizedErrorReference(node) {
   return undefined;
 }
 
-function directoryErrorMetadata(node) {
-  if (!ts.isObjectLiteralExpression(node) || node.properties.length !== 2) return undefined;
-  const fields = new Map();
-  for (const property of node.properties) {
-    if (!ts.isShorthandPropertyAssignment(property) || property.objectAssignmentInitializer) {
-      return undefined;
-    }
-    fields.set(property.name.text, property.name);
-  }
-  if (fields.size !== 2 || !fields.has("tenantId") || !fields.has("error")) return undefined;
-  return fields;
-}
-
+// Every reviewed message shares ONE argument shape: the sanitized error
+// message, nothing else. There used to be a second, richer shape for the
+// tenant-create failure log ({ tenantId, error }) with its own data-flow rule;
+// once the tenant id became derived from the client's idempotency key, keeping
+// it loggable would have meant teaching this gate which derivations launder
+// request data (digests, presence bits, ...) — a growing carve-out surface in
+// a gate whose value is being blunt. The id moved to the route's 503 response
+// instead, and the special case was DELETED rather than refined.
 function isReviewedArguments(message, args, call, bindings) {
   if (args.length !== 2) return false;
-  if (message === "tenant directory index failed") {
-    const fields = directoryErrorMetadata(args[1]);
-    if (!fields || !isReviewedErrorReference(fields.get("error"), call, bindings)) return false;
-    const tenantBinding = resolveBinding(fields.get("tenantId"), bindings);
-    if (tenantBinding?.kind !== "variable" || tenantBinding.initializer === undefined) {
-      return false;
-    }
-    // The tenant id may be minted conditionally — idempotent create derives it
-    // from a digest when the client sent a key, random otherwise. Each VALUE
-    // branch must independently pass the sensitivity trace (which itself skips
-    // only digest-call arguments; see originatesFromSensitiveValue). The
-    // ternary's CONDITION is exempt by review: it selects between two clean
-    // values and so contributes at most the one bit "did the client send a
-    // key", never key content — while a body-derived value in either branch
-    // still fails.
-    const init = tenantBinding.initializer;
-    const branches = ts.isConditionalExpression(init) ? [init.whenTrue, init.whenFalse] : [init];
-    return branches.every((branch) => !originatesFromSensitiveValue(branch, bindings));
-  }
   const error = sanitizedErrorReference(args[1]);
   return error !== undefined && isReviewedErrorReference(error, call, bindings);
 }
