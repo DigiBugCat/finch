@@ -553,14 +553,7 @@ async function handleApiInner(
       if(!(listed.memberships??[]).some((m:any)=>m.tenantId===clerkUserId))listed.memberships=[{tenantId:clerkUserId,role:"owner",state:body.primaryEmail?"active":"invited"},...(listed.memberships??[])];
       const memberships=[];
       for(const indexed of listed.memberships??[]){
-        // `emails` (every VERIFIED address on this identity) rides along so the
-        // DO can repair legacy AccessRequest.grantedTo rows. bindIdentity above
-        // cannot do it: it only runs for tenants with a PENDING invite, and an
-        // alias-bound member's invitation was consumed and its pointer cleared
-        // long ago. This call is the one that reaches every established
-        // membership on every sign-in. See TenantDO.backfillGrantedTo, and the
-        // deploy-preflight gate that keeps this argument from being dropped.
-        const tenantId=String(indexed.tenantId), contextRes=await tenantOpRaw(env,tenantId,"memberContext",{clerkUserId,emails});
+        const tenantId=String(indexed.tenantId), contextRes=await tenantOpRaw(env,tenantId,"memberContext",{clerkUserId});
         if(!contextRes.ok)continue;
         const context:any=await contextRes.json();
         const personalPending=tenantId===clerkUserId&&context.needsBootstrap===true;

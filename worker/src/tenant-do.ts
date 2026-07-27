@@ -231,7 +231,7 @@ export class TenantDO extends DurableObject<Env> {
       switch (op) {
         case "getState":
           return ok(await this.getState(a.viewer));
-        case "memberContext": return ok(await this.memberContext(a.clerkUserId, a.email, a.emails));
+        case "memberContext": return ok(await this.memberContext(a.clerkUserId, a.email));
         case "ensureOwner": return ok(await this.ensureOwner(a.clerkUserId, a.email));
         case "inviteMember": return this.opResponse(await this.inviteMember(a.email,a.role,a.actor));
         case "bindIdentity": return this.opResponse(await this.bindIdentity(a.clerkUserId,a.emails,a.source));
@@ -1814,18 +1814,8 @@ export class TenantDO extends DurableObject<Env> {
     s.tenantMeta={id:this.tenantId(),kind:"personal",displayName:this.tenantId(),createdAt:now,bootstrappedFrom:"legacy-personal",membershipVersion:1}; s.members=[member]; this.rewriteYou(s,em);
     this.log(s,{cat:"access",actor:member.id,action:"bootstrapped workspace",target:em,ip:"",svc:""}); await this.save(s); return {member,tenantMeta:s.tenantMeta};
   }
-  /** Resolve this identity's membership in this tenant.
-   *
-   *  `emails` is every address VERIFIED on the identity, and is supplied by
-   *  /api/user/sync. It is only used to repair legacy `grantedTo` — see
-   *  backfillGrantedTo for why this method, rather than bindIdentity, is where
-   *  that has to happen. Callers that omit it (portal-grant, the org adapter)
-   *  get the same read-only behaviour as before. */
-  private async memberContext(
-    clerkUserId: unknown,
-    email?: unknown,
-    emails?: unknown,
-  ): Promise<any> {
+  /** Resolve this identity's membership in this tenant. Read-only. */
+  private async memberContext(clerkUserId: unknown, email?: unknown): Promise<any> {
     const uid = typeof clerkUserId === "string" ? clerkUserId : "";
     const s = await this.load();
     if (!s.tenantMeta && uid === this.tenantId()) {
@@ -1833,93 +1823,12 @@ export class TenantDO extends DurableObject<Env> {
       return { member: null, tenantMeta: null, needsBootstrap: true };
     }
     const m = s.members.find((x) => x.clerkUserId === uid);
-    if (m && Array.isArray(emails) && (await this.backfillGrantedTo(s, m, emails))) {
-      await this.save(s);
-    }
     return {
       member: m ? { id: m.id, role: m.role, state: m.state, email: m.email } : null,
       tenantMeta: s.tenantMeta ?? null,
     };
   }
 
-  /** Stamp the canonical principal onto legacy `granted` access requests.
-   *
-   *  A row granted by the old code carries no `grantedTo`, and for an
-   *  alias-bound one the ACL rule already sits on the member's CANONICAL
-   *  email — so revokeAccess's fallback to `r.email` picks the alias and
-   *  revokes nothing, which is the original bug reproduced through the fix's
-   *  own fallback.
-   *
-   *  It cannot be inferred from the row: the alias's duplicate member row was
-   *  folded away at bind time, so nothing in stored state links the two
-   *  addresses. The verified-email list on the identity is the only remaining
-   *  link, which means the repair has to run somewhere that has it.
-   *
-   *  That is NOT bindIdentity. /api/user/sync (api.ts) calls bindIdentity only
-   *  for tenants returned by invitesForEmails, and the old alias flow already
-   *  consumed the invitation and cleared its pointer — so a legacy alias-bound
-   *  member never enters that loop again, and a repair placed there would be
-   *  dead code for exactly the rows it targets. Established memberships are
-   *  reached through memberContext, which sync calls for EVERY membership on
-   *  EVERY sign-in. Hence here.
-   *
-   *  Writes only when something actually changed, so the steady state is a
-   *  scan and no save. */
-  /** Does `email` hold a direct, unlocked `user -> service` allow rule?
-   *
-   *  This is deliberately the DIRECT rule only — the same shape addAclState
-   *  writes and stripUserServiceGrantState removes. Access reachable through a
-   *  group, tag or `all` rule is not evidence that this principal is the one
-   *  an access request's grant was installed under, and stamping on that basis
-   *  would be the guess this check exists to refuse. */
-  private hasDirectGrant(s: StoredState, email: string, service: string): boolean {
-    const em = normalizeEmail(email);
-    const svc = service.toLowerCase();
-    return s.acl.some(
-      (r) =>
-        !r.locked &&
-        r.action === "allow" &&
-        r.src.type === "user" &&
-        normalizeEmail(r.src.name ?? "") === em &&
-        r.dst.some((d) => d.type === "service" && (d.name ?? "").toLowerCase() === svc),
-    );
-  }
-
-  private async backfillGrantedTo(
-    s: StoredState,
-    member: TenantMember,
-    emails: unknown[],
-  ): Promise<boolean> {
-    const verified = new Set(
-      emails.filter((e): e is string => typeof e === "string").map(normalizeEmail),
-    );
-    if (!verified.size) return false;
-    const canonical = normalizeEmail(member.email);
-    let changed = false;
-    for (const r of s.accessRequests) {
-      // MIGRATION ONLY — never overwrite a principal that was recorded at
-      // grant time. `grantedTo` is authoritative when present: it names the
-      // address the ACL rule was actually installed under. A verified alias can
-      // move between identities (the membership-conflict check covers member
-      // CANONICAL addresses, not request-only aliases), so a later member
-      // verifying that alias would otherwise rewrite a post-upgrade row onto
-      // THEIR address — and revoking it would then strip the wrong principal
-      // and leave the original grant live. Absent is the only safe trigger.
-      if (r.status !== "granted" || r.grantedTo !== undefined) continue;
-      if (!verified.has(normalizeEmail(r.email))) continue;
-      // A verified email is not proof that THIS member holds the grant. If the
-      // alias was dropped from identity A and later verified by member B before
-      // A's first post-upgrade sync, B arrives here first and would stamp their
-      // address onto a rule that still belongs to A — so revoking would strip B
-      // and leave A authorized. Require the candidate to actually hold a direct
-      // user -> service rule; otherwise leave the row unmigrated, which is
-      // simply the status quo rather than a new wrong answer.
-      if (!this.hasDirectGrant(s, canonical, r.service)) continue;
-      r.grantedTo = canonical;
-      changed = true;
-    }
-    return changed;
-  }
   private async inviteMember(email:unknown,role:unknown,actor:any):Promise<any>{
     const em=typeof email==="string"?normalizeEmail(email):""; if(!em||!['admin','member'].includes(String(role))) return {error:"invalid email or role",status:400};
     const s=await this.load(), am=this.actorMember(s,actor); if(!am||am.role==="member") return {error:"admin role required",status:403};
@@ -2009,36 +1918,19 @@ export class TenantDO extends DurableObject<Env> {
 
       // Access requests parked on any of these emails can now be granted.
       //
-      // `granted` rows are revisited too, to BACKFILL grantedTo. A row granted
-      // by the old code carries no principal, and for an alias-bound one the
-      // rule already sits on the canonical email — so revokeAccess's fallback
-      // to `r.email` would pick the alias and reproduce exactly the bug this
-      // field exists to fix. There is no way to infer the linkage from the row
-      // alone: the alias's duplicate member row was folded away at bind time.
-      // Identity binding is the one place that still knows an alias and a
-      // canonical address belong to the same person, so it is the only place
-      // the repair can happen. It runs on every sync, so a live identity is
-      // corrected the next time its owner signs in.
-      const canonical = normalizeEmail(member.email);
+      // Rows that are ALREADY `granted` are deliberately left alone. A legacy
+      // one carries no principal, and nothing here can recover which address
+      // its rule was installed under: the alias's duplicate member row was
+      // folded away at bind time, so the linkage is simply not in the state
+      // any more. A verified email does not establish it — an alias can be
+      // dropped from one identity and verified by another — and neither does
+      // "this member holds a matching rule", which proves they have *a* grant
+      // to the service, never *the* grant this request created. Every such
+      // inference is wrong under some interleaving, and a wrong principal is
+      // worse than none: it makes revocation strip a bystander and report
+      // success while the real grant survives. revokeAccess refuses those rows
+      // outright instead — see the ambiguity guard there.
       for (const r of s.accessRequests) {
-        if (r.status === "granted") {
-          // Migration only, same rule as backfillGrantedTo: a recorded
-          // principal is authoritative and must never be rewritten, or an
-          // alias that later moves to another identity would repoint a
-          // post-upgrade row onto the wrong address.
-          if (
-            r.grantedTo === undefined &&
-            list.includes(normalizeEmail(r.email)) &&
-            // Same proof requirement as backfillGrantedTo: a verified email is
-            // not evidence that this member is the principal the legacy rule
-            // was installed under.
-            this.hasDirectGrant(s, canonical, r.service)
-          ) {
-            r.grantedTo = canonical;
-            changed = true;
-          }
-          continue;
-        }
         if (r.status !== "invited" || !list.includes(normalizeEmail(r.email))) continue;
         this.addAclState(s, member.email, r.service);
         // The request may name an ALIAS of this member — `list` is every
@@ -2229,6 +2121,35 @@ export class TenantDO extends DurableObject<Env> {
       // rule" guard below also evaluates the same wrong email — it did not
       // even trip that check. The caller saw {ok:true}, the row flipped to
       // `denied`, and the member kept the service.
+      //
+      // AMBIGUOUS LEGACY ROWS ARE REFUSED, NOT GUESSED. `grantedTo` is stamped
+      // at grant time, so any row written by the current code carries its
+      // principal. A row from before that does not, and the linkage is NOT
+      // recoverable from state: the alias's member row was folded away at bind
+      // time. The signature of that case is precise — a granted row whose email
+      // belongs to no member. (When a member DOES hold that email, the grant
+      // went to it by construction, so `r.email` is correct.)
+      //
+      // Refusing beats inferring. Every available heuristic — "this identity
+      // verified the alias", "this member holds a matching rule" — establishes
+      // only that some principal COULD be the one, and picking wrong makes
+      // revocation strip a bystander and report success while the real grant
+      // survives: the same silent failure this whole change exists to remove,
+      // relocated. An error is loud, and the admin has an exact alternative
+      // already in the product: revoke the rule itself by grant id (the
+      // `grantId` branch below), which names the principal unambiguously.
+      if (r.status === "granted" && r.grantedTo === undefined) {
+        const em = normalizeEmail(r.email);
+        if (!s.members.some((m) => normalizeEmail(m.email) === em)) {
+          return {
+            error:
+              "this grant predates per-request principal tracking and its rule cannot be " +
+              "identified from the request alone — revoke it from the Rules tab instead, " +
+              "where the rule names its principal directly",
+            status: 409,
+          };
+        }
+      }
       email = normalizeEmail(r.grantedTo || r.email);
       service = r.service;
     } else {

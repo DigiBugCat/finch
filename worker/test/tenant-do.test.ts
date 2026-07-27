@@ -1436,160 +1436,13 @@ describe("TenantDO — repairing state that predates the fix", () => {
     expect(locked.src.name).toBe("second@example.com");
   });
 
-  it("never overwrites a grantedTo that was recorded at grant time", async () => {
-    // A verified alias can move between identities -- the membership-conflict
-    // check covers member CANONICAL addresses, not request-only aliases. If the
-    // backfill rewrote an existing principal, a later member verifying that
-    // alias would repoint a post-upgrade row onto THEIR address, and revoking
-    // it would strip the wrong principal and leave the original grant live.
-    // The migration must therefore fire only on an ABSENT value.
-    const t = freshTenant();
-    await op(t, "enroll", { name: "Scraper" });
-    const boot = await op<any>(t, "bootstrapMembers", {
-      kind: "team",
-      displayName: "Fleet",
-      bootstrappedFrom: "fresh",
-      claimantClerkUserId: "u_owner",
-      members: [
-        { clerkUserId: "u_owner", email: "owner@example.com", role: "owner", state: "active" },
-        { clerkUserId: "u_other", email: "other@example.com", role: "member", state: "active" },
-      ],
-    });
-    const owner = boot.members[0];
-    const actor = { memberId: owner.id, clerkUserId: "u_owner", label: "owner@example.com" };
-
-    // Grant it the post-upgrade way, so the row carries an authoritative
-    // principal: member A is bound under canonical-a@, then verifies the alias.
-    await op(t, "inviteMember", { email: "canonical-a@example.com", role: "member", actor });
-    await op(t, "bindIdentity", {
-      clerkUserId: "u_a",
-      emails: ["canonical-a@example.com"],
-      source: "sync",
-    });
-    const req = await op<any>(t, "requestAccess", {
-      email: "shared-alias@example.com",
-      service: "scraper",
-      requestedBy: "self",
-    });
-    await op(t, "approveAccess", { id: req.request.id, actor });
-    await op(t, "bindIdentity", {
-      clerkUserId: "u_a",
-      emails: ["canonical-a@example.com", "shared-alias@example.com"],
-      source: "sync",
-    });
-
-    const recorded = (await op<any>(t, "listAccess")).requests.find(
-      (r: any) => r.id === req.request.id,
-    ).grantedTo;
-    expect(recorded).toBe("canonical-a@example.com");
-
-    // A DIFFERENT member now verifies that same alias. The row must not move.
-    await op(t, "memberContext", {
-      clerkUserId: "u_other",
-      emails: ["other@example.com", "shared-alias@example.com"],
-    });
-
-    const after = (await op<any>(t, "listAccess")).requests.find(
-      (r: any) => r.id === req.request.id,
-    );
-    expect(after.grantedTo).toBe("canonical-a@example.com");
-
-    // And the revoke still lands on the principal that actually holds the rule.
-    const rev = await op<any>(t, "revokeAccess", { id: req.request.id, actor });
-    expect(rev.removed).toBe(true);
-    expect(
-      (await op<any>(t, "checkUserAccess", { user: "canonical-a@example.com", service: "scraper" }))
-        .allowed,
-    ).toBe(false);
-  });
-
-  it("refuses to stamp a legacy row onto a member who does not hold the rule", async () => {
-    // The undefined-only guard is not enough on its own. If a request-only
-    // alias was dropped from identity A and later verified by member B before
-    // A's first post-upgrade sync, B reaches the backfill FIRST -- and a
-    // verified email is not evidence that B holds the grant. Stamping B would
-    // make revocation strip B and leave A authorized. Require proof: a direct
-    // user -> service rule. Absent that, leave the row alone.
-    const t = freshTenant();
-    await op(t, "enroll", { name: "Scraper" });
-    const boot = await op<any>(t, "bootstrapMembers", {
-      kind: "team",
-      displayName: "Fleet",
-      bootstrappedFrom: "fresh",
-      claimantClerkUserId: "u_owner",
-      members: [
-        { clerkUserId: "u_owner", email: "owner@example.com", role: "owner", state: "active" },
-      ],
-    });
-    const owner = boot.members[0];
-    const actor = { memberId: owner.id, clerkUserId: "u_owner", label: "owner@example.com" };
-
-    // The legacy row: granted, no principal recorded, and its ACL rule belongs
-    // to holder@example.com -- who is NOT the member that will sync next.
-    await op(t, "inviteMember", { email: "holder@example.com", role: "member", actor });
-    await op(t, "bindIdentity", {
-      clerkUserId: "u_holder",
-      emails: ["holder@example.com"],
-      source: "sync",
-    });
-    const req = await op<any>(t, "requestAccess", {
-      email: "moved-alias@example.com",
-      service: "scraper",
-      requestedBy: "self",
-    });
-    await op(t, "approveAccess", { id: req.request.id, actor });
-    await op(t, "bindIdentity", {
-      clerkUserId: "u_holder",
-      emails: ["holder@example.com", "moved-alias@example.com"],
-      source: "sync",
-    });
-    await runInDO(stubFor(t), async (instance: any) => {
-      const s: any = await instance.ctx.storage.get("state");
-      delete s.accessRequests.find((r: any) => r.id === req.request.id).grantedTo;
-      await instance.ctx.storage.put("state", s);
-    });
-
-    // A bystander member now verifies the same alias and syncs first. They hold
-    // no rule for `scraper`, so the row must stay unmigrated.
-    await op(t, "inviteMember", { email: "bystander@example.com", role: "member", actor });
-    await op(t, "bindIdentity", {
-      clerkUserId: "u_bystander",
-      emails: ["bystander@example.com"],
-      source: "sync",
-    });
-    await op(t, "memberContext", {
-      clerkUserId: "u_bystander",
-      emails: ["bystander@example.com", "moved-alias@example.com"],
-    });
-
-    const row = (await op<any>(t, "listAccess")).requests.find(
-      (r: any) => r.id === req.request.id,
-    );
-    expect(row.grantedTo).toBeUndefined();
-
-    // The real holder syncing later still gets the repair, because they DO
-    // hold the rule.
-    await op(t, "memberContext", {
-      clerkUserId: "u_holder",
-      emails: ["holder@example.com", "moved-alias@example.com"],
-    });
-    const repaired = (await op<any>(t, "listAccess")).requests.find(
-      (r: any) => r.id === req.request.id,
-    );
-    expect(repaired.grantedTo).toBe("holder@example.com");
-  });
-
-  it("leaves the locked grant alone when no active owner remains", async () => {
-    // The rule is the lockout backstop. With no heir, a stale grant beats an
-    // unreachable tenant -- and a pre-bootstrap tenant still carries the "you"
-    // placeholder, which must survive untouched.
-    const t = freshTenant();
-    await op(t, "enroll", { name: "Scraper" });
-    const fresh = (await op<any>(t, "getState")).acl.find((r: any) => r.id === "r_owner");
-    expect(fresh.src.name).toBe("you");
-  });
-
-  it("backfills grantedTo on a legacy alias-bound grant at the next sign-in", async () => {
+  it("refuses to revoke a legacy row whose principal cannot be identified", async () => {
+    // The linkage is simply not in the state: an alias-bound grant sits on the
+    // member's canonical email, and the alias's own member row was folded away
+    // at bind time. No heuristic recovers it -- a verified email or a matching
+    // rule each show that some principal COULD be the one, never that it IS --
+    // and a wrong guess strips a bystander while the real grant survives,
+    // which is the silent failure this whole change removes. So refuse.
     const t = freshTenant();
     await op(t, "enroll", { name: "Scraper" });
     const boot = await op<any>(t, "bootstrapMembers", {
@@ -1622,31 +1475,89 @@ describe("TenantDO — repairing state that predates the fix", () => {
       source: "sync",
     });
 
-    // Rewind to what the OLD code stored: the rule sits on the canonical email
-    // but the row records no principal at all. revokeAccess's fallback to
-    // r.email would pick the alias here and revoke nothing -- the original bug,
-    // reproduced through the fix's own fallback.
+    // Rewind to a pre-upgrade row: granted, no principal recorded.
     await runInDO(stubFor(t), async (instance: any) => {
       const s: any = await instance.ctx.storage.get("state");
       delete s.accessRequests.find((r: any) => r.id === req.request.id).grantedTo;
       await instance.ctx.storage.put("state", s);
     });
 
-    // The next ordinary sign-in repairs it. Crucially this uses the op that
-    // /api/user/sync actually calls for an ESTABLISHED membership --
-    // memberContext -- not bindIdentity: sync only binds tenants that still
-    // have a PENDING invite, and this member's invitation was consumed at the
-    // original bind and its pointer cleared. A repair hung off bindIdentity
-    // would never run for exactly these rows.
-    await op(t, "memberContext", {
-      clerkUserId: "u_alias",
-      emails: ["canonical@example.com", "alias@example.com"],
+    const rev = await op<any>(t, "revokeAccess", { id: req.request.id, actor });
+    expect(rev.error).toContain("Rules tab");
+    expect(rev.ok).toBeUndefined();
+    // Critically: it must NOT have half-applied. The row is untouched and the
+    // access is intact, so the admin sees a true state to act on.
+    const row = (await op<any>(t, "listAccess")).requests.find(
+      (r: any) => r.id === req.request.id,
+    );
+    expect(row.status).toBe("granted");
+    expect(
+      (await op<any>(t, "checkUserAccess", { user: "canonical@example.com", service: "scraper" }))
+        .allowed,
+    ).toBe(true);
+
+    // The documented alternative works and is unambiguous: revoke the RULE.
+    const rule = (await op<any>(t, "getState")).acl.find(
+      (r: any) =>
+        !r.locked &&
+        r.src?.name === "canonical@example.com" &&
+        r.dst?.some((d: any) => d.name === "scraper"),
+    );
+    const byRule = await op<any>(t, "revokeAccess", { ruleId: rule.id, actor });
+    expect(byRule.ok).toBe(true);
+    expect(
+      (await op<any>(t, "checkUserAccess", { user: "canonical@example.com", service: "scraper" }))
+        .allowed,
+    ).toBe(false);
+  });
+
+  it("still revokes a legacy row whose email belongs to a member", async () => {
+    // The ordinary legacy row -- no alias involved -- is NOT ambiguous: the
+    // grant went to r.email by construction, and a member holds that address.
+    // The refusal must not sweep these up.
+    const t = freshTenant();
+    await op(t, "enroll", { name: "Scraper" });
+    const boot = await op<any>(t, "bootstrapMembers", {
+      kind: "team",
+      displayName: "Fleet",
+      bootstrappedFrom: "fresh",
+      claimantClerkUserId: "u_owner",
+      members: [
+        { clerkUserId: "u_owner", email: "owner@example.com", role: "owner", state: "active" },
+        { clerkUserId: "u_plain", email: "plain@example.com", role: "member", state: "active" },
+      ],
+    });
+    const owner = boot.members[0];
+    const actor = { memberId: owner.id, clerkUserId: "u_owner", label: "owner@example.com" };
+    const req = await op<any>(t, "requestAccess", {
+      email: "plain@example.com",
+      service: "scraper",
+      requestedBy: "self",
+    });
+    await op(t, "approveAccess", { id: req.request.id, actor });
+    await runInDO(stubFor(t), async (instance: any) => {
+      const s: any = await instance.ctx.storage.get("state");
+      delete s.accessRequests.find((r: any) => r.id === req.request.id).grantedTo;
+      await instance.ctx.storage.put("state", s);
     });
 
     const rev = await op<any>(t, "revokeAccess", { id: req.request.id, actor });
     expect(rev.ok).toBe(true);
     expect(rev.removed).toBe(true);
-    expect(await reaches(t, "canonical@example.com")).toBe(false);
+    expect(
+      (await op<any>(t, "checkUserAccess", { user: "plain@example.com", service: "scraper" }))
+        .allowed,
+    ).toBe(false);
+  });
+
+  it("leaves the locked grant alone when no active owner remains", async () => {
+    // The rule is the lockout backstop. With no heir, a stale grant beats an
+    // unreachable tenant -- and a pre-bootstrap tenant still carries the "you"
+    // placeholder, which must survive untouched.
+    const t = freshTenant();
+    await op(t, "enroll", { name: "Scraper" });
+    const fresh = (await op<any>(t, "getState")).acl.find((r: any) => r.id === "r_owner");
+    expect(fresh.src.name).toBe("you");
   });
 
 });
