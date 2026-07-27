@@ -21,6 +21,46 @@ test("accepts only the reviewed metadata-only console shapes", () => {
   );
 });
 
+test("accepts a tenant id whose body-derived half is laundered through a digest", () => {
+  // The idempotent-create shape: request data reaches the logged id ONLY as
+  // 128 one-way bits of SHA-256, plus the ternary's presence bit. Both are
+  // reviewed; neither can reproduce the key.
+  assert.doesNotThrow(() =>
+    assertReviewedConsoleSource(`
+      async function create(body) {
+        const idemKey = typeof body.idempotencyKey === "string" ? body.idempotencyKey : null;
+        const tenantId = idemKey
+          ? "ft_" + [...new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(idemKey)))].map((b) => b.toString(16)).join("")
+          : "ft_" + crypto.randomUUID();
+        Promise.reject(new Error("offline")).catch((error) =>
+          console.error("tenant directory index failed", { tenantId, error }),
+        );
+      }
+    `),
+  );
+});
+
+test("still rejects a tenant id carrying body data OUTSIDE the digest", () => {
+  // The carve-out is the digest call's arguments, nothing wider: the same
+  // ternary with the raw key in a branch must stay banned.
+  assert.throws(
+    () =>
+      assertReviewedConsoleSource(
+        `
+      async function create(body) {
+        const idemKey = typeof body.idempotencyKey === "string" ? body.idempotencyKey : null;
+        const tenantId = idemKey ? "ft_" + idemKey : "ft_" + crypto.randomUUID();
+        Promise.reject(new Error("offline")).catch((error) =>
+          console.error("tenant directory index failed", { tenantId, error }),
+        );
+      }
+    `,
+        "raw-key.ts",
+      ),
+    /privacy invariant failed/,
+  );
+});
+
 const evasions = {
   "renamed request data": `
     function leak(req) {

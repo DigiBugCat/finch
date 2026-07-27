@@ -586,10 +586,53 @@ async function handleApiInner(
       // "member limit reached" and "duplicate member identity" and the DO's
       // error contract carries no machine-readable code to tell them apart.
       // Existing short ids keep working: nothing parses the suffix.
-      const tenantId="ft_"+crypto.randomUUID().replace(/-/g,"");
+      //
+      // IDEMPOTENT WHEN THE CLIENT SENDS A KEY. The failure this exists for:
+      // bootstrapMembers commits, the directory index write fails all retries,
+      // we return 503 — and the user retries. Without a key each retry mints a
+      // fresh id and bootstraps a SECOND workspace, leaving the first committed
+      // and permanently unindexed: the retry advice manufactured the very
+      // orphan-plus-duplicate it was meant to prevent. With a key the id is
+      // derived from (caller, key) — 128 bits of SHA-256, same 32-hex shape —
+      // so the retry lands on the SAME tenant: bootstrap replays as a 409 we
+      // recognize below, and the idempotent index write repairs itself.
+      //
+      // Deriving the id from a client-chosen key is safe because the caller's
+      // clerkUserId is mixed in AND the replay branch authorizes via the
+      // TENANT'S OWN membership: it proceeds only when the caller is that
+      // tenant's active owner. Someone who somehow occupied the derived id
+      // first just makes this create 409 — they cannot hand the caller a
+      // foreign workspace.
+      const idemKey=typeof body.idempotencyKey==="string"&&/^[A-Za-z0-9_-]{8,64}$/.test(body.idempotencyKey)?body.idempotencyKey:null;
+      const tenantId=idemKey
+        ?"ft_"+[...new Uint8Array(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(`${clerkUserId}:${idemKey}`)))].slice(0,16).map(b=>b.toString(16).padStart(2,"0")).join("")
+        :"ft_"+crypto.randomUUID().replace(/-/g,"");
       const r=await tenantOpRaw(env,tenantId,"bootstrapMembers",{kind:"team",displayName:body.name,bootstrappedFrom:"fresh",members:[{clerkUserId,email:body.email,role:"owner",state:"active"}],claimantClerkUserId:clerkUserId});
-      if(!r.ok)return cloneResponse(r);
-      const out:any=await r.json();
+      let owner:any;
+      if(!r.ok){
+        // Replay of our own earlier create: the derived id already bootstrapped.
+        // Discriminated by the tenant's membership, not by parsing the error
+        // text — the DO's contract carries no machine-readable code, and "this
+        // caller is the active owner of exactly the tenant this key derives"
+        // is the stronger claim anyway.
+        if(idemKey&&r.status===409){
+          const ctxRes=await tenantOpRaw(env,tenantId,"memberContext",{clerkUserId});
+          if(ctxRes.ok){
+            const ctx:any=await ctxRes.json();
+            const m=ctx?.member;
+            if(m&&m.role==="owner"&&m.state==="active")owner=m;
+          }
+        }
+        if(!owner)return cloneResponse(r);
+      }else{
+        const out:any=await r.json();
+        // Found by clerkUserId rather than by position: the roster is hardcoded
+        // to one member today, but this route already receives `emails`, so
+        // adding invitees is the obvious next change and an index keyed on [0]
+        // would silently drop their invite pointers.
+        owner=(out.members??[]).find((m:any)=>m.clerkUserId===clerkUserId);
+        if(!owner)return json(502,{error:"invalid response from hub"});
+      }
 
       // Index the owner directly instead of calling reindexTenant. reindex
       // exists to purge rows that reference a tenant before rewriting them, and
@@ -598,13 +641,6 @@ async function handleApiInner(
       // lines ago no existing row can possibly reference it, so that scan is
       // provably dead work: O(total platform identities) reads to delete
       // nothing. upsertMembership writes a byte-identical row.
-      //
-      // Found by clerkUserId rather than by position: the roster is hardcoded to
-      // one member today, but this route already receives `emails`, so adding
-      // invitees is the obvious next change and an index keyed on [0] would
-      // silently drop their invite pointers.
-      const owner=(out.members??[]).find((m:any)=>m.clerkUserId===clerkUserId);
-      if(!owner)return json(502,{error:"invalid response from hub"});
 
       // NOT swallowed. The directory row is the ONLY handle on this workspace:
       // /api/user/sync enumerates exclusively through listForUser, and the sole
@@ -633,10 +669,12 @@ async function handleApiInner(
       }
       // Still failing after retries: report it, and hand back the id so the
       // workspace is identifiable rather than lost (the web layer relays error
-      // bodies verbatim and the id is not sensitive). The residual is a
-      // committed-but-unindexed TenantDO — strictly better than the old
-      // behaviour, which left the same orphan AND claimed success — and it is
-      // bounded by the per-user and per-IP rate limits above.
+      // bodies verbatim and the id is not sensitive). When the client sent an
+      // idempotency key, "please retry" is now genuinely true: the retry
+      // derives the SAME tenant id, the bootstrap replay is recognized above,
+      // and this index write runs again — recovery, not duplication. Without a
+      // key the residual is a committed-but-unindexed TenantDO, bounded by the
+      // per-user and per-IP rate limits above.
       if(!indexed)return json(503,{error:"workspace index unavailable — please retry",tenantId});
       return json(200,{tenantId});}
     if(path==="/api/tenant-bootstrap"){const owner=(body.members??[]).find((m:any)=>m.role==="owner"&&m.state==="active");if(owner?.clerkUserId!==clerkUserId)return json(403,{error:"claimant must be owner"});const r=await tenantOpRaw(env,body.tenantId,"bootstrapMembers",{...body,claimantClerkUserId:clerkUserId});if(!r.ok)return cloneResponse(r);const out:any=await r.json();if(body.clerkOrgId)await directoryOp(env,"mapOrg",{clerkOrgId:body.clerkOrgId,tenantId:body.tenantId});await directoryOp(env,"reindexTenant",{tenantId:body.tenantId,members:out.members});return json(200,out);}

@@ -5,7 +5,7 @@
 // /api/finch/state). Every mutation calls the Next bridge under /api/finch/*
 // and then refetch()es so the UI reflects real hub state. The view components
 // are prop-driven and unchanged — only the data source + action handlers here.
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { UserButton, useUser } from '@clerk/nextjs';
 import { HomeView } from './home';
 import { FleetView } from './overview';
@@ -249,12 +249,22 @@ export default function DashboardApp() {
   ] : [["overview", "Fleet"], ["home", "Observability"], ["logs", "Logs"]];
   useEffect(() => { if (!isAdmin && !["overview","home","detail","logs"].includes(view)) setView("overview"); }, [isAdmin, view]);
   const selectWorkspace = async (tenantId:string) => { const res=await fetch("/api/finch/tenants/select",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({tenantId})});if(res.ok)window.location.reload();else flash("couldn't switch workspace"); };
+  // One idempotency key per creation ATTEMPT (keyed by the name), held until
+  // the create succeeds. If the hub commits the workspace but fails to index
+  // it, it returns 503 — and because the retry reuses this key, the hub derives
+  // the SAME tenant id and repairs the original workspace instead of
+  // bootstrapping a duplicate. A different name is a different attempt.
+  const createAttempt = useRef<{ name: string; key: string } | null>(null);
   const createWorkspace = async () => {
     const name = window.prompt("Workspace name")?.trim();
     if (!name) return;
-    const res = await fetch("/api/finch/tenants/create", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name }) });
+    if (createAttempt.current?.name !== name) {
+      createAttempt.current = { name, key: crypto.randomUUID() };
+    }
+    const res = await fetch("/api/finch/tenants/create", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, idempotencyKey: createAttempt.current.key }) });
     const body = await res.json().catch(() => ({}));
-    if (res.ok) window.location.reload(); else flash(body.error || "couldn't create workspace");
+    if (res.ok) { createAttempt.current = null; window.location.reload(); }
+    else flash(body.error || "couldn't create workspace");
   };
   const claimWorkspace = async (clerkOrgId: string) => {
     if (!window.confirm("Import this legacy Clerk organization into Finch? Roles become a Finch-owned snapshot.")) return;

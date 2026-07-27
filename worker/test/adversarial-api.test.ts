@@ -234,8 +234,8 @@ describe("/api/tenant-create", () => {
       ),
     };
   }
-  const createBody = (email: string) =>
-    JSON.stringify({ name: "Acme", email, emails: [email] });
+  const createBody = (email: string, idempotencyKey?: string) =>
+    JSON.stringify({ name: "Acme", email, emails: [email], ...(idempotencyKey ? { idempotencyKey } : {}) });
 
   const listForUser = async (clerkUserId: string) =>
     env.DIRECTORY.get(env.DIRECTORY.idFromName("global"))
@@ -278,6 +278,77 @@ describe("/api/tenant-create", () => {
     expect(res.status).toBe(503);
     // The claim the 200 was making is false, and this is what makes it false.
     expect((await listForUser(clerkUserId)).memberships).toEqual([]);
+  });
+
+  // REGRESSION (P1): when all in-request index retries failed, the 503 told
+  // the user to retry — but each retry minted a FRESH id and bootstrapped a
+  // SECOND workspace, leaving the first committed and permanently unindexed.
+  // With an idempotency key the id derives from (caller, key), so the retry
+  // lands on the SAME tenant: bootstrap replays, the index write repairs.
+  it("recovers the SAME workspace on retry with an idempotency key", async () => {
+    const clerkUserId = `user_idem_${crypto.randomUUID()}`;
+    const key = crypto.randomUUID();
+    const headers = await userHeaders(clerkUserId);
+    const real = env.DIRECTORY;
+    let down = true;
+    const DIRECTORY = {
+      idFromName: (name: string) => real.idFromName(name),
+      get: (id: any) => ({
+        fetch: async (input: any, init?: any) => {
+          const { op } = JSON.parse(String(init?.body ?? "{}"));
+          if (op === "upsertMembership" && down) {
+            return new Response(JSON.stringify({ error: "boom" }), { status: 500 });
+          }
+          return real.get(id).fetch(input, init);
+        },
+      }),
+    };
+
+    // Every in-request retry fails: workspace committed, index missing, 503.
+    const first = await call("/api/tenant-create", createBody("idem@example.test", key), headers, { DIRECTORY });
+    expect(first.status).toBe(503);
+    const firstBody = (await first.json()) as any;
+    expect(firstBody.tenantId).toMatch(/^ft_[0-9a-f]{32}$/);
+
+    // The user retries after the outage. Same key -> same tenant, repaired —
+    // NOT a duplicate.
+    down = false;
+    const second = await call("/api/tenant-create", createBody("idem@example.test", key), headers, { DIRECTORY });
+    expect(second.status).toBe(200);
+    const { tenantId } = (await second.json()) as any;
+    expect(tenantId).toBe(firstBody.tenantId);
+
+    const listed = await listForUser(clerkUserId);
+    expect(listed.memberships).toHaveLength(1);
+    expect(listed.memberships[0].tenantId).toBe(tenantId);
+  });
+
+  it("keys the derived id to the caller: replay is owner-gated, keys are per-attempt", async () => {
+    const clerkUserId = `user_idem2_${crypto.randomUUID()}`;
+    const headers = await userHeaders(clerkUserId);
+    const key = crypto.randomUUID();
+
+    // Plain replay of a fully successful create: same tenant back, still one row.
+    const a = await call("/api/tenant-create", createBody("idem2@example.test", key), headers);
+    expect(a.status).toBe(200);
+    const idA = ((await a.json()) as any).tenantId;
+    const replay = await call("/api/tenant-create", createBody("idem2@example.test", key), headers);
+    expect(replay.status).toBe(200);
+    expect(((await replay.json()) as any).tenantId).toBe(idA);
+    expect((await listForUser(clerkUserId)).memberships).toHaveLength(1);
+
+    // A different key is a different attempt -> a different workspace.
+    const b = await call("/api/tenant-create", createBody("idem2@example.test", crypto.randomUUID()), headers);
+    expect(b.status).toBe(200);
+    expect(((await b.json()) as any).tenantId).not.toBe(idA);
+
+    // Another USER with the same key must not land on (or be handed) that
+    // tenant: the id mixes in the caller, and the replay branch authorizes via
+    // the tenant's own membership.
+    const otherUser = `user_idem3_${crypto.randomUUID()}`;
+    const c = await call("/api/tenant-create", createBody("idem3@example.test", key), await userHeaders(otherUser));
+    expect(c.status).toBe(200);
+    expect(((await c.json()) as any).tenantId).not.toBe(idA);
   });
 
   // REGRESSION: a transient directory failure used to surface as a 503, and the

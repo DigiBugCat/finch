@@ -91,6 +91,29 @@ describe("tenant route request and upstream boundaries", () => {
     expect(mocks.writeActiveTenant).toHaveBeenCalledWith("ft_12345678");
   });
 
+  it("forwards a valid idempotency key to the hub and drops a malformed one", async () => {
+    // The key is what makes a retry after a failed index write REPAIR the
+    // original workspace instead of duplicating it — the hub derives the
+    // tenant id from (user, key). Nothing in the type system holds this
+    // forwarding, so pin the seam: dropped silently, every retry would mint a
+    // fresh workspace again.
+    mocks.userFetch.mockResolvedValue(Response.json({ tenantId: "ft_12345678" }));
+
+    await createTenant(post({ name: "Acme", idempotencyKey: "attempt-1234" }));
+    let [, , init] = mocks.userFetch.mock.calls[0];
+    expect(JSON.parse(init.body).idempotencyKey).toBe("attempt-1234");
+
+    // Malformed (bad charset / too short) degrades to the non-idempotent path
+    // rather than failing an otherwise valid create.
+    for (const bad of ["short", "has spaces in it", "x".repeat(65), 42]) {
+      mocks.userFetch.mockClear();
+      mocks.userFetch.mockResolvedValue(Response.json({ tenantId: "ft_12345678" }));
+      await createTenant(post({ name: "Acme", idempotencyKey: bad }));
+      [, , init] = mocks.userFetch.mock.calls[0];
+      expect("idempotencyKey" in JSON.parse(init.body)).toBe(false);
+    }
+  });
+
   it("rejects overlong or control-bearing workspace names without side effects", async () => {
     for (const name of ["a".repeat(65), "line\nbreak"]) {
       expect((await createTenant(post({ name }))).status).toBe(400);

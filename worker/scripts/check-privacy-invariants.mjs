@@ -242,10 +242,36 @@ function isReviewedErrorReference(reference, call, bindings) {
   return binding.kind === "catch" || (binding.kind === "parameter" && isCatchCallback(binding.owner));
 }
 
+/** A direct `crypto.subtle.digest(...)` call — and nothing looser: bracket
+ * access or an aliased `crypto` does not match, so the carve-out below cannot
+ * be smuggled around. */
+function isDigestCall(part) {
+  return (
+    ts.isCallExpression(part) &&
+    ts.isPropertyAccessExpression(part.expression) &&
+    part.expression.name.text === "digest" &&
+    ts.isPropertyAccessExpression(part.expression.expression) &&
+    part.expression.expression.name.text === "subtle" &&
+    ts.isIdentifier(part.expression.expression.expression) &&
+    part.expression.expression.expression.text === "crypto"
+  );
+}
+
 function originatesFromSensitiveValue(node, bindings, seen = new Set()) {
   let sensitive = false;
-  walk(node, (part) => {
+  const visit = (part) => {
     if (sensitive) return;
+    // REVIEWED CARVE-OUT: a value that reaches the log only THROUGH a
+    // cryptographic digest cannot reproduce its input, so the digest call's
+    // own argument subtree is not traced. Everything AROUND the call still is
+    // — a raw body logged next to a digest stays banned. This is what lets the
+    // tenant-create idempotency key (request data) contribute 128 one-way bits
+    // to a logged tenant id without opening the door to logging request data.
+    if (isDigestCall(part)) return;
+    check(part);
+    part.forEachChild(visit);
+  };
+  const check = (part) => {
     if (
       ts.isPropertyAccessExpression(part) &&
       SENSITIVE_LOG_IDENTIFIERS.has(part.name.text)
@@ -281,7 +307,8 @@ function originatesFromSensitiveValue(node, bindings, seen = new Set()) {
     ) {
       sensitive = true;
     }
-  });
+  };
+  visit(node);
   return sensitive;
 }
 
@@ -329,11 +356,20 @@ function isReviewedArguments(message, args, call, bindings) {
     const fields = directoryErrorMetadata(args[1]);
     if (!fields || !isReviewedErrorReference(fields.get("error"), call, bindings)) return false;
     const tenantBinding = resolveBinding(fields.get("tenantId"), bindings);
-    return (
-      tenantBinding?.kind === "variable" &&
-      tenantBinding.initializer !== undefined &&
-      !originatesFromSensitiveValue(tenantBinding.initializer, bindings)
-    );
+    if (tenantBinding?.kind !== "variable" || tenantBinding.initializer === undefined) {
+      return false;
+    }
+    // The tenant id may be minted conditionally — idempotent create derives it
+    // from a digest when the client sent a key, random otherwise. Each VALUE
+    // branch must independently pass the sensitivity trace (which itself skips
+    // only digest-call arguments; see originatesFromSensitiveValue). The
+    // ternary's CONDITION is exempt by review: it selects between two clean
+    // values and so contributes at most the one bit "did the client send a
+    // key", never key content — while a body-derived value in either branch
+    // still fails.
+    const init = tenantBinding.initializer;
+    const branches = ts.isConditionalExpression(init) ? [init.whenTrue, init.whenFalse] : [init];
+    return branches.every((branch) => !originatesFromSensitiveValue(branch, bindings));
   }
   const error = sanitizedErrorReference(args[1]);
   return error !== undefined && isReviewedErrorReference(error, call, bindings);
