@@ -19,41 +19,46 @@ import { isOnline, Card } from './primitives';
 import { useFinchState } from './useFinchState';
 import type { AccessInfo } from './data';
 
-// One idempotency key per creation ATTEMPT, keyed by the workspace name and
-// held until THAT attempt succeeds. If the hub commits a workspace but fails
-// to index it, it returns 503 — and because a retry of the same name reuses
-// its key, the hub derives the SAME tenant id and repairs the original
-// workspace instead of bootstrapping a duplicate.
+// One idempotency key per creation ATTEMPT, held until THAT attempt succeeds.
+// If the hub commits a workspace but fails to index it, it returns 503 — and
+// because a retry of the same attempt reuses its key, the hub derives the SAME
+// tenant id and repairs the original workspace instead of bootstrapping a
+// duplicate.
 //
-// localStorage, not component state: the failure this exists for ends in a
-// flash + likely reload, and an in-memory key dies with the page — the retry
-// after reload would mint a fresh key and recreate the duplicate. Stored per
-// NAME (not one slot) so failing "A", creating "B", then retrying "A" still
-// reuses A's original key. Entries are removed only when their own attempt
-// succeeds. Storage being unavailable degrades to a per-call key — the create
-// still works; only cross-reload retry identity is lost.
-const CREATE_ATTEMPTS_STORAGE_KEY = "finch.workspace-create-attempts";
-function readCreateAttempts(): Record<string, string> {
+// Storage design, each choice load-bearing:
+//   - localStorage, not component state: the 503 ends in a flash and likely a
+//     reload, and an in-memory key dies with the page — the retry would mint a
+//     fresh key and recreate the duplicate.
+//   - ONE storage entry PER attempt, not a shared JSON map: a map means
+//     read-modify-write of the whole snapshot, and two tabs creating different
+//     workspaces would each write their own snapshot, the later one silently
+//     dropping the other tab's pending key. Independent entries cannot clobber
+//     each other. It also keeps workspace names out of object property slots,
+//     where a user legitimately naming a workspace "__proto__" would hit the
+//     prototype setter and never persist at all.
+//   - namespaced by the signed-in USER: the hub derives the tenant from
+//     (caller, key), so the same name under a different account is a different
+//     attempt — an origin-wide entry would let account B consume and clear
+//     account A's pending key.
+//
+// Entries are removed only when their own attempt succeeds. Storage being
+// unavailable degrades to a per-call key: the create still works; only
+// cross-reload retry identity is lost.
+const CREATE_ATTEMPT_PREFIX = "finch.workspace-create-attempt";
+const createAttemptStorageKey = (userId: string, name: string) =>
+  `${CREATE_ATTEMPT_PREFIX}.${encodeURIComponent(userId)}.${encodeURIComponent(name)}`;
+function takeCreateAttemptKey(userId: string, name: string): string {
+  const storageKey = createAttemptStorageKey(userId, name);
   try {
-    const parsed = JSON.parse(window.localStorage.getItem(CREATE_ATTEMPTS_STORAGE_KEY) ?? "{}");
-    return parsed && typeof parsed === "object" ? parsed : {};
-  } catch { return {}; }
-}
-function writeCreateAttempts(attempts: Record<string, string>): void {
-  try { window.localStorage.setItem(CREATE_ATTEMPTS_STORAGE_KEY, JSON.stringify(attempts)); } catch { /* degrade */ }
-}
-function takeCreateAttemptKey(name: string): string {
-  const attempts = readCreateAttempts();
-  const existing = attempts[name];
-  if (typeof existing === "string" && /^[A-Za-z0-9_-]{8,64}$/.test(existing)) return existing;
+    const existing = window.localStorage.getItem(storageKey);
+    if (existing && /^[A-Za-z0-9_-]{8,64}$/.test(existing)) return existing;
+  } catch { /* degrade */ }
   const key = crypto.randomUUID();
-  attempts[name] = key;
-  writeCreateAttempts(attempts);
+  try { window.localStorage.setItem(storageKey, key); } catch { /* degrade */ }
   return key;
 }
-function clearCreateAttemptKey(name: string): void {
-  const attempts = readCreateAttempts();
-  if (name in attempts) { delete attempts[name]; writeCreateAttempts(attempts); }
+function clearCreateAttemptKey(userId: string, name: string): void {
+  try { window.localStorage.removeItem(createAttemptStorageKey(userId, name)); } catch { /* degrade */ }
 }
 
 export default function DashboardApp() {
@@ -289,10 +294,13 @@ export default function DashboardApp() {
   const createWorkspace = async () => {
     const name = window.prompt("Workspace name")?.trim();
     if (!name) return;
-    const key = takeCreateAttemptKey(name);
+    // No signed-in id (should not happen behind auth) degrades to a per-call
+    // key rather than sharing an anonymous namespace across accounts.
+    const uid = user?.id ?? crypto.randomUUID();
+    const key = takeCreateAttemptKey(uid, name);
     const res = await fetch("/api/finch/tenants/create", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, idempotencyKey: key }) });
     const body = await res.json().catch(() => ({}));
-    if (res.ok) { clearCreateAttemptKey(name); window.location.reload(); }
+    if (res.ok) { clearCreateAttemptKey(uid, name); window.location.reload(); }
     else flash(body.error || "couldn't create workspace");
   };
   const claimWorkspace = async (clerkOrgId: string) => {
