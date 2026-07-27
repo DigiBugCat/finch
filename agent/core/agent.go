@@ -964,7 +964,25 @@ type outStream struct {
 const (
 	maxRelayRequestIDBytes = 256
 	maxRelayInFlight       = 16
-	maxRelayFrameBytes     = 8 << 20
+
+	// maxRelayBodyBytes mirrors MAX_RELAY_BODY_BYTES in worker/src/box-do.ts (and
+	// worker/src/index.ts): the largest request body the Worker will ever hand to
+	// the relay. Keep the two in lockstep.
+	maxRelayBodyBytes = 4 << 20 // 4 MiB
+	// maxRelayFrameBytes bounds a whole SERIALIZED frame, which is not the body
+	// size: the DO ships the request body as a raw JS string inside
+	// JSON.stringify (box-do.ts), so JSON escaping — not base64 — sets the worst
+	// case. Per ECMA-262 QuoteJSONString a control byte with no short escape
+	// (0x00-0x07, 0x0B, 0x0E-0x1F) becomes \u00XX = 6 wire bytes, and 6x is the
+	// maximum expansion any single input byte can reach. NUL is valid UTF-8, so
+	// TextDecoder(fatal:true) passes a body of NULs straight through: a permitted
+	// 4 MiB body can legitimately serialize to 6*4 MiB = 24 MiB, plus the
+	// envelope (id, method, path, headers, the signed assertion) — 2 MiB of
+	// headroom covers that. ANY value below 6*maxRelayBodyBytes lets a request
+	// the Worker explicitly allows trip coder/websocket's read limit, which does
+	// not fail just that request: the read loop returns, cancelling every
+	// concurrent forward on this box and forcing a backoff reconnect.
+	maxRelayFrameBytes = 6*maxRelayBodyBytes + (2 << 20) // 26 MiB
 )
 
 type relayRequestRegistry struct {
