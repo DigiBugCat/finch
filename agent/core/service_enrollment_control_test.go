@@ -6,8 +6,10 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -202,5 +204,110 @@ func TestServiceEnrollmentCoordinator_RejectsOpaqueIDCollision(t *testing.T) {
 	}
 	if c.byPath["incumbent"] != "duplicate" || c.byID["duplicate"] == nil || c.byPath["new"] != "" {
 		t.Fatalf("collision corrupted coordinator maps: byPath=%v byID=%v", c.byPath, c.byID)
+	}
+}
+
+// REGRESSION: the credential-clobber case the in-memory registry check cannot
+// see. byPath only holds PENDING enrollments and is cleared on every terminal
+// transition, so `enroll media -> ready -> enroll Media` found no incumbent and
+// went on to write Media.json -- the same file as media.json on a
+// case-insensitive filesystem -- destroying a working service's refresh
+// credential. The check has to be against the credential directory, and it has
+// to run BEFORE the hub round-trip so no one-shot ticket is burned on it.
+func TestStartRefusesAnAppPathCollidingWithAnExistingCredentialCase(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "creds")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// A service that already enrolled and reached ready: only its credential
+	// file remains, exactly as after byPath was cleared.
+	if err := os.WriteFile(filepath.Join(dir, "media.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	reached := false
+	worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached = true
+		w.WriteHeader(500)
+	}))
+	defer worker.Close()
+	coordinator, err := NewServiceEnrollmentCoordinator(ServiceEnrollmentCoordinatorOptions{
+		Hub: worker.URL, Machine: "box", CredentialDirectory: dir, HTTPClient: worker.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = coordinator.Start(context.Background(), LocalServiceEnrollmentRequest{
+		Service: "Media", AppPath: "Media", Routes: []string{"/mcp"}, EdgeAuth: "key",
+	})
+	if err == nil {
+		t.Fatal("a case variant of an existing credential was accepted")
+	}
+	var httpErr *ServiceEnrollmentHTTPError
+	if !errors.As(err, &httpErr) || httpErr.Status != 409 {
+		t.Fatalf("want 409 manifest_conflict, got %v", err)
+	}
+	if reached {
+		t.Error("the hub was contacted before the collision was detected — a one-shot ticket would have been burned")
+	}
+
+	// The SAME path is not a collision: re-enrolling a service is the ordinary
+	// renewal path and must still reach the hub.
+	_, _ = coordinator.Start(context.Background(), LocalServiceEnrollmentRequest{
+		Service: "Media", AppPath: "media", Routes: []string{"/mcp"}, EdgeAuth: "key",
+	})
+	if !reached {
+		t.Error("re-enrolling the same app_path was blocked as a collision")
+	}
+}
+
+// REGRESSION: the window neither of the other two checks can see. With `media`
+// and `Media` both PENDING, no credential file exists yet (so the directory
+// scan is blind) and byPath was keyed exactly (so the reservation missed the
+// sibling). Both could be approved and both would write the same file on a
+// case-insensitive filesystem, clobbering the first credential.
+func TestStartRefusesAConcurrentPendingAppPathCaseVariant(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "creds")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	worker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var start serviceEnrollmentStartRequest
+		_ = json.NewDecoder(r.Body).Decode(&start)
+		json.NewEncoder(w).Encode(serviceEnrollmentStartResponse{
+			DeviceCode: "d", UserCode: "BIRD-DUCK", VerificationURI: serverURL(r) + "/approve",
+			VerificationURIComplete: serverURL(r) + "/approve?code=BIRD-DUCK", ExpiresIn: 600,
+			ManifestSHA256: start.ManifestSHA256,
+		})
+	}))
+	defer worker.Close()
+	coordinator, err := NewServiceEnrollmentCoordinator(ServiceEnrollmentCoordinatorOptions{
+		Hub: worker.URL, Machine: "box", CredentialDirectory: dir, HTTPClient: worker.Client(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// First enrollment reserves the path and stays PENDING — nothing written.
+	if _, err := coordinator.Start(context.Background(), LocalServiceEnrollmentRequest{
+		Service: "media", AppPath: "media", Routes: []string{"/mcp"}, EdgeAuth: "key",
+	}); err != nil {
+		t.Fatalf("first enrollment rejected: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "media.json")); err == nil {
+		t.Fatal("precondition broken: a credential already exists, so this would not test the pending window")
+	}
+
+	// The case variant must be refused by the RESERVATION, not by the file scan.
+	_, err = coordinator.Start(context.Background(), LocalServiceEnrollmentRequest{
+		Service: "Media", AppPath: "Media", Routes: []string{"/mcp"}, EdgeAuth: "key",
+	})
+	if err == nil {
+		t.Fatal("a concurrently pending case variant was accepted")
+	}
+	var httpErr *ServiceEnrollmentHTTPError
+	if !errors.As(err, &httpErr) || httpErr.Status != 409 {
+		t.Fatalf("want 409, got %v", err)
 	}
 }

@@ -15,7 +15,7 @@ test("accepts only the reviewed metadata-only console shapes", () => {
       }
       const tenantId = "tenant-1";
       Promise.reject(new Error("offline")).catch((error) =>
-        console.error("tenant directory reindex failed", { tenantId, error }),
+        console.error("tenant directory index failed", { tenantId, error }),
       );
     `),
   );

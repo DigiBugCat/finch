@@ -6,13 +6,18 @@ import { hashKey, signAssertion, signToken } from "../src/auth";
 const BASE = "http://hub.test";
 const now = () => Math.floor(Date.now() / 1000);
 
-async function call(path: string, body: BodyInit | null, headers: Record<string, string> = {}) {
+async function call(
+  path: string,
+  body: BodyInit | null,
+  headers: Record<string, string> = {},
+  envOverride: Record<string, unknown> = {},
+) {
   const ctx = createExecutionContext();
   return worker.fetch(new Request(`${BASE}${path}`, {
     method: "POST",
     headers: { "content-type": "application/json", host: "hub.test", ...headers },
     body,
-  }), env as any, ctx);
+  }), { ...env, ...envOverride } as any, ctx);
 }
 
 async function tenantOp<T>(tenant: string, op: string, args: Record<string, unknown> = {}): Promise<T> {
@@ -215,5 +220,130 @@ describe("box-scoped key detach semantics", () => {
       hash: await hashKey(minted.plaintext),
       service,
     })).toMatchObject({ allowed: false, reason: "no-key" });
+  });
+});
+
+// The workspace-creation path: three defects that all landed on one line.
+describe("/api/tenant-create", () => {
+  async function userHeaders(clerkUserId: string) {
+    return {
+      "X-Finch-Service": env.FINCH_SERVICE_SECRET,
+      "X-Finch-Auth": await signAssertion(
+        { tenant: clerkUserId, kind: "user", exp: now() + 60 },
+        env.FINCH_SERVICE_SECRET,
+      ),
+    };
+  }
+  const createBody = (email: string) =>
+    JSON.stringify({ name: "Acme", email, emails: [email] });
+
+  const listForUser = async (clerkUserId: string) =>
+    env.DIRECTORY.get(env.DIRECTORY.idFromName("global"))
+      .fetch("https://directory.internal/", {
+        method: "POST",
+        body: JSON.stringify({ op: "listForUser", clerkUserId }),
+      })
+      .then((r) => r.json() as Promise<any>);
+
+  // REGRESSION: a failed directory write was swallowed and the route still
+  // returned 200. The u: row is the ONLY handle on a team workspace --
+  // /api/user/sync enumerates exclusively through listForUser and its lone
+  // self-heal is the hardcoded personal tenant -- so the browser cleared its
+  // active-tenant cookie on the next load and the committed workspace became
+  // permanently unreachable, having been reported as created.
+  it("does not report success when the workspace index write fails", async () => {
+    const clerkUserId = `user_reindex_${crypto.randomUUID()}`;
+    const real = env.DIRECTORY;
+    const DIRECTORY = {
+      idFromName: (name: string) => real.idFromName(name),
+      get: (id: any) => ({
+        fetch: async (input: any, init?: any) => {
+          const { op } = JSON.parse(String(init?.body ?? "{}"));
+          // Fail exactly the write this route makes.
+          if (op === "upsertMembership" || op === "reindexTenant") {
+            return new Response(JSON.stringify({ error: "boom" }), { status: 500 });
+          }
+          return real.get(id).fetch(input, init);
+        },
+      }),
+    };
+
+    const res = await call(
+      "/api/tenant-create",
+      createBody("owner@example.test"),
+      await userHeaders(clerkUserId),
+      { DIRECTORY },
+    );
+
+    expect(res.status).toBe(503);
+    // The claim the 200 was making is false, and this is what makes it false.
+    expect((await listForUser(clerkUserId)).memberships).toEqual([]);
+  });
+
+  // REGRESSION: a transient directory failure used to surface as a 503, and the
+  // caller's retry minted a FRESH id and bootstrapped a SECOND workspace -- so a
+  // brief blip accumulated orphans one attempt at a time. The TenantDO is
+  // already committed here, so the retry belongs to this request and this
+  // tenant. upsertMembership is idempotent (it filters any existing row for the
+  // tenantId before appending), which is what makes retrying safe.
+  it("retries the idempotent index write instead of making the caller re-create", async () => {
+    const clerkUserId = `user_retry_${crypto.randomUUID()}`;
+    const real = env.DIRECTORY;
+    let attempts = 0;
+    const DIRECTORY = {
+      idFromName: (name: string) => real.idFromName(name),
+      get: (id: any) => ({
+        fetch: async (input: any, init?: any) => {
+          const { op } = JSON.parse(String(init?.body ?? "{}"));
+          if (op === "upsertMembership") {
+            attempts++;
+            // Fail once, then let it through — an ordinary transient blip.
+            if (attempts === 1) {
+              return new Response(JSON.stringify({ error: "boom" }), { status: 500 });
+            }
+          }
+          return real.get(id).fetch(input, init);
+        },
+      }),
+    };
+
+    const res = await call(
+      "/api/tenant-create",
+      createBody("owner3@example.test"),
+      await userHeaders(clerkUserId),
+      { DIRECTORY },
+    );
+
+    expect(res.status).toBe(200);
+    expect(attempts).toBeGreaterThan(1); // it really did retry
+    const { tenantId } = (await res.json()) as any;
+
+    // Exactly ONE workspace exists, indexed — no orphan, no duplicate.
+    const listed = await listForUser(clerkUserId);
+    expect(listed.memberships).toHaveLength(1);
+    expect(listed.memberships[0].tenantId).toBe(tenantId);
+  });
+
+  it("indexes the owner and returns a high-entropy id on success", async () => {
+    const clerkUserId = `user_ok_${crypto.randomUUID()}`;
+    const res = await call(
+      "/api/tenant-create",
+      createBody("owner2@example.test"),
+      await userHeaders(clerkUserId),
+    );
+    expect(res.status).toBe(200);
+    const { tenantId } = (await res.json()) as any;
+
+    // REGRESSION: the id was "ft_" + 8 hex = 32 bits, ~1% collision odds around
+    // 9,300 workspaces. A collision is not benign: bootstrapMembers finds the
+    // EXISTING tenant, returns 409, and the create just fails.
+    expect(tenantId).toMatch(/^ft_[0-9a-f]{32}$/);
+
+    // The owner is discoverable, which is the whole point of the write.
+    const listed = await listForUser(clerkUserId);
+    expect(listed.memberships).toHaveLength(1);
+    expect(listed.memberships[0].tenantId).toBe(tenantId);
+    expect(listed.memberships[0].role).toBe("owner");
+    expect(listed.memberships[0].state).toBe("active");
   });
 });

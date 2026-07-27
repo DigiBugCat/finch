@@ -102,7 +102,11 @@ function walk(node, visit) {
 const SAFE_CONSOLE_MESSAGES = new Set([
   "caller assertion JWKS unavailable",
   "caller assertion signing failed",
-  "tenant directory reindex failed",
+  // Renamed from "tenant directory reindex failed" when /api/tenant-create
+  // stopped calling reindexTenant (the whole-keyspace scan) in favour of a
+  // single upsertMembership. Reviewed: the arguments are { tenantId, error } —
+  // a tenant id and a DO failure, no member email, no request body.
+  "tenant directory index failed",
 ]);
 const SENSITIVE_LOG_IDENTIFIERS = new Set([
   "body",
@@ -321,7 +325,7 @@ function directoryErrorMetadata(node) {
 
 function isReviewedArguments(message, args, call, bindings) {
   if (args.length !== 2) return false;
-  if (message === "tenant directory reindex failed") {
+  if (message === "tenant directory index failed") {
     const fields = directoryErrorMetadata(args[1]);
     if (!fields || !isReviewedErrorReference(fields.get("error"), call, bindings)) return false;
     const tenantBinding = resolveBinding(fields.get("tenantId"), bindings);
