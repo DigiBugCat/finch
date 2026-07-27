@@ -1877,7 +1877,15 @@ export class TenantDO extends DurableObject<Env> {
     const canonical = normalizeEmail(member.email);
     let changed = false;
     for (const r of s.accessRequests) {
-      if (r.status !== "granted" || r.grantedTo === canonical) continue;
+      // MIGRATION ONLY — never overwrite a principal that was recorded at
+      // grant time. `grantedTo` is authoritative when present: it names the
+      // address the ACL rule was actually installed under. A verified alias can
+      // move between identities (the membership-conflict check covers member
+      // CANONICAL addresses, not request-only aliases), so a later member
+      // verifying that alias would otherwise rewrite a post-upgrade row onto
+      // THEIR address — and revoking it would then strip the wrong principal
+      // and leave the original grant live. Absent is the only safe trigger.
+      if (r.status !== "granted" || r.grantedTo !== undefined) continue;
       if (!verified.has(normalizeEmail(r.email))) continue;
       r.grantedTo = canonical;
       changed = true;
@@ -1986,7 +1994,11 @@ export class TenantDO extends DurableObject<Env> {
       const canonical = normalizeEmail(member.email);
       for (const r of s.accessRequests) {
         if (r.status === "granted") {
-          if (list.includes(normalizeEmail(r.email)) && r.grantedTo !== canonical) {
+          // Migration only, same rule as backfillGrantedTo: a recorded
+          // principal is authoritative and must never be rewritten, or an
+          // alias that later moves to another identity would repoint a
+          // post-upgrade row onto the wrong address.
+          if (r.grantedTo === undefined && list.includes(normalizeEmail(r.email))) {
             r.grantedTo = canonical;
             changed = true;
           }

@@ -1436,6 +1436,73 @@ describe("TenantDO — repairing state that predates the fix", () => {
     expect(locked.src.name).toBe("second@example.com");
   });
 
+  it("never overwrites a grantedTo that was recorded at grant time", async () => {
+    // A verified alias can move between identities -- the membership-conflict
+    // check covers member CANONICAL addresses, not request-only aliases. If the
+    // backfill rewrote an existing principal, a later member verifying that
+    // alias would repoint a post-upgrade row onto THEIR address, and revoking
+    // it would strip the wrong principal and leave the original grant live.
+    // The migration must therefore fire only on an ABSENT value.
+    const t = freshTenant();
+    await op(t, "enroll", { name: "Scraper" });
+    const boot = await op<any>(t, "bootstrapMembers", {
+      kind: "team",
+      displayName: "Fleet",
+      bootstrappedFrom: "fresh",
+      claimantClerkUserId: "u_owner",
+      members: [
+        { clerkUserId: "u_owner", email: "owner@example.com", role: "owner", state: "active" },
+        { clerkUserId: "u_other", email: "other@example.com", role: "member", state: "active" },
+      ],
+    });
+    const owner = boot.members[0];
+    const actor = { memberId: owner.id, clerkUserId: "u_owner", label: "owner@example.com" };
+
+    // Grant it the post-upgrade way, so the row carries an authoritative
+    // principal: member A is bound under canonical-a@, then verifies the alias.
+    await op(t, "inviteMember", { email: "canonical-a@example.com", role: "member", actor });
+    await op(t, "bindIdentity", {
+      clerkUserId: "u_a",
+      emails: ["canonical-a@example.com"],
+      source: "sync",
+    });
+    const req = await op<any>(t, "requestAccess", {
+      email: "shared-alias@example.com",
+      service: "scraper",
+      requestedBy: "self",
+    });
+    await op(t, "approveAccess", { id: req.request.id, actor });
+    await op(t, "bindIdentity", {
+      clerkUserId: "u_a",
+      emails: ["canonical-a@example.com", "shared-alias@example.com"],
+      source: "sync",
+    });
+
+    const recorded = (await op<any>(t, "listAccess")).requests.find(
+      (r: any) => r.id === req.request.id,
+    ).grantedTo;
+    expect(recorded).toBe("canonical-a@example.com");
+
+    // A DIFFERENT member now verifies that same alias. The row must not move.
+    await op(t, "memberContext", {
+      clerkUserId: "u_other",
+      emails: ["other@example.com", "shared-alias@example.com"],
+    });
+
+    const after = (await op<any>(t, "listAccess")).requests.find(
+      (r: any) => r.id === req.request.id,
+    );
+    expect(after.grantedTo).toBe("canonical-a@example.com");
+
+    // And the revoke still lands on the principal that actually holds the rule.
+    const rev = await op<any>(t, "revokeAccess", { id: req.request.id, actor });
+    expect(rev.removed).toBe(true);
+    expect(
+      (await op<any>(t, "checkUserAccess", { user: "canonical-a@example.com", service: "scraper" }))
+        .allowed,
+    ).toBe(false);
+  });
+
   it("leaves the locked grant alone when no active owner remains", async () => {
     // The rule is the lockout backstop. With no heir, a stale grant beats an
     // unreachable tenant -- and a pre-bootstrap tenant still carries the "you"
