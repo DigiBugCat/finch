@@ -270,7 +270,7 @@ describe("/api/tenant-create", () => {
 
     const res = await call(
       "/api/tenant-create",
-      createBody("owner@example.test"),
+      createBody("owner@example.test", crypto.randomUUID()),
       await userHeaders(clerkUserId),
       { DIRECTORY },
     );
@@ -380,7 +380,7 @@ describe("/api/tenant-create", () => {
 
     const res = await call(
       "/api/tenant-create",
-      createBody("owner3@example.test"),
+      createBody("owner3@example.test", crypto.randomUUID()),
       await userHeaders(clerkUserId),
       { DIRECTORY },
     );
@@ -395,11 +395,34 @@ describe("/api/tenant-create", () => {
     expect(listed.memberships[0].tenantId).toBe(tenantId);
   });
 
+  // REGRESSION (P1, round 3): the key used to be OPTIONAL, and the unkeyed
+  // fallback minted a fresh random id per request — so every caller without a
+  // key (a dashboard tab from before the deploy, a direct API user, a
+  // malformed key) kept the exact orphan-plus-duplicate retry behaviour the
+  // key was introduced to remove. "Sometimes idempotent" is not idempotent:
+  // no valid key, no state created.
+  it("refuses to create anything without a valid idempotency key", async () => {
+    const clerkUserId = `user_nokey_${crypto.randomUUID()}`;
+    const headers = await userHeaders(clerkUserId);
+    for (const body of [
+      createBody("nokey@example.test"),
+      createBody("nokey@example.test", "short"),
+      createBody("nokey@example.test", "has spaces in it"),
+      createBody("nokey@example.test", "x".repeat(65)),
+    ]) {
+      const res = await call("/api/tenant-create", body, headers);
+      expect(res.status).toBe(400);
+      expect((((await res.json()) as any).error ?? "")).toContain("idempotencyKey");
+    }
+    // Nothing was bootstrapped or indexed for any of the rejected calls.
+    expect((await listForUser(clerkUserId)).memberships).toEqual([]);
+  });
+
   it("indexes the owner and returns a high-entropy id on success", async () => {
     const clerkUserId = `user_ok_${crypto.randomUUID()}`;
     const res = await call(
       "/api/tenant-create",
-      createBody("owner2@example.test"),
+      createBody("owner2@example.test", crypto.randomUUID()),
       await userHeaders(clerkUserId),
     );
     expect(res.status).toBe(200);

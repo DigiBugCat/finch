@@ -83,7 +83,7 @@ describe("tenant route request and upstream boundaries", () => {
     const name = "🪶".repeat(64);
     mocks.userFetch.mockResolvedValue(Response.json({ tenantId: "ft_12345678" }));
 
-    const response = await createTenant(post({ name: ` ${name} ` }));
+    const response = await createTenant(post({ name: ` ${name} `, idempotencyKey: "attempt-1234" }));
 
     expect(response.status).toBe(200);
     const [, , init] = mocks.userFetch.mock.calls[0];
@@ -91,26 +91,27 @@ describe("tenant route request and upstream boundaries", () => {
     expect(mocks.writeActiveTenant).toHaveBeenCalledWith("ft_12345678");
   });
 
-  it("forwards a valid idempotency key to the hub and drops a malformed one", async () => {
+  it("forwards a valid idempotency key and rejects a missing or malformed one", async () => {
     // The key is what makes a retry after a failed index write REPAIR the
     // original workspace instead of duplicating it — the hub derives the
-    // tenant id from (user, key). Nothing in the type system holds this
-    // forwarding, so pin the seam: dropped silently, every retry would mint a
-    // fresh workspace again.
+    // tenant id from (user, key), and it is REQUIRED end to end. Nothing in
+    // the type system holds this forwarding, so pin the seam: forwarded when
+    // valid, and a bad key is a 400 BEFORE any hub call — silently dropping it
+    // would quietly downgrade the create to the non-idempotent behaviour the
+    // key exists to remove.
     mocks.userFetch.mockResolvedValue(Response.json({ tenantId: "ft_12345678" }));
 
     await createTenant(post({ name: "Acme", idempotencyKey: "attempt-1234" }));
-    let [, , init] = mocks.userFetch.mock.calls[0];
+    const [, , init] = mocks.userFetch.mock.calls[0];
     expect(JSON.parse(init.body).idempotencyKey).toBe("attempt-1234");
 
-    // Malformed (bad charset / too short) degrades to the non-idempotent path
-    // rather than failing an otherwise valid create.
-    for (const bad of ["short", "has spaces in it", "x".repeat(65), 42]) {
+    for (const bad of [undefined, "short", "has spaces in it", "x".repeat(65), 42]) {
       mocks.userFetch.mockClear();
-      mocks.userFetch.mockResolvedValue(Response.json({ tenantId: "ft_12345678" }));
-      await createTenant(post({ name: "Acme", idempotencyKey: bad }));
-      [, , init] = mocks.userFetch.mock.calls[0];
-      expect("idempotencyKey" in JSON.parse(init.body)).toBe(false);
+      const res = await createTenant(
+        post({ name: "Acme", ...(bad === undefined ? {} : { idempotencyKey: bad }) }),
+      );
+      expect(res.status).toBe(400);
+      expect(mocks.userFetch).not.toHaveBeenCalled();
     }
   });
 
@@ -126,7 +127,7 @@ describe("tenant route request and upstream boundaries", () => {
   it("does not persist a corrupt tenant id from a successful hub response", async () => {
     mocks.userFetch.mockResolvedValue(Response.json({ tenantId: "bad tenant/id" }));
 
-    const response = await createTenant(post({ name: "Team" }));
+    const response = await createTenant(post({ name: "Team", idempotencyKey: "attempt-1234" }));
 
     expect(response.status).toBe(502);
     expect(mocks.writeActiveTenant).not.toHaveBeenCalled();
@@ -135,7 +136,7 @@ describe("tenant route request and upstream boundaries", () => {
   it("preserves a structured hub failure instead of attempting a cookie write", async () => {
     mocks.userFetch.mockResolvedValue(Response.json({ error: "conflict" }, { status: 409 }));
 
-    const response = await createTenant(post({ name: "Team" }));
+    const response = await createTenant(post({ name: "Team", idempotencyKey: "attempt-1234" }));
 
     expect(response.status).toBe(409);
     expect(await response.json()).toEqual({ error: "conflict" });

@@ -576,37 +576,33 @@ async function handleApiInner(
       if(!(await rateLimitOk(env.JOIN_LIMIT,`tcreate:${clerkUserId}`))||!(await rateLimitOk(env.JOIN_LIMIT,`tcreate:${clientIp(req)}`)))return json(429,{error:"rate limited"});
       if(!body.email||!emails.includes(String(body.email).trim().toLowerCase()))return json(400,{error:"email must be verified"});
 
-      // FULL UUID entropy, not the first 8 hex chars. That was 32 bits: by the
-      // birthday bound ~1% collision odds around 9,300 workspaces and 50% around
-      // 77,000. A collision is not benign — the id names the DO, so
-      // bootstrapMembers finds the EXISTING tenant and returns 409, and this
-      // path does not retry, so a legitimate creation just fails. Widening the
-      // id engineers the failure out instead of handling it; a retry loop
-      // cannot, because 409 is also the correct terminal answer for
-      // "member limit reached" and "duplicate member identity" and the DO's
-      // error contract carries no machine-readable code to tell them apart.
-      // Existing short ids keep working: nothing parses the suffix.
+      // THE IDEMPOTENCY KEY IS REQUIRED — there is no unkeyed path. Creation
+      // must be idempotent because the failure this design exists for is:
+      // bootstrapMembers commits, the directory index write fails, we return
+      // 503, the user retries. A retry that mints a fresh id bootstraps a
+      // SECOND workspace and leaves the first committed and permanently
+      // unindexed — the retry advice manufacturing the very orphan-plus-
+      // duplicate it was meant to prevent. An optional key would keep exactly
+      // that failure alive for every unkeyed caller (a dashboard tab from
+      // before this deploy, a direct API user, a malformed key), so the
+      // contract is strict: no valid key, no state created, 400 with the
+      // recipe. "Sometimes idempotent" is not idempotent.
       //
-      // IDEMPOTENT WHEN THE CLIENT SENDS A KEY. The failure this exists for:
-      // bootstrapMembers commits, the directory index write fails all retries,
-      // we return 503 — and the user retries. Without a key each retry mints a
-      // fresh id and bootstraps a SECOND workspace, leaving the first committed
-      // and permanently unindexed: the retry advice manufactured the very
-      // orphan-plus-duplicate it was meant to prevent. With a key the id is
-      // derived from (caller, key) — 128 bits of SHA-256, same 32-hex shape —
-      // so the retry lands on the SAME tenant: bootstrap replays as a 409 we
-      // recognize below, and the idempotent index write repairs itself.
-      //
-      // Deriving the id from a client-chosen key is safe because the caller's
-      // clerkUserId is mixed in AND the replay branch authorizes via the
-      // TENANT'S OWN membership: it proceeds only when the caller is that
+      // The id is derived from (caller, key): 128 bits of SHA-256, the same
+      // 32-hex shape as a UUID, so a retry lands on the SAME tenant —
+      // bootstrap replays as the 409 recognized below and the index write
+      // repairs itself. Deriving from a client-chosen key is safe because the
+      // caller's clerkUserId is mixed in AND the replay branch authorizes via
+      // the TENANT'S OWN membership: it proceeds only when the caller is that
       // tenant's active owner. Someone who somehow occupied the derived id
       // first just makes this create 409 — they cannot hand the caller a
-      // foreign workspace.
+      // foreign workspace. (Full-width ids also bury the old 32-bit birthday
+      // problem: the previous 8-hex ids collided at ~1% by 9,300 workspaces,
+      // and a collision failed the create outright. Existing short ids keep
+      // working — nothing parses the suffix.)
       const idemKey=typeof body.idempotencyKey==="string"&&/^[A-Za-z0-9_-]{8,64}$/.test(body.idempotencyKey)?body.idempotencyKey:null;
-      const tenantId=idemKey
-        ?"ft_"+[...new Uint8Array(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(`${clerkUserId}:${idemKey}`)))].slice(0,16).map(b=>b.toString(16).padStart(2,"0")).join("")
-        :"ft_"+crypto.randomUUID().replace(/-/g,"");
+      if(!idemKey)return json(400,{error:"idempotencyKey required: 8-64 characters of [A-Za-z0-9_-], held constant across retries of the same creation attempt"});
+      const tenantId="ft_"+[...new Uint8Array(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(`${clerkUserId}:${idemKey}`)))].slice(0,16).map(b=>b.toString(16).padStart(2,"0")).join("");
       const r=await tenantOpRaw(env,tenantId,"bootstrapMembers",{kind:"team",displayName:body.name,bootstrappedFrom:"fresh",members:[{clerkUserId,email:body.email,role:"owner",state:"active"}],claimantClerkUserId:clerkUserId});
       let owner:any;
       if(!r.ok){
@@ -615,7 +611,7 @@ async function handleApiInner(
         // text — the DO's contract carries no machine-readable code, and "this
         // caller is the active owner of exactly the tenant this key derives"
         // is the stronger claim anyway.
-        if(idemKey&&r.status===409){
+        if(r.status===409){
           const ctxRes=await tenantOpRaw(env,tenantId,"memberContext",{clerkUserId});
           if(ctxRes.ok){
             const ctx:any=await ctxRes.json();

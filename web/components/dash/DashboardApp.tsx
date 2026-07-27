@@ -5,7 +5,7 @@
 // /api/finch/state). Every mutation calls the Next bridge under /api/finch/*
 // and then refetch()es so the UI reflects real hub state. The view components
 // are prop-driven and unchanged — only the data source + action handlers here.
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { UserButton, useUser } from '@clerk/nextjs';
 import { HomeView } from './home';
 import { FleetView } from './overview';
@@ -18,6 +18,43 @@ import { SettingsView } from './settings';
 import { isOnline, Card } from './primitives';
 import { useFinchState } from './useFinchState';
 import type { AccessInfo } from './data';
+
+// One idempotency key per creation ATTEMPT, keyed by the workspace name and
+// held until THAT attempt succeeds. If the hub commits a workspace but fails
+// to index it, it returns 503 — and because a retry of the same name reuses
+// its key, the hub derives the SAME tenant id and repairs the original
+// workspace instead of bootstrapping a duplicate.
+//
+// localStorage, not component state: the failure this exists for ends in a
+// flash + likely reload, and an in-memory key dies with the page — the retry
+// after reload would mint a fresh key and recreate the duplicate. Stored per
+// NAME (not one slot) so failing "A", creating "B", then retrying "A" still
+// reuses A's original key. Entries are removed only when their own attempt
+// succeeds. Storage being unavailable degrades to a per-call key — the create
+// still works; only cross-reload retry identity is lost.
+const CREATE_ATTEMPTS_STORAGE_KEY = "finch.workspace-create-attempts";
+function readCreateAttempts(): Record<string, string> {
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(CREATE_ATTEMPTS_STORAGE_KEY) ?? "{}");
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch { return {}; }
+}
+function writeCreateAttempts(attempts: Record<string, string>): void {
+  try { window.localStorage.setItem(CREATE_ATTEMPTS_STORAGE_KEY, JSON.stringify(attempts)); } catch { /* degrade */ }
+}
+function takeCreateAttemptKey(name: string): string {
+  const attempts = readCreateAttempts();
+  const existing = attempts[name];
+  if (typeof existing === "string" && /^[A-Za-z0-9_-]{8,64}$/.test(existing)) return existing;
+  const key = crypto.randomUUID();
+  attempts[name] = key;
+  writeCreateAttempts(attempts);
+  return key;
+}
+function clearCreateAttemptKey(name: string): void {
+  const attempts = readCreateAttempts();
+  if (name in attempts) { delete attempts[name]; writeCreateAttempts(attempts); }
+}
 
 export default function DashboardApp() {
   const { user } = useUser();
@@ -249,26 +286,13 @@ export default function DashboardApp() {
   ] : [["overview", "Fleet"], ["home", "Observability"], ["logs", "Logs"]];
   useEffect(() => { if (!isAdmin && !["overview","home","detail","logs"].includes(view)) setView("overview"); }, [isAdmin, view]);
   const selectWorkspace = async (tenantId:string) => { const res=await fetch("/api/finch/tenants/select",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({tenantId})});if(res.ok)window.location.reload();else flash("couldn't switch workspace"); };
-  // One idempotency key per creation ATTEMPT, keyed by the workspace name and
-  // held until THAT attempt succeeds. If the hub commits the workspace but
-  // fails to index it, it returns 503 — and because a retry of the same name
-  // reuses its key, the hub derives the SAME tenant id and repairs the
-  // original workspace instead of bootstrapping a duplicate.
-  //
-  // A Map, not a single slot: with one slot, failing to create "A", then
-  // creating "B", then retrying "A" would have minted A a fresh key — quietly
-  // recreating the duplicate this key exists to prevent. Entries are removed
-  // only when their own attempt succeeds; the map is bounded by the names a
-  // user types in one page session.
-  const createAttempts = useRef(new Map<string, string>());
   const createWorkspace = async () => {
     const name = window.prompt("Workspace name")?.trim();
     if (!name) return;
-    let key = createAttempts.current.get(name);
-    if (!key) { key = crypto.randomUUID(); createAttempts.current.set(name, key); }
+    const key = takeCreateAttemptKey(name);
     const res = await fetch("/api/finch/tenants/create", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, idempotencyKey: key }) });
     const body = await res.json().catch(() => ({}));
-    if (res.ok) { createAttempts.current.delete(name); window.location.reload(); }
+    if (res.ok) { clearCreateAttemptKey(name); window.location.reload(); }
     else flash(body.error || "couldn't create workspace");
   };
   const claimWorkspace = async (clerkOrgId: string) => {
