@@ -609,23 +609,35 @@ async function handleApiInner(
       // NOT swallowed. The directory row is the ONLY handle on this workspace:
       // /api/user/sync enumerates exclusively through listForUser, and the sole
       // self-heal there is the hardcoded personal tenant. A team tenant with no
-      // u: row is never listed, so the browser's active-tenant cookie is
-      // cleared on the next load and the committed workspace becomes permanently
-      // unreachable — while the user was told it was created. Reporting the
-      // failure lets them retry, which works.
+      // u: row is never listed, so the browser's active-tenant cookie is cleared
+      // on the next load and the committed workspace becomes permanently
+      // unreachable — while the user was told it was created.
       //
-      // The tenant id rides along in the error body so the orphan is
-      // identifiable rather than lost; the web layer relays error bodies
-      // verbatim and the id is not sensitive. A failed index still leaves an
-      // unreferenced TenantDO behind, which is strictly better than today
-      // (same orphan, plus a false success) and is bounded by the rate limit
-      // above.
-      try{
-        await directoryOp(env,"upsertMembership",{clerkUserId,tenantId,memberId:owner.id,role:owner.role,state:owner.state});
-      }catch(error){
-        console.error("tenant directory index failed",{tenantId,error});
-        return json(503,{error:"workspace index unavailable — please retry",tenantId});
+      // RETRY HERE, for THIS tenant, rather than pushing the caller into one.
+      // The TenantDO is already committed at this point, so the identity worth
+      // preserving is the one we hold; a client retry mints a fresh id and
+      // bootstraps a SECOND workspace, so a directory blip would otherwise
+      // accumulate orphans one failed attempt at a time. upsertMembership is
+      // idempotent by construction — it filters any existing row for this
+      // tenantId before appending — so re-running it is always safe, including
+      // when a previous attempt actually committed and only its response was
+      // lost.
+      let indexed=false;
+      for(let attempt=0;attempt<3&&!indexed;attempt++){
+        try{
+          await directoryOp(env,"upsertMembership",{clerkUserId,tenantId,memberId:owner.id,role:owner.role,state:owner.state});
+          indexed=true;
+        }catch(error){
+          if(attempt===2)console.error("tenant directory index failed",{tenantId,error});
+        }
       }
+      // Still failing after retries: report it, and hand back the id so the
+      // workspace is identifiable rather than lost (the web layer relays error
+      // bodies verbatim and the id is not sensitive). The residual is a
+      // committed-but-unindexed TenantDO — strictly better than the old
+      // behaviour, which left the same orphan AND claimed success — and it is
+      // bounded by the per-user and per-IP rate limits above.
+      if(!indexed)return json(503,{error:"workspace index unavailable — please retry",tenantId});
       return json(200,{tenantId});}
     if(path==="/api/tenant-bootstrap"){const owner=(body.members??[]).find((m:any)=>m.role==="owner"&&m.state==="active");if(owner?.clerkUserId!==clerkUserId)return json(403,{error:"claimant must be owner"});const r=await tenantOpRaw(env,body.tenantId,"bootstrapMembers",{...body,claimantClerkUserId:clerkUserId});if(!r.ok)return cloneResponse(r);const out:any=await r.json();if(body.clerkOrgId)await directoryOp(env,"mapOrg",{clerkOrgId:body.clerkOrgId,tenantId:body.tenantId});await directoryOp(env,"reindexTenant",{tenantId:body.tenantId,members:out.members});return json(200,out);}
     if(path==="/api/adapter/org-member"){

@@ -280,6 +280,50 @@ describe("/api/tenant-create", () => {
     expect((await listForUser(clerkUserId)).memberships).toEqual([]);
   });
 
+  // REGRESSION: a transient directory failure used to surface as a 503, and the
+  // caller's retry minted a FRESH id and bootstrapped a SECOND workspace -- so a
+  // brief blip accumulated orphans one attempt at a time. The TenantDO is
+  // already committed here, so the retry belongs to this request and this
+  // tenant. upsertMembership is idempotent (it filters any existing row for the
+  // tenantId before appending), which is what makes retrying safe.
+  it("retries the idempotent index write instead of making the caller re-create", async () => {
+    const clerkUserId = `user_retry_${crypto.randomUUID()}`;
+    const real = env.DIRECTORY;
+    let attempts = 0;
+    const DIRECTORY = {
+      idFromName: (name: string) => real.idFromName(name),
+      get: (id: any) => ({
+        fetch: async (input: any, init?: any) => {
+          const { op } = JSON.parse(String(init?.body ?? "{}"));
+          if (op === "upsertMembership") {
+            attempts++;
+            // Fail once, then let it through — an ordinary transient blip.
+            if (attempts === 1) {
+              return new Response(JSON.stringify({ error: "boom" }), { status: 500 });
+            }
+          }
+          return real.get(id).fetch(input, init);
+        },
+      }),
+    };
+
+    const res = await call(
+      "/api/tenant-create",
+      createBody("owner3@example.test"),
+      await userHeaders(clerkUserId),
+      { DIRECTORY },
+    );
+
+    expect(res.status).toBe(200);
+    expect(attempts).toBeGreaterThan(1); // it really did retry
+    const { tenantId } = (await res.json()) as any;
+
+    // Exactly ONE workspace exists, indexed — no orphan, no duplicate.
+    const listed = await listForUser(clerkUserId);
+    expect(listed.memberships).toHaveLength(1);
+    expect(listed.memberships[0].tenantId).toBe(tenantId);
+  });
+
   it("indexes the owner and returns a high-entropy id on success", async () => {
     const clerkUserId = `user_ok_${crypto.randomUUID()}`;
     const res = await call(
