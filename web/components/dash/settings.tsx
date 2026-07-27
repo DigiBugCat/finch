@@ -2,6 +2,7 @@
 // Roost — Settings: tenant-wide defaults.
 import { useEffect, useRef, useState } from 'react';
 import { Card, SectionLabel, Toggle } from '@/components/dash/primitives';
+import { cliLoginArgv, cliLoginCommand } from '@/lib/cli-login-command';
 
 // Finch-themed pet-name slug generator (adjective + bird), e.g. "sunny-wren".
 const SLUG_ADJ = ['sunny', 'amber', 'dusk', 'quiet', 'brave', 'lucky', 'misty', 'cozy', 'swift', 'fern', 'maple', 'ember', 'cedar', 'wren', 'pebble', 'noble'];
@@ -231,20 +232,27 @@ function CustomDomains({ services }: { services: any[] }) {
 
 // CLI access: mint a token for `finch login`, so a box can enroll services
 // and build its finch.toml from the command line (no dashboard round-trips).
-function CliAccess() {
-  const [cmd, setCmd] = useState('');
+// Exported so the clipboard payload — a tenant-admin credential — can be
+// asserted directly (test/cli-login-command.test.tsx) instead of inferred.
+export function CliAccess() {
+  // Hold the hub and the token SEPARATELY rather than one pre-rendered command
+  // string. The two consumers want different things — the clipboard wants the
+  // whole heredoc, the screen must show no token at all — and keeping them apart
+  // means the rendered string never contains the credential to begin with,
+  // instead of being a prefix slice that merely happens to stop short of it.
+  const [cred, setCred] = useState<{ hub: string; token: string } | null>(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
   const [copied, setCopied] = useState(false);
   const [revoked, setRevoked] = useState(false);
 
   async function generate() {
-    setBusy(true); setErr(''); setCmd(''); setRevoked(false);
+    setBusy(true); setErr(''); setCred(null); setRevoked(false);
     try {
       const r = await fetch('/api/finch/cli-token', { method: 'POST' });
       const j = await r.json();
       if (!r.ok) throw new Error(j.error || 'could not mint token');
-      setCmd(`finch login --hub ${j.hub} ${j.token}`);
+      setCred({ hub: j.hub, token: j.token });
     } catch (e: any) {
       setErr(e.message || 'failed');
     } finally {
@@ -254,7 +262,7 @@ function CliAccess() {
 
   async function revokeAll() {
     if (!confirm('Revoke ALL CLI tokens for this account? Every box logged in via the CLI will need to run `finch login` again.')) return;
-    setBusy(true); setErr(''); setCmd('');
+    setBusy(true); setErr(''); setCred(null);
     try {
       const r = await fetch('/api/finch/cli-revoke', { method: 'POST' });
       if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || 'could not revoke');
@@ -269,11 +277,12 @@ function CliAccess() {
   return (
     <div className="cli-access">
       <p className="set-hint dim" style={{ marginBottom: 12 }}>
-        Prefer <code className="mono">finch login</code> (browser approval). Or generate a token to paste, then{' '}
+        Prefer <code className="mono">finch login</code> (browser approval). Or generate a ready-to-run{' '}
+        <code className="mono">finch login</code> block to paste on the box, then{' '}
         <code className="mono">finch add &lt;name&gt; --service &lt;url&gt;</code> to expose a local server.
       </p>
       <div style={{ display: 'flex', gap: 8 }}>
-        {!cmd && (
+        {!cred && (
           <button type="button" className="btn btn-sm btn-amber" onClick={generate} disabled={busy}>
             {busy ? 'generating…' : 'Generate CLI token'}
           </button>
@@ -284,16 +293,28 @@ function CliAccess() {
       </div>
       {err && <div className="set-hint red" style={{ marginTop: 8 }}>{err}</div>}
       {revoked && <div className="set-hint green" style={{ marginTop: 8 }}>✓ All CLI tokens revoked. Logged-in boxes must re-run <code className="mono">finch login</code>.</div>}
-      {cmd && (
+      {cred && (
         <div style={{ marginTop: 12 }}>
           <div className="cli-cmd mono">
-            <span>{cmd.slice(0, 28)}…<span className="dim"> (token hidden)</span></span>
-            <button type="button" className="btn btn-sm btn-ghost" onClick={() => { navigator.clipboard.writeText(cmd); setCopied(true); setTimeout(() => setCopied(false), 1200); }}>
+            {/* Only the argv line is displayed — it is token-free by construction
+                (cliLoginArgv), and .cli-cmd span already ellipsis-clips overflow
+                (globals.css:396), so no length slicing is needed to keep the
+                credential off screen. */}
+            <span>{cliLoginArgv(cred.hub)}<span className="dim"> … (token hidden)</span></span>
+            <button type="button" className="btn btn-sm btn-ghost" onClick={() => { navigator.clipboard.writeText(cliLoginCommand(cred.hub, cred.token)); setCopied(true); setTimeout(() => setCopied(false), 1200); }}>
               {copied ? 'copied ✓' : 'Copy'}
             </button>
           </div>
           <div className="set-hint dim" style={{ marginTop: 8 }}>
-            Paste this on your box. It's a tenant credential valid ~30 days, shown only once — store it safely. Revoke anytime above.
+            Copy and paste the whole block on your box — it feeds the token to{' '}
+            <code className="mono">finch login</code> on stdin, so the credential stays out
+            of the process table (argv is world-readable via{' '}
+            <code className="mono">/proc</code>). Pasting it at an interactive prompt does
+            still record it in your shell history: start the line with a space, or run{' '}
+            <code className="mono">finch token | ssh box &apos;finch login --token -&apos;</code>{' '}
+            from a box that is already logged in, to avoid that too. It&apos;s a tenant
+            credential valid ~30 days, shown only once — store it safely. Revoke anytime
+            above.
           </div>
         </div>
       )}

@@ -2,35 +2,37 @@
 // Creates (or returns the existing) pending access-request row in the tenant
 // DO. The DO is idempotent for a live pending/invited email+service pair.
 import {
-  callerLabel,
   errorResponse,
-  HttpError,
-  hubProxy,
+  hubFetchAs,
   requireSharing,
 } from "@/lib/hub";
+import { readJsonObject } from "@/lib/request-body";
+import {
+  accessEmail,
+  accessRequestResult,
+  readHubJsonObject,
+  requiredString,
+} from "../_contracts";
 
 export async function POST(req: Request) {
   try {
-    const { userId } = await requireSharing();
-    const body = (await req.json().catch(() => ({}))) as {
-      email?: string;
-      service?: string;
-    };
-    const email = (body?.email ?? "").trim().toLowerCase();
-    const service = (body?.service ?? "").trim();
-    if (!email || !service) {
-      throw new HttpError(400, "email and service required");
-    }
+    const { tenant, userId, email: actorEmail } = await requireSharing();
+    const body = await readJsonObject(req);
+    const email = accessEmail(body);
+    const service = requiredString(body, "service", "valid email and service required");
 
-    return await hubProxy("/api/access/request", {
+    const upstream = await hubFetchAs(tenant, "/api/access/request", {
       method: "POST",
       body: JSON.stringify({
         email,
         service,
-        requestedBy: await callerLabel(userId),
+        requestedBy: actorEmail,
         requestedByUserId: userId,
       }),
     });
+    const out = await readHubJsonObject(upstream);
+    if (!upstream.ok) return Response.json(out, { status: upstream.status });
+    return Response.json(accessRequestResult(out));
   } catch (err) {
     return errorResponse(err);
   }

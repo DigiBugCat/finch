@@ -116,9 +116,13 @@ export default function HowItWorks() {
             <div className="step-n"></div>
             <h3>Connect it</h3>
             <p>Run one line. The box dials out to Finch and comes online. No port-forwarding, no firewall holes.</p>
+            {/* Explicit https:// in BOTH the rendered text and the copy
+                payload: curl treats a scheme-less host as http://, so the
+                displayed one-liner would fetch the installer in cleartext from
+                an unauthenticated origin and pipe it straight into sh. */}
             <div className="step-code">
-              <code id="install-cmd">curl -fsSL finchmcp.com/install | sh</code>
-              <button className="copybtn" data-copy="curl -fsSL finchmcp.com/install | sh" onClick={handleCopy}>Copy</button>
+              <code id="install-cmd">curl -fsSL https://finchmcp.com/install | sh</code>
+              <button className="copybtn" data-copy="curl -fsSL https://finchmcp.com/install | sh" onClick={handleCopy}>Copy</button>
             </div>
           </div>
           <div className="step">

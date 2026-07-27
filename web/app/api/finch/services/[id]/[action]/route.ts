@@ -1,6 +1,7 @@
 // POST /api/finch/services/:id/:action -> hub POST /api/services/:id/:action
 // action ∈ { release, approve, decline }
-import { errorResponse, hubProxy, HttpError, requireAdmin } from "@/lib/hub";
+import { errorResponse, hubFetchAs, HttpError, requireAdmin } from "@/lib/hub";
+import { relayHubJson, requireServiceId } from "../../_contract";
 
 const ACTIONS = new Set(["release", "approve", "decline"]);
 
@@ -9,15 +10,18 @@ export async function POST(
   { params }: { params: Promise<{ id: string; action: string }> },
 ) {
   try {
-    await requireAdmin();
-    const { id, action } = await params;
+    const ctx = await requireAdmin();
+    const { id: rawId, action } = await params;
     if (!ACTIONS.has(action)) {
-      throw new HttpError(404, `unknown service action: ${action}`);
+      throw new HttpError(404, "unknown service action");
     }
-    return await hubProxy(
+    const id = requireServiceId(rawId);
+    const response = await hubFetchAs(
+      ctx.tenant,
       `/api/services/${encodeURIComponent(id)}/${action}`,
       { method: "POST" },
     );
+    return await relayHubJson(response);
   } catch (err) {
     return errorResponse(err);
   }

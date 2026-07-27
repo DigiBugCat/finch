@@ -55,4 +55,50 @@ describe("web→hub tenant assertion contract", () => {
     const token = await signAssertion("user_personal_tenant", SECRET);
     expect(await verifyAssertion(token, SECRET)).toBe("user_personal_tenant");
   });
+
+  it("pins the accepted tenant-id boundary and rejects malformed identities", async () => {
+    const longestTenant = "t".repeat(128);
+    expect(await verifyAssertion(await signAssertion(longestTenant, SECRET), SECRET)).toBe(longestTenant);
+
+    for (const tenant of [
+      "",
+      " ",
+      "tenant.with.dots",
+      "t".repeat(129),
+      null as unknown as string,
+      { toString: () => "user_coerced" } as unknown as string,
+    ]) {
+      await expect(signAssertion(tenant, SECRET, 1)).rejects.toThrow("invalid assertion tenant");
+    }
+  });
+
+  it("refuses missing key material and non-finite or overflowing timestamps", async () => {
+    for (const secret of ["", null as unknown as string, { toString: () => SECRET } as unknown as string]) {
+      await expect(signAssertion("user_1", secret, 1)).rejects.toThrow(
+        "assertion secret is required",
+      );
+    }
+    for (const now of [NaN, Infinity, -1, 1.5, Number.MAX_SAFE_INTEGER]) {
+      await expect(signAssertion("user_1", SECRET, now)).rejects.toThrow(
+        "invalid assertion timestamp",
+      );
+    }
+  });
+
+  it("uses a distinct verified audience for user-scoped assertions", async () => {
+    const token = await signAssertion("user_1", "sëcret-安全", undefined, "user");
+    const verifyWithKind = verifyAssertion as unknown as (
+      token: string,
+      secret: string,
+      expectedKind: string,
+    ) => Promise<string | null>;
+    expect(await verifyAssertion(token, "sëcret-安全")).toBeNull();
+    expect(await verifyWithKind(token, "sëcret-安全", "user")).toBe("user_1");
+  });
+
+  it("does not let runtime callers mint arbitrary assertion audiences", async () => {
+    await expect(
+      signAssertion("user_1", SECRET, undefined, "cli" as "user"),
+    ).rejects.toThrow("invalid assertion kind");
+  });
 });

@@ -1,6 +1,6 @@
 "use client";
 // Roost — Enroll + Keys panels.
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { Button, Card, CopyChip, DuskInput, InlineConfirm, MaskedSecret, SectionLabel } from '@/components/dash/primitives';
 import { formatScope, type PublicKey } from '@/components/dash/data';
 
@@ -52,7 +52,7 @@ export function EnrollView({ host, existingIds, groups, onEnrolled, onWatch }: a
   let error = "";
   if (clean) {
     if (!/^[a-z0-9-]+$/.test(clean)) error = "lowercase letters, digits and dashes only";
-    else if (clean.length > 40) error = "40 characters max";
+    else if (clean.length > 63) error = "63 characters max";
     else if (existingIds.includes(clean)) error = "a service with this id already exists";
   }
   const canMint = clean && !error && phase !== "minting";
@@ -117,7 +117,7 @@ export function EnrollView({ host, existingIds, groups, onEnrolled, onWatch }: a
 
       {advanced && (
         <Card className="enroll-card" style={{ marginTop: 12 }}>
-          <SectionLabel hint="lowercase · digits · dashes · ≤40">service id</SectionLabel>
+          <SectionLabel hint="lowercase · digits · dashes · ≤63">service id</SectionLabel>
           <div className="enroll-input-row">
             <DuskInput value={id} onChange={(v: any) => { setId(v); if (phase === "minted") { setPhase("idle"); setEnrolled(null); } }}
               placeholder="calendar-sync" prefix={`${host}/`} error={!!error} autoFocus />
@@ -178,9 +178,12 @@ export function EnrollView({ host, existingIds, groups, onEnrolled, onWatch }: a
 // key's stable id (not its mutable label). `users` are the real Clerk members.
 export function KeysView({ keys, users, onMint, onRevoke }: any) {
   const [label, setLabel] = useState("");
-  const ownerOptions: string[] = (users || []).filter((u:any)=>u.status==="active").map((u: any) => u.email).filter(Boolean);
+  const ownerOptions: string[] = useMemo(
+    () => (users || []).filter((u:any)=>u.status==="active").map((u: any) => u.email).filter(Boolean),
+    [users],
+  );
   const [owner, setOwner] = useState("");
-  useEffect(()=>{if(!ownerOptions.includes(owner))setOwner(ownerOptions[0]||"");},[owner,ownerOptions.join("|")]);
+  useEffect(()=>{if(!ownerOptions.includes(owner))setOwner(ownerOptions[0]||"");},[owner,ownerOptions]);
   const [revealed, setRevealed] = useState<any>(null); // { label, value }
   const [busy, setBusy] = useState(false);
 

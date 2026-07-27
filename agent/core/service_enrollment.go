@@ -305,6 +305,11 @@ func AckServiceEnrollment(ctx context.Context, pending *PendingServiceEnrollment
 // Finch's normal owner-only state path. The caller must wake the relay
 // reconciler immediately after this returns; it must not wait for lease expiry.
 func PersistServiceEnrollmentGrant(hub, credentialPath string, grant *ServiceEnrollmentGrant, manifest ServiceEnrollmentManifest) error {
+	validatedHub, err := validateHubTransportURL(hub)
+	if err != nil {
+		return err
+	}
+	hub = validatedHub
 	if grant == nil || grant.RefreshToken == "" || grant.Tenant == "" || grant.Service == "" || grant.Box == "" {
 		return fmt.Errorf("cannot persist an incomplete Finch service grant")
 	}
@@ -425,15 +430,7 @@ func validateServiceEnrollmentGrant(manifest ServiceEnrollmentManifest, digest s
 }
 
 func validateEnrollmentHub(hub string) (string, error) {
-	hub = strings.TrimRight(strings.TrimSpace(hub), "/")
-	if hub == "" {
-		hub = "https://finchmcp.com"
-	}
-	u, err := url.Parse(hub)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
-		return "", fmt.Errorf("invalid Finch hub %q", hub)
-	}
-	return hub, nil
+	return validateHubTransportURL(hub)
 }
 
 func validateVerificationURL(raw string, allowedOrigins map[string]bool) error {

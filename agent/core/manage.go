@@ -8,7 +8,6 @@ package core
 
 import (
 	"fmt"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -43,9 +42,11 @@ func Logout() error {
 // approved, and saves the CLI credential. Blocks until approved, expired, or timed
 // out — call it from a goroutine.
 func Login(hub string, onCode func(verificationURI, userCode string)) error {
-	if hub == "" {
-		hub = "https://finchmcp.com"
+	validatedHub, err := validateHubTransportURL(hub)
+	if err != nil {
+		return err
 	}
+	hub = validatedHub
 	start, err := cliRequest("POST", hub, "/api/cli/device/start", "", struct{}{})
 	if err != nil {
 		return fmt.Errorf("could not start login: %w", err)
@@ -175,8 +176,11 @@ func Add(configPath, appPath, service string) (id, publicURL string, err error) 
 	if strings.ContainsAny(appPath, "/ ") {
 		return "", "", fmt.Errorf("app_path %q must be a single URL segment (no slashes or spaces)", appPath)
 	}
-	if u, e := url.Parse(strings.TrimRight(service, "/")); e != nil || u.Scheme == "" || u.Host == "" {
-		return "", "", fmt.Errorf("service %q is not a valid absolute URL (e.g. http://127.0.0.1:8000)", service)
+	if _, e := parseUpstreamTransportURL(service); e != nil {
+		return "", "", fmt.Errorf("service %q has invalid transport: %w", service, e)
+	}
+	if err := validateManifestMutationTarget(configPath); err != nil {
+		return "", "", err
 	}
 
 	cred, err := loadCliCred()
@@ -196,6 +200,9 @@ func Add(configPath, appPath, service string) (id, publicURL string, err error) 
 	if id == "" || ticket == "" {
 		return "", "", fmt.Errorf("unexpected enroll response from hub")
 	}
+	if err := validateServiceID(id); err != nil {
+		return "", "", fmt.Errorf("unsafe service id returned by hub: %w", err)
+	}
 
 	host, _ := os.Hostname()
 	box, credDir := addPaths(configPath, host)
@@ -214,6 +221,12 @@ func Add(configPath, appPath, service string) (id, publicURL string, err error) 
 // finch.yml edit is best-effort — a hub-side removal that succeeds is reported as
 // success even if the manifest couldn't be rewritten.
 func Remove(configPath, appPath string) error {
+	if err := validateServiceID(strings.TrimSpace(appPath)); err != nil {
+		return err
+	}
+	if err := validateManifestMutationTarget(configPath); err != nil {
+		return err
+	}
 	cred, err := loadCliCred()
 	if err != nil {
 		return err
@@ -221,7 +234,9 @@ func Remove(configPath, appPath string) error {
 	if _, err := cliRequest("POST", cred.Hub, "/api/cli/services/release", cred.Token, map[string]string{"id": appPath}); err != nil {
 		return err
 	}
-	_ = removeIngress(configPath, appPath)
+	if err := removeIngress(configPath, appPath); err != nil {
+		return fmt.Errorf("service was released but local manifest update failed: %w", err)
+	}
 	return nil
 }
 
@@ -229,6 +244,15 @@ func Remove(configPath, appPath string) error {
 // preserving comments + unmodeled keys via a yaml.Node round-trip (the mirror of
 // appendIngress). A missing file or absent rule is a no-op.
 func removeIngress(configPath, appPath string) error {
+	manifestMutationMu.Lock()
+	defer manifestMutationMu.Unlock()
+	return removeIngressLocked(configPath, appPath)
+}
+
+func removeIngressLocked(configPath, appPath string) error {
+	if err := validateManifestMutationTarget(configPath); err != nil {
+		return err
+	}
 	b, err := os.ReadFile(configPath)
 	if err != nil {
 		if os.IsNotExist(err) {

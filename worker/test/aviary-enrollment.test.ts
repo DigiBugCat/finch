@@ -109,6 +109,52 @@ async function call(path: string, body?: unknown, headers: Record<string, string
   return res;
 }
 
+/** POST a chunked body (no content-length) whose chunks are produced lazily, so
+ *  the returned counter reports how much of the body the worker actually pulled.
+ *  `chunks` is the number the stream would emit if read to completion. */
+function streamed(
+  path: string,
+  chunks: number,
+  ip: string,
+  overrides: Record<string, unknown> = {},
+): { pulled: () => number; response: Promise<Response> } {
+  let pulled = 0;
+  // highWaterMark 0 keeps the stream from pre-filling a chunk on construction,
+  // so `pulled` counts only what the worker actually demanded.
+  const body = new ReadableStream(
+    {
+      pull(controller) {
+        if (pulled >= chunks) {
+          controller.close();
+          return;
+        }
+        pulled++;
+        controller.enqueue(new Uint8Array(4096).fill(0x20)); // JSON-legal whitespace
+      },
+    },
+    { highWaterMark: 0 },
+  );
+  const ctx = createExecutionContext();
+  const response = (async () => {
+    const res = await worker.fetch(
+      new Request(`${BASE}${path}`, {
+        method: "POST",
+        headers: {
+          host: "hub.test",
+          "content-type": "application/json",
+          "cf-connecting-ip": ip,
+        },
+        body,
+      } as RequestInit),
+      { ...(env as any), ...overrides } as any,
+      ctx,
+    );
+    await waitOnExecutionContext(ctx);
+    return res;
+  })();
+  return { pulled: () => pulled, response };
+}
+
 async function tenantHeaders(tenant = TENANT): Promise<Record<string, string>> {
   return {
     "X-Finch-Service": SERVICE_SECRET,
@@ -714,6 +760,37 @@ describe("Aviary service device enrollment", () => {
     const huge = await call("/api/aviary/device/start", { padding: "x".repeat(17 * 1024) });
     expect(huge.status).toBe(400);
     expect((await huge.json() as any).error.code).toBe("invalid_json");
+  });
+
+  it("stops reading a chunked body at the cap instead of buffering it whole", async () => {
+    // No content-length to pre-check, so the only defence is the incremental
+    // byte counter: 4 MiB offered, at most 16 KiB + one chunk may be pulled.
+    const flood = streamed("/api/aviary/device/start", 1024, "192.0.2.10");
+    const response = await flood.response;
+    expect(response.status).toBe(400);
+    expect((await response.json() as any).error.code).toBe("invalid_json");
+    expect(flood.pulled()).toBeLessThanOrEqual(5); // 16 KiB cap / 4 KiB chunks + 1
+  });
+
+  it("throttles a start flood before the request body is read at all", async () => {
+    // JOIN_LIMIT is unbound in the test env (rateLimitOk then fails open), so a
+    // stub limiter stands in to observe the ordering: a throttled request must
+    // be refused without a single chunk of the body being pulled, otherwise the
+    // limiter cannot bound the buffering an unauthenticated caller can force.
+    const limitKeys: string[] = [];
+    const throttled = streamed("/api/aviary/device/start", 1024, "192.0.2.20", {
+      JOIN_LIMIT: {
+        limit: async ({ key }: { key: string }) => {
+          limitKeys.push(key);
+          return { success: false };
+        },
+      },
+    });
+    const response = await throttled.response;
+    expect(response.status).toBe(429);
+    expect((await response.json() as any).error.code).toBe("rate_limited");
+    expect(limitKeys).toEqual(["aviary-start:192.0.2.20"]);
+    expect(throttled.pulled()).toBe(0);
   });
 
   it("pins verification origins and persistently throttles start floods per IP", async () => {

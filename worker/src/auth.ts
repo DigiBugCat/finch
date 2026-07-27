@@ -25,15 +25,23 @@ function bytesToB64url(bytes: Uint8Array): string {
 }
 
 function b64urlToBytes(s: string): Uint8Array {
+  // Compact tokens use canonical, unpadded base64url. Rejecting the standard
+  // alphabet, padding, impossible lengths, and non-canonical trailing bits
+  // prevents multiple wire strings from representing the same signed bytes.
+  if (!/^[A-Za-z0-9_-]+$/.test(s) || s.length % 4 === 1) {
+    throw new Error("invalid base64url");
+  }
   const b64 = s.replace(/-/g, "+").replace(/_/g, "/");
   const pad = b64.length % 4 === 0 ? "" : "=".repeat(4 - (b64.length % 4));
   const bin = atob(b64 + pad);
   const out = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  if (bytesToB64url(out) !== s) throw new Error("non-canonical base64url");
   return out;
 }
 
 const enc = new TextEncoder();
+const MAX_COMPACT_TOKEN_CHARS = 16 * 1024;
 
 function bytesToHex(bytes: Uint8Array): string {
   let hex = "";
@@ -169,7 +177,12 @@ async function verifyEnvelope<T extends { exp: number }>(
   secret: string,
   validate: (p: any) => T | null,
 ): Promise<T | null> {
-  if (!token || !secret) return null;
+  if (
+    typeof token !== "string" ||
+    !token ||
+    token.length > MAX_COMPACT_TOKEN_CHARS ||
+    !secret
+  ) return null;
   const dot = token.indexOf(".");
   if (dot <= 0 || dot === token.length - 1) return null;
   const body = token.slice(0, dot);
@@ -195,7 +208,7 @@ async function verifyEnvelope<T extends { exp: number }>(
   if (typeof parsed !== "object" || parsed === null) return null;
   const payload = validate(parsed);
   if (!payload) return null;
-  if (Date.now() / 1000 > payload.exp) return null; // expired
+  if (!Number.isFinite(payload.exp) || Date.now() / 1000 >= payload.exp) return null;
   return payload;
 }
 
@@ -220,7 +233,12 @@ export function signToken(
  *  for the agent kinds, and type-check the optional fields; the per-callsite
  *  predicate (e.g. _connect's kind==="connect" check) does the rest. */
 function validateTicket(p: any): TicketPayload | null {
-  if (typeof p.tenant !== "string" || typeof p.exp !== "number") return null;
+  if (
+    typeof p.tenant !== "string" ||
+    !p.tenant ||
+    typeof p.exp !== "number" ||
+    !Number.isFinite(p.exp)
+  ) return null;
   const kind = p.kind;
   const knownKind =
     kind === undefined ||
@@ -234,15 +252,18 @@ function validateTicket(p: any): TicketPayload | null {
   // kind) are service-scoped — `service` MUST be a string. The browser grants
   // (portal/session) are slug-scoped and carry no service.
   const isBrowserKind = kind === "portal" || kind === "session";
-  if (!isBrowserKind && typeof p.service !== "string") return null;
-  if (p.service !== undefined && typeof p.service !== "string") return null;
+  if (!isBrowserKind && (typeof p.service !== "string" || !p.service)) return null;
+  if (p.service !== undefined && (typeof p.service !== "string" || !p.service)) return null;
   if (p.box !== undefined && typeof p.box !== "string") return null;
   if (p.slug !== undefined && typeof p.slug !== "string") return null;
   if (p.userId !== undefined && typeof p.userId !== "string") return null;
   if (p.mid !== undefined && typeof p.mid !== "string") return null;
   if (p.email !== undefined && typeof p.email !== "string") return null;
   if (p.admin !== undefined && typeof p.admin !== "boolean") return null;
-  if (p.epoch !== undefined && typeof p.epoch !== "number") return null;
+  if (
+    p.epoch !== undefined &&
+    (typeof p.epoch !== "number" || !Number.isFinite(p.epoch))
+  ) return null;
   if (p.jti !== undefined && typeof p.jti !== "string") return null;
   return p as TicketPayload;
 }
@@ -345,7 +366,11 @@ export async function verifyAssertionPayload(
   secret: string,
 ): Promise<TenantAssertion | null> {
   return verifyEnvelope<TenantAssertion>(token, secret, (p) =>
-    typeof p.tenant === "string" && p.tenant && typeof p.exp === "number"
+    typeof p.tenant === "string" && p.tenant &&
+      typeof p.exp === "number" && Number.isFinite(p.exp) &&
+      (p.kind === undefined || typeof p.kind === "string") &&
+      (p.epoch === undefined ||
+        (typeof p.epoch === "number" && Number.isFinite(p.epoch)))
       ? {
           tenant: p.tenant,
           exp: p.exp,
@@ -653,6 +678,12 @@ export async function verifyCallerAssertion(
   jwks: { keys: CallerAssertionJwk[] },
   expected: CallerAssertionExpectations = {},
 ): Promise<CallerAssertionClaims | null> {
+  if (
+    typeof token !== "string" ||
+    token.length > MAX_COMPACT_TOKEN_CHARS ||
+    !jwks ||
+    !Array.isArray(jwks.keys)
+  ) return null;
   const parts = token.split(".");
   if (parts.length !== 3) return null;
   let header: any;
@@ -713,14 +744,20 @@ export async function verifyCallerAssertion(
     return null;
   }
   if (
-    typeof claims.iat !== "number" ||
-    typeof claims.nbf !== "number" ||
-    typeof claims.exp !== "number"
+    typeof claims.iat !== "number" || !Number.isFinite(claims.iat) ||
+    typeof claims.nbf !== "number" || !Number.isFinite(claims.nbf) ||
+    typeof claims.exp !== "number" || !Number.isFinite(claims.exp)
   ) {
     return null;
   }
   const now = expected.now ?? Math.floor(Date.now() / 1000);
-  if (claims.exp <= now || claims.nbf > now + 5 || claims.iat > now + 5) return null;
+  if (
+    claims.exp <= now ||
+    claims.nbf > now + 5 ||
+    claims.iat > now + 5 ||
+    claims.exp <= claims.iat ||
+    claims.exp <= claims.nbf
+  ) return null;
   if (claims.exp - claims.iat > 300) return null; // assertions are always short-lived
   if (
     !["finch_key", "oauth", "browser", "service"].includes(
@@ -766,8 +803,10 @@ export async function verifyCallerAssertion(
 // Clerk round-trip off the hot path for chatty MCP sessions.
 
 const CLERK_TOKEN_CACHE = new Map<string, { who: ClerkIdentity | null; exp: number }>();
+const CLERK_TOKEN_PENDING = new Map<string, Promise<ClerkIdentity | null>>();
 const CLERK_TOKEN_CACHE_TTL_MS = 60_000;
 const CLERK_TOKEN_CACHE_MAX = 500;
+const MAX_CLERK_USERINFO_BYTES = 16 * 1024;
 
 export interface ClerkIdentity {
   sub?: string;      // Clerk user id (user_…)
@@ -777,27 +816,100 @@ export interface ClerkIdentity {
   org_role?: string; // org role, when Clerk includes it for org-scoped tokens
 }
 
+async function boundedResponseJson(res: Response): Promise<unknown> {
+  const declared = res.headers.get("content-length");
+  if (declared && /^\d+$/.test(declared) && Number(declared) > MAX_CLERK_USERINFO_BYTES) {
+    throw new Error("userinfo response too large");
+  }
+  if (!res.body) throw new Error("missing userinfo body");
+  const reader = res.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > MAX_CLERK_USERINFO_BYTES) {
+        await reader.cancel("userinfo response too large");
+        throw new Error("userinfo response too large");
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return JSON.parse(new TextDecoder().decode(bytes));
+}
+
 export async function verifyClerkOAuthToken(
   token: string,
   issuer: string,
   userinfoFetcher?: Pick<Fetcher, "fetch">,
 ): Promise<ClerkIdentity | null> {
+  if (
+    typeof token !== "string" || !token ||
+    token.length > MAX_COMPACT_TOKEN_CHARS ||
+    typeof issuer !== "string" || !issuer
+  ) return null;
   const key = await hashKey(`${issuer}\0${token}`); // never cache raw tokens
   const now = Date.now();
   const hit = CLERK_TOKEN_CACHE.get(key);
   if (hit && hit.exp > now) return hit.who;
-  let who: ClerkIdentity | null = null;
+  const pending = CLERK_TOKEN_PENDING.get(key);
+  if (pending) return pending;
+
+  const lookup = (async (): Promise<ClerkIdentity | null> => {
+    let who: ClerkIdentity | null = null;
+    let cacheable = false;
+    try {
+      const target = `${issuer.replace(/\/+$/, "")}/oauth/userinfo`;
+      const init = { headers: { authorization: `Bearer ${token}` } };
+      const r = userinfoFetcher
+        ? await userinfoFetcher.fetch(target, init)
+        : await fetch(target, init);
+      cacheable = [400, 401, 403].includes(r.status);
+      if (r.ok) {
+        const raw = await boundedResponseJson(r);
+        if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+          const value = raw as Record<string, unknown>;
+          const optionalStrings = ["sub", "user_id", "org_id", "email", "org_role"];
+          if (
+            optionalStrings.every(
+              (name) => value[name] === undefined || typeof value[name] === "string",
+            ) &&
+            (typeof value.sub === "string" || typeof value.user_id === "string")
+          ) {
+            who = value as ClerkIdentity;
+            cacheable = true;
+          }
+        }
+      }
+    } catch {
+      who = null; // network/parse fault reads as unauthenticated but is retryable
+    }
+    if (cacheable) {
+      if (CLERK_TOKEN_CACHE.size >= CLERK_TOKEN_CACHE_MAX) {
+        const oldest = CLERK_TOKEN_CACHE.keys().next().value as string | undefined;
+        if (oldest) CLERK_TOKEN_CACHE.delete(oldest);
+      }
+      CLERK_TOKEN_CACHE.set(key, {
+        who,
+        exp: Date.now() + CLERK_TOKEN_CACHE_TTL_MS,
+      });
+    }
+    return who;
+  })();
+  CLERK_TOKEN_PENDING.set(key, lookup);
   try {
-    const target = `${issuer.replace(/\/+$/, "")}/oauth/userinfo`;
-    const init = { headers: { authorization: `Bearer ${token}` } };
-    const r = userinfoFetcher
-      ? await userinfoFetcher.fetch(target, init)
-      : await fetch(target, init);
-    if (r.ok) who = (await r.json()) as ClerkIdentity;
-  } catch {
-    who = null; // network fault reads as unauthenticated; caller 401s
+    return await lookup;
+  } finally {
+    CLERK_TOKEN_PENDING.delete(key);
   }
-  if (CLERK_TOKEN_CACHE.size >= CLERK_TOKEN_CACHE_MAX) CLERK_TOKEN_CACHE.clear();
-  CLERK_TOKEN_CACHE.set(key, { who, exp: now + CLERK_TOKEN_CACHE_TTL_MS });
-  return who;
 }

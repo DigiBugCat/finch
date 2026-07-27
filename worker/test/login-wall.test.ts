@@ -861,6 +861,187 @@ describe("login wall — session cookie validity", () => {
   });
 });
 
+// F7 — the login-wall cookie is named `__Host-finch_session`. The prefix is the
+// class fix, not a cosmetic rename: any tenant can serve arbitrary HTML on its
+// own <slug>.finchmcp.com (a service with auth "public" skips the wall and the
+// relay happily re-emits text/html), and finchmcp.com is not a public suffix,
+// so without the prefix that page can `document.cookie = "finch_session=…;
+// domain=finchmcp.com; path=/<svc>"` and plant a SECOND same-named cookie in a
+// sibling tenant's jar. Browsers REJECT a `__Host-` cookie carrying Domain, so
+// the pair can no longer exist. These tests pin the name that gets WRITTEN, the
+// legacy name that is still ACCEPTED (renaming a live cookie would log every
+// user out), and the precedence that keeps the transition itself un-gameable.
+describe("login wall — __Host- session cookie + legacy transition (F7)", () => {
+  it("relays on the __Host- cookie name", async () => {
+    const { host, base, slug, tenant, service, agent } = await standUpService();
+    const cookie = await mintSession({ tenant, slug });
+    const reqSeen = nextFrame(agent);
+    const relayP = call(
+      new Request(`${base}/${service}/index.html`, {
+        method: "GET",
+        headers: {
+          host,
+          accept: "text/html",
+          cookie: `__Host-finch_session=${cookie}`,
+        },
+        redirect: "manual",
+      }),
+    );
+    const f = await reqSeen;
+    reply200(agent, f.id, "<ok/>");
+    expect((await relayP).status).toBe(200);
+    agent.close(1000, "done");
+  });
+
+  it("still relays on the LEGACY name — the deploy does not log anyone out", async () => {
+    const { host, base, slug, tenant, service, agent } = await standUpService();
+    // Cookie minted by the PREVIOUS deploy: same envelope, pre-prefix name.
+    const cookie = await mintSession({ tenant, slug });
+    const reqSeen = nextFrame(agent);
+    const relayP = call(
+      new Request(`${base}/${service}/index.html`, {
+        method: "GET",
+        headers: { host, accept: "text/html", cookie: `finch_session=${cookie}` },
+        redirect: "manual",
+      }),
+    );
+    const f = await reqSeen;
+    reply200(agent, f.id, "<ok/>");
+    expect((await relayP).status).toBe(200);
+    agent.close(1000, "done");
+  });
+
+  it("prefers the __Host- cookie over a legacy one in EITHER header order", async () => {
+    const { host, base, slug, tenant, service, agent } = await standUpService();
+    const good = await mintSession({ tenant, slug }); // admin → relays
+    // A legacy-named session for an ungranted member: evaluating it yields a
+    // hard 403 (see the per-app grants suite), so a 200 here proves the
+    // __Host- candidate was the one that decided — and RFC 6265 §5.4 lets the
+    // injector choose its position, hence both orders.
+    const denied = await mintSession({
+      tenant,
+      slug,
+      userId: "member_1",
+      admin: false,
+      email: "member@x.com",
+    });
+    for (const cookie of [
+      `__Host-finch_session=${good}; finch_session=${denied}`,
+      `finch_session=${denied}; __Host-finch_session=${good}`,
+    ]) {
+      const reqSeen = nextFrame(agent);
+      const relayP = call(
+        new Request(`${base}/${service}/index.html`, {
+          method: "GET",
+          headers: { host, accept: "text/html", cookie },
+          redirect: "manual",
+        }),
+      );
+      const f = await reqSeen;
+      reply200(agent, f.id, "<ok/>");
+      expect((await relayP).status).toBe(200);
+    }
+    agent.close(1000, "done");
+  });
+
+  it("ignores a shadowing legacy pair that LEADS the header (all values are candidates)", async () => {
+    const { host, base, slug, tenant, service, agent } = await standUpService();
+    const real = await mintSession({ tenant, slug });
+    // The transition-window attack: a sibling tenant plants
+    // `finch_session=…; Domain=finchmcp.com; Path=/<svc>` — a longer path, so
+    // the browser sends it FIRST. It cannot be signed for this tenant, so it is
+    // junk; a first-match read would still return it and wall the victim.
+    const reqSeen = nextFrame(agent);
+    const relayP = call(
+      new Request(`${base}/${service}/index.html`, {
+        method: "GET",
+        headers: {
+          host,
+          accept: "text/html",
+          cookie: `finch_session=attacker-planted-value; finch_session=${real}`,
+        },
+        redirect: "manual",
+      }),
+    );
+    const f = await reqSeen;
+    reply200(agent, f.id, "<ok/>");
+    expect((await relayP).status).toBe(200);
+    agent.close(1000, "done");
+  });
+
+  it("strips BOTH cookie names from the relayed Cookie header", async () => {
+    const { host, base, slug, tenant, service, agent } = await standUpService();
+    const cookie = await mintSession({ tenant, slug });
+    const reqSeen = nextFrame(agent);
+    const relayP = call(
+      new Request(`${base}/${service}/index.html`, {
+        method: "GET",
+        headers: {
+          host,
+          accept: "text/html",
+          // A browser mid-transition can carry both names at once; neither may
+          // cross the trust boundary into the customer-operated box.
+          cookie: `__Host-finch_session=${cookie}; finch_session=${cookie}; app_sid=abc123`,
+        },
+        redirect: "manual",
+      }),
+    );
+    const f = await reqSeen;
+    const fwd = (f.headers ?? {}) as Record<string, string>;
+    expect(fwd.cookie).toBe("app_sid=abc123");
+    reply200(agent, f.id, "<ok/>");
+    expect((await relayP).status).toBe(200);
+    agent.close(1000, "done");
+  });
+
+  it("/__finch/cb writes ONLY the __Host- name and expires the legacy one", async () => {
+    const { host, base, slug, tenant } = await freshTenantSlug();
+    const grant = await mintPortal({ tenant, slug });
+    const res = await call(
+      new Request(`${base}/__finch/cb?g=${encodeURIComponent(grant)}&rd=%2F`, {
+        method: "GET",
+        headers: { host, accept: "text/html" },
+        redirect: "manual",
+      }),
+    );
+    expect(res.status).toBe(302);
+    const cookies = (res.headers as any).getAll("set-cookie") as string[];
+    expect(cookies).toHaveLength(2);
+    // The session VALUE is written under the prefixed name and nothing else.
+    const set = cookies.find((c) => !c.includes("Max-Age=0"))!;
+    expect(set.startsWith("__Host-finch_session=")).toBe(true);
+    expect(set).not.toMatch(/(^|[;\s])finch_session=/);
+    // __Host- is only honored with exactly Secure + Path=/ + no Domain: those
+    // attributes are load-bearing now, not decoration.
+    expect(set).toContain("Secure");
+    expect(set).toContain("Path=/");
+    expect(set.toLowerCase()).not.toContain("domain=");
+    // ...and the pre-prefix cookie is retired in the same response, so one
+    // re-login is all it takes to stop carrying the shadowable name.
+    const cleared = cookies.find((c) => c.includes("Max-Age=0"))!;
+    expect(cleared.startsWith("finch_session=;")).toBe(true);
+  });
+
+  it("/__finch/logout expires BOTH names", async () => {
+    const { host, base } = await freshTenantSlug();
+    const res = await call(
+      new Request(`${base}/__finch/logout?rd=%2F`, {
+        method: "GET",
+        headers: { host, accept: "text/html" },
+        redirect: "manual",
+      }),
+    );
+    expect(res.status).toBe(302);
+    const cookies = (res.headers as any).getAll("set-cookie") as string[];
+    // Leaving the legacy cookie alive would leave the user logged in through
+    // browserGate's legacy candidate — a logout that doesn't log out.
+    expect(cookies).toHaveLength(2);
+    expect(cookies.some((c) => c.startsWith("__Host-finch_session=;"))).toBe(true);
+    expect(cookies.some((c) => c.startsWith("finch_session=;"))).toBe(true);
+    for (const c of cookies) expect(c).toContain("Max-Age=0");
+  });
+});
+
 describe("login wall — per-app user grants (member sessions)", () => {
   it("403s a non-admin member with no user→service grant", async () => {
     const { host, base, slug, tenant, service, agent } = await standUpService();

@@ -22,14 +22,15 @@ import (
 )
 
 const (
-	defaultLeaseSeconds = 30
-	minLeaseSeconds     = 10
-	maxLeaseSeconds     = 300
-	maxAppPathLength    = 63
-	maxUpstreamLength   = 2048
-	maxRouteLength      = 256
-	maxRoutesPerService = 16
-	maxDynamicServices  = 128
+	defaultLeaseSeconds  = 30
+	minLeaseSeconds      = 10
+	maxLeaseSeconds      = 300
+	maxAppPathLength     = 63
+	maxUpstreamLength    = 2048
+	maxRouteLength       = 256
+	maxRoutesPerService  = 16
+	maxDynamicServices   = 128
+	maxIDGenerationTries = 8
 )
 
 // RegistrationRequest is the JSON body accepted by POST /v1/registrations.
@@ -103,7 +104,7 @@ func NewDynamicRegistry(staticServices []StaticService) *DynamicRegistry {
 	static := make(map[string]ServiceStatus, len(staticServices))
 	for _, service := range staticServices {
 		static[service.AppPath] = ServiceStatus{
-			AppPath: service.AppPath, Upstream: service.Upstream, Routes: service.Routes,
+			AppPath: service.AppPath, Upstream: service.Upstream, Routes: append([]string(nil), service.Routes...),
 			Source: "finch.yml", State: "configured", ForwardAll: service.ForwardAll,
 		}
 	}
@@ -218,10 +219,23 @@ func (r *DynamicRegistry) Register(req RegistrationRequest) (ServiceStatus, erro
 			msg: fmt.Sprintf("dynamic service limit of %d reached", r.maxDynamic),
 		}
 	}
-	leaseID, err := r.newLease()
-	if err != nil {
+	var leaseID string
+	for attempt := 0; attempt < maxIDGenerationTries; attempt++ {
+		leaseID, err = r.newLease()
+		if err != nil {
+			r.mu.Unlock()
+			return ServiceStatus{}, fmt.Errorf("generating lease id: %w", err)
+		}
+		if leaseID != "" {
+			if _, exists := r.byLease[leaseID]; !exists {
+				break
+			}
+		}
+		leaseID = ""
+	}
+	if leaseID == "" {
 		r.mu.Unlock()
-		return ServiceStatus{}, fmt.Errorf("generating lease id: %w", err)
+		return ServiceStatus{}, fmt.Errorf("generating lease id: repeated empty or duplicate values")
 	}
 	status := ServiceStatus{
 		AppPath: clean.AppPath, Upstream: clean.Upstream, Routes: clean.Routes,
@@ -232,7 +246,7 @@ func (r *DynamicRegistry) Register(req RegistrationRequest) (ServiceStatus, erro
 	r.byLease[leaseID] = status.AppPath
 	r.mu.Unlock()
 	r.signal()
-	return status, nil
+	return cloneServiceStatus(status), nil
 }
 
 // Renew extends an existing lease using its originally requested duration.
@@ -250,7 +264,7 @@ func (r *DynamicRegistry) Renew(leaseID string) (ServiceStatus, error) {
 	r.dynamic[appPath] = reg
 	r.mu.Unlock()
 	r.signal()
-	return reg.ServiceStatus, nil
+	return cloneServiceStatus(reg.ServiceStatus), nil
 }
 
 // Remove releases an existing lease. It never modifies static configuration.
@@ -315,13 +329,18 @@ func (r *DynamicRegistry) Services() []ServiceStatus {
 	r.expireLocked(r.now())
 	out := make([]ServiceStatus, 0, len(r.static)+len(r.dynamic))
 	for _, st := range r.static {
-		out = append(out, st)
+		out = append(out, cloneServiceStatus(st))
 	}
 	for _, reg := range r.dynamic {
-		out = append(out, reg.ServiceStatus)
+		out = append(out, cloneServiceStatus(reg.ServiceStatus))
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].AppPath < out[j].AppPath })
 	return out
+}
+
+func cloneServiceStatus(status ServiceStatus) ServiceStatus {
+	status.Routes = append([]string(nil), status.Routes...)
+	return status
 }
 
 // NextExpiry returns the earliest live dynamic lease deadline. The reconciler
@@ -356,6 +375,9 @@ func validateRegistration(req RegistrationRequest) (RegistrationRequest, time.Du
 	u, err := url.Parse(req.Upstream)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
 		return req, 0, invalid("upstream must be an absolute http(s) URL without credentials, query, or fragment")
+	}
+	if _, err := parseUpstreamTransportURL(req.Upstream); err != nil {
+		return req, 0, invalid(err.Error())
 	}
 	if len(req.Routes) > maxRoutesPerService {
 		return req, 0, invalid(fmt.Sprintf("routes may contain at most %d entries", maxRoutesPerService))

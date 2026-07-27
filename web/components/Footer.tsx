@@ -28,7 +28,7 @@ export default function Footer() {
             <h5>Company</h5>
             <a href="#">About</a>
             <a href="#">Blog</a>
-            <a href="#">Privacy</a>
+            <Link href="/docs/privacy">Privacy</Link>
             <a href="#">Contact</a>
           </div>
         </div>

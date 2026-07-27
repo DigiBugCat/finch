@@ -17,7 +17,7 @@
 import "server-only";
 import { auth, clerkClient } from "@clerk/nextjs/server";
 import { cache } from "react";
-import { readActiveTenant, clearActiveTenant } from "./tenant-cookie";
+import { readActiveTenant, clearActiveTenant, validTenantId } from "./tenant-cookie";
 // The assertion signer lives in its own dependency-free module so it can be
 // contract-tested against the hub's verifyAssertion (worker/src/auth.ts).
 import { signAssertion } from "./assertion";
@@ -64,7 +64,7 @@ export async function readRuntimeEnv(name: string): Promise<string | undefined> 
 export async function getHubUrl(): Promise<string> {
   const hubUrl = await runtimeEnv("HUB_URL");
   if (!hubUrl) throw new HttpError(500, "HUB_URL is not configured");
-  return hubUrl.replace(/\/+$/, "");
+  return normalizeHubUrl(hubUrl);
 }
 
 /** Native Finch tenant context, revalidated against TenantDO per request. */
@@ -76,10 +76,22 @@ async function resolveTenantUncached():Promise<ResolvedTenant>{
   let res=await hubFetchAs(tenant,"/api/member-context",{method:"POST",body:JSON.stringify({clerkUserId:userId})});
   if(!res.ok)throw new HttpError(res.status,"could not resolve workspace membership");
   let data:any;try{data=await res.json();}catch{throw new HttpError(502,"invalid response from hub");}
-  if(data.needsBootstrap&&tenant===userId){const clerk=await clerkClient();const u=await clerk.users.getUser(userId);const verified=u.emailAddresses.filter(e=>e.verification?.status==="verified");const primary=verified.find(e=>e.id===u.primaryEmailAddressId)??verified[0];if(!primary)throw new HttpError(403,"verify your email to finish setting up your workspace");res=await hubFetchAs(tenant,"/api/member-context",{method:"POST",body:JSON.stringify({clerkUserId:userId,email:primary.emailAddress})});if(!res.ok)throw new HttpError(res.status,"could not bootstrap workspace membership");try{data=await res.json();}catch{throw new HttpError(502,"invalid response from hub");}}
+  if(!data||typeof data!=="object")throw new HttpError(502,"invalid response from hub");
+  if(data.needsBootstrap===true&&tenant===userId){const clerk=await clerkClient();const u=await clerk.users.getUser(userId);const verified=u.emailAddresses.filter(e=>e.verification?.status==="verified");const primary=verified.find(e=>e.id===u.primaryEmailAddressId)??verified[0];if(!primary)throw new HttpError(403,"verify your email to finish setting up your workspace");res=await hubFetchAs(tenant,"/api/member-context",{method:"POST",body:JSON.stringify({clerkUserId:userId,email:primary.emailAddress})});if(!res.ok)throw new HttpError(res.status,"could not bootstrap workspace membership");try{data=await res.json();}catch{throw new HttpError(502,"invalid response from hub");}}
   if(!data||typeof data!=="object"||!("member" in data))throw new HttpError(502,"invalid response from hub");
-  if(!data.member||data.member.state!=="active"){if(selected)try{await clearActiveTenant();}catch{}throw new HttpError(403,"not an active member of this workspace");}
-  return {tenant,userId,memberId:data.member.id,email:data.member.email,role:data.member.role,isAdmin:data.member.role!=="member"};
+  if(data.member===null){if(selected)try{await clearActiveTenant();}catch{}throw new HttpError(403,"not an active member of this workspace");}
+  if(typeof data.member!=="object"||Array.isArray(data.member))throw new HttpError(502,"invalid response from hub");
+  const { id, email, role, state } = data.member;
+  if (
+    typeof id !== "string" || !id ||
+    typeof email !== "string" || !email ||
+    (role !== "owner" && role !== "admin" && role !== "member") ||
+    (state !== "active" && state !== "invited" && state !== "disabled")
+  ) {
+    throw new HttpError(502, "invalid response from hub");
+  }
+  if(state!=="active"){if(selected)try{await clearActiveTenant();}catch{}throw new HttpError(403,"not an active member of this workspace");}
+  return {tenant,userId,memberId:id,email,role,isAdmin:role!=="member"};
 }
 export const resolveTenant = process.env.NODE_ENV === "test" ? resolveTenantUncached : cache(resolveTenantUncached);
 export async function requireAdmin():Promise<ResolvedTenant>{const ctx=await resolveTenant();if(!ctx.isAdmin)throw new HttpError(403,"admin role required");return ctx;}
@@ -114,24 +126,64 @@ export async function revokeSessions(): Promise<Response> {
   return hubFetchAs(ctx.tenant, "/api/sessions-revoke", { method: "POST", body: "{}" });
 }
 
-/** Throw 500 unless `hubUrl` is https: or a localhost/127.0.0.1 dev URL. Guards
- *  against a misconfigured cleartext HUB_URL leaking the service secret +
- *  signed assertion. Fail-closed: an unparseable URL is rejected too. */
-function assertSecureHubUrl(hubUrl: string): void {
+/** Return a canonical origin, or throw unless `hubUrl` is https: or a
+ *  localhost/127.0.0.1 dev URL. Credentials and URL suffixes are refused so
+ *  every authenticated request is built against an unambiguous origin. */
+function normalizeHubUrl(hubUrl: string): string {
   let u: URL;
   try {
     u = new URL(hubUrl);
   } catch {
     throw new HttpError(500, "HUB_URL is not a valid URL");
   }
-  if (u.protocol === "https:") return;
+  if (u.username || u.password || u.search || u.hash || (u.pathname && u.pathname !== "/")) {
+    throw new HttpError(500, "HUB_URL must be an origin without credentials, path, query, or fragment");
+  }
+  if (u.protocol === "https:") return u.origin;
   const isLocalhost =
     u.hostname === "localhost" ||
     u.hostname === "127.0.0.1" ||
     u.hostname === "[::1]" ||
     u.hostname === "::1";
-  if (u.protocol === "http:" && isLocalhost) return;
+  if (u.protocol === "http:" && isLocalhost) return u.origin;
   throw new HttpError(500, "HUB_URL must be https (or http on localhost)");
+}
+
+function validateHubRequestIdentity(value: string, label: string): void {
+  if (!validTenantId(value)) throw new HttpError(500, `invalid ${label}`);
+}
+
+function validateHubPath(path: string): void {
+  if (
+    !path.startsWith("/") ||
+    path.startsWith("//") ||
+    path.includes("\\") ||
+    path.includes("#") ||
+    /[\u0000-\u001f\u007f]/.test(path)
+  ) {
+    throw new HttpError(500, "invalid hub path");
+  }
+  const rawPathname = path.split("?", 1)[0];
+  for (const rawSegment of rawPathname.split("/")) {
+    let segment: string;
+    try {
+      segment = decodeURIComponent(rawSegment);
+    } catch {
+      throw new HttpError(500, "invalid hub path");
+    }
+    // WHATWG URLs normalize literal and percent-encoded dot segments, and
+    // treat backslashes as separators. Refuse both so a nominal /api/* call
+    // cannot be rewritten to another endpoint. Percent-encoded forward slashes
+    // remain allowed because stable resource ids intentionally contain them.
+    if (
+      segment === "." ||
+      segment === ".." ||
+      segment.includes("\\") ||
+      /[\u0000-\u001f\u007f]/.test(segment)
+    ) {
+      throw new HttpError(500, "invalid hub path");
+    }
+  }
 }
 
 /**
@@ -170,21 +222,25 @@ export async function hubFetchAs(
   // override would leak them on the wire. Allow https: always, and plain http
   // only for a localhost/127.0.0.1 dev hub. Reject everything else regardless
   // of how HUB_URL was set.
-  assertSecureHubUrl(hubUrl);
+  const hubOrigin = normalizeHubUrl(hubUrl);
+  validateHubRequestIdentity(tenant, "tenant id");
+  validateHubPath(path);
 
   const headers = new Headers(init.headers);
   headers.set("X-Finch-Service", serviceSecret);
   // Bind the tenant cryptographically: sign {tenant,exp} with the service
   // secret. The hub verifies this and ignores any raw X-Finch-Tenant.
   headers.set("X-Finch-Auth", await signAssertion(tenant, serviceSecret));
-  if (init.body && !headers.has("content-type")) {
+  if (init.body != null && !headers.has("content-type")) {
     headers.set("content-type", "application/json");
   }
 
-  return fetch(`${hubUrl}${path}`, { ...init, headers });
+  // Control endpoints must never redirect: custom auth headers can otherwise
+  // cross a trust boundary depending on the runtime's redirect implementation.
+  return fetch(`${hubOrigin}${path}`, { ...init, headers, redirect: "error" });
 }
 
-export async function userFetch(clerkUserId:string,path:string,init:RequestInit={}):Promise<Response>{const hubUrl=await runtimeEnv("HUB_URL"),secret=await runtimeEnv("FINCH_SERVICE_SECRET");if(!hubUrl||!secret)throw new HttpError(500,"hub is not configured");assertSecureHubUrl(hubUrl);const headers=new Headers(init.headers);headers.set("X-Finch-Service",secret);headers.set("X-Finch-Auth",await signAssertion(clerkUserId,secret,undefined,"user"));if(init.body&&!headers.has("content-type"))headers.set("content-type","application/json");return fetch(`${hubUrl}${path}`,{...init,headers});}
+export async function userFetch(clerkUserId:string,path:string,init:RequestInit={}):Promise<Response>{const hubUrl=await runtimeEnv("HUB_URL"),secret=await runtimeEnv("FINCH_SERVICE_SECRET");if(!hubUrl||!secret)throw new HttpError(500,"hub is not configured");const hubOrigin=normalizeHubUrl(hubUrl);validateHubRequestIdentity(clerkUserId,"Clerk user id");validateHubPath(path);const headers=new Headers(init.headers);headers.set("X-Finch-Service",secret);headers.set("X-Finch-Auth",await signAssertion(clerkUserId,secret,undefined,"user"));if(init.body!=null&&!headers.has("content-type"))headers.set("content-type","application/json");return fetch(`${hubOrigin}${path}`,{...init,headers,redirect:"error"});}
 
 // ---- access sharing helpers -----------------------------------------------
 // Thin typed wrappers over the hub's /api/access* + /api/acl surface, shared
@@ -217,21 +273,6 @@ export async function listAccessAs(
   const res = await hubFetchAs(tenant, "/api/access", { method: "GET" });
   if (!res.ok) throw new HttpError(res.status, "could not list access");
   return (await res.json()) as { requests: AccessRow[]; grants: AccessGrant[] };
-}
-
-/** Transition an access-request row's status in the tenant DO. */
-export async function setAccessStatusAs(
-  tenant: string,
-  id: string,
-  status: AccessRow["status"],
-  resolvedBy: string,
-  resolvedByUserId?: string,
-): Promise<void> {
-  const res = await hubFetchAs(tenant, "/api/access/status", {
-    method: "POST",
-    body: JSON.stringify({ id, status, resolvedBy, ...(resolvedByUserId ? { resolvedByUserId } : {}) }),
-  });
-  if (!res.ok) throw new HttpError(res.status, "could not update access request");
 }
 
 /** Ensure a user→service ACL grant exists. Idempotence lives in the DO's
