@@ -213,4 +213,33 @@ if (env === "staging" || env === "production") {
   }
 }
 
+// The legacy-grantedTo repair is a CROSS-FILE contract: TenantDO.memberContext
+// can only stamp the canonical principal onto pre-upgrade access requests if
+// /api/user/sync hands it the identity's verified emails. Nothing in the type
+// system ties the two together — `emails` is read off an untyped op payload —
+// and no test exercises the HTTP route, which needs Clerk auth. Drop the
+// argument and the repair silently becomes dead code, leaving revokeAccess
+// stripping the wrong principal on exactly the rows it was written for: a
+// revocation that reports success and revokes nothing.
+//
+// So the seam is asserted here, where a broken wiring blocks the DEPLOY rather
+// than merely failing a test. Same rationale as web's viewerScoped gate.
+//
+// Matched exactly rather than by scanning for the nearest "memberContext":
+// /api/user/sync makes TWO such calls, and the first (the personal-tenant
+// bootstrap, which passes `email: body.primaryEmail`) is not the one that
+// reaches established memberships.
+{
+  const api = readFileSync(join(root, "src", "api.ts"), "utf8");
+  const start = api.indexOf('path==="/api/user/sync"');
+  const sync = start === -1 ? "" : api.slice(start, api.indexOf('path==="/api/tenant-create"', start));
+  if (!sync.includes('"memberContext",{clerkUserId,emails}')) {
+    fail(
+      "/api/user/sync no longer passes `emails` to memberContext; the legacy " +
+        "AccessRequest.grantedTo backfill (TenantDO.backfillGrantedTo) would be dead code " +
+        "and revokeAccess would keep stripping the alias instead of the canonical principal.",
+    );
+  }
+}
+
 console.log(`finch deploy-preflight OK for --env ${env} (no dev-secret/vars leak, fail-closed invariants hold).`);

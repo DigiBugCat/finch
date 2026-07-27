@@ -231,7 +231,7 @@ export class TenantDO extends DurableObject<Env> {
       switch (op) {
         case "getState":
           return ok(await this.getState(a.viewer));
-        case "memberContext": return ok(await this.memberContext(a.clerkUserId, a.email));
+        case "memberContext": return ok(await this.memberContext(a.clerkUserId, a.email, a.emails));
         case "ensureOwner": return ok(await this.ensureOwner(a.clerkUserId, a.email));
         case "inviteMember": return this.opResponse(await this.inviteMember(a.email,a.role,a.actor));
         case "bindIdentity": return this.opResponse(await this.bindIdentity(a.clerkUserId,a.emails,a.source));
@@ -1814,10 +1814,75 @@ export class TenantDO extends DurableObject<Env> {
     s.tenantMeta={id:this.tenantId(),kind:"personal",displayName:this.tenantId(),createdAt:now,bootstrappedFrom:"legacy-personal",membershipVersion:1}; s.members=[member]; this.rewriteYou(s,em);
     this.log(s,{cat:"access",actor:member.id,action:"bootstrapped workspace",target:em,ip:"",svc:""}); await this.save(s); return {member,tenantMeta:s.tenantMeta};
   }
-  private async memberContext(clerkUserId: unknown, email?: unknown): Promise<any> {
-    const uid=typeof clerkUserId==="string"?clerkUserId:""; const s=await this.load();
-    if(!s.tenantMeta&&uid===this.tenantId()) { if(typeof email==="string"&&email) return this.ensureOwner(uid,email); return {member:null,tenantMeta:null,needsBootstrap:true}; }
-    const m=s.members.find(x=>x.clerkUserId===uid); return {member:m?{id:m.id,role:m.role,state:m.state,email:m.email}:null,tenantMeta:s.tenantMeta??null};
+  /** Resolve this identity's membership in this tenant.
+   *
+   *  `emails` is every address VERIFIED on the identity, and is supplied by
+   *  /api/user/sync. It is only used to repair legacy `grantedTo` — see
+   *  backfillGrantedTo for why this method, rather than bindIdentity, is where
+   *  that has to happen. Callers that omit it (portal-grant, the org adapter)
+   *  get the same read-only behaviour as before. */
+  private async memberContext(
+    clerkUserId: unknown,
+    email?: unknown,
+    emails?: unknown,
+  ): Promise<any> {
+    const uid = typeof clerkUserId === "string" ? clerkUserId : "";
+    const s = await this.load();
+    if (!s.tenantMeta && uid === this.tenantId()) {
+      if (typeof email === "string" && email) return this.ensureOwner(uid, email);
+      return { member: null, tenantMeta: null, needsBootstrap: true };
+    }
+    const m = s.members.find((x) => x.clerkUserId === uid);
+    if (m && Array.isArray(emails) && (await this.backfillGrantedTo(s, m, emails))) {
+      await this.save(s);
+    }
+    return {
+      member: m ? { id: m.id, role: m.role, state: m.state, email: m.email } : null,
+      tenantMeta: s.tenantMeta ?? null,
+    };
+  }
+
+  /** Stamp the canonical principal onto legacy `granted` access requests.
+   *
+   *  A row granted by the old code carries no `grantedTo`, and for an
+   *  alias-bound one the ACL rule already sits on the member's CANONICAL
+   *  email — so revokeAccess's fallback to `r.email` picks the alias and
+   *  revokes nothing, which is the original bug reproduced through the fix's
+   *  own fallback.
+   *
+   *  It cannot be inferred from the row: the alias's duplicate member row was
+   *  folded away at bind time, so nothing in stored state links the two
+   *  addresses. The verified-email list on the identity is the only remaining
+   *  link, which means the repair has to run somewhere that has it.
+   *
+   *  That is NOT bindIdentity. /api/user/sync (api.ts) calls bindIdentity only
+   *  for tenants returned by invitesForEmails, and the old alias flow already
+   *  consumed the invitation and cleared its pointer — so a legacy alias-bound
+   *  member never enters that loop again, and a repair placed there would be
+   *  dead code for exactly the rows it targets. Established memberships are
+   *  reached through memberContext, which sync calls for EVERY membership on
+   *  EVERY sign-in. Hence here.
+   *
+   *  Writes only when something actually changed, so the steady state is a
+   *  scan and no save. */
+  private async backfillGrantedTo(
+    s: StoredState,
+    member: TenantMember,
+    emails: unknown[],
+  ): Promise<boolean> {
+    const verified = new Set(
+      emails.filter((e): e is string => typeof e === "string").map(normalizeEmail),
+    );
+    if (!verified.size) return false;
+    const canonical = normalizeEmail(member.email);
+    let changed = false;
+    for (const r of s.accessRequests) {
+      if (r.status !== "granted" || r.grantedTo === canonical) continue;
+      if (!verified.has(normalizeEmail(r.email))) continue;
+      r.grantedTo = canonical;
+      changed = true;
+    }
+    return changed;
   }
   private async inviteMember(email:unknown,role:unknown,actor:any):Promise<any>{
     const em=typeof email==="string"?normalizeEmail(email):""; if(!em||!['admin','member'].includes(String(role))) return {error:"invalid email or role",status:400};

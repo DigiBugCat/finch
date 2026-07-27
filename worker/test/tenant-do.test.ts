@@ -1446,7 +1446,7 @@ describe("TenantDO — repairing state that predates the fix", () => {
     expect(fresh.src.name).toBe("you");
   });
 
-  it("backfills grantedTo on a legacy alias-bound grant at the next bind", async () => {
+  it("backfills grantedTo on a legacy alias-bound grant at the next sign-in", async () => {
     const t = freshTenant();
     await op(t, "enroll", { name: "Scraper" });
     const boot = await op<any>(t, "bootstrapMembers", {
@@ -1489,12 +1489,15 @@ describe("TenantDO — repairing state that predates the fix", () => {
       await instance.ctx.storage.put("state", s);
     });
 
-    // The next ordinary sign-in repairs it: binding is the only place that
-    // still knows the alias and the canonical address are the same person.
-    await op(t, "bindIdentity", {
+    // The next ordinary sign-in repairs it. Crucially this uses the op that
+    // /api/user/sync actually calls for an ESTABLISHED membership --
+    // memberContext -- not bindIdentity: sync only binds tenants that still
+    // have a PENDING invite, and this member's invitation was consumed at the
+    // original bind and its pointer cleared. A repair hung off bindIdentity
+    // would never run for exactly these rows.
+    await op(t, "memberContext", {
       clerkUserId: "u_alias",
       emails: ["canonical@example.com", "alias@example.com"],
-      source: "sync",
     });
 
     const rev = await op<any>(t, "revokeAccess", { id: req.request.id, actor });
@@ -1502,4 +1505,5 @@ describe("TenantDO — repairing state that predates the fix", () => {
     expect(rev.removed).toBe(true);
     expect(await reaches(t, "canonical@example.com")).toBe(false);
   });
+
 });
