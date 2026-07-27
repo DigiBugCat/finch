@@ -200,6 +200,19 @@ export interface AccessRequest {
   resolvedBy?: string;
   resolvedByUserId?: string;
   resolvedAt?: number; // epoch ms
+  // The email the ACL rule for this request was actually installed under.
+  //
+  // Normally identical to `email`. It differs when the request was raised
+  // against an ALIAS of a member who is (or becomes) bound under a different
+  // canonical address: identity binding grants the service to the member's
+  // canonical email, because that is what gateBrowser evaluates. Revocation
+  // must then strip the rule under the CANONICAL email — searching the alias
+  // finds nothing and silently leaves access in place.
+  //
+  // Optional because rows written before this field existed do not carry it;
+  // revokeAccess falls back to `email`, which for those rows is what the
+  // grant path used at the time.
+  grantedTo?: string;
 }
 
 export interface Group {

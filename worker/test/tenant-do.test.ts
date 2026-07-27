@@ -1286,3 +1286,311 @@ describe("TenantDO.boxExists — /refresh revocation gate", () => {
     expect(state.host).toBe("demo-team.finchmcp.com");
   });
 });
+
+// REGRESSION (P1, Codex round 3): two ways a principal kept access after the
+// dashboard reported it taken away. Both are privilege RETENTION -- the UI says
+// success, the ACL disagrees -- so both assert through the door gate
+// (checkUserAccess), never through the response shape alone.
+describe("TenantDO — revocation actually revokes", () => {
+  async function teamWithOwner(t: string, extra: any[] = []) {
+    const boot = await op<any>(t, "bootstrapMembers", {
+      kind: "team",
+      displayName: "Fleet",
+      bootstrappedFrom: "fresh",
+      claimantClerkUserId: "u_owner",
+      members: [
+        { clerkUserId: "u_owner", email: "owner@example.com", role: "owner", state: "active" },
+        ...extra,
+      ],
+    });
+    return boot.members;
+  }
+
+  const reaches = async (t: string, user: string, service = "scraper") =>
+    (await op<any>(t, "checkUserAccess", { user, service })).allowed;
+
+  it("revokes an alias-bound grant under the member's canonical identity", async () => {
+    const t = freshTenant();
+    await op(t, "enroll", { name: "Scraper" });
+    const [owner] = await teamWithOwner(t);
+    const actor = { memberId: owner.id, clerkUserId: "u_owner", label: "owner@example.com" };
+
+    // 1. The person is ALREADY bound under their canonical address.
+    await op(t, "inviteMember", { email: "canonical@example.com", role: "member", actor });
+    await op(t, "bindIdentity", {
+      clerkUserId: "u_alias",
+      emails: ["canonical@example.com"],
+      source: "sync",
+    });
+
+    // 2. A request arrives naming an ALIAS of that same person. Approval cannot
+    //    know they are the same yet, so it parks an invitation on the alias.
+    const req = await op<any>(t, "requestAccess", {
+      email: "alias@example.com",
+      service: "scraper",
+      requestedBy: "self",
+    });
+    await op(t, "approveAccess", { id: req.request.id, actor });
+
+    // 3. The alias is verified on the identity. Binding folds the duplicate
+    //    invitation in and grants the service under the CANONICAL email --
+    //    which is the principal the door evaluates.
+    await op(t, "bindIdentity", {
+      clerkUserId: "u_alias",
+      emails: ["canonical@example.com", "alias@example.com"],
+      source: "sync",
+    });
+    expect(await reaches(t, "canonical@example.com")).toBe(true);
+
+    // Revoking by request id used to strip the ALIAS: it removed nothing, and
+    // the "still granted by a broader rule" guard evaluated that same wrong
+    // email so it did not fire either. The caller saw ok:true, the row flipped
+    // to denied, and the member kept the service.
+    const rev = await op<any>(t, "revokeAccess", { id: req.request.id, actor });
+    expect(rev.ok).toBe(true);
+    expect(rev.removed).toBe(true); // an ACL rule was actually found
+    expect(rev.denied).toBe(1); // and the request row was resolved
+
+    expect(await reaches(t, "canonical@example.com")).toBe(false);
+    expect(await reaches(t, "alias@example.com")).toBe(false);
+  });
+
+  // bootstrap rewrites the locked `r_owner` rule (user -> all) onto the
+  // bootstrapping owner's email, and nothing moved it again. stripGrants skips
+  // locked rules by design, so losing ownership left a LOCKED grant to EVERY
+  // service sitting on that address -- which gateBrowser, gateOauth and the
+  // dashboard's viewer filter all honour. The role badge changed; the access
+  // did not.
+  for (const how of ["demote", "disable", "remove"] as const) {
+    it(`moves the locked owner grant off an owner on ${how}`, async () => {
+      const t = freshTenant();
+      await op(t, "enroll", { name: "Scraper" });
+      const [first, second] = await teamWithOwner(t, [
+        { clerkUserId: "u_second", email: "second@example.com", role: "owner", state: "active" },
+      ]);
+      const actor = { memberId: second.id, clerkUserId: "u_second" };
+      expect(await reaches(t, "owner@example.com")).toBe(true);
+
+      const call =
+        how === "demote"
+          ? op<any>(t, "setMemberRole", { memberId: first.id, role: "member", actor })
+          : how === "disable"
+            ? op<any>(t, "setMemberState", { memberId: first.id, state: "disabled", actor })
+            : op<any>(t, "removeMember", { memberId: first.id, actor });
+      expect((await call).ok).toBe(true);
+
+      expect(await reaches(t, "owner@example.com")).toBe(false);
+      // REASSIGNED, not deleted: the remaining owner must not be locked out of
+      // their own tenant.
+      expect(await reaches(t, "second@example.com")).toBe(true);
+      const locked = (await op<any>(t, "getState")).acl.find((r: any) => r.id === "r_owner");
+      expect(locked.locked).toBe(true);
+      expect(locked.src.name).toBe("second@example.com");
+    });
+  }
+});
+
+// REGRESSION (P1, Codex round 4): the two fixes above were FORWARD-ONLY. They
+// corrected new transitions and newly granted rows, but every tenant already
+// carrying the broken state -- which is the entire installed base, since both
+// bugs shipped long ago -- would have kept it. A fix that repairs nothing that
+// is already wrong does not close a live privilege-retention hole.
+describe("TenantDO — repairing state that predates the fix", () => {
+  const stubFor = (t: string) => env.TENANT.get(env.TENANT.idFromName(t));
+  const runInDO = runInDurableObject as unknown as (
+    target: ReturnType<typeof stubFor>,
+    callback: (instance: any) => unknown,
+  ) => Promise<any>;
+
+  const reaches = async (t: string, user: string, service = "scraper") =>
+    (await op<any>(t, "checkUserAccess", { user, service })).allowed;
+
+  it("moves a locked owner grant already stranded on a non-owner", async () => {
+    const t = freshTenant();
+    await op(t, "enroll", { name: "Scraper" });
+    await op<any>(t, "bootstrapMembers", {
+      kind: "team",
+      displayName: "Fleet",
+      bootstrappedFrom: "fresh",
+      claimantClerkUserId: "u_owner",
+      members: [
+        { clerkUserId: "u_owner", email: "owner@example.com", role: "owner", state: "active" },
+        { clerkUserId: "u_second", email: "second@example.com", role: "owner", state: "active" },
+      ],
+    });
+
+    // Exactly what a pre-upgrade DO holds: the demotion already happened under
+    // the old code, so the locked rule still names the demoted member and no
+    // future transition will ever revisit it.
+    await runInDO(stubFor(t), async (instance: any) => {
+      const s: any = await instance.ctx.storage.get("state");
+      s.members.find((m: any) => m.email === "owner@example.com").role = "member";
+      await instance.ctx.storage.put("state", s);
+    });
+
+    // load() normalizes in memory, so the very first read after deploy is
+    // already correct -- no migration, and the gates see it immediately.
+    expect(await reaches(t, "owner@example.com")).toBe(false);
+    expect(await reaches(t, "second@example.com")).toBe(true);
+    const locked = (await op<any>(t, "getState")).acl.find((r: any) => r.id === "r_owner");
+    expect(locked.src.name).toBe("second@example.com");
+  });
+
+  it("refuses to revoke a legacy row whose principal cannot be identified", async () => {
+    // The linkage is simply not in the state: an alias-bound grant sits on the
+    // member's canonical email, and the alias's own member row was folded away
+    // at bind time. No heuristic recovers it -- a verified email or a matching
+    // rule each show that some principal COULD be the one, never that it IS --
+    // and a wrong guess strips a bystander while the real grant survives,
+    // which is the silent failure this whole change removes. So refuse.
+    const t = freshTenant();
+    await op(t, "enroll", { name: "Scraper" });
+    const boot = await op<any>(t, "bootstrapMembers", {
+      kind: "team",
+      displayName: "Fleet",
+      bootstrappedFrom: "fresh",
+      claimantClerkUserId: "u_owner",
+      members: [
+        { clerkUserId: "u_owner", email: "owner@example.com", role: "owner", state: "active" },
+      ],
+    });
+    const owner = boot.members[0];
+    const actor = { memberId: owner.id, clerkUserId: "u_owner", label: "owner@example.com" };
+
+    await op(t, "inviteMember", { email: "canonical@example.com", role: "member", actor });
+    await op(t, "bindIdentity", {
+      clerkUserId: "u_alias",
+      emails: ["canonical@example.com"],
+      source: "sync",
+    });
+    const req = await op<any>(t, "requestAccess", {
+      email: "alias@example.com",
+      service: "scraper",
+      requestedBy: "self",
+    });
+    await op(t, "approveAccess", { id: req.request.id, actor });
+    await op(t, "bindIdentity", {
+      clerkUserId: "u_alias",
+      emails: ["canonical@example.com", "alias@example.com"],
+      source: "sync",
+    });
+
+    // Rewind to a pre-upgrade row: granted, no principal recorded.
+    await runInDO(stubFor(t), async (instance: any) => {
+      const s: any = await instance.ctx.storage.get("state");
+      delete s.accessRequests.find((r: any) => r.id === req.request.id).grantedTo;
+      await instance.ctx.storage.put("state", s);
+    });
+
+    const rev = await op<any>(t, "revokeAccess", { id: req.request.id, actor });
+    expect(rev.error).toContain("Rules tab");
+    expect(rev.ok).toBeUndefined();
+    // Critically: it must NOT have half-applied. The row is untouched and the
+    // access is intact, so the admin sees a true state to act on.
+    const row = (await op<any>(t, "listAccess")).requests.find(
+      (r: any) => r.id === req.request.id,
+    );
+    expect(row.status).toBe("granted");
+    expect(
+      (await op<any>(t, "checkUserAccess", { user: "canonical@example.com", service: "scraper" }))
+        .allowed,
+    ).toBe(true);
+
+    // The documented alternative works and is unambiguous: revoke the RULE.
+    const rule = (await op<any>(t, "getState")).acl.find(
+      (r: any) =>
+        !r.locked &&
+        r.src?.name === "canonical@example.com" &&
+        r.dst?.some((d: any) => d.name === "scraper"),
+    );
+    const byRule = await op<any>(t, "revokeAccess", { ruleId: rule.id, actor });
+    expect(byRule.ok).toBe(true);
+    expect(
+      (await op<any>(t, "checkUserAccess", { user: "canonical@example.com", service: "scraper" }))
+        .allowed,
+    ).toBe(false);
+  });
+
+  it("refuses uniformly — a member row for the email is not proof either", async () => {
+    // The alias may have been invited as its OWN member AFTER the grant went
+    // to someone else, which from stored state is indistinguishable from that
+    // member having been the grantee. So the existence of a member row is not
+    // a discriminator, and no legacy row gets a fallback.
+    const t = freshTenant();
+    await op(t, "enroll", { name: "Scraper" });
+    const boot = await op<any>(t, "bootstrapMembers", {
+      kind: "team",
+      displayName: "Fleet",
+      bootstrappedFrom: "fresh",
+      claimantClerkUserId: "u_owner",
+      members: [
+        { clerkUserId: "u_owner", email: "owner@example.com", role: "owner", state: "active" },
+        { clerkUserId: "u_plain", email: "plain@example.com", role: "member", state: "active" },
+      ],
+    });
+    const owner = boot.members[0];
+    const actor = { memberId: owner.id, clerkUserId: "u_owner", label: "owner@example.com" };
+    const req = await op<any>(t, "requestAccess", {
+      email: "plain@example.com",
+      service: "scraper",
+      requestedBy: "self",
+    });
+    await op(t, "approveAccess", { id: req.request.id, actor });
+    await runInDO(stubFor(t), async (instance: any) => {
+      const s: any = await instance.ctx.storage.get("state");
+      delete s.accessRequests.find((r: any) => r.id === req.request.id).grantedTo;
+      await instance.ctx.storage.put("state", s);
+    });
+
+    const rev = await op<any>(t, "revokeAccess", { id: req.request.id, actor });
+    expect(rev.error).toContain("Rules tab");
+    expect(
+      (await op<any>(t, "checkUserAccess", { user: "plain@example.com", service: "scraper" }))
+        .allowed,
+    ).toBe(true);
+  });
+
+  it("revokes a row granted by the current code by request id, as before", async () => {
+    // The refusal must not become the normal path: a row carrying grantedTo
+    // is unambiguous and keeps working exactly as it did.
+    const t = freshTenant();
+    await op(t, "enroll", { name: "Scraper" });
+    const boot = await op<any>(t, "bootstrapMembers", {
+      kind: "team",
+      displayName: "Fleet",
+      bootstrappedFrom: "fresh",
+      claimantClerkUserId: "u_owner",
+      members: [
+        { clerkUserId: "u_owner", email: "owner@example.com", role: "owner", state: "active" },
+        { clerkUserId: "u_plain", email: "plain@example.com", role: "member", state: "active" },
+      ],
+    });
+    const owner = boot.members[0];
+    const actor = { memberId: owner.id, clerkUserId: "u_owner", label: "owner@example.com" };
+    const req = await op<any>(t, "requestAccess", {
+      email: "plain@example.com",
+      service: "scraper",
+      requestedBy: "self",
+    });
+    await op(t, "approveAccess", { id: req.request.id, actor });
+
+    const rev = await op<any>(t, "revokeAccess", { id: req.request.id, actor });
+    expect(rev.ok).toBe(true);
+    expect(rev.removed).toBe(true);
+    expect(
+      (await op<any>(t, "checkUserAccess", { user: "plain@example.com", service: "scraper" }))
+        .allowed,
+    ).toBe(false);
+  });
+
+  it("leaves the locked grant alone when no active owner remains", async () => {
+    // The rule is the lockout backstop. With no heir, a stale grant beats an
+    // unreachable tenant -- and a pre-bootstrap tenant still carries the "you"
+    // placeholder, which must survive untouched.
+    const t = freshTenant();
+    await op(t, "enroll", { name: "Scraper" });
+    const fresh = (await op<any>(t, "getState")).acl.find((r: any) => r.id === "r_owner");
+    expect(fresh.src.name).toBe("you");
+  });
+
+});
