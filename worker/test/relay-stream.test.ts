@@ -292,13 +292,18 @@ describe("BoxDO streaming relay — head + chunks + end", () => {
     expect(await res.text()).toBe("hello");
   });
 
-  it("confines agent Set-Cookie to the request host and keeps host-only cookies", async () => {
+  it("strips every agent Set-Cookie Domain attribute, including one naming the request host", async () => {
     // The box agent is customer-operated, so a `head` can carry
     // `Domain=finchmcp.com` — a cookie scoped to the SHARED parent domain, which
     // browsers would then send to the dashboard and to every sibling tenant's
     // <slug>.finchmcp.com (shadowing their host-only finch_session, and enabling
     // login-CSRF). Only the Domain attribute may be stripped; the cookie itself
     // and every other attribute must survive verbatim.
+    //
+    // `Domain=<the request host>` goes too. It is NOT a host-only cookie: an
+    // RFC 6265 domain-match covers subdomains, so it would still reach any
+    // nested custom hostname — which, ownership being unverified, may belong to
+    // a different tenant.
     const m = freshBox();
     const stub = stubFor(m);
     const agent = await connectAgent(stub, m);
@@ -322,10 +327,14 @@ describe("BoxDO streaming relay — head + chunks + end", () => {
           ["set-cookie", "finch_session=evil; Domain=finchmcp.com; Path=/; HttpOnly"],
           // Leading-dot legacy form of the same parent domain.
           ["set-cookie", "b=2; Domain=.FinchMcp.com; Path=/"],
-          // Exactly the request host — no broader than the box already is.
+          // Exactly the request host — still stripped: it would reach
+          // <anything>.acme.finchmcp.com, which a host-only cookie does not.
           ["set-cookie", "c=3; Domain=acme.finchmcp.com; Path=/"],
           // The ordinary legitimate case: host-only, untouched.
           ["set-cookie", "d=4; Path=/; HttpOnly; Secure; SameSite=Lax"],
+          // A descendant of the request host, which is the nesting case
+          // directly: it must not survive either.
+          ["set-cookie", "e=5; Domain=sub.acme.finchmcp.com; Path=/"],
         ],
       }),
     );
@@ -340,10 +349,12 @@ describe("BoxDO streaming relay — head + chunks + end", () => {
     expect(setCookies).toEqual([
       "finch_session=evil; Path=/; HttpOnly",
       "b=2; Path=/",
-      "c=3; Domain=acme.finchmcp.com; Path=/",
+      "c=3; Path=/",
       "d=4; Path=/; HttpOnly; Secure; SameSite=Lax",
+      "e=5; Path=/",
     ]);
-    expect(setCookies.join("\n")).not.toContain("Domain=finchmcp.com");
+    // No Domain attribute of any spelling survives the pass.
+    expect(setCookies.join("\n").toLowerCase()).not.toContain("domain=");
     expect(await res.text()).toBe("hello");
   });
 
