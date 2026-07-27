@@ -1286,3 +1286,106 @@ describe("TenantDO.boxExists — /refresh revocation gate", () => {
     expect(state.host).toBe("demo-team.finchmcp.com");
   });
 });
+
+// REGRESSION (P1, Codex round 3): two ways a principal kept access after the
+// dashboard reported it taken away. Both are privilege RETENTION -- the UI says
+// success, the ACL disagrees -- so both assert through the door gate
+// (checkUserAccess), never through the response shape alone.
+describe("TenantDO — revocation actually revokes", () => {
+  async function teamWithOwner(t: string, extra: any[] = []) {
+    const boot = await op<any>(t, "bootstrapMembers", {
+      kind: "team",
+      displayName: "Fleet",
+      bootstrappedFrom: "fresh",
+      claimantClerkUserId: "u_owner",
+      members: [
+        { clerkUserId: "u_owner", email: "owner@example.com", role: "owner", state: "active" },
+        ...extra,
+      ],
+    });
+    return boot.members;
+  }
+
+  const reaches = async (t: string, user: string, service = "scraper") =>
+    (await op<any>(t, "checkUserAccess", { user, service })).allowed;
+
+  it("revokes an alias-bound grant under the member's canonical identity", async () => {
+    const t = freshTenant();
+    await op(t, "enroll", { name: "Scraper" });
+    const [owner] = await teamWithOwner(t);
+    const actor = { memberId: owner.id, clerkUserId: "u_owner", label: "owner@example.com" };
+
+    // 1. The person is ALREADY bound under their canonical address.
+    await op(t, "inviteMember", { email: "canonical@example.com", role: "member", actor });
+    await op(t, "bindIdentity", {
+      clerkUserId: "u_alias",
+      emails: ["canonical@example.com"],
+      source: "sync",
+    });
+
+    // 2. A request arrives naming an ALIAS of that same person. Approval cannot
+    //    know they are the same yet, so it parks an invitation on the alias.
+    const req = await op<any>(t, "requestAccess", {
+      email: "alias@example.com",
+      service: "scraper",
+      requestedBy: "self",
+    });
+    await op(t, "approveAccess", { id: req.request.id, actor });
+
+    // 3. The alias is verified on the identity. Binding folds the duplicate
+    //    invitation in and grants the service under the CANONICAL email --
+    //    which is the principal the door evaluates.
+    await op(t, "bindIdentity", {
+      clerkUserId: "u_alias",
+      emails: ["canonical@example.com", "alias@example.com"],
+      source: "sync",
+    });
+    expect(await reaches(t, "canonical@example.com")).toBe(true);
+
+    // Revoking by request id used to strip the ALIAS: it removed nothing, and
+    // the "still granted by a broader rule" guard evaluated that same wrong
+    // email so it did not fire either. The caller saw ok:true, the row flipped
+    // to denied, and the member kept the service.
+    const rev = await op<any>(t, "revokeAccess", { id: req.request.id, actor });
+    expect(rev.ok).toBe(true);
+    expect(rev.removed).toBe(true); // an ACL rule was actually found
+    expect(rev.denied).toBe(1); // and the request row was resolved
+
+    expect(await reaches(t, "canonical@example.com")).toBe(false);
+    expect(await reaches(t, "alias@example.com")).toBe(false);
+  });
+
+  // bootstrap rewrites the locked `r_owner` rule (user -> all) onto the
+  // bootstrapping owner's email, and nothing moved it again. stripGrants skips
+  // locked rules by design, so losing ownership left a LOCKED grant to EVERY
+  // service sitting on that address -- which gateBrowser, gateOauth and the
+  // dashboard's viewer filter all honour. The role badge changed; the access
+  // did not.
+  for (const how of ["demote", "disable", "remove"] as const) {
+    it(`moves the locked owner grant off an owner on ${how}`, async () => {
+      const t = freshTenant();
+      await op(t, "enroll", { name: "Scraper" });
+      const [first, second] = await teamWithOwner(t, [
+        { clerkUserId: "u_second", email: "second@example.com", role: "owner", state: "active" },
+      ]);
+      const actor = { memberId: second.id, clerkUserId: "u_second" };
+      expect(await reaches(t, "owner@example.com")).toBe(true);
+
+      const call =
+        how === "demote"
+          ? op<any>(t, "setMemberRole", { memberId: first.id, role: "member", actor })
+          : how === "disable"
+            ? op<any>(t, "setMemberState", { memberId: first.id, state: "disabled", actor })
+            : op<any>(t, "removeMember", { memberId: first.id, actor });
+      expect((await call).ok).toBe(true);
+
+      expect(await reaches(t, "owner@example.com")).toBe(false);
+      // REASSIGNED, not deleted: the remaining owner must not be locked out of
+      // their own tenant.
+      expect(await reaches(t, "second@example.com")).toBe(true);
+      const locked = (await op<any>(t, "getState")).acl.find((r: any) => r.id === "r_owner");
+      expect(locked.locked).toBe(true);
+      expect(locked.src.name).toBe("second@example.com");
+    });
+  }
+});

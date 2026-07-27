@@ -1736,10 +1736,42 @@ export class TenantDO extends DurableObject<Env> {
   }
   private activeOwners(s: StoredState): TenantMember[] { return s.members.filter(m=>m.role==="owner"&&m.state==="active"); }
   private bump(s: StoredState): void { if(s.tenantMeta) s.tenantMeta.membershipVersion++; }
+  /** Replace the pre-membership placeholder principal ("you") with the real
+   *  owner's email, once a tenant gains its first identity. */
   private rewriteYou(s: StoredState, email: string): void {
-    const owner=s.acl.find(r=>r.id==="r_owner"&&r.locked); if(owner) owner.src={type:"user",name:email};
-    for(const k of s.keys) if(!k.owner||k.owner==="you") k.owner=email;
-    for(const g of s.groups) g.members=[...new Set(g.members.map(x=>x==="you"?email:x))];
+    const owner = s.acl.find((r) => r.id === "r_owner" && r.locked);
+    if (owner) owner.src = { type: "user", name: email };
+    for (const k of s.keys) {
+      if (!k.owner || k.owner === "you") k.owner = email;
+    }
+    for (const g of s.groups) {
+      g.members = [...new Set(g.members.map((x) => (x === "you" ? email : x)))];
+    }
+  }
+  /** Keep the locked `r_owner` rule (`user:<email> -> all`) pointed at someone
+   *  who is still an active OWNER.
+   *
+   *  That rule exists so an owner can never lock themselves out, and bootstrap
+   *  rewrites its `src` from the placeholder "you" to the bootstrapping owner's
+   *  email. Nothing then moved it again — so demoting that owner to `member`,
+   *  disabling them, or removing them left a LOCKED `-> all` grant sitting on
+   *  their address. gateBrowser, gateOauth and the dashboard's viewerFilter all
+   *  evaluate it, and stripGrants deliberately skips locked rules, so the
+   *  demotion changed the badge in the UI while the person kept every service
+   *  in the tenant. Keys owned by that email kept the same reach.
+   *
+   *  Every caller is already guarded by the last-active-owner check, so an
+   *  active owner other than `leaving` exists whenever this runs. If one
+   *  somehow does not, the rule is left ALONE rather than pointed at a
+   *  non-owner or blanked: an unreachable tenant is a worse failure than a
+   *  stale grant, and this is the lockout backstop. */
+  private reassignOwnerGrant(s: StoredState, leaving: TenantMember): void {
+    const rule = s.acl.find((r) => r.id === "r_owner" && r.locked);
+    if (!rule || rule.src.type !== "user") return;
+    if (normalizeEmail(rule.src.name ?? "") !== normalizeEmail(leaving.email)) return;
+    const heir = this.activeOwners(s).find((m) => m.id !== leaving.id);
+    if (!heir) return;
+    rule.src = { type: "user", name: normalizeEmail(heir.email) };
   }
   private async ensureOwner(clerkUserId: unknown, email: unknown): Promise<any> {
     const uid=typeof clerkUserId==="string"?clerkUserId:"", em=typeof email==="string"?normalizeEmail(email):"";
@@ -1760,13 +1792,128 @@ export class TenantDO extends DurableObject<Env> {
     const old=s.members.find(m=>normalizeEmail(m.email)===em); if(old){if(old.state==="disabled") return {error:"member is disabled; re-enable instead",status:409}; return {ok:true,member:old};}
     if(s.members.length>=MAX_MEMBERS)return {error:"member limit reached",status:409}; const now=Date.now(); const member:TenantMember={id:"m_"+crypto.randomUUID().slice(0,8),tenantId:this.tenantId(),clerkUserId:null,email:em,role:role as FinchRole,state:"invited",invitedBy:am.id,createdAt:now,updatedAt:now}; s.members.push(member);this.bump(s);this.log(s,{cat:"access",actor:am.id,action:"invited member",target:em,ip:"",svc:""});await this.save(s);return {ok:true,member};
   }
-  private addAclState(s:StoredState,email:string,service:string):void{const src={type:"user",name:normalizeEmail(email)} as AclEntity,dst={type:"service",name:service} as AclEntity;if(!s.acl.some(r=>!r.locked&&entEq(r.src,src)&&r.dst.some(d=>entEq(d,dst))))s.acl.push({id:"r_"+crypto.randomUUID().slice(0,8),src,dst:[dst],action:"allow"});}
-  private bindIdentityState(s:StoredState,uid:string,list:string[],source:unknown):any{
-    if(s.members.some(m=>m.state==="disabled"&&(m.clerkUserId===uid||list.includes(normalizeEmail(m.email)))))return {error:"member is disabled",status:409,save:false};
-    const conflict=s.members.find(m=>m.clerkUserId&&m.clerkUserId!==uid&&list.includes(normalizeEmail(m.email)));if(conflict){this.log(s,{cat:"access",actor:uid,action:"bind-conflict",target:`${conflict.id} <${conflict.email}>`,ip:"",svc:""});return {error:"email belongs to another identity",status:409,save:true};}
-    let member=s.members.find(m=>m.clerkUserId===uid); const matches=s.members.filter(m=>m.state==="invited"&&list.includes(normalizeEmail(m.email))); let changed=false; const consumed:string[]=[];
-    if(!member&&matches[0]) member=matches[0]; if(member){for(const dup of matches){if(dup!==member){s.members=s.members.filter(m=>m!==dup);changed=true;consumed.push(dup.email);}} if(member.clerkUserId!==uid||member.state!=="active"){member.clerkUserId=uid;member.state="active";member.boundAt=Date.now();member.updatedAt=Date.now();changed=true;consumed.push(member.email);} for(const r of s.accessRequests.filter(r=>r.status==="invited"&&list.includes(normalizeEmail(r.email)))){this.addAclState(s,member.email,r.service);r.status="granted";r.resolvedBy="identity-bind";r.resolvedAt=Date.now();changed=true;}}
-    if(changed){this.bump(s);this.log(s,{cat:"access",actor:uid,action:"bound identity",target:member?`${member.id} <${member.email}>`:String(source??"sync"),ip:"",svc:""});} return {ok:true,changed,member,consumedEmails:[...new Set(consumed)],staleInviteEmails:list.filter(e=>!matches.some(m=>normalizeEmail(m.email)===e)),save:changed};
+  /** Add a `user -> service` allow rule, unless an unlocked one already says
+   *  the same thing. Locked rules are ignored on purpose: they are the
+   *  bootstrap grants, not per-service ones. */
+  private addAclState(s: StoredState, email: string, service: string): void {
+    const src = { type: "user", name: normalizeEmail(email) } as AclEntity;
+    const dst = { type: "service", name: service } as AclEntity;
+    const exists = s.acl.some(
+      (r) => !r.locked && entEq(r.src, src) && r.dst.some((d) => entEq(d, dst)),
+    );
+    if (exists) return;
+    s.acl.push({
+      id: "r_" + crypto.randomUUID().slice(0, 8),
+      src,
+      dst: [dst],
+      action: "allow",
+    });
+  }
+
+  /** Attach a Clerk identity (`uid`) to this tenant's membership, given every
+   *  email VERIFIED on that identity (`list`).
+   *
+   *  Folds any invitations addressed to those emails into a single member row
+   *  and settles the access requests they were waiting on. Mutates `s` and
+   *  reports whether the caller must persist it (`save`). */
+  private bindIdentityState(
+    s: StoredState,
+    uid: string,
+    list: string[],
+    source: unknown,
+  ): any {
+    const named = (m: TenantMember) => list.includes(normalizeEmail(m.email));
+
+    // A disabled member is never re-admitted by signing in again; an admin
+    // must re-enable them explicitly.
+    if (s.members.some((m) => m.state === "disabled" && (m.clerkUserId === uid || named(m)))) {
+      return { error: "member is disabled", status: 409, save: false };
+    }
+
+    // One of these emails is already bound to a DIFFERENT identity. Logged
+    // (hence save:true) because it is the signature of an account takeover
+    // attempt as much as of an ordinary mistake.
+    const conflict = s.members.find((m) => m.clerkUserId && m.clerkUserId !== uid && named(m));
+    if (conflict) {
+      this.log(s, {
+        cat: "access",
+        actor: uid,
+        action: "bind-conflict",
+        target: `${conflict.id} <${conflict.email}>`,
+        ip: "",
+        svc: "",
+      });
+      return { error: "email belongs to another identity", status: 409, save: true };
+    }
+
+    // Prefer the row already bound to this identity; otherwise adopt an
+    // invitation addressed to one of its emails.
+    const invitations = s.members.filter((m) => m.state === "invited" && named(m));
+    const member = s.members.find((m) => m.clerkUserId === uid) ?? invitations[0];
+
+    let changed = false;
+    const consumed: string[] = [];
+
+    if (member) {
+      // Any OTHER invitation addressed to this same person is a duplicate of
+      // the row we just settled on.
+      for (const dup of invitations) {
+        if (dup === member) continue;
+        s.members = s.members.filter((m) => m !== dup);
+        consumed.push(dup.email);
+        changed = true;
+      }
+
+      if (member.clerkUserId !== uid || member.state !== "active") {
+        member.clerkUserId = uid;
+        member.state = "active";
+        member.boundAt = Date.now();
+        member.updatedAt = Date.now();
+        consumed.push(member.email);
+        changed = true;
+      }
+
+      // Access requests parked on any of these emails can now be granted.
+      for (const r of s.accessRequests) {
+        if (r.status !== "invited" || !list.includes(normalizeEmail(r.email))) continue;
+        this.addAclState(s, member.email, r.service);
+        // The request may name an ALIAS of this member — `list` is every
+        // verified email on the identity — while the grant necessarily goes to
+        // the canonical `member.email`, which is the principal gateBrowser
+        // evaluates. Record which of the two actually carries the rule, or
+        // revokeAccess later strips the alias, finds nothing, and reports
+        // success while the access survives. See AccessRequest.grantedTo.
+        r.grantedTo = normalizeEmail(member.email);
+        r.status = "granted";
+        r.resolvedBy = "identity-bind";
+        r.resolvedAt = Date.now();
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      this.bump(s);
+      this.log(s, {
+        cat: "access",
+        actor: uid,
+        action: "bound identity",
+        target: member ? `${member.id} <${member.email}>` : String(source ?? "sync"),
+        ip: "",
+        svc: "",
+      });
+    }
+    return {
+      ok: true,
+      changed,
+      member,
+      consumedEmails: [...new Set(consumed)],
+      // Emails on the identity that matched no invitation — the caller uses
+      // these to clear stale invite state upstream.
+      staleInviteEmails: list.filter(
+        (e) => !invitations.some((m) => normalizeEmail(m.email) === e),
+      ),
+      save: changed,
+    };
   }
   private async bindIdentity(clerkUserId:unknown,emails:unknown,source:unknown):Promise<any>{
     const uid=typeof clerkUserId==="string"?clerkUserId:"", list=Array.isArray(emails)?[...new Set(emails.filter((x):x is string=>typeof x==="string").map(normalizeEmail))]:[]; const s=await this.load();
@@ -1804,6 +1951,10 @@ export class TenantDO extends DurableObject<Env> {
     let m = s.members.find((x) => normalizeEmail(x.email) === em);
     if (m?.state === "active") {
       this.addAclState(s, m.email, r.service);
+      // `m` was found BY `em`, so these agree today; stamped anyway so every
+      // granted row carries the principal its rule was installed under and
+      // revokeAccess never has to infer it.
+      r.grantedTo = normalizeEmail(m.email);
       r.status = "granted";
     } else {
       if (!m) {
@@ -1907,7 +2058,14 @@ export class TenantDO extends DurableObject<Env> {
     if (requestId) {
       const r = s.accessRequests.find((candidate) => candidate.id === requestId);
       if (!r) return { error: "unknown access request", status: 404 };
-      email = normalizeEmail(r.email);
+      // Revoke the principal the rule was actually INSTALLED under, which is
+      // not always the one the request names: identity binding grants an
+      // alias's request to the member's canonical email. Stripping the alias
+      // instead removed nothing, and — because the "still granted by a broader
+      // rule" guard below also evaluates the same wrong email — it did not
+      // even trip that check. The caller saw {ok:true}, the row flipped to
+      // `denied`, and the member kept the service.
+      email = normalizeEmail(r.grantedTo || r.email);
       service = r.service;
     } else {
       const rule = s.acl.find((candidate) => candidate.id === grantId);
@@ -1944,7 +2102,12 @@ export class TenantDO extends DurableObject<Env> {
     let denied = 0;
     const resolvedAt = Date.now();
     for (const r of s.accessRequests) {
-      if (normalizeEmail(r.email) !== email || r.service !== service || r.status === "denied") {
+      // Match on the GRANT principal, falling back to the request's own email.
+      // `email` above is now the canonical one for an alias-bound row, so
+      // comparing `r.email` alone would skip the very request being revoked
+      // and leave it sitting in `granted` after its rule was stripped.
+      const principal = normalizeEmail(r.grantedTo || r.email);
+      if (principal !== email || r.service !== service || r.status === "denied") {
         continue;
       }
       r.status = "denied";
@@ -1966,8 +2129,72 @@ export class TenantDO extends DurableObject<Env> {
     }
     return { ok: true, removed, denied };
   }
-  private authority(s:StoredState,actor:any,target?:TenantMember,ownerEdge=false):TenantMember|any{const am=this.actorMember(s,actor);if(!am||am.role==="member")return {error:"admin role required",status:403};if((ownerEdge||target?.role==="owner")&&am.role!=="owner")return {error:"owner role required",status:403};return am;}
-  private async setMemberRole(memberId:unknown,role:unknown,actor:any):Promise<any>{if(!['owner','admin','member'].includes(String(role)))return {error:"invalid role",status:400};const s=await this.load(),t=s.members.find(m=>m.id===memberId);if(!t)return {error:"member not found",status:404};const am=this.authority(s,actor,t,t.role==="owner"||role==="owner");if(am.error)return am;if(t.role===role)return {ok:true,member:t};if(am.id===t.id&&!(t.role==="owner"&&role!=="owner"&&this.activeOwners(s).length>1))return {error:"cannot change own role",status:409};if(t.role==="owner"&&role!=="owner"&&this.activeOwners(s).length<=1)return {error:"last active owner",status:409};const prior=t.role;t.role=role as FinchRole;t.updatedAt=Date.now();this.bump(s);this.log(s,{cat:"access",actor:am.id,action:`changed member role ${prior} → ${t.role}`,target:`${t.id} <${t.email}>`,ip:"",svc:""});await this.save(s);return {ok:true,member:t};}
+  /** Resolve the acting member and check they outrank this operation.
+   *  `ownerEdge` marks operations that require owner even when the TARGET is
+   *  not currently an owner (notably: promoting someone TO owner). */
+  private authority(
+    s: StoredState,
+    actor: any,
+    target?: TenantMember,
+    ownerEdge = false,
+  ): TenantMember | any {
+    const am = this.actorMember(s, actor);
+    if (!am || am.role === "member") {
+      return { error: "admin role required", status: 403 };
+    }
+    if ((ownerEdge || target?.role === "owner") && am.role !== "owner") {
+      return { error: "owner role required", status: 403 };
+    }
+    return am;
+  }
+  private async setMemberRole(
+    memberId: unknown,
+    role: unknown,
+    actor: any,
+  ): Promise<any> {
+    if (!["owner", "admin", "member"].includes(String(role))) {
+      return { error: "invalid role", status: 400 };
+    }
+    const s = await this.load();
+    const t = s.members.find((m) => m.id === memberId);
+    if (!t) return { error: "member not found", status: 404 };
+
+    // Touching an owner — as the subject OR as the destination role — is an
+    // owner-only edge.
+    const am = this.authority(s, actor, t, t.role === "owner" || role === "owner");
+    if (am.error) return am;
+    if (t.role === role) return { ok: true, member: t };
+
+    const steppingDown =
+      t.role === "owner" && role !== "owner" && this.activeOwners(s).length > 1;
+    // You may not edit your own role, with one exception: stepping down from
+    // owner while another active owner remains.
+    if (am.id === t.id && !steppingDown) {
+      return { error: "cannot change own role", status: 409 };
+    }
+    if (t.role === "owner" && role !== "owner" && this.activeOwners(s).length <= 1) {
+      return { error: "last active owner", status: 409 };
+    }
+
+    const prior = t.role;
+    t.role = role as FinchRole;
+    t.updatedAt = Date.now();
+    // Demotion out of `owner` must also move the locked r_owner grant off
+    // them, or the role change is cosmetic — see reassignOwnerGrant.
+    if (prior === "owner" && role !== "owner") this.reassignOwnerGrant(s, t);
+
+    this.bump(s);
+    this.log(s, {
+      cat: "access",
+      actor: am.id,
+      action: `changed member role ${prior} → ${t.role}`,
+      target: `${t.id} <${t.email}>`,
+      ip: "",
+      svc: "",
+    });
+    await this.save(s);
+    return { ok: true, member: t };
+  }
   private stripGrants(s: StoredState, email: string): void {
     const principal = normalizeEmail(email);
     s.acl = s.acl.flatMap((rule) => {
@@ -1978,8 +2205,103 @@ export class TenantDO extends DurableObject<Env> {
       return dst.length ? [{ ...rule, dst }] : [];
     });
   }
-  private async setMemberState(memberId:unknown,state:unknown,revoke:boolean,actor:any):Promise<any>{if(state!=="active"&&state!=="disabled")return {error:"invalid state",status:400};const s=await this.load(),t=s.members.find(m=>m.id===memberId);if(!t)return {error:"member not found",status:404};if(t.state==="invited")return {error:"invited member must be canceled",status:409};const am=this.authority(s,actor,t);if(am.error)return am;if(t.state===state)return {ok:true,member:t};if(am.id===t.id)return {error:"cannot change own membership",status:409};if(state==="disabled"&&t.role==="owner"&&t.state==="active"&&this.activeOwners(s).length<=1)return {error:"last active owner",status:409};const prior=t.state;t.state=state;t.updatedAt=Date.now();if(state==="disabled")t.disabledAt=Date.now();else delete t.disabledAt;if(revoke)this.stripGrants(s,t.email);this.bump(s);this.log(s,{cat:"access",actor:am.id,action:`changed member state ${prior} → ${t.state}${revoke?" and revoked grants":""}`,target:`${t.id} <${t.email}>`,ip:"",svc:""});await this.save(s);return {ok:true,member:t};}
-  private async removeMember(memberId:unknown,revoke:boolean,actor:any):Promise<any>{const s=await this.load(),t=s.members.find(m=>m.id===memberId);if(!t)return {error:"member not found",status:404};const am=this.authority(s,actor,t);if(am.error)return am;if(am.id===t.id)return {error:"cannot change own membership",status:409};if(t.role==="owner"&&t.state==="active"&&this.activeOwners(s).length<=1)return {error:"last active owner",status:409};let removed="disabled";if(t.state==="invited"){s.members=s.members.filter(m=>m!==t);removed="canceled";}else{t.state="disabled";t.disabledAt=Date.now();t.updatedAt=Date.now();}if(revoke)this.stripGrants(s,t.email);this.bump(s);this.log(s,{cat:"access",actor:am.id,action:`${removed==="canceled"?"canceled invitation":"disabled member"}${revoke?" and revoked grants":""}`,target:`${t.id} <${t.email}>`,ip:"",svc:""});await this.save(s);return {ok:true,removed,member:t};}
+  private async setMemberState(
+    memberId: unknown,
+    state: unknown,
+    revoke: boolean,
+    actor: any,
+  ): Promise<any> {
+    if (state !== "active" && state !== "disabled") {
+      return { error: "invalid state", status: 400 };
+    }
+    const s = await this.load();
+    const t = s.members.find((m) => m.id === memberId);
+    if (!t) return { error: "member not found", status: 404 };
+    if (t.state === "invited") {
+      return { error: "invited member must be canceled", status: 409 };
+    }
+    const am = this.authority(s, actor, t);
+    if (am.error) return am;
+    if (t.state === state) return { ok: true, member: t };
+    if (am.id === t.id) return { error: "cannot change own membership", status: 409 };
+    if (
+      state === "disabled" &&
+      t.role === "owner" &&
+      t.state === "active" &&
+      this.activeOwners(s).length <= 1
+    ) {
+      return { error: "last active owner", status: 409 };
+    }
+
+    const prior = t.state;
+    t.state = state;
+    t.updatedAt = Date.now();
+    if (state === "disabled") t.disabledAt = Date.now();
+    else delete t.disabledAt;
+
+    // A disabled owner is no longer an ACTIVE owner, so the locked r_owner
+    // grant must not keep naming them; stripGrants skips locked rules by
+    // design and would leave it behind even when `revoke` is set. Runs after
+    // the state flip so activeOwners() cannot return them as their own heir.
+    if (state === "disabled" && t.role === "owner") this.reassignOwnerGrant(s, t);
+    if (revoke) this.stripGrants(s, t.email);
+
+    this.bump(s);
+    this.log(s, {
+      cat: "access",
+      actor: am.id,
+      action: `changed member state ${prior} → ${t.state}${revoke ? " and revoked grants" : ""}`,
+      target: `${t.id} <${t.email}>`,
+      ip: "",
+      svc: "",
+    });
+    await this.save(s);
+    return { ok: true, member: t };
+  }
+  private async removeMember(
+    memberId: unknown,
+    revoke: boolean,
+    actor: any,
+  ): Promise<any> {
+    const s = await this.load();
+    const t = s.members.find((m) => m.id === memberId);
+    if (!t) return { error: "member not found", status: 404 };
+    const am = this.authority(s, actor, t);
+    if (am.error) return am;
+    if (am.id === t.id) return { error: "cannot change own membership", status: 409 };
+    if (t.role === "owner" && t.state === "active" && this.activeOwners(s).length <= 1) {
+      return { error: "last active owner", status: 409 };
+    }
+
+    // An invitation is deleted outright; a member who ever signed in is
+    // disabled instead, so their id keeps resolving in the audit log.
+    let removed = "disabled";
+    if (t.state === "invited") {
+      s.members = s.members.filter((m) => m !== t);
+      removed = "canceled";
+    } else {
+      t.state = "disabled";
+      t.disabledAt = Date.now();
+      t.updatedAt = Date.now();
+    }
+
+    // Same reason as setMemberState: removal must not leave the locked owner
+    // grant sitting on the removed member's address.
+    if (t.role === "owner") this.reassignOwnerGrant(s, t);
+    if (revoke) this.stripGrants(s, t.email);
+
+    this.bump(s);
+    this.log(s, {
+      cat: "access",
+      actor: am.id,
+      action: `${removed === "canceled" ? "canceled invitation" : "disabled member"}${revoke ? " and revoked grants" : ""}`,
+      target: `${t.id} <${t.email}>`,
+      ip: "",
+      svc: "",
+    });
+    await this.save(s);
+    return { ok: true, removed, member: t };
+  }
   private async bootstrapMembers(a: any): Promise<any> {
     const s = await this.load();
     if (s.tenantMeta) {
