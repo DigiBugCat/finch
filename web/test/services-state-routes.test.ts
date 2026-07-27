@@ -473,8 +473,17 @@ describe("state route upstream corruption handling", () => {
     // ...and so does `overview`. It is computed by the hub over the services it
     // chose to return, so an unnarrowed hub makes it fleet-wide magnitudes —
     // the shape of an estate this branch exists to withhold.
-    expect(body.overview).toEqual({});
     expect(JSON.stringify(body)).not.toContain("4242");
+    expect(body.overview.total).toBe(0);
+    expect(body.overview.callsToday).toBe(0);
+    expect(body.overview.activeNow).toBe(0);
+    // ZEROED, NOT EMPTY. Observability is in a member's nav and home.tsx does
+    // ov.traffic24h.map(...) unguarded, so dropping the arrays would trade a
+    // data leak for a TypeError in the exact degraded state this branch serves.
+    expect(Array.isArray(body.overview.traffic24h)).toBe(true);
+    expect(body.overview.traffic24h).toEqual([]);
+    expect(Array.isArray(body.overview.latency24h)).toBe(true);
+    expect(body.overview.latency24h).toEqual([]);
     // The LOG goes with them. An un-narrowed logs[] re-supplies the same fleet
     // in prose — `device` rows are service/box pairs and `request` rows are
     // `${service} ${route}` + status, 500 deep — so emptying services[] while
