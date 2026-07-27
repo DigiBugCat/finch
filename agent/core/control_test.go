@@ -310,6 +310,21 @@ func TestRegisterRejectsRoutesOutsideTheUpstreamBasePath(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("rejected a route under the upstream base path: %v", err)
 	}
+	// And a route BROADER than the base path is servable too: /base/mcp and its
+	// children are children of the /base allowlist entry AND inside the /base/mcp
+	// confinement. The question is whether the two prefixes intersect, not
+	// whether the route root is itself reachable.
+	if _, err := r.Register(RegistrationRequest{
+		AppPath: "ok3", Upstream: "http://127.0.0.1:7342/base/mcp", Routes: []string{"/base"},
+	}); err != nil {
+		t.Fatalf("rejected a route that CONTAINS the upstream base path: %v", err)
+	}
+	// Sibling paths that merely share a textual prefix are still divergent.
+	if _, err := r.Register(RegistrationRequest{
+		AppPath: "bad2", Upstream: "http://127.0.0.1:7342/ab", Routes: []string{"/a"},
+	}); err == nil {
+		t.Fatal("accepted a route on a divergent branch (/a vs /ab)")
+	}
 	if _, err := r.Register(RegistrationRequest{
 		AppPath: "ok2", Upstream: "http://127.0.0.1:7342", Routes: []string{"/mcp"},
 	}); err != nil {

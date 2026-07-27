@@ -447,8 +447,23 @@ func validateRegistration(req RegistrationRequest) (RegistrationRequest, time.Du
 	// verbatim), and inventing a second path-composition rule inside the one
 	// function that must stay obviously correct would change relay semantics for
 	// existing static configs too.
+	// The question is whether the two prefixes INTERSECT, not whether the route
+	// root is itself servable. A route may legitimately be BROADER than the base
+	// path — upstream http://host/base/mcp with route /base serves /base/mcp and
+	// its children, passing both gates — and testing the route root alone would
+	// reject that.
+	//
+	// Probe the DEEPER of the two. If they lie on the same branch, the deeper
+	// path is under both and resolves; if they diverge, it fails at least one
+	// gate. That is exactly the intersection test, still answered by the relay's
+	// own resolver rather than by a second copy of the predicate.
+	prefix := strings.TrimRight(u.Path, "/")
 	for _, route := range req.Routes {
-		if _, err := resolveUpstreamWithRoutes(u, route, false, req.Routes); err != nil {
+		probe := route
+		if len(prefix) > len(probe) {
+			probe = prefix
+		}
+		if _, err := resolveUpstreamWithRoutes(u, probe, false, req.Routes); err != nil {
 			return req, 0, invalid(fmt.Sprintf("route %q can never be served by upstream %q: %v", route, req.Upstream, err))
 		}
 	}
