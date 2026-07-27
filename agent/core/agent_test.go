@@ -10,6 +10,8 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -209,6 +211,73 @@ func TestJoinRejectsMismatchedOrUnsafeAssignment(t *testing.T) {
 			t.Errorf("unsafe join assignment accepted: %+v", jr)
 		}
 		srv.Close()
+	}
+}
+
+// REGRESSION: the assignment check above compared the hub's echo against the
+// RAW requested name. The hub trims (cleanBox / cleanBoxName), so `--box
+// " My Mac "` produced a successful join whose echo ("My Mac") did not match
+// the raw request — and the client rejected it AFTER the hub had burned the
+// one-shot ticket, leaving a registered box the operator could no longer reach.
+func TestJoinNormalizesBoxNameBeforeSendingAndComparing(t *testing.T) {
+	var sent string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct{ Box string }
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		sent = body.Box
+		// What the hub does with the name: trim, then echo the stored form.
+		_ = json.NewEncoder(w).Encode(joinResp{
+			OK: true, Service: "media", Box: strings.TrimSpace(body.Box), ConnectToken: "token",
+		})
+	}))
+	defer srv.Close()
+
+	jr, err := joinContext(t.Context(), srv.URL, "ticket", "  My Mac  ")
+	if err != nil {
+		t.Fatalf("padded box name rejected its own successful join: %v", err)
+	}
+	if sent != "My Mac" {
+		t.Errorf("sent box name %q to the hub, want the normalized %q", sent, "My Mac")
+	}
+	if jr.Box != "My Mac" {
+		t.Errorf("assignment %q, want %q", jr.Box, "My Mac")
+	}
+}
+
+// A genuinely different assignment must still be rejected — normalizing the
+// comparison must not blunt the check that motivated it.
+func TestJoinStillRejectsDifferentBoxAfterNormalization(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(joinResp{
+			OK: true, Service: "media", Box: "someone-elses-box", ConnectToken: "token",
+		})
+	}))
+	defer srv.Close()
+	if _, err := joinContext(t.Context(), srv.URL, "ticket", "  My Mac  "); err == nil {
+		t.Error("a different box assignment was accepted")
+	}
+}
+
+// The DO admits MAX_STREAMS_PER_BOX concurrent streams per box; a smaller
+// agent-side cap is not extra safety but a hole — the DO accepts requests the
+// agent then answers with a terminal 429, so the advertised relay capacity is
+// unreachable. Read the worker's constant rather than restating it, so the two
+// cannot drift silently.
+func TestRelayInFlightLimitMatchesTheWorker(t *testing.T) {
+	src, err := os.ReadFile("../../worker/src/box-do.ts")
+	if err != nil {
+		t.Skipf("worker source not present: %v", err)
+	}
+	m := regexp.MustCompile(`MAX_STREAMS_PER_BOX\s*=\s*(\d+)`).FindSubmatch(src)
+	if m == nil {
+		t.Fatal("MAX_STREAMS_PER_BOX not found in worker/src/box-do.ts")
+	}
+	want, err := strconv.Atoi(string(m[1]))
+	if err != nil {
+		t.Fatalf("unparsable MAX_STREAMS_PER_BOX: %v", err)
+	}
+	if maxRelayInFlight != want {
+		t.Errorf("maxRelayInFlight = %d, but the DO admits %d streams per box", maxRelayInFlight, want)
 	}
 }
 
