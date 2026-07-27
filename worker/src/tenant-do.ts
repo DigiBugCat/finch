@@ -375,7 +375,7 @@ export class TenantDO extends DurableObject<Env> {
     const stored = await this.ctx.storage.get<any>("state");
     const base = this.fresh();
     if (!stored || typeof stored !== "object") return base;
-    return {
+    const s: StoredState = {
       ...base,
       ...stored,
       // normalize legacy state names ("chirping"/"resting") stored before the
@@ -411,6 +411,39 @@ export class TenantDO extends DurableObject<Env> {
       members: Array.isArray(stored.members) ? stored.members : [],
       tenantMeta: stored.tenantMeta && typeof stored.tenantMeta === "object" ? stored.tenantMeta : undefined,
     };
+    this.normalizeOwnerGrant(s);
+    return s;
+  }
+
+  /** Repair a locked `r_owner` rule that names someone who is no longer an
+   *  active owner.
+   *
+   *  reassignOwnerGrant fixes this at the moment ownership is lost, but only
+   *  for transitions that happen after it ships. A tenant whose owner was
+   *  demoted, disabled or removed BEFORE that — which is every tenant already
+   *  in this state — would otherwise keep the locked `-> all` grant on that
+   *  person forever, since nothing else ever revisits the rule.
+   *
+   *  So the invariant is enforced here, on every load, rather than only on the
+   *  transitions. This runs in memory before any caller sees the state, which
+   *  means the gates (gateBrowser, gateOauth, checkUserAccess) and the viewer
+   *  filter are all correct on the very first read after deploy — no migration
+   *  step, no write amplification, and it is idempotent, so re-running it costs
+   *  a scan and changes nothing. The corrected rule is persisted whenever any
+   *  op happens to save.
+   *
+   *  Leaves the rule ALONE when no active owner exists: pre-bootstrap tenants
+   *  still carry the "you" placeholder, and pointing the lockout backstop at a
+   *  non-owner (or blanking it) would be worse than a stale grant. */
+  private normalizeOwnerGrant(s: StoredState): void {
+    const rule = s.acl.find((r) => r.id === "r_owner" && r.locked);
+    if (!rule || rule.src.type !== "user") return;
+    const named = normalizeEmail(rule.src.name ?? "");
+    if (!named) return;
+    const owners = s.members.filter((m) => m.role === "owner" && m.state === "active");
+    if (!owners.length) return; // pre-bootstrap, or no heir — see above
+    if (owners.some((m) => normalizeEmail(m.email) === named)) return; // already correct
+    rule.src = { type: "user", name: normalizeEmail(owners[0].email) };
   }
 
   /** A brand-new tenant: empty roost, default settings, no mock seed data.
@@ -1874,7 +1907,26 @@ export class TenantDO extends DurableObject<Env> {
       }
 
       // Access requests parked on any of these emails can now be granted.
+      //
+      // `granted` rows are revisited too, to BACKFILL grantedTo. A row granted
+      // by the old code carries no principal, and for an alias-bound one the
+      // rule already sits on the canonical email — so revokeAccess's fallback
+      // to `r.email` would pick the alias and reproduce exactly the bug this
+      // field exists to fix. There is no way to infer the linkage from the row
+      // alone: the alias's duplicate member row was folded away at bind time.
+      // Identity binding is the one place that still knows an alias and a
+      // canonical address belong to the same person, so it is the only place
+      // the repair can happen. It runs on every sync, so a live identity is
+      // corrected the next time its owner signs in.
+      const canonical = normalizeEmail(member.email);
       for (const r of s.accessRequests) {
+        if (r.status === "granted") {
+          if (list.includes(normalizeEmail(r.email)) && r.grantedTo !== canonical) {
+            r.grantedTo = canonical;
+            changed = true;
+          }
+          continue;
+        }
         if (r.status !== "invited" || !list.includes(normalizeEmail(r.email))) continue;
         this.addAclState(s, member.email, r.service);
         // The request may name an ALIAS of this member — `list` is every
