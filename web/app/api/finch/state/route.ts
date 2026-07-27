@@ -163,6 +163,34 @@ function projectForMember(state: Record<string, unknown>): Record<string, unknow
     out.services = [];
     out.boxes = [];
     out.logs = [];
+    // `overview` is derived by the hub from the services it decided to return.
+    // An unnarrowed hub computes it over the WHOLE fleet, so passing it through
+    // would leak fleet-wide magnitudes — total, callsToday, activeNow, p50/p95,
+    // errRate, keysActive and the 24h charts — through the very branch that
+    // exists to withhold the fleet. No names or routes, but still the shape of
+    // an estate the member was fenced out of.
+    //
+    // ZEROED, NOT EMPTY. `{}` would withhold the data and then crash the very
+    // view it was meant to blank: Observability is in a member's nav and
+    // components/dash/home.tsx dereferences ov.traffic24h.map(...) (and
+    // ov.latency24h) unguarded, so an absent array throws a TypeError instead of
+    // rendering an empty dashboard. Keep the Overview shape whole and neutral.
+    // `latest` stays: it is the public latest-agent version, already served
+    // unnarrowed as state.latestAgent, and is not fleet data.
+    const priorOverview = isJsonObject(state.overview) ? state.overview : {};
+    out.overview = {
+      callsToday: 0,
+      callsDelta: 0,
+      activeNow: 0,
+      total: 0,
+      p50: 0,
+      p95: 0,
+      errRate: 0,
+      keysActive: 0,
+      traffic24h: [],
+      latency24h: [],
+      latest: typeof priorOverview.latest === "string" ? priorOverview.latest : "",
+    };
     return out;
   }
   if (Array.isArray(out.services)) {
