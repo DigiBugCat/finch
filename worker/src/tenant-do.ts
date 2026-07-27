@@ -2122,33 +2122,35 @@ export class TenantDO extends DurableObject<Env> {
       // even trip that check. The caller saw {ok:true}, the row flipped to
       // `denied`, and the member kept the service.
       //
-      // AMBIGUOUS LEGACY ROWS ARE REFUSED, NOT GUESSED. `grantedTo` is stamped
-      // at grant time, so any row written by the current code carries its
-      // principal. A row from before that does not, and the linkage is NOT
-      // recoverable from state: the alias's member row was folded away at bind
-      // time. The signature of that case is precise — a granted row whose email
-      // belongs to no member. (When a member DOES hold that email, the grant
-      // went to it by construction, so `r.email` is correct.)
+      // EVERY LEGACY ROW IS REFUSED. `grantedTo` is stamped at grant time, so
+      // a row written by the current code always names its principal. A row
+      // from before that does not, and the linkage is NOT recoverable: the
+      // alias's member row was folded away at bind time.
       //
-      // Refusing beats inferring. Every available heuristic — "this identity
-      // verified the alias", "this member holds a matching rule" — establishes
-      // only that some principal COULD be the one, and picking wrong makes
-      // revocation strip a bystander and report success while the real grant
-      // survives: the same silent failure this whole change exists to remove,
-      // relocated. An error is loud, and the admin has an exact alternative
-      // already in the product: revoke the rule itself by grant id (the
-      // `grantId` branch below), which names the principal unambiguously.
+      // No discriminator is applied, because none of them are proof — that is
+      // the whole lesson of this fix. "The identity verified the alias" fails
+      // when an alias moves between identities. "This member holds a matching
+      // rule" fails when they hold an independent grant to the same service.
+      // Even "a member exists with this email" fails: the alias may have been
+      // invited as its OWN member after the grant went to someone else, which
+      // is indistinguishable from that member having been the grantee. Each
+      // shows a principal COULD be the one, never that it IS, and picking
+      // wrong makes revocation strip a bystander and report success while the
+      // real grant survives — the exact silent failure this change removes,
+      // relocated onto a new victim.
+      //
+      // So: refuse, loudly, with a working alternative. Revoking the rule by
+      // grant id (the `grantId` branch below) already exists and names its
+      // principal unambiguously. The affected population is bounded and
+      // shrinking — no new row can be ambiguous.
       if (r.status === "granted" && r.grantedTo === undefined) {
-        const em = normalizeEmail(r.email);
-        if (!s.members.some((m) => normalizeEmail(m.email) === em)) {
-          return {
-            error:
-              "this grant predates per-request principal tracking and its rule cannot be " +
-              "identified from the request alone — revoke it from the Rules tab instead, " +
-              "where the rule names its principal directly",
-            status: 409,
-          };
-        }
+        return {
+          error:
+            "this grant predates per-request principal tracking, so the rule it created " +
+            "cannot be identified from the request alone — revoke it from the Rules tab " +
+            "instead, where the rule names its principal directly",
+          status: 409,
+        };
       }
       email = normalizeEmail(r.grantedTo || r.email);
       service = r.service;

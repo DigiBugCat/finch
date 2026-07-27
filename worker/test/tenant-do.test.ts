@@ -1511,10 +1511,11 @@ describe("TenantDO — repairing state that predates the fix", () => {
     ).toBe(false);
   });
 
-  it("still revokes a legacy row whose email belongs to a member", async () => {
-    // The ordinary legacy row -- no alias involved -- is NOT ambiguous: the
-    // grant went to r.email by construction, and a member holds that address.
-    // The refusal must not sweep these up.
+  it("refuses uniformly — a member row for the email is not proof either", async () => {
+    // The alias may have been invited as its OWN member AFTER the grant went
+    // to someone else, which from stored state is indistinguishable from that
+    // member having been the grantee. So the existence of a member row is not
+    // a discriminator, and no legacy row gets a fallback.
     const t = freshTenant();
     await op(t, "enroll", { name: "Scraper" });
     const boot = await op<any>(t, "bootstrapMembers", {
@@ -1540,6 +1541,38 @@ describe("TenantDO — repairing state that predates the fix", () => {
       delete s.accessRequests.find((r: any) => r.id === req.request.id).grantedTo;
       await instance.ctx.storage.put("state", s);
     });
+
+    const rev = await op<any>(t, "revokeAccess", { id: req.request.id, actor });
+    expect(rev.error).toContain("Rules tab");
+    expect(
+      (await op<any>(t, "checkUserAccess", { user: "plain@example.com", service: "scraper" }))
+        .allowed,
+    ).toBe(true);
+  });
+
+  it("revokes a row granted by the current code by request id, as before", async () => {
+    // The refusal must not become the normal path: a row carrying grantedTo
+    // is unambiguous and keeps working exactly as it did.
+    const t = freshTenant();
+    await op(t, "enroll", { name: "Scraper" });
+    const boot = await op<any>(t, "bootstrapMembers", {
+      kind: "team",
+      displayName: "Fleet",
+      bootstrappedFrom: "fresh",
+      claimantClerkUserId: "u_owner",
+      members: [
+        { clerkUserId: "u_owner", email: "owner@example.com", role: "owner", state: "active" },
+        { clerkUserId: "u_plain", email: "plain@example.com", role: "member", state: "active" },
+      ],
+    });
+    const owner = boot.members[0];
+    const actor = { memberId: owner.id, clerkUserId: "u_owner", label: "owner@example.com" };
+    const req = await op<any>(t, "requestAccess", {
+      email: "plain@example.com",
+      service: "scraper",
+      requestedBy: "self",
+    });
+    await op(t, "approveAccess", { id: req.request.id, actor });
 
     const rev = await op<any>(t, "revokeAccess", { id: req.request.id, actor });
     expect(rev.ok).toBe(true);
