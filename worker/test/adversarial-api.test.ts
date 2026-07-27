@@ -24,6 +24,74 @@ async function tenantOp<T>(tenant: string, op: string, args: Record<string, unkn
   return await res.json() as T;
 }
 
+/** A request body with NO content-length — the runtime sends it chunked, so the
+ *  declared-length pre-gates are all skipped and only a streaming reader can
+ *  bound it. `pulled` counts the chunks the Worker actually took: if it stays
+ *  far below `chunks`, the reader was cancelled mid-upload rather than the whole
+ *  body being materialized into the isolate first. */
+function chunkedBody(chunkBytes: number, chunks: number) {
+  const chunk = new Uint8Array(chunkBytes).fill(0x61); // "a"
+  const state = { pulled: 0 };
+  const body = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (state.pulled >= chunks) {
+        controller.close();
+        return;
+      }
+      state.pulled++;
+      controller.enqueue(chunk);
+    },
+  });
+  return { body: body as unknown as BodyInit, state };
+}
+
+// A chunked body is the only shape that reaches the buffering code: every
+// content-length pre-gate is a no-op without the header. The platform accepts
+// ~100 MB bodies and an isolate dies past 128 MB, so materializing before the
+// check (arrayBuffer()/text()) is a memory-exhaustion lever that takes
+// co-resident in-flight requests with it. (security F2 / F5)
+describe("unbounded chunked bodies are cut off while streaming, not after", () => {
+  it("caps the pre-tenant /register DCR proxy body", async () => {
+    // This branch runs BEFORE resolveTenant and BEFORE RELAY_LIMIT, so it is
+    // unauthenticated, untenanted and unthrottled — the cheapest lever there is.
+    const { body, state } = chunkedBody(64 * 1024, 256); // 16 MiB offered
+    const res = await call("/register", body);
+    expect(res.status).toBe(413);
+    expect(await res.json()).toEqual({ error: "request body too large" });
+    expect(state.pulled).toBeLessThan(8); // 64 KiB cap → a couple of chunks, not 256
+  });
+
+  it("caps the /chat/completions body ahead of the model calls", async () => {
+    const { body, state } = chunkedBody(64 * 1024, 256); // 16 MiB offered
+    const res = await call("/chat/completions", body);
+    expect(res.status).toBe(413);
+    expect(await res.json()).toEqual({ error: "request body too large" });
+    expect(state.pulled).toBeLessThan(16); // 256 KiB cap
+  });
+
+  it("caps the relay body before it is buffered for failover replay", async () => {
+    // hub.test is not a slug host, so resolveTenant falls back to DEFAULT_TENANT;
+    // the service must live in THAT tenant for the relay to find it.
+    const tenant = env.DEFAULT_TENANT!;
+    const { id: service } = await tenantOp<{ id: string }>(tenant, "enroll", {
+      name: "Relay Cap",
+    });
+    await tenantOp(tenant, "registerBox", {
+      service, box: "box-1", os: "test", version: "1",
+    });
+    await tenantOp(tenant, "approve", { id: service });
+    // Public: relayMcp's checkKey gate runs BEFORE the body read, so an
+    // unauthenticated call would 401 before exercising the cap.
+    await tenantOp(tenant, "setAuth", { service, mode: "public" });
+
+    const { body, state } = chunkedBody(256 * 1024, 128); // 32 MiB offered
+    const res = await call(`/${service}/box-1/mcp`, body);
+    expect(res.status).toBe(413);
+    expect(await res.json()).toEqual({ error: "request body too large" });
+    expect(state.pulled).toBeLessThan(24); // 4 MiB cap = 16 chunks, never all 128
+  });
+});
+
 describe("public credential endpoints fail closed on hostile bodies", () => {
   it.each([
     ["/join", "null", 400],

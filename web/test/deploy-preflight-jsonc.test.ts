@@ -34,6 +34,16 @@ describe("deploy preflight JSONC parser", () => {
     expect(production.logpush).toBe(false);
     expect(production.workers_dev).toBe(false);
   });
+
+  it("pins the production Clerk azp audience to the exact app origin", () => {
+    // deploy-preflight.mjs fails closed on this var; the value itself is the
+    // one middleware.ts passes as authorizedParties, and a wildcard there would
+    // re-admit tokens minted on a tenant's <slug>.finchmcp.com.
+    const config = parseJsonc(readFileSync(resolve(import.meta.dirname, "../wrangler.jsonc"), "utf8"));
+    const origin = config.env.production.vars.NEXT_PUBLIC_APP_ORIGIN;
+    expect(origin).toBe("https://finchmcp.com");
+    expect(origin).not.toContain("*");
+  });
 });
 
 // REGRESSION: the app shipped no frame protection at all — only HSTS. /cli and

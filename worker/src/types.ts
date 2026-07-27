@@ -157,6 +157,35 @@ export interface LogEvent {
   result?: number;
 }
 
+/** The form a log entry is STORED in. `svc` is the entry's ACL subject — the
+ *  single service the entry is about — and exists so the audit log can be
+ *  narrowed by the same viewerFilter that narrows services[]
+ *  (worker/src/tenant-do.ts getState). It is metadata, not display data:
+ *  getState strips it on the way out, so an admin's `logs` payload is
+ *  byte-for-byte what it always was.
+ *
+ *  The subject cannot be recovered from the prose: `target` is free text like
+ *  `scraper /run`, `scraper → public` or `dave@x.com → scraper`, and
+ *  substring-matching a service id against it would both miss (an entry that
+ *  names the service by label) and over-match (a service id that is a substring
+ *  of another id, of an email, or of a route). So it is recorded structurally at
+ *  write time, and there are exactly two readings:
+ *
+ *    "<service id>" — about exactly that service. A scoped viewer sees the row
+ *                     iff that service survives their viewerFilter.
+ *    ""             — no single service subject: either tenant-wide (settings,
+ *                     roster, epochs) or plural (an ACL rule's whole dst list).
+ *                     Never shown to a scoped viewer — see getState for why the
+ *                     tenant-wide half is denied too.
+ *    undefined      — a row written before this field existed. Reads exactly
+ *                     like "": its prose may name any service, so a scoped
+ *                     viewer must not see it. Legacy rows need no migration;
+ *                     they age out of the 500-entry ring on their own.
+ */
+export interface StoredLogEvent extends LogEvent {
+  svc?: string;
+}
+
 /** A row in the app-level access-sharing queue. Clerk stays authentication-
  *  only; the web hub orchestrates approve/deny and reuses addAcl/removeAcl for
  *  the actual grant — the DO just owns the queue. */
@@ -219,6 +248,13 @@ export interface TenantState {
   settings: Settings;
   overview: Overview;
   latestAgent: string;
+  /** Set iff the request named a `viewer` and this hub evaluated it, so
+   *  services/boxes/overview cover only what that viewer may reach. The web's
+   *  member projection REQUIRES this echo and empties the collections without
+   *  it — web and hub deploy independently, and a hub that predates viewer
+   *  scoping would otherwise answer a member's scoped request with the whole
+   *  fleet. */
+  viewerScoped?: boolean;
 }
 
 /** A key as exposed to the dashboard — no hash, no plaintext. */

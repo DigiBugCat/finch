@@ -408,7 +408,7 @@ async function handleApiInner(
     }
     // POST /api/cli/token — an already-authed box mints a FRESH CLI token, so a
     // new box can be provisioned with no human in the loop:
-    //   ssh newbox "finch login --token $(finch token)"
+    //   finch token | ssh newbox "finch login --token -"
     // No new capability (the caller already holds a tenant CLI token); the new
     // token is epoch-bound and dies on "revoke all CLI tokens".
     if (path === "/api/cli/token" && method === "POST") {
@@ -647,9 +647,15 @@ async function handleApiInner(
     return cloneResponse(res);
   }
 
-  // GET /api/state
+  // GET /api/state[?viewer=<memberId>] — the dashboard's read. `viewer` names
+  // the MEMBER on whose behalf the web is asking; the DO then returns only the
+  // services/boxes that member may reach (TenantDO.viewerFilter, the same rule
+  // the browser door applies). The id is a tenant-local member id and is
+  // resolved inside the DO against this tenant's active roster, so a wrong or
+  // stale one narrows to nothing rather than widening.
   if (method === "GET" && seg.length === 1 && seg[0] === "state") {
-    const state = await tenantOp<TenantState>(env, tenant, "getState");
+    const viewer = url.searchParams.get("viewer") ?? undefined;
+    const state = await tenantOp<TenantState>(env, tenant, "getState", { viewer });
     return json(200, state);
   }
 

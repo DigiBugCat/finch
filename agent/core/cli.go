@@ -1,12 +1,20 @@
 package core
 
 // finch CLI setup commands — `finch login` and `finch add`. Together they let a
-// box enroll services and build its finch.yml without ever touching the
-// dashboard (cloudflared's `tunnel login` + `tunnel create`):
+// box enroll services and build its finch.yml with no dashboard round-trips
+// after one browser approval (cloudflared's `tunnel login` + `tunnel create`):
 //
-//	finch login <token>                         # paste the CLI token from the dashboard
+//	finch login                                  # one browser approval, FIRST box only
 //	finch add printer --service http://:8000     # enroll + append an ingress rule
 //	finch run                                    # serve everything in finch.yml
+//
+// On a FRESH box `finch login` is the only bootstrap: `finch token` cannot be,
+// because cmdToken (cli.go:1009) opens with loadCliCred(), which exits "not
+// logged in" (cli.go:278) when no credential exists yet — `finch token | finch
+// login --token -` is circular on box #1. Every LATER box skips the browser by
+// piping a token from a box that is already logged in:
+//
+//	finch token | ssh newbox "finch login --token -"   # token never hits argv
 //
 // The CLI token is a long-lived tenant assertion the dashboard issues; the box
 // presents it as `Authorization: Bearer <token>` to /api/cli/*.
@@ -84,10 +92,13 @@ The client then calls:
 
 ## Provision ANOTHER box, no human in the loop
 From a box that is already logged in:
-  ssh user@newbox "finch login --token $(finch token)"
+  finch token | ssh user@newbox "finch login --token -"
   ssh user@newbox "finch add api --service http://127.0.0.1:9000 && finch run"
 'finch token' mints a fresh, revocable CLI token. The browser step is only ever
 needed for your FIRST box.
+Pipe the token ('--token -', or set FINCH_CLI_TOKEN) rather than passing it as
+an argument: the CLI token is a ~30-day tenant-admin credential, and argv is
+world-readable on the remote box and kept in shell/SSH history.
 
 ## Inspect state
   finch version --json    # local binary version + OS/architecture
@@ -121,6 +132,8 @@ finch hub. Your box dials OUT, so nothing listens and no ports are opened.
 Usage:
   finch version [--json]              Show this binary's version and platform
   finch login [--hub URL]              Log in (opens the browser to approve a code)
+  finch login --token -                Log in with a token piped on stdin (or FINCH_CLI_TOKEN);
+                                          keeps the tenant-admin token off argv/history
   finch login --headless               Log in on a screenless box over SSH: prints a link
                                           + code (approve on your phone), no local browser
   finch add <app_path> --service <url> Enroll a service and append it to finch.yml
@@ -178,7 +191,7 @@ Automation / driving finch from an agent (after the one-time 'finch login'):
     finch revoke-tokens            # de-authorize every CLI login at once
 
   Provision a NEW box from this already-authed one, zero human in the loop:
-    ssh user@newbox 'finch login --token '"$(finch token)"
+    finch token | ssh user@newbox 'finch login --token -'   # token never hits argv
     ssh user@newbox 'finch add api --service http://127.0.0.1:9000 && finch run'
 
 Run 'finch <command> -h' for a command's own flags.
@@ -262,7 +275,7 @@ func loadCliCred() (*cliCred, error) {
 		return nil, err
 	}
 	if b == nil {
-		return nil, fmt.Errorf("not logged in — run `finch login <token>` first (get a token from the dashboard → Settings → CLI access)")
+		return nil, fmt.Errorf("not logged in — run `finch login` first (no browser here? the dashboard → Settings → CLI access → Generate → Copy gives a ready-to-run `finch login` block to paste)")
 	}
 	var c cliCred
 	if err := json.Unmarshal(b, &c); err != nil {
@@ -458,11 +471,44 @@ func cmdAuth(args []string) {
 	fmt.Printf("finch: %q is now %s\n", args[0], args[1])
 }
 
-// cmdLogin: finch login [--hub URL] <token>
+// resolveCliToken applies argv-free intake for the CLI token, mirroring
+// resolveTicket (cli.go:1131): "-" reads the token from stdin and FINCH_CLI_TOKEN
+// is the env fallback. It matters strictly MORE here than for a ticket — the CLI
+// token is a ~30-day TENANT-ADMIN assertion (see saveCliCred, cli.go:249), while a
+// ticket is one-shot and scoped to a single service — yet until now it could only
+// arrive on argv, where it is readable by any local user via /proc/<pid>/cmdline
+// and is persisted verbatim into shell/SSH history.
+//
+// Returns the resolved token plus whether it came from argv, so the caller can
+// warn about that (still-supported) path. stdin is a parameter so the intake is
+// unit-testable; callers pass os.Stdin.
+func resolveCliToken(token string, stdin io.Reader) (string, bool) {
+	if token == "-" {
+		b, err := io.ReadAll(io.LimitReader(stdin, 4096))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "finch: could not read token from stdin: %v\n", err)
+			os.Exit(1)
+		}
+		tok := strings.TrimSpace(string(b))
+		if tok == "" {
+			fmt.Fprintln(os.Stderr, "finch: --token - given but stdin was empty")
+			os.Exit(1)
+		}
+		return tok, false
+	}
+	if token != "" {
+		return token, true
+	}
+	// Empty here also covers "no token at all" — cmdLogin then falls through to
+	// the interactive device flow, which is the most argv-free path of all.
+	return strings.TrimSpace(os.Getenv("FINCH_CLI_TOKEN")), false
+}
+
+// cmdLogin: finch login [--hub URL] [--token -|<token>]
 func cmdLogin(args []string) {
 	fs := flag.NewFlagSet("login", flag.ExitOnError)
 	hub := fs.String("hub", "https://finchmcp.com", "finch hub base URL")
-	tokenFlag := fs.String("token", "", "CLI token (or pass as a positional argument)")
+	tokenFlag := fs.String("token", "", "CLI token; '-' reads it from stdin, or set FINCH_CLI_TOKEN (a literal value on argv is accepted but leaks into the process table and shell history)")
 	headless := fs.Bool("headless", false, "no local browser: print the link + code (open it on any device, e.g. your phone) and poll — for a screenless box reached over SSH")
 	_ = fs.Parse(args)
 	validatedHub, err := validateHubTransportURL(*hub)
@@ -475,6 +521,15 @@ func cmdLogin(args []string) {
 	token := *tokenFlag
 	if token == "" && fs.NArg() > 0 {
 		token = fs.Arg(0)
+	}
+	token, fromArgv := resolveCliToken(token, os.Stdin)
+	if fromArgv {
+		// Warn but proceed: the token is already on this box's argv by the time
+		// we run, so refusing it would only break existing scripts without
+		// un-leaking anything. The warning is what moves callers to the piped
+		// form for the NEXT box they provision.
+		fmt.Fprintln(os.Stderr, "finch: warning: the CLI token was passed on the command line, so it lands in the process table (/proc/<pid>/cmdline) and shell/SSH history")
+		fmt.Fprintln(os.Stderr, "finch:          prefer:  finch token | ssh newbox 'finch login --token -'   (or set FINCH_CLI_TOKEN)")
 	}
 	// No token → run the interactive device flow (open browser, approve a code).
 	// The device flow also hands back the approver's email (for the account label);
@@ -911,14 +966,50 @@ func cmdRevokeTokens(args []string) {
 	fmt.Println("finch: revoked all CLI tokens — every logged-in box (including this one) must `finch login` again")
 }
 
+// loginHeredocDelimiter terminates the token heredoc in loginCommand. It is
+// quoted at the use site (<<'...') so the shell performs NO expansion on the
+// body: a token containing $, `, or \ is delivered byte-for-byte. The body
+// cannot terminate itself early either — a heredoc ends only on a line that is
+// exactly the delimiter, and the token occupies one whole line with no newline
+// in it (it is a bearer token: it travels in an Authorization header, where a
+// newline is not representable).
+const loginHeredocDelimiter = "FINCH_CLI_TOKEN"
+
+// loginCommand renders a copy-pasteable `finch login` that keeps the ~30-day
+// tenant-admin token OFF argv, for the two places that hand a user a whole
+// command instead of a bare token: `finch token --login` (below) and the
+// dashboard's Settings → CLI access copy button (web/components/dash/settings.tsx).
+//
+// The obvious form — `finch login --hub <hub> <token>` — leaks: argv is
+// world-readable via /proc/<pid>/cmdline for the life of the process, and the
+// pasted line is persisted verbatim into ~/.bash_history / ~/.zsh_history. It
+// leaked worst exactly where it was most used, since callers pipe a printed
+// command straight into a shell. A heredoc instead delivers the token on the
+// login process's STDIN (resolveCliToken, cli.go:485, reads "-" from stdin), so
+// nothing but the hub is ever visible in the process table.
+//
+// The heredoc body is written by the shell itself, so this stays a single
+// paste with no temp file to clean up and no helper process (`echo`/`printf`)
+// whose own argv would re-leak the token.
+func loginCommand(hub, token string) string {
+	return fmt.Sprintf("finch login --hub %s --token - <<'%s'\n%s\n%s",
+		hub, loginHeredocDelimiter, token, loginHeredocDelimiter)
+}
+
 // cmdToken: finch token [--json] [--login] — an authed box mints a FRESH CLI
 // token, for non-interactive provisioning of a new box:
 //
-//	ssh newbox "finch login --token $(finch token)"
+//	finch token | ssh newbox "finch login --token -"
+//
+// Piping is the intended shape: the bare-token output goes down the SSH channel
+// into the remote login's stdin, so the tenant-admin token never appears in the
+// remote argv (/proc/<pid>/cmdline) or in either shell's history.
+//
+// --login prints the same thing pre-assembled, via loginCommand below.
 func cmdToken(args []string) {
 	fs := flag.NewFlagSet("token", flag.ExitOnError)
 	asJSON := fs.Bool("json", false, "print the raw {token,hub,expiresAt} JSON")
-	asLogin := fs.Bool("login", false, "print a full `finch login` command instead of just the token")
+	asLogin := fs.Bool("login", false, "print a ready-to-run `finch login` block instead of just the token (heredoc: the token is fed on stdin, never on argv)")
 	_ = fs.Parse(args)
 
 	cred, err := loadCliCred()
@@ -942,9 +1033,9 @@ func cmdToken(args []string) {
 		b, _ := json.Marshal(out)
 		fmt.Println(string(b))
 	case *asLogin:
-		fmt.Printf("finch login --hub %s %s\n", hub, token)
+		fmt.Println(loginCommand(hub, token))
 	default:
-		fmt.Println(token) // bare token, for `ssh host "finch login --token $(finch token)"`
+		fmt.Println(token) // bare token, for `finch token | ssh host "finch login --token -"`
 	}
 }
 

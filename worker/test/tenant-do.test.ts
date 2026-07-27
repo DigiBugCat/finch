@@ -973,6 +973,187 @@ describe("TenantDO.checkUserAccess — the browser/OAuth door gate", () => {
   });
 });
 
+// REGRESSION: the dashboard read handed every caller the WHOLE fleet. The web
+// layer could only blank fields (keys, addresses, callers), never narrow the
+// collections -- it has no ACL -- so a `member`, the role approveAccess mints
+// for an outsider granted exactly ONE service, still received every service id,
+// owner, route, box and metric in the tenant. Scoping lives here because this
+// is where the ACL is, and it must agree with the door (gateBrowser).
+describe("TenantDO.getState — viewer scoping", () => {
+  async function fleet() {
+    const t = freshTenant();
+    await op(t, "enroll", { name: "Scraper" }); // granted to the member
+    await op(t, "enroll", { name: "Kestrel" }); // NOT granted
+    await op(t, "enroll", { name: "Status" });
+    await op(t, "setAuth", { service: "status", mode: "public" });
+    for (const [service, box] of [["scraper", "b1"], ["kestrel", "b2"], ["status", "b3"]]) {
+      await op(t, "registerBox", { service, box, os: "linux", version: "1.4.0" });
+    }
+    const boot = await op<any>(t, "bootstrapMembers", {
+      kind: "team",
+      displayName: "Fleet",
+      bootstrappedFrom: "fresh",
+      claimantClerkUserId: "u_owner",
+      members: [
+        { clerkUserId: "u_owner", email: "owner@example.com", role: "owner", state: "active" },
+        { clerkUserId: "u_member", email: "member@example.com", role: "member", state: "active" },
+      ],
+    });
+    const [owner, member] = boot.members;
+    await op(t, "addAcl", {
+      src: { type: "user", name: "member@example.com" },
+      dst: [{ type: "service", name: "scraper" }],
+    });
+    return { t, owner, member };
+  }
+
+  const ids = (state: any) => state.services.map((a: any) => a.id).sort();
+
+  it("narrows a member to granted + public services, boxes and overview", async () => {
+    const { t, member } = await fleet();
+    const state = await op<any>(t, "getState", { viewer: member.id });
+
+    // `status` is public — the door lets the member call it unauthenticated, so
+    // hiding it from the dashboard would hide something they already reach.
+    expect(ids(state)).toEqual(["scraper", "status"]);
+    // The flattened Boxes lens is derived from the SAME narrowed list, and so
+    // are the fleet totals — otherwise the hidden services leak back as counts.
+    expect(state.boxes.map((m: any) => m.name).sort()).toEqual(["b1", "b3"]);
+    expect(state.overview.total).toBe(2);
+    expect(state.viewerScoped).toBe(true);
+    expect(JSON.stringify(state.services)).not.toContain("kestrel");
+  });
+
+  it("agrees with the door gate on every service it hides", async () => {
+    const { t, member } = await fleet();
+    const state = await op<any>(t, "getState", { viewer: member.id });
+    const visible = new Set(ids(state));
+    for (const service of ["scraper", "kestrel", "status"]) {
+      const gate = await op<any>(t, "gateBrowser", {
+        clerkUserId: "u_member",
+        email: "member@example.com",
+        epoch: 0,
+        service,
+      });
+      expect(gate.allowed).toBe(visible.has(service));
+    }
+  });
+
+  it("leaves an admin viewer and an unscoped read untouched", async () => {
+    const { t, owner } = await fleet();
+    expect(ids(await op<any>(t, "getState", { viewer: owner.id }))).toEqual([
+      "kestrel", "scraper", "status",
+    ]);
+    // No viewer at all — the CLI's /api/cli/state and the internal lookups.
+    const unscoped = await op<any>(t, "getState");
+    expect(ids(unscoped)).toEqual(["kestrel", "scraper", "status"]);
+    expect(unscoped.viewerScoped).toBeUndefined();
+  });
+
+  it("fails closed for a viewer id that is not an active member", async () => {
+    const { t, member } = await fleet();
+    await op(t, "setMemberState", {
+      memberId: member.id,
+      state: "disabled",
+      actor: { memberId: (await op<any>(t, "getState")).members[0].id, clerkUserId: "u_owner" },
+    });
+    for (const viewer of [member.id, "m_ghost"]) {
+      const state = await op<any>(t, "getState", { viewer });
+      expect(state.services).toEqual([]);
+      expect(state.boxes).toEqual([]);
+      expect(state.logs).toEqual([]);
+      expect(state.viewerScoped).toBe(true);
+    }
+  });
+
+  // REGRESSION (F8 round 2): narrowing services[] alone did not close the hole
+  // -- the AUDIT LOG re-supplies the same data. A `request` row is
+  // `${service} ${route}` + status (the per-route call feed the finding named,
+  // 500 deep), a `device` row is service -> box, `set-auth` is
+  // `${id} -> ${mode}`. The web layer keeps exactly those two categories for a
+  // member, so an ungated log handed back every hidden service anyway.
+  describe("audit log", () => {
+    async function busyFleet() {
+      const f = await fleet();
+      // Traffic + a control-plane change on each service, so every row shape
+      // the member could read exists for BOTH a granted and a denied service.
+      for (const service of ["scraper", "kestrel", "status"]) {
+        await op(f.t, "recordCall", {
+          service,
+          box: service === "scraper" ? "b1" : service === "kestrel" ? "b2" : "b3",
+          route: `/${service}-secret-route`,
+          status: 200,
+          ms: 5,
+          caller: "finch_key_label",
+        });
+        await op(f.t, "setTags", { service, tags: ["tag-" + service] });
+      }
+      return f;
+    }
+
+    const logsOf = async (t: string, viewer?: string) =>
+      (await op<any>(t, "getState", viewer ? { viewer } : {})).logs;
+
+    it("hides every entry about a service the member cannot see", async () => {
+      const { t, member } = await busyFleet();
+      const logs = await logsOf(t, member.id);
+      // The denied service leaks through NOTHING -- not its id, not its route.
+      expect(JSON.stringify(logs)).not.toContain("kestrel");
+      // ...while the granted and public ones still have their feed.
+      const targets = logs.map((e: any) => e.target);
+      expect(targets).toContain("scraper /scraper-secret-route");
+      expect(targets).toContain("status /status-secret-route");
+      // Tenant-wide rows (roster/settings prose, e.g. the bootstrap entry) are
+      // denied too -- see getState: the boundary rides the ACL, not the web's
+      // category list.
+      expect(JSON.stringify(logs)).not.toContain("member@example.com");
+    });
+
+    it("leaves an admin's log byte-for-byte unchanged, with no svc field", async () => {
+      const { t, owner } = await busyFleet();
+      const unscoped = await logsOf(t);
+      expect(await logsOf(t, owner.id)).toEqual(unscoped);
+      // `svc` is ACL metadata, stripped on the way out for every caller.
+      for (const entry of unscoped) expect(entry).not.toHaveProperty("svc");
+      expect(JSON.stringify(unscoped)).toContain("kestrel");
+    });
+
+    it("fails closed on legacy rows written before the svc field existed", async () => {
+      const { t, member } = await busyFleet();
+      const stub = env.TENANT.get(env.TENANT.idFromName(t));
+      const runInDO = runInDurableObject as unknown as (
+        target: typeof stub,
+        callback: (instance: any) => unknown,
+      ) => Promise<any>;
+      await runInDO(stub, async (instance: any) => {
+        const s: any = await instance.ctx.storage.get("state");
+        // Exactly what a pre-upgrade DO holds: the prose, no subject field.
+        s.logs.unshift({
+          ts: Date.now(),
+          ago: "",
+          cat: "request",
+          actor: "finch_key_label",
+          action: "called",
+          target: "kestrel /legacy-route",
+          ip: "",
+          result: 200,
+        });
+        await instance.ctx.storage.put("state", s);
+      });
+      expect(JSON.stringify(await logsOf(t, member.id))).not.toContain("legacy-route");
+      // The admin still sees it -- the legacy row is hidden, not dropped.
+      expect(JSON.stringify(await logsOf(t))).toContain("legacy-route");
+    });
+
+    it("hides a row once its service leaves the member's ACL", async () => {
+      const { t, member } = await busyFleet();
+      expect(JSON.stringify(await logsOf(t, member.id))).toContain("scraper");
+      await op(t, "removeUserGrant", { email: "member@example.com", service: "scraper" });
+      expect(JSON.stringify(await logsOf(t, member.id))).not.toContain("scraper");
+    });
+  });
+});
+
 describe("TenantDO.recordCall — metadata-only persistence", () => {
   it("drops request/response payload fields before public and raw durable state", async () => {
     const t = freshTenant();

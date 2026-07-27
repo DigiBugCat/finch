@@ -292,6 +292,61 @@ describe("BoxDO streaming relay — head + chunks + end", () => {
     expect(await res.text()).toBe("hello");
   });
 
+  it("confines agent Set-Cookie to the request host and keeps host-only cookies", async () => {
+    // The box agent is customer-operated, so a `head` can carry
+    // `Domain=finchmcp.com` — a cookie scoped to the SHARED parent domain, which
+    // browsers would then send to the dashboard and to every sibling tenant's
+    // <slug>.finchmcp.com (shadowing their host-only finch_session, and enabling
+    // login-CSRF). Only the Domain attribute may be stripped; the cookie itself
+    // and every other attribute must survive verbatim.
+    const m = freshBox();
+    const stub = stubFor(m);
+    const agent = await connectAgent(stub, m);
+
+    const reqSeen = nextFrame(agent);
+    const resPromise = stub.fetch(
+      new Request(
+        `https://acme.finchmcp.com/${m.service}/${encodeURIComponent(m.box)}/mcp`,
+        { method: "POST", body: "x" },
+      ),
+    );
+    const { id } = await reqSeen;
+
+    agent.send(
+      JSON.stringify({
+        id,
+        type: "head",
+        status: 200,
+        headers: [
+          // Parent domain: attribute must go, cookie stays host-only.
+          ["set-cookie", "finch_session=evil; Domain=finchmcp.com; Path=/; HttpOnly"],
+          // Leading-dot legacy form of the same parent domain.
+          ["set-cookie", "b=2; Domain=.FinchMcp.com; Path=/"],
+          // Exactly the request host — no broader than the box already is.
+          ["set-cookie", "c=3; Domain=acme.finchmcp.com; Path=/"],
+          // The ordinary legitimate case: host-only, untouched.
+          ["set-cookie", "d=4; Path=/; HttpOnly; Secure; SameSite=Lax"],
+        ],
+      }),
+    );
+    agent.send(JSON.stringify({ id, type: "chunk", data: "aGVsbG8=" }));
+    agent.send(JSON.stringify({ id, type: "end" }));
+
+    const res = await resPromise;
+    expect(res.status).toBe(200);
+    const setCookies = (
+      res.headers as Headers & { getSetCookie(): string[] }
+    ).getSetCookie();
+    expect(setCookies).toEqual([
+      "finch_session=evil; Path=/; HttpOnly",
+      "b=2; Path=/",
+      "c=3; Domain=acme.finchmcp.com; Path=/",
+      "d=4; Path=/; HttpOnly; Secure; SameSite=Lax",
+    ]);
+    expect(setCookies.join("\n")).not.toContain("Domain=finchmcp.com");
+    expect(await res.text()).toBe("hello");
+  });
+
   it("tolerates a head with the `headers` key absent (no forwardable headers)", async () => {
     // When every upstream header is hop-by-hop, the agent emits a head with no
     // `headers` key; the DO must not crash iterating `undefined`. (review: major)

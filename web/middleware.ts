@@ -49,6 +49,41 @@ function isSameOrigin(request: Request): boolean {
   }
 }
 
+/**
+ * Pin the origins whose session tokens this middleware will accept.
+ *
+ * A Clerk session JWT carries an `azp` claim naming the origin the token was
+ * minted for. @clerk/backend only checks it when `authorizedParties` is set —
+ * assertAuthorizedPartiesClaim() returns immediately on an empty list — so with
+ * no options object every token signed by our instance is accepted regardless of
+ * where it was created. That is not a theoretical gap here: every tenant gets
+ * <slug>.finchmcp.com and a service with auth "public" serves arbitrary tenant
+ * HTML there, so an attacker-controlled origin exists inside the same
+ * registrable domain and shares our Clerk cookies. A token minted on that
+ * subdomain, exfiltrated, and replayed server-side with `Sec-Fetch-Site:
+ * same-origin` (which satisfies isSameOrigin above, by design — see the CSRF
+ * note) would mint a ~30-day tenant-admin credential at POST
+ * /api/finch/cli-token for the victim's workspace. Checking `azp` is what stops
+ * that: the attacker's token names <slug>.finchmcp.com, not the app origin.
+ *
+ * Environment resolution mirrors allowedRedirectOrigins() in app/layout.tsx:59 —
+ * the deployed origin is configuration, so NEXT_PUBLIC_APP_ORIGIN (a wrangler
+ * `var`, per env) wins when set. The pk_live_ branch is the fail-closed backstop
+ * so a missing/typo'd var can never silently disable the check in production;
+ * scripts/deploy-preflight.mjs additionally refuses to ship prod without a real,
+ * non-wildcard value. Returning undefined elsewhere keeps Clerk's default (no
+ * azp assertion), which is what local dev and the workers.dev previews need:
+ * their origins are not fixed here, and a pk_test instance's tenant hosts are
+ * not siblings of its accounts.dev frontend API, so the attack above has no
+ * same-site foothold there.
+ */
+function authorizedParties(): string[] | undefined {
+  const configured = process.env.NEXT_PUBLIC_APP_ORIGIN?.trim();
+  if (configured) return [configured];
+  const key = process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY ?? "";
+  return key.startsWith("pk_live_") ? ["https://finchmcp.com"] : undefined;
+}
+
 export default clerkMiddleware(async (auth, request) => {
   // Reject an insecure request before Clerk authentication or any route handler
   // can read a credential/body. Do not redirect mutations: the caller must fix
@@ -84,7 +119,11 @@ export default clerkMiddleware(async (auth, request) => {
   } else if (isProtectedRoute(request)) {
     await auth.protect();
   }
-});
+},
+// Options callback (not a literal object): under OpenNext the Cloudflare env is
+// bound per request, so reading process.env at module-evaluation time can see an
+// empty env and silently produce an unpinned middleware.
+() => ({ authorizedParties: authorizedParties() }));
 
 export const config = {
   matcher: [

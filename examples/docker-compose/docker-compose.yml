@@ -2,7 +2,7 @@
 #
 # One-time setup (state persists in the `finch-data` volume):
 #
-#   docker compose run --rm finch login --hub https://finchmcp.com <cli-token>
+#   docker compose run --rm -T finch login --hub https://finchmcp.com --token - <<<"$CLI_TOKEN"
 #   docker compose run --rm finch add hello --service http://hello-mcp:8000 --name "Hello MCP"
 #
 # Then serve (prints the public URL):

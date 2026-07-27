@@ -55,8 +55,10 @@ function mockMemberThen(response: Response) {
 }
 
 /** State whose admin-only collections are all populated, so a projection
- *  regression shows up as real data crossing the role boundary. */
-function sensitiveState(): Record<string, unknown> {
+ *  regression shows up as real data crossing the role boundary. Pass
+ *  `{ viewerScoped: true }` to stand in for a hub that HAS applied the
+ *  ?viewer= narrowing — without that echo the route fails closed. */
+function sensitiveState(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return validState({
     keys: [
       { id: "k1", label: "prod", owner: "owner@example.com", scope: "svc", last4: "ab12" },
@@ -87,6 +89,7 @@ function sensitiveState(): Record<string, unknown> {
       },
     ],
     boxes: [{ name: "b1", keys: ["prod"], address: "100.64.0.1", relay: "iad" }],
+    ...overrides,
   });
 }
 
@@ -395,9 +398,15 @@ describe("state route upstream corruption handling", () => {
   // It was a strict superset of the requireSharing()-gated /api/finch/access,
   // and the boundary existed only in the browser (DashboardApp hid the tabs).
   it("withholds admin-only workspace data from a member", async () => {
-    mockMemberThen(Response.json(sensitiveState()));
+    const fetchSpy = mockMemberThen(Response.json(sensitiveState({ viewerScoped: true })));
 
     const response = await state();
+    // The fleet itself is narrowed by the HUB, which holds the ACL: the read is
+    // made on behalf of this member id and the DO answers with only the
+    // services that member may reach (worker TenantDO.viewerFilter).
+    expect(String(fetchSpy.mock.calls[1][0])).toBe(
+      "https://hub.example.com/api/state?viewer=member_plain",
+    );
     expect(response.status).toBe(200);
     const body = (await response.json()) as Record<string, any>;
 
@@ -439,13 +448,65 @@ describe("state route upstream corruption handling", () => {
     expect(serialized).not.toContain("subdomain → demo");
   });
 
-  it("still returns the full workspace to an admin", async () => {
-    mockOwnerThen(Response.json(sensitiveState()));
+  // REGRESSION (the other half of the projection above): blanking FIELDS never
+  // narrowed the COLLECTIONS, so a member granted one service still received
+  // every service and box in the tenant — ids, owners, routes, traffic and
+  // latency histories, and the per-route call feed — for services the relay
+  // gate denies them. The narrowing is the hub's (it holds the ACL) and this
+  // route refuses to serve a fleet the hub did not confirm it scoped.
+  it("empties the fleet when the hub did not confirm it scoped the read", async () => {
+    mockMemberThen(Response.json(sensitiveState())); // no viewerScoped echo
 
     const response = await state();
     expect(response.status).toBe(200);
     const body = (await response.json()) as Record<string, any>;
 
+    expect(body.services).toEqual([]);
+    expect(body.boxes).toEqual([]);
+    // The LOG goes with them. An un-narrowed logs[] re-supplies the same fleet
+    // in prose — `device` rows are service/box pairs and `request` rows are
+    // `${service} ${route}` + status, 500 deep — so emptying services[] while
+    // shipping the log would just move the leak.
+    expect(body.logs).toEqual([]);
+    const serialized = JSON.stringify(body);
+    expect(serialized).not.toContain("100.64.0.1");
+    expect(serialized).not.toContain("svc/b1");
+  });
+
+  // The narrowing of logs[] belongs to the hub for the same reason services[]
+  // does — it is an ACL question. This route's category filter is the coarser
+  // second layer, and it must not silently drop what the hub already cleared.
+  it("passes the hub's narrowed log through for a member", async () => {
+    mockMemberThen(
+      Response.json(
+        sensitiveState({
+          viewerScoped: true,
+          // What a scoped hub read returns: only rows about a service this
+          // member may see (worker TenantDO.getState, keyed on StoredLogEvent.svc).
+          logs: [
+            { ago: "1m", ts: 2, cat: "device", actor: "svc", action: "came online", target: "b1", ip: "" },
+            { ago: "2m", ts: 1, cat: "request", actor: "prod", action: "called", target: "svc /mcp", ip: "", result: 200 },
+          ],
+        }),
+      ),
+    );
+
+    const response = await state();
+    const body = (await response.json()) as Record<string, any>;
+    expect(body.logs.map((l: any) => l.target)).toEqual(["b1", "svc /mcp"]);
+    expect(body.logs[1].actor).toBe(""); // still the finch_ key label
+  });
+
+  it("still returns the full workspace to an admin", async () => {
+    const fetchSpy = mockOwnerThen(Response.json(sensitiveState()));
+
+    const response = await state();
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as Record<string, any>;
+
+    // An admin's read is unchanged: no viewer, so the hub takes its
+    // unnarrowed path and no fail-closed check applies.
+    expect(String(fetchSpy.mock.calls[1][0])).toBe("https://hub.example.com/api/state");
     expect(body.callerRole).toBe("owner");
     expect(body.keys).toHaveLength(1);
     expect(body.acl).toHaveLength(1);

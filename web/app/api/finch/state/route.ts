@@ -67,8 +67,12 @@ function parseMembers(value: unknown): {
 // users. This route cannot simply join them, because the member dashboard
 // (overview / home / detail / logs) reads it. So project instead of gate.
 //
-// This has to happen here: hubFetchAs sends only a signed {tenant} assertion and
-// getState() takes no actor, so the hub has no idea who is asking.
+// FIELD projection is only half of it: blanking keys/acl/labels still shipped
+// every service and box in the fleet. Narrowing the COLLECTIONS needs the ACL,
+// so it happens in the hub — GET /api/state?viewer=<memberId>, evaluated by
+// TenantDO.viewerFilter with the same predicate the browser door uses
+// (worker/src/tenant-do.ts gateBrowser). Re-implementing that walk here would
+// fork the rule and eventually hide services a member can legitimately call.
 //
 // Collections are emptied rather than deleted so the client's shape expectations
 // (and requireStateShape's own contract) still hold.
@@ -83,6 +87,13 @@ const EMPTY_COLLECTIONS = ["keys", "acl", "accessRequests", "groups", "members"]
 // so the category filter, not the collection emptying, is what actually holds
 // the boundary. Kept: `device` (enrollment/join/online-offline, whose actor and
 // target are service and box ids) and `request` (the latency-and-errors feed).
+//
+// This category filter is a FIELD projection, not an ACL one: the two kept
+// categories are per-SERVICE rows, and which services a member may see is a
+// question only the hub can answer. So the hub narrows logs[] by the same
+// viewerFilter it narrows services[] with (tenant-do.ts getState, keyed on the
+// structured StoredLogEvent.svc). This filter stays as the second, coarser
+// layer — it is not the thing holding the service boundary.
 const MEMBER_LOG_CATEGORIES = new Set(["device", "request"]);
 
 function projectLogsForMember(logs: unknown): unknown {
@@ -127,6 +138,33 @@ function projectForMember(state: Record<string, unknown>): Record<string, unknow
   for (const field of EMPTY_COLLECTIONS) out[field] = [];
   out.settings = {};
   out.logs = projectLogsForMember(out.logs);
+  // The hub echoes viewerScoped only after it has actually applied the ACL
+  // narrowing. Web and hub deploy independently, so an unpatched (or rolled
+  // back) hub would answer the ?viewer= request with the WHOLE fleet and the
+  // field projection below would happily dress it up as member-safe. Fail
+  // closed instead: no echo, no fleet — and no LOG either, since an unnarrowed
+  // logs[] carries the same per-service call feed (`${service} ${route}` +
+  // status, 500 deep) that emptying services[] was meant to withhold.
+  //
+  // ============================ DEPLOY ORDER =============================
+  // THE HUB MUST BE DEPLOYED BEFORE THIS WEB WORKER. Ship web first and every
+  // member gets a blank dashboard until the hub catches up — an availability
+  // regression, not a security one, and the trade is deliberate: this branch
+  // does not get weakened to soften it.
+  //
+  // Two things enforce the order rather than merely asking for it:
+  //   - .github/workflows/deploy.yml — the `web` job declares `needs: hub`, so
+  //     the hub Worker for the env is live before web is built at all.
+  //   - web/scripts/deploy-preflight.mjs — refuses to build web from a tree
+  //     whose worker/src/tenant-do.ts does not emit the echo, which is what a
+  //     hand-run `npm run deploy` from a stale/reverted checkout looks like.
+  // =======================================================================
+  if (state.viewerScoped !== true) {
+    out.services = [];
+    out.boxes = [];
+    out.logs = [];
+    return out;
+  }
   if (Array.isArray(out.services)) {
     out.services = out.services.map((service) =>
       isJsonObject(service) ? stripServiceDetail(service) : service,
@@ -139,7 +177,12 @@ function projectForMember(state: Record<string, unknown>): Record<string, unknow
 export async function GET() {
   try {
     const ctx = await resolveTenant();
-    const response = await hubFetchAs(ctx.tenant, "/api/state", { method: "GET" });
+    // Only a member is scoped. An admin's read is byte-for-byte what it was:
+    // no viewer, so the DO takes its unnarrowed path.
+    const path = ctx.isAdmin
+      ? "/api/state"
+      : `/api/state?viewer=${encodeURIComponent(ctx.memberId)}`;
+    const response = await hubFetchAs(ctx.tenant, path, { method: "GET" });
     if (!response.ok) {
       const contentType = response.headers.get("content-type") ?? "application/json";
       return new Response(response.body, {
