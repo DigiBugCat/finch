@@ -758,6 +758,16 @@ func joinContext(ctx context.Context, hub, ticket, box string) (*joinResp, error
 		return nil, err
 	}
 	hub = validatedHub
+	// Normalize ONCE, before the wire, so the value we send and the value we
+	// later compare the assignment against are the same string. The hub trims
+	// (cleanBox in worker/src/api.ts, cleanBoxName in tenant-do.ts), so sending
+	// `--box " My Mac "` raw and then insisting the echo match it verbatim would
+	// reject a join the hub considered successful — after it had already burned
+	// the one-shot ticket, leaving a registered box and no way to reach it.
+	// Trimming is the whole of the hub's normalization for a name that clears
+	// BOX_NAME_RE; anything the hub would alter FURTHER is a name it rejects
+	// outright, so the mismatch check below keeps its teeth.
+	box = strings.TrimSpace(box)
 	body, _ := json.Marshal(map[string]string{
 		"ticket":  ticket,
 		"box":     box,
@@ -963,7 +973,16 @@ type outStream struct {
 
 const (
 	maxRelayRequestIDBytes = 256
-	maxRelayInFlight       = 16
+
+	// maxRelayInFlight mirrors MAX_STREAMS_PER_BOX in worker/src/box-do.ts. Keep
+	// the two in lockstep: the DO admits that many concurrent streams per box
+	// precisely to cover a page's subresource burst, so a SMALLER agent-side cap
+	// is not extra safety — it is a hole. The DO has already accepted requests
+	// 17..32 and is holding their clients when the agent answers each with a
+	// terminal 429 ("too many in-flight relay requests"), so the advertised
+	// capacity is unreachable and an ordinary multi-resource page fails well
+	// inside the limit the relay was sized for.
+	maxRelayInFlight = 32
 
 	// maxRelayBodyBytes mirrors MAX_RELAY_BODY_BYTES in worker/src/box-do.ts (and
 	// worker/src/index.ts): the largest request body the Worker will ever hand to

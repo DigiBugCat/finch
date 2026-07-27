@@ -1024,6 +1024,28 @@ describe("TenantDO.getState — viewer scoping", () => {
     expect(JSON.stringify(state.services)).not.toContain("kestrel");
   });
 
+  // REGRESSION: narrowing services[] narrowed every Overview field EXCEPT
+  // keysActive, which was computed over the tenant's whole key set and so
+  // handed a member the tenant-wide credential count -- through the one
+  // aggregate services[] narrowing could not reach, and which the web layer
+  // explicitly treats as a fleet magnitude that must not leak.
+  it("zeroes keysActive for a scoped viewer and leaves it intact for an admin", async () => {
+    const { t, member, owner } = await fleet();
+    await op(t, "mintKey", { label: "k1", scope: { all: true } });
+    await op(t, "mintKey", { label: "k2", scope: { all: true } });
+
+    const unscoped = await op<any>(t, "getState");
+    expect(unscoped.overview.keysActive).toBe(2);
+    // An admin viewer takes the unnarrowed path — byte-for-byte unchanged.
+    expect((await op<any>(t, "getState", { viewer: owner.id })).overview.keysActive).toBe(2);
+
+    const scoped = await op<any>(t, "getState", { viewer: member.id });
+    expect(scoped.overview.keysActive).toBe(0);
+    // The rest of the Overview still reflects the member's narrowed fleet
+    // rather than being blanked wholesale.
+    expect(scoped.overview.total).toBe(2);
+  });
+
   it("agrees with the door gate on every service it hides", async () => {
     const { t, member } = await fleet();
     const state = await op<any>(t, "getState", { viewer: member.id });
