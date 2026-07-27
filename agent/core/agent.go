@@ -324,6 +324,9 @@ func Main() {
 			printUsage()
 			return
 		}
+		if err := validateRelayCommandArg(os.Args[1]); err != nil {
+			log.Fatalf("finch: %v", err)
+		}
 	}
 
 	hostName, _ := os.Hostname()
@@ -345,6 +348,9 @@ func Main() {
 		os.Args = append(os.Args[:1], os.Args[2:]...)
 	}
 	flag.Parse()
+	if err := validateRelayPositionals(flag.Args()); err != nil {
+		log.Fatalf("finch: %v", err)
+	}
 
 	// Argv-free ticket intake (--ticket - from stdin, FINCH_TICKET from env),
 	// same as `finch enroll`: keep the refresh-token-minting ticket off the
@@ -381,6 +387,11 @@ func Main() {
 		runConfig(cfg)
 		return
 	}
+	normalizedHub, err := validateHubTransportURL(*hub)
+	if err != nil {
+		log.Fatalf("finch: %v", err)
+	}
+	*hub = normalizedHub
 	// `finch run` is also the zero-config AviaryMCP daemon mode. With no
 	// finch.yml it owns only the local control socket and starts relays as SDK
 	// leases arrive; bare `finch` retains the historical single-service path.
@@ -392,9 +403,9 @@ func Main() {
 
 	// Single-service: confine forwarded requests to one upstream (SSRF guard in
 	// forward()). Parse it once.
-	upstreamURL, err := url.Parse(strings.TrimRight(*upstream, "/"))
-	if err != nil || upstreamURL.Scheme == "" || upstreamURL.Host == "" {
-		log.Fatalf("finch: --upstream %q is not a valid absolute URL", *upstream)
+	upstreamURL, err := parseUpstreamTransportURL(*upstream)
+	if err != nil {
+		log.Fatalf("finch: --upstream %q is invalid: %v", *upstream, err)
 	}
 	// `finch join --ticket <t>` enrolls inline (first run), then resumes from the
 	// saved credential — the same enroll-then-resume split `finch enroll`/`finch
@@ -425,6 +436,20 @@ func Main() {
 		hub: *hub, statePath: *statePath, upstream: upstreamURL,
 		ticket: *ticket, box: *box, forwardAll: *forwardAll,
 	})
+}
+
+func validateRelayCommandArg(arg string) error {
+	if arg == "join" || arg == "run" || strings.HasPrefix(arg, "-") {
+		return nil
+	}
+	return fmt.Errorf("unknown command %q; run `finch help` for usage", arg)
+}
+
+func validateRelayPositionals(args []string) error {
+	if len(args) == 0 {
+		return nil
+	}
+	return fmt.Errorf("unexpected positional argument %q; run `finch help` for usage", args[0])
 }
 
 func agentDefaultHub() string {
@@ -466,6 +491,11 @@ func aviaryServeConfigFromEnv() *config {
 // callers can read the hub-slugified service id. Shared by the single-service
 // `finch join` path and `finch add` (both write a fixed state file).
 func enrollToState(hub, box, ticket, statePath string) (*agentState, *joinResp, error) {
+	validatedHub, err := validateHubTransportURL(hub)
+	if err != nil {
+		return nil, nil, err
+	}
+	hub = validatedHub
 	jr, err := join(hub, ticket, box)
 	if err != nil {
 		return nil, nil, err
@@ -516,9 +546,9 @@ func runLegacyConfig(cfg *config) {
 	var wg sync.WaitGroup
 	started := 0
 	for _, ing := range cfg.Ingress {
-		up, err := url.Parse(strings.TrimRight(ing.Service, "/"))
-		if err != nil || up.Scheme == "" || up.Host == "" {
-			log.Printf("finch[%s]: service %q is not a valid absolute URL — skipping", ing.AppPath, ing.Service)
+		up, err := parseUpstreamTransportURL(ing.Service)
+		if err != nil {
+			log.Printf("finch[%s]: service %q has invalid transport: %v — skipping", ing.AppPath, ing.Service, err)
 			continue
 		}
 		statePath := cfg.statePathFor(ing.AppPath)
@@ -696,7 +726,13 @@ func runService(o serviceOpts) (enrolled bool) {
 			log.Printf("%s: refreshed connect-token (valid until %s)", lp, connectExp.Format(time.RFC3339))
 		}
 
-		wsURL := wsBase + "?ct=" + url.QueryEscape(connectToken)
+		wsURL, err := relayConnectURL(wsBase, connectToken)
+		if err != nil {
+			log.Printf("%s: invalid relay assignment: %v (refreshing after %s)", lp, err, backoff)
+			connectExp = time.Time{}
+			backoffSleep()
+			continue
+		}
 		start := time.Now()
 		if err := serve(context.Background(), wsURL, upstreamURL, o.forwardAll, hub); err != nil {
 			log.Printf("%s: link down: %v (reconnecting in %s)", lp, err, backoff)
@@ -717,13 +753,18 @@ func join(hub, ticket, box string) (*joinResp, error) {
 }
 
 func joinContext(ctx context.Context, hub, ticket, box string) (*joinResp, error) {
+	validatedHub, err := validateHubTransportURL(hub)
+	if err != nil {
+		return nil, err
+	}
+	hub = validatedHub
 	body, _ := json.Marshal(map[string]string{
 		"ticket":  ticket,
 		"box":     box,
 		"os":      osLabel(),
 		"version": agentVersion,
 	})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(hub, "/")+"/join", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, hub+"/join", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -747,6 +788,12 @@ func joinContext(ctx context.Context, hub, ticket, box string) (*joinResp, error
 	if !jr.OK || jr.Service == "" || jr.Box == "" {
 		return nil, fmt.Errorf("join rejected: %s", jr.Error)
 	}
+	if err := validateServiceID(jr.Service); err != nil {
+		return nil, fmt.Errorf("unsafe service assignment: %w", err)
+	}
+	if jr.Box != box {
+		return nil, fmt.Errorf("join response assigned box %q instead of requested box %q", jr.Box, box)
+	}
 	if jr.ConnectToken == "" {
 		return nil, fmt.Errorf("join response missing connectToken")
 	}
@@ -762,6 +809,11 @@ func refresh(hub, refreshToken string) (*joinResp, error) {
 }
 
 func refreshContext(ctx context.Context, hub, refreshToken string) (*joinResp, error) {
+	validatedHub, err := validateHubTransportURL(hub)
+	if err != nil {
+		return nil, err
+	}
+	hub = validatedHub
 	// version rides along so the hub can re-stamp it: after a hub-pushed update
 	// the agent re-execs and resumes via /refresh (never /join), so this is the
 	// only place the NEW version reaches the registry. Older hubs ignore it.
@@ -769,7 +821,7 @@ func refreshContext(ctx context.Context, hub, refreshToken string) (*joinResp, e
 		"refreshToken": refreshToken,
 		"version":      agentVersion,
 	})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(hub, "/")+"/refresh", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, hub+"/refresh", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -792,6 +844,9 @@ func refreshContext(ctx context.Context, hub, refreshToken string) (*joinResp, e
 	}
 	if !jr.OK || jr.Service == "" || jr.Box == "" || jr.ConnectToken == "" {
 		return nil, fmt.Errorf("refresh rejected: %s", jr.Error)
+	}
+	if err := validateServiceID(jr.Service); err != nil {
+		return nil, fmt.Errorf("unsafe service assignment: %w", err)
 	}
 	return &jr, nil
 }
@@ -845,6 +900,23 @@ func relayDialURL(jr *joinResp, hub string) string {
 	return relayURL(hub, jr.Service, jr.Box)
 }
 
+// relayConnectURL treats a hub-provided connectUrl as an untrusted base URL.
+// In particular, a query or fragment in the base must not be allowed to
+// swallow, duplicate, or hide the proof-bearing connect token.
+func relayConnectURL(base, connectToken string) (string, error) {
+	u, err := url.Parse(strings.TrimSpace(base))
+	if err != nil || u.RawQuery != "" || u.Fragment != "" {
+		return "", fmt.Errorf("invalid Finch relay base URL")
+	}
+	q := u.Query()
+	q.Set("ct", connectToken)
+	u.RawQuery = q.Encode()
+	if err := validateRelayTransportURL(u.String()); err != nil {
+		return "", err
+	}
+	return u.String(), nil
+}
+
 // relayURL builds ws(s)://<host>/<service>/<box>/_connect from the hub
 // base (without the query string — the caller appends ?ct=<token>).
 func relayURL(hub, service, box string) string {
@@ -889,6 +961,78 @@ type outStream struct {
 	cancel context.CancelFunc
 }
 
+const (
+	maxRelayRequestIDBytes = 256
+	maxRelayInFlight       = 16
+
+	// maxRelayBodyBytes mirrors MAX_RELAY_BODY_BYTES in worker/src/box-do.ts (and
+	// worker/src/index.ts): the largest request body the Worker will ever hand to
+	// the relay. Keep the two in lockstep.
+	maxRelayBodyBytes = 4 << 20 // 4 MiB
+	// maxRelayFrameBytes bounds a whole SERIALIZED frame, which is not the body
+	// size: the DO ships the request body as a raw JS string inside
+	// JSON.stringify (box-do.ts), so JSON escaping — not base64 — sets the worst
+	// case. Per ECMA-262 QuoteJSONString a control byte with no short escape
+	// (0x00-0x07, 0x0B, 0x0E-0x1F) becomes \u00XX = 6 wire bytes, and 6x is the
+	// maximum expansion any single input byte can reach. NUL is valid UTF-8, so
+	// TextDecoder(fatal:true) passes a body of NULs straight through: a permitted
+	// 4 MiB body can legitimately serialize to 6*4 MiB = 24 MiB, plus the
+	// envelope (id, method, path, headers, the signed assertion) — 2 MiB of
+	// headroom covers that. ANY value below 6*maxRelayBodyBytes lets a request
+	// the Worker explicitly allows trip coder/websocket's read limit, which does
+	// not fail just that request: the read loop returns, cancelling every
+	// concurrent forward on this box and forcing a backoff reconnect.
+	maxRelayFrameBytes = 6*maxRelayBodyBytes + (2 << 20) // 26 MiB
+)
+
+type relayRequestRegistry struct {
+	mu      sync.Mutex
+	streams map[string]*outStream
+	limit   int
+}
+
+func newRelayRequestRegistry(limit int) *relayRequestRegistry {
+	return &relayRequestRegistry{streams: make(map[string]*outStream), limit: limit}
+}
+
+// add returns false for an active duplicate or when the connection is at its
+// fixed concurrency limit. The read loop is the only caller that adds, while
+// forwarding goroutines remove concurrently.
+func (r *relayRequestRegistry) add(id string, stream *outStream) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if id == "" || len(id) > maxRelayRequestIDBytes || stream == nil || len(r.streams) >= r.limit {
+		return false
+	}
+	if _, exists := r.streams[id]; exists {
+		return false
+	}
+	r.streams[id] = stream
+	return true
+}
+
+func (r *relayRequestRegistry) lookup(id string) *outStream {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.streams[id]
+}
+
+// remove is identity-aware so a late completion can never delete a future
+// generation that legitimately reuses an ID after the old stream has ended.
+func (r *relayRequestRegistry) remove(id string, expected *outStream) {
+	r.mu.Lock()
+	if r.streams[id] == expected {
+		delete(r.streams, id)
+	}
+	r.mu.Unlock()
+}
+
+func runForwardedRelayRequest(ctx context.Context, registry *relayRequestRegistry, upstream *url.URL, f frame, write func(frame) error, stream *outStream, forwardAll bool, routes []string) {
+	defer stream.cancel() // detach the child context from the long-lived relay
+	defer registry.remove(f.ID, stream)
+	forwardWithRoutes(ctx, upstream, f, write, stream, forwardAll, routes)
+}
+
 // isPaused reports the current pause state under the lock.
 func (o *outStream) isPaused() bool {
 	o.mu.Lock()
@@ -926,10 +1070,15 @@ func serveWithRoutes(parent context.Context, wsURL string, upstream *url.URL, fo
 }
 
 func serveWithRoutesStatus(parent context.Context, wsURL string, upstream *url.URL, forwardAll bool, routes []string, hub string, onConnected func()) error {
+	if err := validateRelayTransportURL(wsURL); err != nil {
+		return err
+	}
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 
-	c, response, err := websocket.Dial(ctx, wsURL, nil)
+	dialCtx, dialCancel := context.WithTimeout(ctx, 15*time.Second)
+	c, response, err := websocket.Dial(dialCtx, wsURL, &websocket.DialOptions{HTTPClient: secureRedirectHTTPClient})
+	dialCancel()
 	if err != nil {
 		if response != nil {
 			return fmt.Errorf("Finch relay dial failed (HTTP %d)", response.StatusCode)
@@ -937,7 +1086,7 @@ func serveWithRoutesStatus(parent context.Context, wsURL string, upstream *url.U
 		return fmt.Errorf("Finch relay dial failed")
 	}
 	defer c.Close(websocket.StatusNormalClosure, "bye")
-	c.SetReadLimit(32 << 20) // 32 MiB frames
+	c.SetReadLimit(maxRelayFrameBytes)
 	log.Printf("finch: relay open -> %s", upstream)
 	if onConnected != nil {
 		onConnected()
@@ -1004,18 +1153,7 @@ func serveWithRoutesStatus(parent context.Context, wsURL string, upstream *url.U
 	// serialized against registration; forward() only reads its own outStream
 	// (under outStream.mu) and deletes its entry on return. outMu guards the map
 	// itself against the concurrent delete each forward goroutine does.
-	var outMu sync.Mutex
-	out := map[string]*outStream{}
-	lookup := func(id string) *outStream {
-		outMu.Lock()
-		defer outMu.Unlock()
-		return out[id]
-	}
-	remove := func(id string) {
-		outMu.Lock()
-		delete(out, id)
-		outMu.Unlock()
-	}
+	inFlight := newRelayRequestRegistry(maxRelayInFlight)
 
 	for {
 		_, data, err := c.Read(ctx)
@@ -1033,15 +1171,16 @@ func serveWithRoutesStatus(parent context.Context, wsURL string, upstream *url.U
 		case "req":
 			fctx, fcancel := context.WithCancel(ctx)
 			os := &outStream{resume: make(chan struct{}, 1), cancel: fcancel}
-			outMu.Lock()
-			out[f.ID] = os
-			outMu.Unlock()
-			go func(f frame, os *outStream) {
-				defer remove(f.ID)
-				forwardWithRoutes(fctx, upstream, f, write, os, forwardAll, routes)
-			}(f, os)
+			if !inFlight.add(f.ID, os) {
+				fcancel()
+				if f.ID != "" && len(f.ID) <= maxRelayRequestIDBytes && inFlight.lookup(f.ID) == nil {
+					_ = write(frame{ID: f.ID, Type: "err", Status: http.StatusTooManyRequests, Message: "too many in-flight relay requests"})
+				}
+				continue
+			}
+			go runForwardedRelayRequest(fctx, inFlight, upstream, f, write, os, forwardAll, routes)
 		case "window":
-			if os := lookup(f.ID); os != nil {
+			if os := inFlight.lookup(f.ID); os != nil {
 				// credits===0 => PAUSE; credits>0 => RESUME. A missing credits
 				// field (nil) is treated as a pause (fail-closed: never grow the
 				// queue on a malformed window).
@@ -1053,9 +1192,9 @@ func serveWithRoutesStatus(parent context.Context, wsURL string, upstream *url.U
 			// read promptly) and drop it from the registry. The DO sends this on
 			// idle-after-head / client-cancel; the old read loop IGNORED it and
 			// kept draining the upstream into a dead stream — this is the fix.
-			if os := lookup(f.ID); os != nil {
+			if os := inFlight.lookup(f.ID); os != nil {
 				os.cancel()
-				remove(f.ID)
+				inFlight.remove(f.ID, os)
 			}
 		case "update":
 			// Out-of-band hub push (dashboard "update now"): self-update from OUR
@@ -1439,6 +1578,10 @@ func loadConfig(path, hostName string) (*config, error) {
 	if c.Hub == "" {
 		c.Hub = "https://finchmcp.com"
 	}
+	c.Hub, err = validateHubTransportURL(c.Hub)
+	if err != nil {
+		return nil, fmt.Errorf("hub: %w", err)
+	}
 	if c.Box == "" {
 		c.Box = hostName
 	}
@@ -1455,15 +1598,26 @@ func loadConfig(path, hostName string) (*config, error) {
 		if ing.AppPath == "" || ing.Service == "" {
 			return nil, fmt.Errorf("ingress #%d: both `app_path` and `service` are required", i+1)
 		}
-		if strings.ContainsAny(ing.AppPath, "/ ") {
-			return nil, fmt.Errorf("ingress app_path %q must be a single URL segment (no slashes or spaces)", ing.AppPath)
+		if err := validateServiceID(ing.AppPath); err != nil {
+			return nil, fmt.Errorf("ingress app_path: %w", err)
 		}
-		if seen[ing.AppPath] {
-			return nil, fmt.Errorf("ingress app_path %q is listed twice", ing.AppPath)
+		if _, err := parseUpstreamTransportURL(ing.Service); err != nil {
+			return nil, fmt.Errorf("ingress %q: %w", ing.AppPath, err)
 		}
-		seen[ing.AppPath] = true
+		foldedPath := strings.ToLower(ing.AppPath)
+		if seen[foldedPath] {
+			return nil, fmt.Errorf("ingress app_path %q collides case-insensitively with another service", ing.AppPath)
+		}
+		seen[foldedPath] = true
 	}
 	return &c, nil
+}
+
+func validateServiceID(id string) error {
+	if len(id) > maxAppPathLength || !validAppPath(id) {
+		return fmt.Errorf("service id %q must be a safe URL segment of at most %d characters", id, maxAppPathLength)
+	}
+	return nil
 }
 
 // statePathFor is where service `appPath`'s refresh credential lives: a per-rule
@@ -1509,7 +1663,16 @@ func defaultStatePath() string {
 
 // loadState reads the persisted credential, returning (nil,nil) if the file
 // doesn't exist yet (first run).
-func loadState(path string) (*agentState, error) {
+// readCredentialFile reads an on-disk credential with the checks a credential
+// deserves: refuse anything that is not a regular file (a symlink planted by
+// another local account would otherwise be followed), refuse group/world-
+// readable modes, and verify via SameFile that the path did not change under us
+// between stat, open and read. Returns (nil, nil) when the file does not exist.
+//
+// Shared by the per-box refresh token (loadState) and the tenant-admin CLI
+// token (loadCliCred) — the latter is the MORE privileged of the two, so it
+// must not get weaker handling.
+func readCredentialFile(path string, limit int64) ([]byte, error) {
 	before, err := os.Lstat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -1532,31 +1695,29 @@ func loadState(path string) (*agentState, error) {
 	if err != nil || !os.SameFile(before, opened) {
 		return nil, fmt.Errorf("credential path %q changed while opening", path)
 	}
-	b, err := io.ReadAll(io.LimitReader(file, credentialStateLimit+1))
+	b, err := io.ReadAll(io.LimitReader(file, limit+1))
 	if err != nil {
 		return nil, err
 	}
-	if len(b) > credentialStateLimit {
-		return nil, fmt.Errorf("credential path %q exceeds %d bytes", path, credentialStateLimit)
+	if int64(len(b)) > limit {
+		return nil, fmt.Errorf("credential path %q exceeds %d bytes", path, limit)
 	}
 	after, err := os.Lstat(path)
 	if err != nil || !os.SameFile(before, after) {
 		return nil, fmt.Errorf("credential path %q changed while reading", path)
 	}
-	var st agentState
-	if err := json.Unmarshal(b, &st); err != nil {
-		return nil, err
-	}
-	return &st, nil
+	return b, nil
 }
 
-// saveState writes the credential 0600 (dir 0700). The refresh token is a
-// long-lived per-box credential, so keep it owner-only.
-func saveState(path string, st *agentState) error {
-	b, err := json.MarshalIndent(st, "", "  ")
-	if err != nil {
-		return err
-	}
+// writeCredentialFile installs a credential atomically at 0600 in a 0700
+// directory: it refuses a symlinked or group/world-writable directory, refuses
+// to replace a non-regular target (so a pre-planted symlink cannot redirect the
+// write into another account's tree), writes a temp file and renames.
+//
+// os.WriteFile would be wrong here on both counts: it follows an existing
+// symlink, and its mode argument applies only on creation, so a pre-existing
+// loose-mode file stays loose.
+func writeCredentialFile(path string, b []byte) error {
 	dir := filepath.Dir(path)
 	if dir == "" {
 		dir = "."
@@ -1629,4 +1790,32 @@ func saveState(path string, st *agentState) error {
 		_ = dirFile.Close()
 	}
 	return nil
+}
+
+func loadState(path string) (*agentState, error) {
+	b, err := readCredentialFile(path, credentialStateLimit)
+	if err != nil {
+		return nil, err
+	}
+	if b == nil {
+		return nil, nil
+	}
+	var st agentState
+	if err := json.Unmarshal(b, &st); err != nil {
+		return nil, err
+	}
+	return &st, nil
+}
+
+// saveState writes the credential 0600 (dir 0700). The refresh token is a
+// long-lived per-box credential, so keep it owner-only.
+func saveState(path string, st *agentState) error {
+	b, err := json.MarshalIndent(st, "", "  ")
+	if err != nil {
+		return err
+	}
+	if len(b) > credentialStateLimit {
+		return fmt.Errorf("credential state exceeds %d bytes", credentialStateLimit)
+	}
+	return writeCredentialFile(path, b)
 }

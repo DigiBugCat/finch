@@ -1,1 +1,33 @@
-import {errorResponse,HttpError,requireSharing,hubFetchAs} from "@/lib/hub";export async function POST(req:Request,{params}:{params:Promise<{id:string}>}){try{const ctx=await requireSharing(),{id}=await params,b=await req.json().catch(()=>({})),role=String(b.role||"").toLowerCase();if(!['owner','admin','member'].includes(role))throw new HttpError(400,"invalid role");const res=await hubFetchAs(ctx.tenant,"/api/members/role",{method:"POST",body:JSON.stringify({memberId:id,role,actor:{clerkUserId:ctx.userId,memberId:ctx.memberId,label:ctx.email}})});return new Response(await res.text(),{status:res.status,headers:{"content-type":"application/json"}})}catch(e){return errorResponse(e)}}
+import { errorResponse, requireSharing, hubFetchAs } from "@/lib/hub";
+import { readJsonObject } from "@/lib/request-body";
+import { readHubJsonObject } from "../../../_shared";
+import { memberId, memberRole } from "../../_input";
+
+export async function POST(
+  req: Request,
+  { params }: { params: Promise<{ id: string }> },
+) {
+  try {
+    const ctx = await requireSharing();
+    const { id: rawId } = await params;
+    const id = memberId(rawId);
+    const body = await readJsonObject(req, 1_024);
+    const role = memberRole(body.role);
+    const response = await hubFetchAs(ctx.tenant, "/api/members/role", {
+      method: "POST",
+      body: JSON.stringify({
+        memberId: id,
+        role,
+        actor: {
+          clerkUserId: ctx.userId,
+          memberId: ctx.memberId,
+          label: ctx.email,
+        },
+      }),
+    });
+    const out = await readHubJsonObject(response);
+    return Response.json(out, { status: response.status });
+  } catch (error) {
+    return errorResponse(error);
+  }
+}

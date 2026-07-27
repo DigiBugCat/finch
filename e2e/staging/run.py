@@ -9,11 +9,13 @@ installed, which also supplies FastMCP for that check.
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import contextlib
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import socket
 import stat
@@ -23,14 +25,24 @@ import threading
 import time
 from typing import Any
 from urllib.error import HTTPError
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 from urllib.request import Request, urlopen
 
 
 DEFAULT_STAGING_HUB = "https://finch-staging.pantainos.workers.dev"
+STAGING_WEB_ORIGIN = "https://finch-web-staging.pantainos.workers.dev"
 OPT_IN = "FINCH_STAGING_E2E"
 MODES = frozenset({"local", "agent"})
 APP_RESTART_TIMEOUT = 90
+MAX_CREDENTIAL_BYTES = 1024 * 1024
+MAX_HTTP_RESPONSE_BYTES = 1024 * 1024
+MAX_ENROLLMENT_EVENTS = 64
+MAX_EVENT_LINE_CHARS = 64 * 1024
+MAX_UNIX_SOCKET_PATH_BYTES = 100
+RELAY_READY_TIMEOUT = 20
+RELAY_RETRY_INTERVAL = 1.0
+APP_PATH_RE = re.compile(r"aviary-e2e-[0-9]{10,}-[0-9a-f]{32}")
+USER_CODE_RE = re.compile(r"[A-Z2-9]{4}-[A-Z2-9]{4}")
 
 
 class SmokeFailure(RuntimeError):
@@ -38,23 +50,19 @@ class SmokeFailure(RuntimeError):
 
 
 def checked_staging_hub(value: str) -> str:
-    hub = value.rstrip("/")
-    parsed = urlsplit(hub)
-    if (
-        parsed.scheme != "https"
-        or parsed.hostname != "finch-staging.pantainos.workers.dev"
-        or parsed.port is not None
-        or parsed.path not in ("", "/")
-        or parsed.query
-        or parsed.fragment
-        or parsed.username
-        or parsed.password
-    ):
+    # Compare the original string, rather than a parsed/normalized form.
+    # ``urlsplit`` silently strips tabs and newlines and cannot distinguish an
+    # absent query from a trailing empty ``?``.  A destructive staging gate
+    # should accept only the two spellings we deliberately document.
+    if not isinstance(value, str) or value not in {
+        DEFAULT_STAGING_HUB,
+        f"{DEFAULT_STAGING_HUB}/",
+    }:
         raise SmokeFailure(
             "refusing non-staging hub; this suite is hard-bound to "
             f"{DEFAULT_STAGING_HUB}"
         )
-    return hub
+    return DEFAULT_STAGING_HUB
 
 
 def require_opt_in(env: dict[str, str]) -> None:
@@ -66,6 +74,59 @@ def checked_mode(value: str) -> str:
     if value not in MODES:
         raise SmokeFailure("FINCH_E2E_MODE must be local or agent")
     return value
+
+
+def checked_app_path(value: str) -> str:
+    if APP_PATH_RE.fullmatch(value) is None:
+        raise SmokeFailure("refusing a non-disposable Finch service path")
+    return value
+
+
+def checked_private_directory(value: str, name: str) -> Path:
+    path = Path(value).expanduser()
+    try:
+        initial = path.lstat()
+        resolved = path.resolve(strict=True)
+        current = resolved.stat()
+    except OSError as exc:
+        raise SmokeFailure(f"{name} must name an existing private directory") from exc
+    if stat.S_ISLNK(initial.st_mode) or not stat.S_ISDIR(current.st_mode):
+        raise SmokeFailure(f"{name} must name a real private directory, not a symlink")
+    if stat.S_IMODE(current.st_mode) & 0o077:
+        raise SmokeFailure(f"{name} must not be group/world accessible")
+    if resolved.parent == resolved:
+        raise SmokeFailure(f"{name} must not be the filesystem root")
+    return resolved
+
+
+def checked_control_socket_path(value: str) -> Path:
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    if "\x00" in str(path):
+        raise SmokeFailure("FINCH_CONTROL_SOCKET contains a NUL byte")
+    try:
+        encoded = os.fsencode(path)
+    except UnicodeError as exc:
+        raise SmokeFailure("FINCH_CONTROL_SOCKET is not a valid filesystem path") from exc
+    if len(encoded) > MAX_UNIX_SOCKET_PATH_BYTES:
+        raise SmokeFailure(
+            "FINCH_CONTROL_SOCKET is too long for a portable Unix-domain socket"
+        )
+    return path
+
+
+def checked_e2e_layout(cli_home: Path, credentials: Path, control_parent: Path) -> Path:
+    root = credentials.parent
+    if (
+        cli_home.parent != root
+        or control_parent.parent != root
+        or root in {Path.home().resolve(), Path.cwd().resolve()}
+    ):
+        raise SmokeFailure(
+            "CLI HOME, credentials, and control socket must be siblings in a dedicated root"
+        )
+    return root
 
 
 def find_free_port() -> int:
@@ -92,22 +153,86 @@ def run_cli(binary: Path, home: Path, *args: str, json_output: bool = False) -> 
     return completed.stdout.strip()
 
 
+def read_private_file(path: Path, description: str) -> tuple[bytes, int]:
+    """Read a small mode-0600 regular file without following a final symlink."""
+
+    try:
+        initial = path.lstat()
+        if not stat.S_ISREG(initial.st_mode):
+            raise SmokeFailure(f"{description} must be a regular file, not a symlink or device")
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        try:
+            current = os.fstat(descriptor)
+            mode = stat.S_IMODE(current.st_mode)
+            if not stat.S_ISREG(current.st_mode):
+                raise SmokeFailure(f"{description} changed while it was being opened")
+            if mode & 0o077:
+                raise SmokeFailure(f"{description} must not be group/world accessible: {path}")
+            if current.st_size > MAX_CREDENTIAL_BYTES:
+                raise SmokeFailure(f"{description} is unexpectedly large: {path}")
+            with os.fdopen(descriptor, "rb", closefd=False) as stream:
+                data = stream.read(MAX_CREDENTIAL_BYTES + 1)
+            if len(data) > MAX_CREDENTIAL_BYTES:
+                raise SmokeFailure(f"{description} is unexpectedly large: {path}")
+            return data, mode
+        finally:
+            os.close(descriptor)
+    except SmokeFailure:
+        raise
+    except OSError as exc:
+        raise SmokeFailure(f"could not safely read {description}: {path}") from exc
+
+
+def parse_json_object(data: bytes, description: str) -> dict[str, Any]:
+    def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate key {key!r}")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(data, object_pairs_hook=reject_duplicate_keys)
+    except (UnicodeError, ValueError, RecursionError) as exc:
+        raise SmokeFailure(f"{description} is not valid unambiguous JSON") from exc
+    if not isinstance(value, dict):
+        raise SmokeFailure(f"{description} must contain a JSON object")
+    return value
+
+
+def checked_secret(value: Any, description: str, *, prefix: str | None = None) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or len(value) > 16 * 1024
+        or any(ord(character) < 0x20 or ord(character) == 0x7F for character in value)
+        or (prefix is not None and not value.startswith(prefix))
+    ):
+        raise SmokeFailure(f"{description} is missing or malformed")
+    return value
+
+
 def verify_cli_login(home: Path, expected_hub: str) -> None:
     credential = home / ".finch" / "cli.json"
     try:
-        mode = stat.S_IMODE(credential.stat().st_mode)
-        value = json.loads(credential.read_text())
-    except (OSError, ValueError) as exc:
+        data, _ = read_private_file(credential, "CLI credential")
+        value = parse_json_object(data, "CLI credential")
+    except SmokeFailure as exc:
         raise SmokeFailure(
-            f"missing isolated staging login at {credential}; run finch login "
+            f"invalid isolated staging login at {credential}; run finch login "
             f"--hub {expected_hub} with HOME={home}"
         ) from exc
-    if mode & 0o077:
-        raise SmokeFailure(f"CLI credential must not be group/world accessible: {credential}")
-    if value.get("hub", "").rstrip("/") != expected_hub:
+    try:
+        credential_hub = checked_staging_hub(value.get("hub"))
+    except (SmokeFailure, TypeError) as exc:
+        raise SmokeFailure("isolated CLI credential is not scoped to the staging hub") from exc
+    if credential_hub != expected_hub:
         raise SmokeFailure("isolated CLI credential is not scoped to the staging hub")
-    if not value.get("token"):
-        raise SmokeFailure("isolated CLI credential has no token")
+    checked_secret(value.get("token"), "isolated CLI credential token")
 
 
 def request_json(
@@ -133,10 +258,14 @@ def request_json(
     request = Request(url, method=method, headers=headers, data=data)
     try:
         with urlopen(request, timeout=20) as response:
-            raw = response.read()
+            raw = response.read(MAX_HTTP_RESPONSE_BYTES + 1)
+            if len(raw) > MAX_HTTP_RESPONSE_BYTES:
+                raise SmokeFailure("staging response exceeded the size limit")
             return response.status, json.loads(raw) if raw else None
     except HTTPError as exc:
-        raw = exc.read()
+        raw = exc.read(MAX_HTTP_RESPONSE_BYTES + 1)
+        if len(raw) > MAX_HTTP_RESPONSE_BYTES:
+            raise SmokeFailure("staging error response exceeded the size limit")
         try:
             payload = json.loads(raw) if raw else None
         except ValueError:
@@ -153,22 +282,101 @@ def result_value(payload: Any) -> Any:
     return None
 
 
+def checked_enrollment_authorization(event: Any) -> str:
+    if not isinstance(event, dict):
+        raise SmokeFailure("enrollment event must be a JSON object")
+    authorization = event.get("authorization")
+    if not isinstance(authorization, dict):
+        raise SmokeFailure("enrollment event omitted authorization details")
+    user_code = authorization.get("user_code")
+    if not isinstance(user_code, str) or USER_CODE_RE.fullmatch(user_code) is None:
+        raise SmokeFailure("enrollment did not return a valid user_code")
+    verification_uri = authorization.get("verification_uri_complete")
+    if not isinstance(verification_uri, str) or any(
+        ord(character) < 0x20 or ord(character) == 0x7F
+        for character in verification_uri
+    ):
+        raise SmokeFailure("enrollment omitted a valid verification URL")
+    try:
+        verification = urlsplit(verification_uri)
+        port = verification.port
+    except ValueError as exc:
+        raise SmokeFailure("enrollment returned a malformed verification URL") from exc
+    if (
+        verification.scheme != "https"
+        or verification.hostname != "finch-web-staging.pantainos.workers.dev"
+        or port is not None
+        or verification.username is not None
+        or verification.password is not None
+        or verification.path != "/aviary/authorize"
+        or verification.fragment
+    ):
+        raise SmokeFailure("enrollment verification URL escaped the staging web endpoint")
+    try:
+        query = parse_qs(
+            verification.query,
+            keep_blank_values=True,
+            strict_parsing=True,
+            max_num_fields=2,
+        )
+    except ValueError as exc:
+        raise SmokeFailure("enrollment verification URL had a malformed query") from exc
+    if query != {"code": [user_code]}:
+        raise SmokeFailure("enrollment verification URL did not match its user_code")
+    return user_code
+
+
+def terminate_process(process: subprocess.Popen[Any], description: str) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        process.wait()
+        return
+    try:
+        process.wait(timeout=10)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        process.kill()
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired as exc:
+        raise SmokeFailure(f"could not stop {description}") from exc
+
+
 def request_after_relay_ready(
     method: str,
     url: str,
+    *,
+    timeout: float = RELAY_READY_TIMEOUT,
     **kwargs: Any,
 ) -> tuple[int, Any]:
-    deadline = time.monotonic() + 20
+    if timeout < 0:
+        raise ValueError("timeout must be non-negative")
+    deadline = time.monotonic() + timeout
     while True:
-        status, payload = request_json(method, url, **kwargs)
-        if status not in {502, 503, 504} or time.monotonic() >= deadline:
+        try:
+            status, payload = request_json(method, url, **kwargs)
+        except OSError as exc:
+            now = time.monotonic()
+            if now >= deadline:
+                raise SmokeFailure("relay remained unreachable after retries") from exc
+            time.sleep(min(RELAY_RETRY_INTERVAL, deadline - now))
+            continue
+        now = time.monotonic()
+        if status not in {502, 503, 504} or now >= deadline:
             return status, payload
-        time.sleep(1)
+        time.sleep(min(RELAY_RETRY_INTERVAL, deadline - now))
 
 
 class AppProcess:
     def __init__(self, env: dict[str, str]) -> None:
-        self.events: list[dict[str, Any]] = []
+        self.events: deque[dict[str, Any]] = deque(maxlen=MAX_ENROLLMENT_EVENTS)
         self._lock = threading.Lock()
         self.process = subprocess.Popen(
             [sys.executable, str(Path(__file__).with_name("app.py"))],
@@ -188,7 +396,18 @@ class AppProcess:
             thread.start()
 
     def _consume(self, stream: Any) -> None:
-        for line in stream:
+        discarding_oversized_line = False
+        while True:
+            line = stream.readline(MAX_EVENT_LINE_CHARS + 1)
+            if not line:
+                return
+            ends_line = line.endswith("\n")
+            if discarding_oversized_line:
+                discarding_oversized_line = not ends_line
+                continue
+            if len(line) > MAX_EVENT_LINE_CHARS:
+                discarding_oversized_line = not ends_line
+                continue
             line = line.strip()
             if not line:
                 continue
@@ -214,13 +433,9 @@ class AppProcess:
         raise SmokeFailure(f"timed out waiting for enrollment state {state!r}")
 
     def stop(self) -> None:
-        if self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=5)
+        terminate_process(self.process, "AviaryMCP")
+        for thread in self._threads:
+            thread.join(timeout=1)
 
 
 class AgentProcess:
@@ -232,6 +447,8 @@ class AgentProcess:
         control_socket: Path,
         box: str,
     ) -> None:
+        self.control_socket = control_socket
+        self._socket_identity: tuple[int, int] | None = None
         env = os.environ.copy()
         env.update(
             FINCH_HUB=hub,
@@ -240,11 +457,20 @@ class AgentProcess:
             FINCH_CONTROL_SOCKET_MODE="0600",
             FINCH_CREDENTIALS_DIR=str(credentials),
             FINCH_AVIARY_VERIFICATION_ORIGINS=(
-                "https://finch-web-staging.pantainos.workers.dev"
+                STAGING_WEB_ORIGIN
             ),
         )
-        with contextlib.suppress(FileNotFoundError):
-            control_socket.unlink()
+        try:
+            existing = control_socket.lstat()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise SmokeFailure("could not inspect Finch agent control socket path") from exc
+        else:
+            kind = "socket" if stat.S_ISSOCK(existing.st_mode) else "non-socket path"
+            raise SmokeFailure(
+                f"FINCH_CONTROL_SOCKET already exists as a {kind}; refusing to replace it"
+            )
         self.process = subprocess.Popen(
             [str(binary), "run"],
             env=env,
@@ -252,28 +478,48 @@ class AgentProcess:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        deadline = time.monotonic() + 15
-        while time.monotonic() < deadline:
-            if self.process.poll() is not None:
-                raise SmokeFailure(f"Finch agent exited early ({self.process.returncode})")
-            if control_socket.exists() and stat.S_ISSOCK(control_socket.stat().st_mode):
+        try:
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                if self.process.poll() is not None:
+                    raise SmokeFailure(f"Finch agent exited early ({self.process.returncode})")
+                try:
+                    current = control_socket.lstat()
+                except FileNotFoundError:
+                    time.sleep(0.1)
+                    continue
+                except OSError as exc:
+                    raise SmokeFailure("could not inspect Finch agent control socket") from exc
+                if not stat.S_ISSOCK(current.st_mode):
+                    raise SmokeFailure("Finch agent created a non-socket control path")
+                if stat.S_IMODE(current.st_mode) & 0o077:
+                    raise SmokeFailure("Finch agent control socket must be mode 0600")
+                self._socket_identity = (current.st_dev, current.st_ino)
                 return
-            time.sleep(0.1)
-        self.stop()
-        raise SmokeFailure("timed out waiting for Finch agent control socket")
+            raise SmokeFailure("timed out waiting for Finch agent control socket")
+        except BaseException:
+            self.stop()
+            raise
 
     def stop(self) -> None:
-        if self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=5)
+        terminate_process(self.process, "Finch agent")
+        if self._socket_identity is None:
+            return
+        try:
+            current = self.control_socket.lstat()
+            if (
+                stat.S_ISSOCK(current.st_mode)
+                and (current.st_dev, current.st_ino) == self._socket_identity
+            ):
+                self.control_socket.unlink()
+        except FileNotFoundError:
+            pass
+        finally:
+            self._socket_identity = None
 
 
 def approve_aviary_with_retry(binary: Path, home: Path, user_code: str) -> None:
-    if not user_code or len(user_code) > 32:
+    if USER_CODE_RE.fullmatch(user_code) is None:
         raise SmokeFailure("enrollment did not return a valid user_code")
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
@@ -289,16 +535,15 @@ def approve_aviary_with_retry(binary: Path, home: Path, user_code: str) -> None:
 
 
 def credential_fingerprint(root: Path, app_path: str) -> tuple[Path, str, int]:
+    checked_app_path(app_path)
     candidates = list(root.rglob(f"{app_path}.json"))
     if len(candidates) != 1:
         raise SmokeFailure(
             f"expected one project-scoped service credential, found {len(candidates)}"
         )
     path = candidates[0]
-    mode = stat.S_IMODE(path.stat().st_mode)
-    if mode & 0o077:
-        raise SmokeFailure(f"service credential must be mode 0600: {path}")
-    return path, hashlib.sha256(path.read_bytes()).hexdigest(), mode
+    data, mode = read_private_file(path, "service credential")
+    return path, hashlib.sha256(data).hexdigest(), mode
 
 
 async def check_mcp(url: str, token: str) -> None:
@@ -330,21 +575,32 @@ def main() -> int:
     if missing:
         raise SmokeFailure(f"missing required environment: {', '.join(missing)}")
     binary = Path(required_paths["FINCH_E2E_BINARY"]).expanduser().resolve()
-    cli_home = Path(required_paths["FINCH_E2E_CLI_HOME"]).expanduser().resolve()
-    credentials = Path(required_paths["FINCH_CREDENTIALS_DIR"]).expanduser().resolve()
-    control_socket = Path(required_paths["FINCH_CONTROL_SOCKET"]).expanduser().resolve()
+    cli_home = checked_private_directory(
+        required_paths["FINCH_E2E_CLI_HOME"], "FINCH_E2E_CLI_HOME"
+    )
+    credentials = checked_private_directory(
+        required_paths["FINCH_CREDENTIALS_DIR"], "FINCH_CREDENTIALS_DIR"
+    )
     if not binary.is_file() or not os.access(binary, os.X_OK):
         raise SmokeFailure("FINCH_E2E_BINARY must name an executable Finch binary")
-    if not cli_home.is_dir():
-        raise SmokeFailure("FINCH_E2E_CLI_HOME must name an isolated login HOME")
-    if not credentials.is_dir():
-        raise SmokeFailure("FINCH_CREDENTIALS_DIR must name the running agent's credential directory")
-    control_socket.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    project_dir = checked_private_directory(
+        str(credentials.parent), "FINCH_CREDENTIALS_DIR parent"
+    )
+    requested_socket = checked_control_socket_path(required_paths["FINCH_CONTROL_SOCKET"])
+    requested_socket.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    control_parent = checked_private_directory(
+        str(requested_socket.parent), "FINCH_CONTROL_SOCKET parent"
+    )
+    control_socket = checked_control_socket_path(str(control_parent / requested_socket.name))
+    project_dir = checked_e2e_layout(cli_home, credentials, control_parent)
     verify_cli_login(cli_home, hub)
 
-    app_path = f"aviary-e2e-{int(time.time())}-{secrets.token_hex(3)}"
-    box = f"github-e2e-{secrets.token_hex(4)}"
-    project_dir = credentials.parent
+    app_path = checked_app_path(
+        f"aviary-e2e-{int(time.time())}-{secrets.token_hex(16)}"
+    )
+    box = f"github-e2e-{secrets.token_hex(16)}"
+    if next(project_dir.rglob(f"{app_path}.json"), None) is not None:
+        raise SmokeFailure("generated service path collided with an existing credential")
     port = find_free_port()
     env = os.environ.copy()
     env.update(
@@ -355,6 +611,7 @@ def main() -> int:
         FINCH_E2E_BINARY=str(binary),
         FINCH_E2E_BOX=box,
         FINCH_E2E_PROJECT_DIR=str(project_dir),
+        FINCH_CONTROL_SOCKET=str(control_socket),
         PYTHONUNBUFFERED="1",
     )
     agent: AgentProcess | None = None
@@ -369,12 +626,7 @@ def main() -> int:
         )
         app = AppProcess(env)
         pending = app.wait_event("needs_enrollment", 30)
-        verification = urlsplit(pending["authorization"]["verification_uri_complete"])
-        if verification.scheme != "https" or verification.hostname != "finch-web-staging.pantainos.workers.dev":
-            raise SmokeFailure("enrollment verification URL escaped the staging web origin")
-        user_code = pending.get("authorization", {}).get("user_code")
-        if not isinstance(user_code, str):
-            raise SmokeFailure("enrollment authorization omitted user_code")
+        user_code = checked_enrollment_authorization(pending)
         approve_aviary_with_retry(binary, cli_home, user_code)
         ready = app.wait_event("ready", 60)
         expected_mcp = f"{hub}/{app_path}/mcp"
@@ -397,10 +649,10 @@ def main() -> int:
             "--json",
             json_output=True,
         )
-        token = minted.get("key")
-        key_id = minted.get("id")
-        if not isinstance(token, str) or not token.startswith("finch_") or not isinstance(key_id, str):
-            raise SmokeFailure("key mint response omitted the key or id")
+        if not isinstance(minted, dict):
+            raise SmokeFailure("key mint response was not a JSON object")
+        key_id = checked_secret(minted.get("id"), "key mint id")
+        token = checked_secret(minted.get("key"), "key mint key", prefix="finch_")
 
         rest_url = f"{hub}/{app_path}/api/v1/tools/add"
         print("[3/7] checking default-deny edge auth", flush=True)
@@ -467,9 +719,12 @@ def main() -> int:
                 )
             except (OSError, ValueError):
                 local_status = None
-            status, payload = request_json(
-                "POST", rest_url, token=token, body={"a": 19, "b": 23}
-            )
+            try:
+                status, payload = request_json(
+                    "POST", rest_url, token=token, body={"a": 19, "b": 23}
+                )
+            except OSError:
+                status, payload = 0, None
             if status == 200 and result_value(payload) == 42:
                 break
             if time.monotonic() >= deadline:
@@ -506,6 +761,6 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (SmokeFailure, subprocess.CalledProcessError, OSError, ValueError) as exc:
+    except (SmokeFailure, subprocess.SubprocessError, OSError, ValueError) as exc:
         print(f"STAGING E2E FAILED: {exc}", file=sys.stderr)
         raise SystemExit(1)

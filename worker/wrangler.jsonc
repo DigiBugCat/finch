@@ -4,7 +4,11 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-06-01",
   "compatibility_flags": ["nodejs_compat"],
-  "observability": { "enabled": true },
+  // Privacy default: production-like deploys do not persist Worker invocation
+  // logs or traces. Relay payloads are intentionally observable only while
+  // they are being forwarded; TenantDO owns the metadata-only call history.
+  "observability": { "enabled": false },
+  "logpush": false,
   // No top-level `vars`. DEFAULT_TENANT is DEV-ONLY (see [env.dev]) — it must
   // never ship to prod, where tenantFromHost/resolveTenant fail closed (404).
   // Secrets (FINCH_SERVICE_SECRET, TICKET_SECRET) come from `.dev.vars` in dev
@@ -65,7 +69,19 @@
     "dev": {
       "name": "finch-dev",
       "workers_dev": true,
-      "observability": { "enabled": true },
+      // Local/dev keeps explicit application errors for debugging, but disables
+      // Cloudflare-generated invocation logs and traces so request data cannot
+      // be captured implicitly. Production and staging disable persistence.
+      "observability": {
+        "enabled": true,
+        "logs": {
+          "enabled": true,
+          "invocation_logs": false,
+          "persist": true
+        },
+        "traces": { "enabled": false }
+      },
+      "logpush": false,
       // DEFAULT_TENANT lives ONLY here (and in .dev.vars for `wrangler dev`).
       // DEV=1 gates the dev-only tenant fallback in resolveTenant.
       "vars": {
@@ -120,7 +136,8 @@
     "staging": {
       "name": "finch-staging",
       "workers_dev": true,
-      "observability": { "enabled": true },
+      "observability": { "enabled": false },
+      "logpush": false,
       "vars": {
         // Staging has one workers.dev host (no per-tenant subdomains), so the
         // relay plane resolves every request to this single dev-fallback tenant.
@@ -193,7 +210,8 @@
     "production": {
       "name": "finch-prod",
       "workers_dev": false,
-      "observability": { "enabled": true },
+      "observability": { "enabled": false },
+      "logpush": false,
       // NO DEFAULT_TENANT and NO DEV — resolveTenant fails closed (404) for any
       // host without a registered host key.
       "vars": {

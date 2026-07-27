@@ -15,7 +15,7 @@
 //     BoxDO by THAT tenant id. Unknown slug FAILS CLOSED (404). The
 //     DEFAULT_TENANT fallback exists ONLY for local dev (env.DEV === "1").
 
-import { BoxDO } from "./box-do";
+import { BoxDO, readBoundedBody } from "./box-do";
 import { TenantDO } from "./tenant-do";
 import { RouterDO, routerLookup } from "./router-do";
 import { AviaryEnrollmentDO } from "./aviary-enrollment-do";
@@ -63,6 +63,10 @@ export interface Env {
   SESSION_SECRET: string;
   DEFAULT_TENANT?: string; // DEV-ONLY tenant fallback when no slug resolves
   DEV?: string; // "1" in the dev env; gates the DEFAULT_TENANT fallback
+  // Explicit local-test escape hatch for plain HTTP. It is effective only when
+  // DEV=1 as well; production and staging intentionally omit both values, so
+  // the public hub fails closed before reading an unencrypted request body.
+  ALLOW_INSECURE_HTTP?: string;
   WEB_URL?: string; // dashboard base URL — the `finch login` device page lives at <WEB_URL>/cli
   // Comma-separated HTTPS origins permitted when Aviary verification lives on
   // a different origin than the hub. WEB_URL must be the hub origin unless it
@@ -139,10 +143,35 @@ export function clientIp(req: Request): string {
   );
 }
 
+/** Finch's public transport boundary. Cloudflare normally presents production
+ * requests as HTTPS/WSS, but enforcing that assumption here prevents a route,
+ * zone, or client misconfiguration from silently turning plain HTTP into an
+ * accepted relay path. The escape hatch exists only for local dev and isolated
+ * tests; deploy preflight forbids it in staging/production. */
+export function secureTransport(req: Request, env: Env): boolean {
+  const url = new URL(req.url);
+  if (url.protocol === "https:") return true;
+  if (
+    url.hostname === "localhost" ||
+    url.hostname === "127.0.0.1" ||
+    url.hostname === "[::1]" ||
+    url.hostname === "::1"
+  ) {
+    return true;
+  }
+  return env.DEV === "1" && env.ALLOW_INSECURE_HTTP === "1";
+}
+
 // Max relay request body we'll buffer into a DO (#16 / security L9). The DO
 // buffers the whole body via req.text(); a few-MB cap keeps concurrent POSTs
 // from summing past DO heap. Enforced here pre-stub AND in BoxDO.fetch.
 const MAX_RELAY_BODY_BYTES = 4 * 1024 * 1024; // 4 MiB
+
+// Max body accepted by the /register DCR proxy. That branch runs BEFORE tenant
+// resolution and before RELAY_LIMIT, so it is the cheapest unauthenticated path
+// into this Worker — the cap has to be tight. RFC 7591 client metadata is a
+// handful of fields (redirect_uris dominates); 64 KiB is generous.
+const MAX_DCR_BODY_BYTES = 64 * 1024; // 64 KiB
 
 // Browser login-wall session cookie lifetime (12h). The cookie is the long-lived
 // proof a browser already cleared the Clerk wall; the portal hand-off grant that
@@ -154,7 +183,30 @@ const SESSION_TTL_SECONDS = 12 * 60 * 60;
 // HOST-scoped (no Domain attribute) so a cookie minted for one host key
 // (<slug>.finchmcp.com, <box>.aviary.run, or a BYO hostname) can't be
 // replayed against a sibling tenant's host.
-const SESSION_COOKIE = "finch_session";
+//
+// The `__Host-` prefix is what MAKES that host-scoping unforgeable rather than
+// merely intended. Every tenant gets HTML execution on its own host under the
+// shared parent (a service with auth "public" skips the login wall entirely —
+// index.ts:456 — and the relay is protocol-agnostic, so it will happily serve
+// text/html). finchmcp.com is not a public suffix, so without the prefix that
+// page can run `document.cookie = "finch_session=…; domain=finchmcp.com;
+// path=/<svc>"` and plant a SECOND cookie of the same name in a victim's jar on
+// a sibling host — HttpOnly does not protect it, because a different
+// domain/path key is a DISTINCT cookie, not an overwrite. RFC 6265 §5.4 sorts
+// the longer-path cookie FIRST, so the injected value leads the Cookie header:
+// denial of the login wall for the victim, and session fixation. Browsers
+// REJECT any `__Host-` cookie that carries a Domain attribute or a Path other
+// than "/", which kills that whole class at the jar — no sibling can create a
+// cookie under this name at all. Same prefix the dashboard already uses for its
+// tenant cookie (web/lib/tenant-cookie.ts:5).
+const SESSION_COOKIE = "__Host-finch_session";
+
+// The pre-prefix cookie name. Renaming a cookie invalidates every live session,
+// so we still ACCEPT this one (browserGate ranks it below the prefixed name —
+// see readSessionCookies) and CLEAR it whenever we mint or expire a session.
+// It can be deleted once the 12h SESSION_TTL_SECONDS window has passed since
+// the deploy that introduced the prefixed name: no legacy cookie outlives it.
+const LEGACY_SESSION_COOKIE = "finch_session";
 
 // Caller-controlled copies are removed before any relay authentication runs;
 // only the Worker may inject this header after a successful auth decision.
@@ -169,6 +221,20 @@ const RESERVED_CALLER_IDENTITY_HEADERS = new Set([
   "x-finch-session",
   "x-finch-principal",
 ]);
+
+// Reserved BoxDO surfaces. The DO strips two path segments, so ANY relayed
+// upstream whose first segment is one of these lands on a control surface
+// instead of the hosted app. The authenticated _connect branch is the only
+// legitimate way onto that surface; anything arriving at the generic relay with
+// one of these as its upstream head is probing, so it 404s at the edge.
+// (A two-segment /<service>/_connect used to slip past the parts[2] === "_connect"
+// check — parts has no leading empty element — and hijack the agent socket.)
+const RESERVED_BOX_UPSTREAM = new Set(["_connect", "_control"]);
+
+function isReservedUpstream(upstream: string): boolean {
+  const head = upstream.split("/").filter(Boolean)[0];
+  return !!head && RESERVED_BOX_UPSTREAM.has(head);
+}
 
 function stripUntrustedCallerIdentity(headers: Headers): void {
   for (const name of [...headers.keys()]) {
@@ -216,7 +282,7 @@ function base64url(bytes: Uint8Array): string {
     .replace(/=+$/, "");
 }
 
-async function requestBodySha256(body: ArrayBuffer | null): Promise<string> {
+async function requestBodySha256(body: BufferSource | null): Promise<string> {
   const digest = await crypto.subtle.digest(
     "SHA-256",
     body ?? new Uint8Array(0),
@@ -235,7 +301,7 @@ async function injectCallerAssertion(
   service: string,
   caller: RelayCaller | null,
   upstreamPath: string,
-  body: ArrayBuffer | null,
+  body: BufferSource | null,
 ): Promise<void> {
   stripUntrustedCallerIdentity(headers);
   if (!caller) return; // public/anonymous relay: never claim an authenticated identity
@@ -273,32 +339,80 @@ async function injectCallerAssertion(
   );
 }
 
-/** Parse a single cookie value out of a Cookie header. Returns "" if absent.
+/** A Set-Cookie that expires `name` on the current host. The attributes must
+ *  mirror the set (Secure, Path=/, no Domain) or the browser keys the expiry to
+ *  a different cookie and the live one survives. */
+function expireSessionCookie(name: string): string {
+  return `${name}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0`;
+}
+
+/** Expire BOTH login-wall cookies — what logout owes: leaving the legacy name
+ *  behind would leave browserGate's legacy candidate still walking the user
+ *  through the wall. The mint expires only the legacy name (it is writing the
+ *  other), so that a single re-login during the transition retires the
+ *  shadowable pre-prefix cookie instead of dragging it for its full 12h TTL. */
+function clearSessionCookies(): string[] {
+  return [SESSION_COOKIE, LEGACY_SESSION_COOKIE].map(expireSessionCookie);
+}
+
+/** Every value carried under `name` in the Cookie header, in header order.
  *  Minimal + allocation-light; cookie values here are base64url envelopes (no
- *  special chars), so a plain name=value split per pair is sufficient. */
-function readCookie(req: Request, name: string): string {
+ *  special chars), so a plain name=value split per pair is sufficient.
+ *
+ *  ALL matches, not the first: a Cookie header can legitimately repeat a name
+ *  (distinct domain/path keys collapse into one header), and "first match wins"
+ *  is precisely the behaviour an injected cookie games — RFC 6265 §5.4 puts the
+ *  longer-path cookie first, and the attacker picks the path. */
+function readCookieValues(req: Request, name: string): string[] {
   const raw = req.headers.get("cookie");
-  if (!raw) return "";
+  if (!raw) return [];
+  const out: string[] = [];
   for (const part of raw.split(";")) {
     const eq = part.indexOf("=");
     if (eq < 0) continue;
-    if (part.slice(0, eq).trim() === name) return part.slice(eq + 1).trim();
+    if (part.slice(0, eq).trim() === name) out.push(part.slice(eq + 1).trim());
   }
-  return "";
+  return out;
 }
 
-/** Strip ONLY the finch_session login-wall cookie out of a Cookie header,
- *  preserving the hosted app's OWN cookies (e.g. app_sid). Parses the header into
- *  name=value pairs, drops the SESSION_COOKIE pair, and re-serializes the rest.
- *  Returns "" if nothing remains (caller then deletes the header). The login-wall
- *  cookie must never cross to the box, but a blanket "contains finch_" strip would
- *  delete the whole Cookie header and break every cookie-based hosted site. (#1) */
+// Bound on how many session-cookie candidates browserGate will verify. Each
+// candidate that parses costs a signature check plus a gateBrowser round-trip,
+// and the header is caller-controlled, so the loop must not be unbounded. Two
+// is the honest maximum in the wild (prefixed + legacy); 4 leaves slack.
+const MAX_SESSION_COOKIE_CANDIDATES = 4;
+
+/** Session-cookie candidates for browserGate, BEST FIRST: every `__Host-`-named
+ *  value ahead of every legacy-named one, regardless of Cookie header order.
+ *
+ *  Ranking (rather than a single first-match read) is what makes the transition
+ *  safe. A sibling tenant cannot plant a `__Host-` cookie in a victim's jar at
+ *  all, but it CAN still plant the legacy name with `Domain=finchmcp.com`; if
+ *  header order decided the winner, that injected pair would shadow the
+ *  victim's own legacy cookie during the changeover window. Ordering by name
+ *  first, and treating the list as candidates to try in turn, means the
+ *  attacker's pair can only ever be evaluated after the real one. */
+function readSessionCookies(req: Request): string[] {
+  return [
+    ...readCookieValues(req, SESSION_COOKIE),
+    ...readCookieValues(req, LEGACY_SESSION_COOKIE),
+  ].slice(0, MAX_SESSION_COOKIE_CANDIDATES);
+}
+
+/** Strip ONLY the login-wall cookies out of a Cookie header, preserving the
+ *  hosted app's OWN cookies (e.g. app_sid). Parses the header into name=value
+ *  pairs, drops the SESSION_COOKIE / LEGACY_SESSION_COOKIE pairs, and
+ *  re-serializes the rest. Returns "" if nothing remains (caller then deletes
+ *  the header). The login-wall cookie must never cross to the box — and that
+ *  includes the legacy name for as long as browserGate still honors it — but a
+ *  blanket "contains finch_" strip would delete the whole Cookie header and
+ *  break every cookie-based hosted site. (#1) */
 function stripSessionCookie(cookieHeader: string): string {
   const kept: string[] = [];
   for (const part of cookieHeader.split(";")) {
     const eq = part.indexOf("=");
     const name = (eq < 0 ? part : part.slice(0, eq)).trim();
-    if (name === SESSION_COOKIE) continue; // drop only the login-wall cookie pair
+    // drop only the login-wall cookie pairs
+    if (name === SESSION_COOKIE || name === LEGACY_SESSION_COOKIE) continue;
     const pair = part.trim();
     if (pair) kept.push(pair);
   }
@@ -419,11 +533,18 @@ async function maybeBrowserGate(
 /** browserGate — the login-wall decision for a relay request that is NOT a
  *  finch_ bearer call, NOT service-authed, and NOT a public service (the
  *  caller checks those first). For such a request (a plain browser hit on a
- *  PRIVATE service) we require a valid finch_session cookie bound to THIS
- *  tenant+slug whose epoch matches the tenant's current sessionEpoch. A valid
- *  cookie passes as {browserAuthed:true} (relayMcp skips the key gate); a
+ *  PRIVATE service) we require a valid session cookie bound to THIS tenant+slug
+ *  whose epoch matches the tenant's current sessionEpoch. A valid cookie passes
+ *  as {browserAuthed:true} (relayMcp skips the key gate); a
  *  missing/invalid/stale cookie 302s to the Clerk-gated portal start page. The
- *  cookie is the ONLY thing checked here; the service-private check is upstream. */
+ *  cookie is the ONLY thing checked here; the service-private check is upstream.
+ *
+ *  We walk CANDIDATES rather than one value (readSessionCookies, best-first) so
+ *  that a shadowing pair under the legacy name cannot deny the wall to a user
+ *  whose real cookie sits later in the header: a junk candidate only costs the
+ *  next iteration. A definitive "not shared with you" verdict still short-
+ *  circuits — that answer is about the USER, so a later candidate cannot
+ *  improve it, and letting one try would turn the loop into an oracle. */
 async function browserGate(
   req: Request,
   env: Env,
@@ -432,8 +553,8 @@ async function browserGate(
   service: string,
   originalPathAndQuery: string,
 ): Promise<GateDecision> {
-  const cookie = readCookie(req, SESSION_COOKIE);
-  if (cookie) {
+  for (const cookie of readSessionCookies(req)) {
+    if (!cookie) continue;
     const sess = await verifySession(cookie, env.SESSION_SECRET);
     if (
       sess &&
@@ -602,6 +723,23 @@ export default {
     env: Env,
     ctx: ExecutionContext,
   ): Promise<Response> {
+    // Reject insecure requests before authentication and, critically, before
+    // any handler reads or buffers a request body. We do not redirect POSTs:
+    // doing so could encourage a client to send a credential or payload over
+    // plaintext once before retrying securely.
+    if (!secureTransport(req, env)) {
+      return new Response(
+        JSON.stringify({ error: "HTTPS is required" }),
+        {
+          status: 426,
+          headers: {
+            "content-type": "application/json",
+            "cache-control": "no-store",
+          },
+        },
+      );
+    }
+
     const url = new URL(req.url);
     const host = req.headers.get("host") || url.host;
     const path = url.pathname;
@@ -846,7 +984,23 @@ export default {
       // `scope`, and forward. On any parse failure, forward the raw text
       // unchanged — never break registration just because we couldn't augment
       // it. (Reading text first avoids a half-consumed req.body on a throw.)
-      const raw = await req.text();
+      //
+      // SIZE CAP FIRST: this branch sits AHEAD of resolveTenant and the
+      // per-(tenant,IP) RELAY_LIMIT, so it is unauthenticated, untenanted and
+      // unthrottled — req.text() on a chunked body would let anyone stream
+      // ~100 MB into a 128 MB isolate and take co-resident requests down with
+      // it. readBoundedBody cancels the reader the moment the running total
+      // would cross the cap; a real DCR document is a few KB.
+      let rawBytes: Uint8Array | undefined;
+      try {
+        rawBytes = await readBoundedBody(req, MAX_DCR_BODY_BYTES);
+      } catch {
+        return json(400, { error: "invalid request body" });
+      }
+      if (rawBytes === undefined) {
+        return json(413, { error: "request body too large" });
+      }
+      const raw = new TextDecoder().decode(rawBytes);
       let body = raw;
       try {
         const reg = JSON.parse(raw) as Record<string, unknown>;
@@ -886,14 +1040,12 @@ export default {
     if (path === "/__finch/logout" && req.method === "GET") {
       // Clear the session cookie (Max-Age=0) and 302 to a validated relative rd
       // (default "/"). Host-scoped clear: same attributes as the set, no Domain.
+      // BOTH names — a logout that left the legacy cookie behind would leave the
+      // user still walked through the wall by browserGate's legacy candidate.
       const rd = safeRelPath(url.searchParams.get("rd"));
-      return new Response(null, {
-        status: 302,
-        headers: {
-          location: rd,
-          "set-cookie": `${SESSION_COOKIE}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0`,
-        },
-      });
+      const headers = new Headers({ location: rd });
+      for (const sc of clearSessionCookies()) headers.append("set-cookie", sc);
+      return new Response(null, { status: 302, headers });
     }
 
     const service = parts[0];
@@ -940,8 +1092,20 @@ export default {
       connectUrl.searchParams.set("tenant", tenant);
       connectUrl.searchParams.set("service", service);
       connectUrl.searchParams.set("box", box);
+      // PROVE PROVENANCE TO THE DO. BoxDO cannot tell an upgrade that came
+      // through this authenticated branch from one the public relay forwarded
+      // (the relay carries ARBITRARY client paths, and /<service>/_connect
+      // reaches the DO as relPath /_connect). Present the service secret, which
+      // relayMcp strips from caller headers — same trust model as /_control.
+      const connectHeaders = new Headers(req.headers);
+      connectHeaders.set("X-Finch-Service", env.FINCH_SERVICE_SECRET);
       const stub = boxStub(env, tenant, service, box);
-      return stub.fetch(new Request(connectUrl.toString(), req));
+      return stub.fetch(
+        new Request(connectUrl.toString(), {
+          method: req.method,
+          headers: connectHeaders,
+        }),
+      );
     }
 
     // Generic public relay: forward ANY path under the service to the box —
@@ -1017,6 +1181,7 @@ export default {
       if (pinned) {
         // Specific box: upstream = everything after <service>/<box>.
         const upstream = parts.slice(2).join("/");
+        if (isReservedUpstream(upstream)) return json(404, { error: "not found" });
         const allowed = await tenantOp<{ exists: boolean; allowed: boolean }>(
           env,
           tenant,
@@ -1033,6 +1198,7 @@ export default {
       // WHOLE healthy pool (shuffled) and FAIL OVER inside relayMcp on a
       // stale-pick "service offline" 503. (code-review #12)
       const upstream = parts.slice(1).join("/");
+      if (isReservedUpstream(upstream)) return json(404, { error: "not found" });
       const allowed = await tenantOp<{ exists: boolean; allowed: boolean }>(
         env,
         tenant,
@@ -1299,13 +1465,25 @@ async function relayMcp(
   }
   // Buffer the body ONCE so we can replay it across failover candidates (a
   // streaming body can't be re-sent). Enforce the real size cap here too, since
-  // content-length may be absent for a chunked request.
-  let bodyBytes: ArrayBuffer | null = null;
+  // content-length may be absent for a chunked request — and enforce it WHILE
+  // reading: arrayBuffer() would materialize the whole upload before we could
+  // measure it, so a chunked ~100 MB POST (the platform's body ceiling) would
+  // sit in the isolate's 128 MB heap and take co-resident in-flight requests
+  // down with it. readBoundedBody cancels the stream the moment the running
+  // total would cross the cap, so at most MAX_RELAY_BODY_BYTES is ever held.
+  let bodyBytes: Uint8Array | null = null;
   if (req.body) {
-    bodyBytes = await req.arrayBuffer();
-    if (bodyBytes.byteLength > MAX_RELAY_BODY_BYTES) {
+    let read: Uint8Array | undefined;
+    try {
+      read = await readBoundedBody(req, MAX_RELAY_BODY_BYTES);
+    } catch {
+      // read failure (client hung up / malformed chunking) — distinct from oversize
+      return json(400, { error: "invalid request body" });
+    }
+    if (read === undefined) {
       return json(413, { error: "request body too large" });
     }
+    bodyBytes = read;
   }
   try {
     const upstreamPath =
@@ -1478,17 +1656,25 @@ async function handleFinchCb(
   );
 
   // HOST-scoped cookie (NO Domain) so it can't be replayed against a sibling
-  // tenant's slug host. HttpOnly + Secure + SameSite=Lax + Path=/. Max-Age makes
-  // it a PERSISTENT cookie for the full session lifetime — without it the browser
-  // treats it as a session cookie that dies when the tab closes (the 12h TTL
-  // baked into the signed envelope would then be moot). (code-review #11)
-  return new Response(null, {
-    status: 302,
-    headers: {
-      location: rd,
-      "set-cookie": `${SESSION_COOKIE}=${session}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${SESSION_TTL_SECONDS}`,
-    },
-  });
+  // tenant's slug host — and named with the `__Host-` prefix, which is what
+  // stops a sibling from planting a same-named cookie of its own (see
+  // SESSION_COOKIE). HttpOnly + Secure + SameSite=Lax + Path=/; the prefix
+  // REQUIRES exactly Secure + Path=/ + no Domain, so those attributes are now
+  // load-bearing: drop any of them and the browser discards the cookie
+  // outright. Max-Age makes it a PERSISTENT cookie for the full session
+  // lifetime — without it the browser treats it as a session cookie that dies
+  // when the tab closes (the 12h TTL baked into the signed envelope would then
+  // be moot). (code-review #11)
+  //
+  // A second Set-Cookie expires the pre-prefix name in the same response: only
+  // the new name is ever WRITTEN, and re-login is what retires the old one.
+  const headers = new Headers({ location: rd });
+  headers.append(
+    "set-cookie",
+    `${SESSION_COOKIE}=${session}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${SESSION_TTL_SECONDS}`,
+  );
+  headers.append("set-cookie", expireSessionCookie(LEGACY_SESSION_COOKIE));
+  return new Response(null, { status: 302, headers });
 }
 
 /** The `finch` agent installer served at GET /install. The enroll one-liner is

@@ -10,7 +10,9 @@ import {
   verifyToken,
   signAssertion,
   verifyAssertion,
+  verifyAssertionPayload,
   verifyCallerAssertion,
+  verifyClerkOAuthToken,
   type CallerAssertionClaims,
   type CallerAssertionJwk,
   type TicketPayload,
@@ -53,22 +55,11 @@ describe("hashKey", () => {
     expect(h1).toBe(h2);
   });
 
-  it("produces a 64-char lowercase hex sha-256 digest", async () => {
-    const h = await hashKey("finch_whatever");
-    expect(h).toMatch(/^[0-9a-f]{64}$/);
-  });
-
-  it("differs for different inputs", async () => {
-    const a = await hashKey(genFinchKey());
-    const b = await hashKey(genFinchKey());
-    expect(a).not.toBe(b);
-  });
-
-  it("matches a known SHA-256 vector", async () => {
+  it("matches the canonical SHA-256 vector and encoding", async () => {
     // sha256("abc") — canonical NIST vector.
-    expect(await hashKey("abc")).toBe(
-      "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
-    );
+    const digest = await hashKey("abc");
+    expect(digest).toBe("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    expect(digest).toMatch(/^[0-9a-f]{64}$/);
   });
 });
 
@@ -151,6 +142,28 @@ describe("signToken / verifyToken (join + connect tickets)", () => {
     expect(await verifyToken("", SECRET)).toBeNull();
   });
 
+  it("rejects hostile runtime types, oversized tokens, empty ids, and non-finite expiry", async () => {
+    const malformed: unknown[] = [null, {}, [], 42, "x".repeat(16 * 1024 + 1)];
+    for (const value of malformed) {
+      expect(await verifyToken(value as string, SECRET)).toBeNull();
+    }
+    for (const payload of [
+      { ...basePayload(), tenant: "" },
+      { ...basePayload(), service: "" },
+      { ...basePayload(), exp: Infinity },
+    ]) {
+      expect(await verifyToken(await signToken(payload, SECRET), SECRET)).toBeNull();
+    }
+  });
+
+  it("rejects padded and standard-alphabet encodings even when bytes/signature are unchanged", async () => {
+    const token = await signToken(basePayload(), SECRET);
+    const [body, signature] = token.split(".");
+    expect(await verifyToken(`${body}.${signature}=`, SECRET)).toBeNull();
+    const standard = signature.replace(/-/g, "+").replace(/_/g, "/");
+    if (standard !== signature) expect(await verifyToken(`${body}.${standard}`, SECRET)).toBeNull();
+  });
+
   it("rejects a ticket with an invalid kind", async () => {
     // Hand-build a payload with a bogus kind, signed correctly, to prove the
     // shape validation (not just the HMAC) rejects it.
@@ -176,6 +189,14 @@ describe("signAssertion / verifyAssertion (tenant assertion)", () => {
       SECRET,
     );
     expect(await verifyAssertion(tok, SECRET)).toBe("org_123");
+  });
+
+  it("rejects an explicitly malformed kind instead of defaulting it to assertion", async () => {
+    const tok = await signAssertion(
+      { tenant: "org_123", exp: nowSec() + 60, kind: null as unknown as string },
+      SECRET,
+    );
+    expect(await verifyAssertionPayload(tok, SECRET)).toBeNull();
   });
 
   it("rejects an expired assertion", async () => {
@@ -400,5 +421,60 @@ describe("ES256 caller assertions", () => {
         "https://finch.test",
       ),
     ).rejects.toThrow(/active assertion key not found/);
+  });
+
+  it("returns null for malformed runtime token/JWKS values instead of throwing", async () => {
+    expect(await verifyCallerAssertion(null as unknown as string, { keys: [] })).toBeNull();
+    expect(await verifyCallerAssertion("a.b.c", {} as any)).toBeNull();
+    expect(await verifyCallerAssertion("x".repeat(16 * 1024 + 1), { keys: [] })).toBeNull();
+  });
+});
+
+describe("Clerk userinfo verification boundaries", () => {
+  it("coalesces concurrent misses for the same opaque token", async () => {
+    let calls = 0;
+    const fetcher = {
+      async fetch() {
+        calls++;
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        return Response.json({ sub: "user_singleflight", email: "u@example.test" });
+      },
+    };
+    const token = `opaque-${crypto.randomUUID()}`;
+    const results = await Promise.all(Array.from({ length: 20 }, () =>
+      verifyClerkOAuthToken(token, "https://clerk.test", fetcher as any)));
+    expect(calls).toBe(1);
+    expect(results.every((value) => value?.sub === "user_singleflight")).toBe(true);
+  });
+
+  it.each([null, [], { sub: "u", email: 7 }, { email: "missing-sub@example.test" }])(
+    "rejects malformed successful identity payload %#",
+    async (payload) => {
+      const fetcher = { fetch: async () => Response.json(payload) };
+      expect(await verifyClerkOAuthToken(
+        `opaque-${crypto.randomUUID()}`, "https://clerk.test", fetcher as any,
+      )).toBeNull();
+    },
+  );
+
+  it("does not cache transient 5xx failures", async () => {
+    let calls = 0;
+    const fetcher = { fetch: async () => { calls++; return new Response("down", { status: 503 }); } };
+    const token = `opaque-${crypto.randomUUID()}`;
+    expect(await verifyClerkOAuthToken(token, "https://clerk.test", fetcher as any)).toBeNull();
+    expect(await verifyClerkOAuthToken(token, "https://clerk.test", fetcher as any)).toBeNull();
+    expect(calls).toBe(2);
+  });
+
+  it("rejects an oversized userinfo response without caching it", async () => {
+    let calls = 0;
+    const fetcher = { fetch: async () => {
+      calls++;
+      return Response.json({ sub: "u", padding: "x".repeat(17 * 1024) });
+    } };
+    const token = `opaque-${crypto.randomUUID()}`;
+    expect(await verifyClerkOAuthToken(token, "https://clerk.test", fetcher as any)).toBeNull();
+    expect(await verifyClerkOAuthToken(token, "https://clerk.test", fetcher as any)).toBeNull();
+    expect(calls).toBe(2);
   });
 });

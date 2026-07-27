@@ -2,7 +2,7 @@
 #
 # One-time setup (state persists in the `finch-data` volume):
 #
-#   docker compose run --rm finch login --hub https://finchmcp.com <cli-token>
+#   docker compose run --rm -T finch login --hub https://finchmcp.com --token - <<<"$CLI_TOKEN"
 #   docker compose run --rm finch add hello --service http://hello-mcp:8000 --name "Hello MCP"
 #
 # Then serve (prints the public URL):
@@ -22,6 +22,12 @@ services:
       HOST: 0.0.0.0   # reachable from the finch container (not the host)
     volumes:
       - ../hello-mcp/server.py:/app/server.py:ro
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/', timeout=2).read()"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+      start_period: 2s
     restart: unless-stopped
 
   finch:
@@ -30,7 +36,8 @@ services:
     volumes:
       - finch-data:/data
     depends_on:
-      - hello-mcp
+      hello-mcp:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:

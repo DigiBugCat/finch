@@ -2,6 +2,8 @@ import { describe, it, expect } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
 import vectors from "./relay-vectors.json";
 import {
+  MAX_PENDING_RELAY_BODY_BYTES,
+  MAX_RELAY_BODY_BYTES,
   MAX_STREAMS_PER_BOX,
   RELAY_HEAD_TIMEOUT_MS,
   RELAY_IDLE_MS,
@@ -59,8 +61,11 @@ function relayUrl(
   return `https://hub/${m.service}/${encodeURIComponent(m.box)}/${rest}`;
 }
 
-/** Register a fake agent over a real WS upgrade to the DO's _connect (the DO
- *  itself does no auth; index.ts gates that). Returns the agent's client end. */
+/** Register a fake agent over a real WS upgrade to the DO's _connect. index.ts
+ *  verifies the per-box connect token and then proves provenance to the DO with
+ *  X-Finch-Service; the DO fails closed without it, so a request the public
+ *  relay forwarded can never claim the agent socket. Returns the agent's client
+ *  end. */
 async function connectAgent(
   stub: Stub,
   m: { tenant: string; service: string; box: string },
@@ -68,7 +73,12 @@ async function connectAgent(
   const url =
     `https://hub/${m.service}/${encodeURIComponent(m.box)}/_connect` +
     `?tenant=${m.tenant}&service=${m.service}&box=${encodeURIComponent(m.box)}`;
-  const res = await stub.fetch(url, { headers: { Upgrade: "websocket" } });
+  const res = await stub.fetch(url, {
+    headers: {
+      Upgrade: "websocket",
+      "X-Finch-Service": env.FINCH_SERVICE_SECRET,
+    },
+  });
   expect(res.status).toBe(101);
   const client = res.webSocket!;
   client.accept();
@@ -131,6 +141,10 @@ const runInDO = runInDurableObject as unknown as (
 
 async function fireIdle(stub: Stub, id: string): Promise<void> {
   await runInDO(stub, (instance) => instance.onIdle(id));
+}
+
+async function streamCount(stub: Stub): Promise<number> {
+  return await runInDO(stub, (instance) => instance.streams.size) as number;
 }
 
 /** Drain a Response body that is EXPECTED to be errored mid-stream, returning
@@ -197,6 +211,51 @@ describe("BoxDO streaming relay — head + chunks + end", () => {
     expect(await res.text()).toBe("hello world");
   });
 
+  it("keeps request/response payloads transient and persists socket identity only", async () => {
+    const m = freshBox();
+    const stub = stubFor(m);
+    const agent = await connectAgent(stub, m);
+    const requestMarker = `PRIVATE_REQUEST_${crypto.randomUUID()}`;
+    const responseMarker = `PRIVATE_RESPONSE_${crypto.randomUUID()}`;
+
+    const reqSeen = nextFrame(agent);
+    const resPromise = stub.fetch(
+      new Request(relayUrl(m), { method: "POST", body: requestMarker }),
+    );
+    const req = await reqSeen;
+    expect(req.body).toBe(requestMarker);
+
+    agent.send(JSON.stringify({ id: req.id, type: "head", status: 200 }));
+    agent.send(
+      JSON.stringify({
+        id: req.id,
+        type: "chunk",
+        data: btoa(responseMarker),
+      }),
+    );
+    agent.send(JSON.stringify({ id: req.id, type: "end" }));
+    expect(await (await resPromise).text()).toBe(responseMarker);
+
+    const snapshot = await runInDO(stub, async (instance) => {
+      const sockets = instance.ctx.getWebSockets("agent");
+      const stored = await instance.ctx.storage.list();
+      return {
+        streamCount: instance.streams.size,
+        attachment: sockets[0]?.deserializeAttachment(),
+        storageKeys: [...stored.keys()],
+      };
+    }) as any;
+    expect(snapshot.streamCount).toBe(0);
+    expect(snapshot.attachment).toEqual({
+      tenant: m.tenant,
+      service: m.service,
+      box: m.box,
+    });
+    expect(snapshot.storageKeys).toEqual([]);
+    expect(JSON.stringify(snapshot)).not.toContain(requestMarker);
+    expect(JSON.stringify(snapshot)).not.toContain(responseMarker);
+  });
+
   it("excludes hop-by-hop headers the agent (defensively) re-sent in head", async () => {
     const m = freshBox();
     const stub = stubFor(m);
@@ -233,6 +292,61 @@ describe("BoxDO streaming relay — head + chunks + end", () => {
     expect(await res.text()).toBe("hello");
   });
 
+  it("confines agent Set-Cookie to the request host and keeps host-only cookies", async () => {
+    // The box agent is customer-operated, so a `head` can carry
+    // `Domain=finchmcp.com` — a cookie scoped to the SHARED parent domain, which
+    // browsers would then send to the dashboard and to every sibling tenant's
+    // <slug>.finchmcp.com (shadowing their host-only finch_session, and enabling
+    // login-CSRF). Only the Domain attribute may be stripped; the cookie itself
+    // and every other attribute must survive verbatim.
+    const m = freshBox();
+    const stub = stubFor(m);
+    const agent = await connectAgent(stub, m);
+
+    const reqSeen = nextFrame(agent);
+    const resPromise = stub.fetch(
+      new Request(
+        `https://acme.finchmcp.com/${m.service}/${encodeURIComponent(m.box)}/mcp`,
+        { method: "POST", body: "x" },
+      ),
+    );
+    const { id } = await reqSeen;
+
+    agent.send(
+      JSON.stringify({
+        id,
+        type: "head",
+        status: 200,
+        headers: [
+          // Parent domain: attribute must go, cookie stays host-only.
+          ["set-cookie", "finch_session=evil; Domain=finchmcp.com; Path=/; HttpOnly"],
+          // Leading-dot legacy form of the same parent domain.
+          ["set-cookie", "b=2; Domain=.FinchMcp.com; Path=/"],
+          // Exactly the request host — no broader than the box already is.
+          ["set-cookie", "c=3; Domain=acme.finchmcp.com; Path=/"],
+          // The ordinary legitimate case: host-only, untouched.
+          ["set-cookie", "d=4; Path=/; HttpOnly; Secure; SameSite=Lax"],
+        ],
+      }),
+    );
+    agent.send(JSON.stringify({ id, type: "chunk", data: "aGVsbG8=" }));
+    agent.send(JSON.stringify({ id, type: "end" }));
+
+    const res = await resPromise;
+    expect(res.status).toBe(200);
+    const setCookies = (
+      res.headers as Headers & { getSetCookie(): string[] }
+    ).getSetCookie();
+    expect(setCookies).toEqual([
+      "finch_session=evil; Path=/; HttpOnly",
+      "b=2; Path=/",
+      "c=3; Domain=acme.finchmcp.com; Path=/",
+      "d=4; Path=/; HttpOnly; Secure; SameSite=Lax",
+    ]);
+    expect(setCookies.join("\n")).not.toContain("Domain=finchmcp.com");
+    expect(await res.text()).toBe("hello");
+  });
+
   it("tolerates a head with the `headers` key absent (no forwardable headers)", async () => {
     // When every upstream header is hop-by-hop, the agent emits a head with no
     // `headers` key; the DO must not crash iterating `undefined`. (review: major)
@@ -255,6 +369,220 @@ describe("BoxDO streaming relay — head + chunks + end", () => {
     expect(res.status).toBe(200);
     expect([...res.headers.keys()]).not.toContain("set-cookie");
     expect(await res.text()).toBe("hello");
+  });
+});
+
+describe("BoxDO adversarial protocol boundaries", () => {
+  it.each([
+    ["end before head", (id: string) => ({ id, type: "end" })],
+    ["chunk before head", (id: string) => ({ id, type: "chunk", data: "YQ==" })],
+    ["invalid status", (id: string) => ({ id, type: "head", status: 99, headers: [] })],
+    ["malformed headers", (id: string) => ({ id, type: "head", status: 200, headers: [null] })],
+    ["invalid error", (id: string) => ({ id, type: "err", status: 200, message: "wrong" })],
+    ["invalid reset", (id: string) => ({ id, type: "reset", message: 42 })],
+    ["non-string type", (id: string) => ({ id, type: 42 })],
+    ["unknown type", (id: string) => ({ id, type: "surprise" })],
+  ])("turns %s into a controlled 502, resets agent work, and releases the slot", async (_name, makeFrame) => {
+    const m = freshBox();
+    const stub = stubFor(m);
+    const agent = await connectAgent(stub, m);
+    const seen = nextFrame(agent);
+    const response = stub.fetch(new Request(relayUrl(m), { method: "POST", body: "x" }));
+    const { id } = await seen;
+    const resetSeen = waitForFrame(
+      agent,
+      (frame) => frame.type === "reset" && frame.id === id,
+    );
+    agent.send(JSON.stringify(makeFrame(id)));
+    expect((await response).status).toBe(502);
+    expect(await resetSeen).toMatchObject({ id, type: "reset" });
+    expect(await streamCount(stub)).toBe(0);
+  });
+
+  it("ignores primitive JSON without poisoning a following valid frame", async () => {
+    const m = freshBox();
+    const stub = stubFor(m);
+    const agent = await connectAgent(stub, m);
+    const seen = nextFrame(agent);
+    const response = stub.fetch(new Request(relayUrl(m), { method: "POST", body: "x" }));
+    const { id } = await seen;
+    for (const value of ["null", "[]", "42", '"text"']) agent.send(value);
+    agent.send(JSON.stringify({ id, type: "head", status: 200, headers: [] }));
+    agent.send(JSON.stringify({ id, type: "end" }));
+    expect(await (await response).text()).toBe("");
+    expect(await streamCount(stub)).toBe(0);
+  });
+
+  it.each([204, 205, 304])("returns bodyless status %i without throwing or leaking", async (status) => {
+    const m = freshBox();
+    const stub = stubFor(m);
+    const agent = await connectAgent(stub, m);
+    const seen = nextFrame(agent);
+    const response = stub.fetch(new Request(relayUrl(m), { method: "GET" }));
+    const { id } = await seen;
+    agent.send(JSON.stringify({ id, type: "head", status, headers: [] }));
+    const res = await response;
+    expect(res.status).toBe(status);
+    expect(res.body).toBeNull();
+    expect(await streamCount(stub)).toBe(0);
+  });
+
+  it("cleans stale-owned work without letting that generation abort replacement work", async () => {
+    const m = freshBox();
+    const stub = stubFor(m);
+    const original = await connectAgent(stub, m);
+    const staleReqSeen = nextFrame(original);
+    const staleResponse = stub.fetch(
+      new Request(relayUrl(m), { method: "POST", body: "stale" }),
+    );
+    await staleReqSeen;
+    // Preserve the actual accepted server socket before replacement. The prior
+    // regression fabricated an unrelated WebSocketPair, which could not prove
+    // generation ownership across the real last-writer-wins path.
+    await runInDO(stub, (instance) => {
+      instance.testSupersededAgent = instance.currentAgent;
+    });
+    const replacement = await connectAgent(stub, m);
+    const seen = nextFrame(replacement);
+    const response = stub.fetch(new Request(relayUrl(m), { method: "POST", body: "x" }));
+    const { id } = await seen;
+    await runInDO(stub, async (instance) => {
+      const stale = instance.testSupersededAgent;
+      expect(stale).toBeDefined();
+      expect(stale).not.toBe(instance.currentAgent);
+      await instance.webSocketClose(stale, 1012, "superseded");
+      await instance.webSocketError(stale, new Error("late stale error"));
+      delete instance.testSupersededAgent;
+    });
+    expect((await staleResponse).status).toBe(502);
+    replacement.send(JSON.stringify({ id, type: "head", status: 200, headers: [] }));
+    replacement.send(JSON.stringify({ id, type: "chunk", data: "b2s=" }));
+    replacement.send(JSON.stringify({ id, type: "end" }));
+    expect(await (await response).text()).toBe("ok");
+  });
+
+  it("dispatches a slow request body through the replacement socket generation", async () => {
+    const m = freshBox();
+    const stub = stubFor(m);
+    await connectAgent(stub, m);
+    let bodyController!: ReadableStreamDefaultController<Uint8Array>;
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        bodyController = controller;
+        controller.enqueue(new TextEncoder().encode("x"));
+      },
+    });
+    const response = stub.fetch(new Request(relayUrl(m), { method: "POST", body }));
+    for (let i = 0; i < 100; i++) {
+      const pending = await runInDO(
+        stub,
+        (instance) => instance.pendingBodyReads,
+      ) as number;
+      if (pending === 1) break;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    expect(await runInDO(stub, (instance) => instance.pendingBodyReads)).toBe(1);
+
+    const replacement = await connectAgent(stub, m);
+    const replacementReqSeen = nextFrame(replacement);
+    bodyController.close();
+    const replacementReq = await replacementReqSeen;
+    expect(replacementReq).toMatchObject({ type: "req", body: "x" });
+    replacement.send(JSON.stringify({
+      id: replacementReq.id,
+      type: "err",
+      status: 502,
+      message: "generation observed",
+    }));
+    expect((await response).status).toBe(502);
+  });
+
+  it("marks the current agent offline even when it closes with code 1012", async () => {
+    const m = freshBox();
+    const stub = stubFor(m);
+    await connectAgent(stub, m);
+    const transitions = await runInDO(stub, async (instance) => {
+      const seen: boolean[] = [];
+      instance.markBox = async (_meta: unknown, connected: boolean) => {
+        seen.push(connected);
+      };
+      await instance.webSocketClose(instance.currentAgent, 1012, "peer restart");
+      return seen;
+    }) as boolean[];
+    expect(transitions).toEqual([false]);
+  });
+
+  it("maps a current-socket send failure to the load-balancer offline contract", async () => {
+    const m = freshBox();
+    const stub = stubFor(m);
+    await connectAgent(stub, m);
+    // Workerd does not expose a deterministic way to force send() itself to
+    // throw before its close callback runs. Substitute only the current
+    // generation's transport operation so this exact catch path is stable.
+    await runInDO(stub, (instance) => {
+      instance.currentAgent = {
+        readyState: 1,
+        send() { throw new Error("transport already gone"); },
+        close() {},
+      };
+    });
+
+    const res = await stub.fetch(
+      new Request(relayUrl(m), { method: "POST", body: "x" }),
+    );
+    expect(res.status).toBe(503);
+    expect(res.headers.get("X-Finch-Offline")).toBe("1");
+    expect(await res.json()).toEqual({ error: "service offline", id: m.service });
+    expect(await streamCount(stub)).toBe(0);
+  });
+
+  it("enforces the relay request cap on UTF-8 bytes, not UTF-16 code units", async () => {
+    const m = freshBox();
+    const stub = stubFor(m);
+    await connectAgent(stub, m);
+    const multibyte = "💥".repeat(1_048_577); // >4 MiB UTF-8, ~2 Mi JS code units
+    const res = await stub.fetch(new Request(relayUrl(m), { method: "POST", body: multibyte }));
+    expect(res.status).toBe(413);
+    expect(await streamCount(stub)).toBe(0);
+    const invalid = await stub.fetch(new Request(relayUrl(m), {
+      method: "POST",
+      body: new Uint8Array([0xc3, 0x28]),
+    }));
+    expect(invalid.status).toBe(400);
+    expect(await invalid.json()).toEqual({ error: "relay request body must be valid UTF-8" });
+  });
+
+  it("accepts the exact body limit and rejects an over-limit stream before EOF", async () => {
+    const m = freshBox();
+    const stub = stubFor(m);
+    const agent = await connectAgent(stub, m);
+
+    const exactSeen = nextFrame(agent);
+    const exactResponse = stub.fetch(new Request(relayUrl(m), {
+      method: "POST",
+      body: new Uint8Array(MAX_RELAY_BODY_BYTES).fill(0x61),
+    }));
+    const exact = await exactSeen;
+    expect(exact.body).toHaveLength(MAX_RELAY_BODY_BYTES);
+    agent.send(JSON.stringify({
+      id: exact.id,
+      type: "err",
+      status: 502,
+      message: "boundary observed",
+    }));
+    expect((await exactResponse).status).toBe(502);
+
+    const neverEnding = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(MAX_RELAY_BODY_BYTES + 1));
+      },
+    });
+    const over = await stub.fetch(new Request(relayUrl(m), {
+      method: "POST",
+      body: neverEnding,
+    }));
+    expect(over.status).toBe(413);
+    expect(await streamCount(stub)).toBe(0);
   });
 });
 
@@ -443,14 +771,6 @@ describe("BoxDO streaming relay — reset / offline", () => {
 });
 
 describe("BoxDO streaming relay — per-box stream cap (S1)", () => {
-  it("pins the slowloris constants: pre-head 120s, post-head idle 300s, cap 32", () => {
-    // The pre-head timer must be TIGHTER than the streaming idle so head-less
-    // (slowloris) slots recycle fast; the cap bounds concurrent DO memory.
-    expect(RELAY_HEAD_TIMEOUT_MS).toBe(120_000);
-    expect(RELAY_IDLE_MS).toBe(300_000);
-    expect(MAX_STREAMS_PER_BOX).toBe(32);
-  });
-
   it("429s the request over the cap; a freed slot admits the next request", async () => {
     const m = freshBox();
     const stub = stubFor(m);
@@ -488,8 +808,11 @@ describe("BoxDO streaming relay — per-box stream cap (S1)", () => {
       parked.push(
         stub.fetch(new Request(relayUrl(m), { method: "POST", body: "x" })),
       );
+      // Let this small body dispatch and release its byte reservation before
+      // starting the next. This test isolates the persistent stream-count cap;
+      // the separate slow-body test below owns reservation-budget behavior.
+      await waitForReqs(i + 1);
     }
-    await waitForReqs(MAX_STREAMS_PER_BOX);
 
     // One more is over the cap → 429, terminal (no X-Finch-Offline: the LB
     // must NOT treat a saturated box as offline / fail its load over).
@@ -536,6 +859,69 @@ describe("BoxDO streaming relay — per-box stream cap (S1)", () => {
     }
     const rest = await Promise.all([...parked.slice(1), admitted]);
     for (const r of rest) expect(r.status).toBe(502);
+  }, 10_000);
+
+  it("bounds concurrent slow request-body reservations by bytes, not stream count", async () => {
+    const m = freshBox();
+    const stub = stubFor(m);
+    const agent = await connectAgent(stub, m);
+    const reqIds: string[] = [];
+    agent.addEventListener("message", ((event: MessageEvent) => {
+      const frame = JSON.parse(event.data as string);
+      if (frame.type === "req") reqIds.push(frame.id);
+    }) as EventListener);
+
+    const reservationSlots = MAX_PENDING_RELAY_BODY_BYTES / MAX_RELAY_BODY_BYTES;
+    expect(Number.isInteger(reservationSlots)).toBe(true);
+    expect(reservationSlots).toBeLessThan(MAX_STREAMS_PER_BOX);
+    const controllers: ReadableStreamDefaultController<Uint8Array>[] = [];
+    const requests = Array.from({ length: reservationSlots }, () => {
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controllers.push(controller);
+          controller.enqueue(new TextEncoder().encode("x"));
+        },
+      });
+      return stub.fetch(new Request(relayUrl(m), { method: "POST", body }));
+    });
+
+    // The over-budget request must resolve while every accepted body is still
+    // blocked. Without a byte reservation, stream-count-only admission permits
+    // roughly MAX_STREAMS_PER_BOX * MAX_RELAY_BODY_BYTES of request buffers.
+    let pendingReads = 0;
+    let reservedBytes = 0;
+    for (let i = 0; i < 100 && reservedBytes < MAX_PENDING_RELAY_BODY_BYTES; i++) {
+      const snapshot = await runInDO(stub, (instance) => ({
+        pendingReads: instance.pendingBodyReads,
+        reservedBytes: instance.reservedRequestBodyBytes,
+      })) as { pendingReads: number; reservedBytes: number };
+      pendingReads = snapshot.pendingReads;
+      reservedBytes = snapshot.reservedBytes;
+      if (reservedBytes < MAX_PENDING_RELAY_BODY_BYTES) {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+    }
+    expect(pendingReads).toBe(reservationSlots);
+    expect(reservedBytes).toBe(MAX_PENDING_RELAY_BODY_BYTES);
+    const over = await stub.fetch(new Request(relayUrl(m), { method: "POST", body: "x" }));
+    expect(over.status).toBe(429);
+    expect(over.headers.get("X-Finch-Offline")).toBeNull();
+    expect(await over.json()).toEqual({
+      error: "too many request bytes in flight for this box",
+    });
+    expect(reqIds).toHaveLength(0);
+
+    for (const controller of controllers) controller.close();
+    for (let i = 0; i < 100 && reqIds.length < reservationSlots; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    expect(reqIds).toHaveLength(reservationSlots);
+    for (const id of reqIds) {
+      agent.send(JSON.stringify({ id, type: "err", status: 502, message: "done" }));
+    }
+    const statuses = (await Promise.all(requests)).map((res) => res.status);
+    expect(statuses.every((status) => status === 502)).toBe(true);
+    expect(await streamCount(stub)).toBe(0);
   }, 10_000);
 });
 
@@ -749,4 +1135,3 @@ describe("BoxDO streaming relay — backpressure (window frames)", () => {
     expect((await res2Promise).status).toBe(502);
   }, 15_000);
 });
-

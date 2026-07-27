@@ -1,10 +1,14 @@
 package core
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 func writeYAML(t *testing.T, body string) string {
@@ -178,8 +182,13 @@ func TestLoadConfig_Rejects(t *testing.T) {
 		"missing service":   "ingress:\n  - app_path: a\n",
 		"missing app_path":  "ingress:\n  - service: http://x\n",
 		"slash in app_path": "ingress:\n  - app_path: a/b\n    service: http://x\n",
-		"duplicate app_path": "ingress:\n  - app_path: a\n    service: http://x\n" +
-			"  - app_path: a\n    service: http://y\n",
+		"unsafe app_path":   "ingress:\n  - app_path: ../x\n    service: http://127.0.0.1\n",
+		"remote plaintext":  "ingress:\n  - app_path: a\n    service: http://mcp.example\n",
+		"upstream query":    "ingress:\n  - app_path: a\n    service: https://mcp.example/mcp?secret=x\n",
+		"duplicate app_path": "ingress:\n  - app_path: a\n    service: https://x.example\n" +
+			"  - app_path: a\n    service: https://y.example\n",
+		"case collision": "ingress:\n  - app_path: Media\n    service: https://one.example\n" +
+			"  - app_path: media\n    service: https://two.example\n",
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -187,5 +196,71 @@ func TestLoadConfig_Rejects(t *testing.T) {
 				t.Fatalf("expected rejection for %s", name)
 			}
 		})
+	}
+}
+
+func TestManifestMutation_IsAtomicSerializedAndPreservesMalformedInput(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "nested", "finch.yml")
+	const writers = 32
+	writeErrs := make(chan error, writers)
+	readErr := make(chan error, 1)
+	stopReader := make(chan struct{})
+	readerDone := make(chan struct{})
+	go func() {
+		defer close(readerDone)
+		for {
+			select {
+			case <-stopReader:
+				return
+			default:
+			}
+			b, err := os.ReadFile(p)
+			if err == nil {
+				var doc yaml.Node
+				if err := yaml.Unmarshal(b, &doc); err != nil {
+					select {
+					case readErr <- err:
+					default:
+					}
+					return
+				}
+			}
+		}
+	}()
+	var wg sync.WaitGroup
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			writeErrs <- appendIngress(p, "https://hub.example", fmt.Sprintf("app-%02d", i), fmt.Sprintf("https://service-%02d.example", i), "box")
+		}(i)
+	}
+	wg.Wait()
+	close(stopReader)
+	<-readerDone
+	for i := 0; i < writers; i++ {
+		if err := <-writeErrs; err != nil {
+			t.Fatal(err)
+		}
+	}
+	select {
+	case err := <-readErr:
+		t.Fatalf("reader observed torn YAML: %v", err)
+	default:
+	}
+	c, err := loadConfig(p, "host")
+	if err != nil || len(c.Ingress) != writers {
+		t.Fatalf("concurrent manifest mutations lost data: rules=%d err=%v", len(c.Ingress), err)
+	}
+
+	bad := []byte("hub: https://hub.example\ningress: {keep: me}\n")
+	if err := os.WriteFile(p, bad, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := appendIngress(p, "https://hub.example", "new", "https://new.example", "box"); err == nil {
+		t.Fatal("malformed ingress mapping was silently overwritten")
+	}
+	if got, _ := os.ReadFile(p); string(got) != string(bad) {
+		t.Fatalf("malformed manifest changed on rejected mutation:\n%s", got)
 	}
 }

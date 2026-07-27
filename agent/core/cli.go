@@ -1,30 +1,39 @@
 package core
 
 // finch CLI setup commands — `finch login` and `finch add`. Together they let a
-// box enroll services and build its finch.yml without ever touching the
-// dashboard (cloudflared's `tunnel login` + `tunnel create`):
+// box enroll services and build its finch.yml with no dashboard round-trips
+// after one browser approval (cloudflared's `tunnel login` + `tunnel create`):
 //
-//	finch login <token>                         # paste the CLI token from the dashboard
+//	finch login                                  # one browser approval, FIRST box only
 //	finch add printer --service http://:8000     # enroll + append an ingress rule
 //	finch run                                    # serve everything in finch.yml
+//
+// On a FRESH box `finch login` is the only bootstrap: `finch token` cannot be,
+// because cmdToken (cli.go:1009) opens with loadCliCred(), which exits "not
+// logged in" (cli.go:278) when no credential exists yet — `finch token | finch
+// login --token -` is circular on box #1. Every LATER box skips the browser by
+// piping a token from a box that is already logged in:
+//
+//	finch token | ssh newbox "finch login --token -"   # token never hits argv
 //
 // The CLI token is a long-lived tenant assertion the dashboard issues; the box
 // presents it as `Authorization: Bearer <token>` to /api/cli/*.
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -83,10 +92,13 @@ The client then calls:
 
 ## Provision ANOTHER box, no human in the loop
 From a box that is already logged in:
-  ssh user@newbox "finch login --token $(finch token)"
+  finch token | ssh user@newbox "finch login --token -"
   ssh user@newbox "finch add api --service http://127.0.0.1:9000 && finch run"
 'finch token' mints a fresh, revocable CLI token. The browser step is only ever
 needed for your FIRST box.
+Pipe the token ('--token -', or set FINCH_CLI_TOKEN) rather than passing it as
+an argument: the CLI token is a ~30-day tenant-admin credential, and argv is
+world-readable on the remote box and kept in shell/SSH history.
 
 ## Inspect state
   finch version --json    # local binary version + OS/architecture
@@ -120,6 +132,8 @@ finch hub. Your box dials OUT, so nothing listens and no ports are opened.
 Usage:
   finch version [--json]              Show this binary's version and platform
   finch login [--hub URL]              Log in (opens the browser to approve a code)
+  finch login --token -                Log in with a token piped on stdin (or FINCH_CLI_TOKEN);
+                                          keeps the tenant-admin token off argv/history
   finch login --headless               Log in on a screenless box over SSH: prints a link
                                           + code (approve on your phone), no local browser
   finch add <app_path> --service <url> Enroll a service and append it to finch.yml
@@ -177,7 +191,7 @@ Automation / driving finch from an agent (after the one-time 'finch login'):
     finch revoke-tokens            # de-authorize every CLI login at once
 
   Provision a NEW box from this already-authed one, zero human in the loop:
-    ssh user@newbox 'finch login --token '"$(finch token)"
+    finch token | ssh user@newbox 'finch login --token -'   # token never hits argv
     ssh user@newbox 'finch add api --service http://127.0.0.1:9000 && finch run'
 
 Run 'finch <command> -h' for a command's own flags.
@@ -245,13 +259,23 @@ func cliCredPath() string {
 	return ".finch-cli.json"
 }
 
+// cli.json holds the ~30-day TENANT-ADMIN token (finch keys mint, finch token,
+// finch domain, finch rm). It is strictly more privileged than the per-box
+// refresh token in agent.json, so it goes through the same hardened credential
+// path — lstat/symlink/mode checks on read, atomic 0600 write in a 0700
+// directory that is refused if group/world-writable.
+//
+// Previously this used os.ReadFile / os.WriteFile, which follow an existing
+// symlink and apply the mode only on creation: a pre-planted ~/.finch/cli.json
+// symlink would have been written through, and a loose-mode file read without
+// complaint — while the LESS privileged agent.json rejected both.
 func loadCliCred() (*cliCred, error) {
-	b, err := os.ReadFile(cliCredPath())
+	b, err := readCredentialFile(cliCredPath(), credentialStateLimit)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("not logged in — run `finch login <token>` first (get a token from the dashboard → Settings → CLI access)")
-		}
 		return nil, err
+	}
+	if b == nil {
+		return nil, fmt.Errorf("not logged in — run `finch login` first (no browser here? the dashboard → Settings → CLI access → Generate → Copy gives a ready-to-run `finch login` block to paste)")
 	}
 	var c cliCred
 	if err := json.Unmarshal(b, &c); err != nil {
@@ -261,24 +285,29 @@ func loadCliCred() (*cliCred, error) {
 }
 
 func saveCliCred(c *cliCred) error {
-	p := cliCredPath()
-	if dir := filepath.Dir(p); dir != "" && dir != "." {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return err
-		}
+	b, err := json.MarshalIndent(c, "", "  ")
+	if err != nil {
+		return err
 	}
-	b, _ := json.MarshalIndent(c, "", "  ")
-	return os.WriteFile(p, b, 0o600)
+	if len(b) > credentialStateLimit {
+		return fmt.Errorf("credential state exceeds %d bytes", credentialStateLimit)
+	}
+	return writeCredentialFile(cliCredPath(), b)
 }
 
 // cliGET/cliPOST hit /api/cli/* with the bearer token.
 func cliRequest(method, hub, path, token string, body any) (map[string]any, error) {
+	validatedHub, err := validateHubTransportURL(hub)
+	if err != nil {
+		return nil, err
+	}
+	hub = validatedHub
 	var rdr io.Reader
 	if body != nil {
 		b, _ := json.Marshal(body)
 		rdr = bytes.NewReader(b)
 	}
-	req, err := http.NewRequest(method, strings.TrimRight(hub, "/")+path, rdr)
+	req, err := http.NewRequest(method, hub+path, rdr)
 	if err != nil {
 		return nil, err
 	}
@@ -442,17 +471,65 @@ func cmdAuth(args []string) {
 	fmt.Printf("finch: %q is now %s\n", args[0], args[1])
 }
 
-// cmdLogin: finch login [--hub URL] <token>
+// resolveCliToken applies argv-free intake for the CLI token, mirroring
+// resolveTicket (cli.go:1131): "-" reads the token from stdin and FINCH_CLI_TOKEN
+// is the env fallback. It matters strictly MORE here than for a ticket — the CLI
+// token is a ~30-day TENANT-ADMIN assertion (see saveCliCred, cli.go:249), while a
+// ticket is one-shot and scoped to a single service — yet until now it could only
+// arrive on argv, where it is readable by any local user via /proc/<pid>/cmdline
+// and is persisted verbatim into shell/SSH history.
+//
+// Returns the resolved token plus whether it came from argv, so the caller can
+// warn about that (still-supported) path. stdin is a parameter so the intake is
+// unit-testable; callers pass os.Stdin.
+func resolveCliToken(token string, stdin io.Reader) (string, bool) {
+	if token == "-" {
+		b, err := io.ReadAll(io.LimitReader(stdin, 4096))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "finch: could not read token from stdin: %v\n", err)
+			os.Exit(1)
+		}
+		tok := strings.TrimSpace(string(b))
+		if tok == "" {
+			fmt.Fprintln(os.Stderr, "finch: --token - given but stdin was empty")
+			os.Exit(1)
+		}
+		return tok, false
+	}
+	if token != "" {
+		return token, true
+	}
+	// Empty here also covers "no token at all" — cmdLogin then falls through to
+	// the interactive device flow, which is the most argv-free path of all.
+	return strings.TrimSpace(os.Getenv("FINCH_CLI_TOKEN")), false
+}
+
+// cmdLogin: finch login [--hub URL] [--token -|<token>]
 func cmdLogin(args []string) {
 	fs := flag.NewFlagSet("login", flag.ExitOnError)
 	hub := fs.String("hub", "https://finchmcp.com", "finch hub base URL")
-	tokenFlag := fs.String("token", "", "CLI token (or pass as a positional argument)")
+	tokenFlag := fs.String("token", "", "CLI token; '-' reads it from stdin, or set FINCH_CLI_TOKEN (a literal value on argv is accepted but leaks into the process table and shell history)")
 	headless := fs.Bool("headless", false, "no local browser: print the link + code (open it on any device, e.g. your phone) and poll — for a screenless box reached over SSH")
 	_ = fs.Parse(args)
+	validatedHub, err := validateHubTransportURL(*hub)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "finch: login failed: %v\n", err)
+		os.Exit(1)
+	}
+	*hub = validatedHub
 
 	token := *tokenFlag
 	if token == "" && fs.NArg() > 0 {
 		token = fs.Arg(0)
+	}
+	token, fromArgv := resolveCliToken(token, os.Stdin)
+	if fromArgv {
+		// Warn but proceed: the token is already on this box's argv by the time
+		// we run, so refusing it would only break existing scripts without
+		// un-leaking anything. The warning is what moves callers to the piped
+		// form for the NEXT box they provision.
+		fmt.Fprintln(os.Stderr, "finch: warning: the CLI token was passed on the command line, so it lands in the process table (/proc/<pid>/cmdline) and shell/SSH history")
+		fmt.Fprintln(os.Stderr, "finch:          prefer:  finch token | ssh newbox 'finch login --token -'   (or set FINCH_CLI_TOKEN)")
 	}
 	// No token → run the interactive device flow (open browser, approve a code).
 	// The device flow also hands back the approver's email (for the account label);
@@ -859,6 +936,10 @@ func cmdRm(args []string) {
 		fmt.Fprintln(os.Stderr, "usage: finch rm <service>")
 		os.Exit(2)
 	}
+	if err := validateServiceID(args[0]); err != nil {
+		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
+		os.Exit(2)
+	}
 	cred, err := loadCliCred()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
@@ -885,14 +966,50 @@ func cmdRevokeTokens(args []string) {
 	fmt.Println("finch: revoked all CLI tokens — every logged-in box (including this one) must `finch login` again")
 }
 
+// loginHeredocDelimiter terminates the token heredoc in loginCommand. It is
+// quoted at the use site (<<'...') so the shell performs NO expansion on the
+// body: a token containing $, `, or \ is delivered byte-for-byte. The body
+// cannot terminate itself early either — a heredoc ends only on a line that is
+// exactly the delimiter, and the token occupies one whole line with no newline
+// in it (it is a bearer token: it travels in an Authorization header, where a
+// newline is not representable).
+const loginHeredocDelimiter = "FINCH_CLI_TOKEN"
+
+// loginCommand renders a copy-pasteable `finch login` that keeps the ~30-day
+// tenant-admin token OFF argv, for the two places that hand a user a whole
+// command instead of a bare token: `finch token --login` (below) and the
+// dashboard's Settings → CLI access copy button (web/components/dash/settings.tsx).
+//
+// The obvious form — `finch login --hub <hub> <token>` — leaks: argv is
+// world-readable via /proc/<pid>/cmdline for the life of the process, and the
+// pasted line is persisted verbatim into ~/.bash_history / ~/.zsh_history. It
+// leaked worst exactly where it was most used, since callers pipe a printed
+// command straight into a shell. A heredoc instead delivers the token on the
+// login process's STDIN (resolveCliToken, cli.go:485, reads "-" from stdin), so
+// nothing but the hub is ever visible in the process table.
+//
+// The heredoc body is written by the shell itself, so this stays a single
+// paste with no temp file to clean up and no helper process (`echo`/`printf`)
+// whose own argv would re-leak the token.
+func loginCommand(hub, token string) string {
+	return fmt.Sprintf("finch login --hub %s --token - <<'%s'\n%s\n%s",
+		hub, loginHeredocDelimiter, token, loginHeredocDelimiter)
+}
+
 // cmdToken: finch token [--json] [--login] — an authed box mints a FRESH CLI
 // token, for non-interactive provisioning of a new box:
 //
-//	ssh newbox "finch login --token $(finch token)"
+//	finch token | ssh newbox "finch login --token -"
+//
+// Piping is the intended shape: the bare-token output goes down the SSH channel
+// into the remote login's stdin, so the tenant-admin token never appears in the
+// remote argv (/proc/<pid>/cmdline) or in either shell's history.
+//
+// --login prints the same thing pre-assembled, via loginCommand below.
 func cmdToken(args []string) {
 	fs := flag.NewFlagSet("token", flag.ExitOnError)
 	asJSON := fs.Bool("json", false, "print the raw {token,hub,expiresAt} JSON")
-	asLogin := fs.Bool("login", false, "print a full `finch login` command instead of just the token")
+	asLogin := fs.Bool("login", false, "print a ready-to-run `finch login` block instead of just the token (heredoc: the token is fed on stdin, never on argv)")
 	_ = fs.Parse(args)
 
 	cred, err := loadCliCred()
@@ -916,9 +1033,9 @@ func cmdToken(args []string) {
 		b, _ := json.Marshal(out)
 		fmt.Println(string(b))
 	case *asLogin:
-		fmt.Printf("finch login --hub %s %s\n", hub, token)
+		fmt.Println(loginCommand(hub, token))
 	default:
-		fmt.Println(token) // bare token, for `ssh host "finch login --token $(finch token)"`
+		fmt.Println(token) // bare token, for `finch token | ssh host "finch login --token -"`
 	}
 }
 
@@ -1022,13 +1139,17 @@ func cmdAdd(args []string) {
 		fmt.Fprintln(os.Stderr, "  <app_path> becomes the public URL segment: https://<your-slug>.finchmcp.com/<app_path>/")
 		os.Exit(2)
 	}
-	if strings.ContainsAny(wantPath, "/ ") {
-		fmt.Fprintf(os.Stderr, "finch: <app_path> %q must be a single URL segment (no slashes or spaces)\n", wantPath)
+	if err := validateServiceID(wantPath); err != nil {
+		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
 		os.Exit(2)
 	}
-	if u, err := url.Parse(strings.TrimRight(*service, "/")); err != nil || u.Scheme == "" || u.Host == "" {
-		fmt.Fprintf(os.Stderr, "finch: --service %q is not a valid absolute URL\n", *service)
+	if _, err := parseUpstreamTransportURL(*service); err != nil {
+		fmt.Fprintf(os.Stderr, "finch: --service %q has invalid transport: %v\n", *service, err)
 		os.Exit(2)
+	}
+	if err := validateManifestMutationTarget(*configPath); err != nil {
+		fmt.Fprintf(os.Stderr, "finch: cannot safely update manifest: %v\n", err)
+		os.Exit(1)
 	}
 
 	cred, err := loadCliCred()
@@ -1049,6 +1170,10 @@ func cmdAdd(args []string) {
 	pubURL, _ := out["url"].(string)
 	if id == "" || ticket == "" {
 		fmt.Fprintf(os.Stderr, "finch: unexpected enroll response: %v\n", out)
+		os.Exit(1)
+	}
+	if err := validateServiceID(id); err != nil {
+		fmt.Fprintf(os.Stderr, "finch: unsafe service id returned by hub: %v\n", err)
 		os.Exit(1)
 	}
 	if id != wantPath {
@@ -1139,8 +1264,8 @@ func cmdEnroll(args []string) {
 		fmt.Fprintln(os.Stderr, "  keep it off argv/history: 'echo <t> | finch enroll <app_path> --ticket -' or set FINCH_TICKET")
 		os.Exit(2)
 	}
-	if strings.ContainsAny(appPath, "/ ") {
-		fmt.Fprintf(os.Stderr, "finch: <app_path> %q must be a single URL segment (no slashes or spaces)\n", appPath)
+	if err := validateServiceID(appPath); err != nil {
+		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
 		os.Exit(2)
 	}
 
@@ -1153,6 +1278,10 @@ func cmdEnroll(args []string) {
 		os.Exit(1)
 	}
 	id := jr.Service
+	if err := validateServiceID(id); err != nil {
+		fmt.Fprintf(os.Stderr, "finch: unsafe service id returned by hub: %v\n", err)
+		os.Exit(1)
+	}
 	statePath := filepath.Join(expandHome(*credDir), id+".json")
 	if _, err := persistJoin(*hub, jr, statePath); err != nil {
 		fmt.Fprintf(os.Stderr, "finch: enroll failed: %v\n", err)
@@ -1205,6 +1334,32 @@ func addPaths(configPath, host string) (box, credDir string) {
 	return box, credDir
 }
 
+var manifestMutationMu sync.Mutex
+
+func validateManifestMutationTarget(configPath string) error {
+	b, err := os.ReadFile(configPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal(b, &doc); err != nil {
+		return fmt.Errorf("parsing %s: %w", configPath, err)
+	}
+	if doc.Kind == 0 || (doc.Kind == yaml.DocumentNode && len(doc.Content) == 0) {
+		return nil
+	}
+	if doc.Kind != yaml.DocumentNode || len(doc.Content) == 0 || doc.Content[0].Kind != yaml.MappingNode {
+		return fmt.Errorf("%s: top-level YAML is not a mapping", configPath)
+	}
+	if seq := yamlMapValue(doc.Content[0], "ingress"); seq != nil && seq.Kind != yaml.SequenceNode {
+		return fmt.Errorf("%s: ingress must be a sequence", configPath)
+	}
+	return nil
+}
+
 // appendIngress adds (or updates) one ingress rule in finch.yml WITHOUT clobbering
 // user comments or keys finch doesn't model: it edits an existing file through a
 // yaml.Node (yaml.v3 preserves comments + unknown content across a Node round-trip)
@@ -1213,6 +1368,15 @@ func addPaths(configPath, host string) (box, credDir string) {
 // only when absent. A missing file is created from the managed header + a minimal
 // struct marshal. No ticket is written — the credential is saved separately by enroll.
 func appendIngress(configPath, hub, appPath, service, box string) error {
+	manifestMutationMu.Lock()
+	defer manifestMutationMu.Unlock()
+	return appendIngressLocked(configPath, hub, appPath, service, box)
+}
+
+func appendIngressLocked(configPath, hub, appPath, service, box string) error {
+	if err := validateManifestMutationTarget(configPath); err != nil {
+		return err
+	}
 	b, err := os.ReadFile(configPath)
 	if err != nil {
 		if !os.IsNotExist(err) {
@@ -1227,7 +1391,7 @@ func appendIngress(configPath, hub, appPath, service, box string) error {
 		if merr != nil {
 			return merr
 		}
-		return os.WriteFile(configPath, append([]byte("# finch.yml — managed by `finch add`\n"), out...), 0o600)
+		return atomicManifestWrite(configPath, append([]byte("# finch.yml — managed by `finch add`\n"), out...))
 	}
 
 	// Existing file: edit through a yaml.Node so comments + unmodeled keys survive.
@@ -1261,7 +1425,7 @@ func appendIngress(configPath, hub, appPath, service, box string) error {
 
 	// Locate (or create) the ingress sequence.
 	seq := yamlMapValue(root, "ingress")
-	if seq == nil || seq.Kind != yaml.SequenceNode {
+	if seq == nil {
 		seq = &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
 		yamlMapSet(root, "ingress", seq)
 	}
@@ -1321,14 +1485,46 @@ func yamlWriteFile(configPath string, doc *yaml.Node) error {
 	if err != nil {
 		return err
 	}
-	// A fresh manifest may target ~/.finch/finch.yml before anything else has
-	// created the dotfile dir (defaultManifestPath).
+	return atomicManifestWrite(configPath, out)
+}
+
+func atomicManifestWrite(configPath string, out []byte) error {
 	if dir := filepath.Dir(configPath); dir != "." {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return err
 		}
 	}
-	return os.WriteFile(configPath, out, 0o600)
+	dir := filepath.Dir(configPath)
+	tmp, err := os.CreateTemp(dir, ".finch-yaml-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	cleanup := func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpPath)
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		cleanup()
+		return err
+	}
+	if _, err := tmp.Write(out); err != nil {
+		cleanup()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		cleanup()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Rename(tmpPath, configPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	return nil
 }
 
 // cmdUpdate: finch update [--hub URL] [--force] [--restart=auto|service|self|none]
@@ -1354,6 +1550,11 @@ func cmdUpdate(args []string) {
 	force := fs.Bool("force", false, "reinstall even if already on the latest version")
 	restart := fs.String("restart", "auto", "how to restart the running serve: auto|service|self|none")
 	_ = fs.Parse(args)
+	mode, err := resolveUpdateRestartMode(*restart, finchTunnelActive(), runningAsServe())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
+		os.Exit(2)
+	}
 
 	// Hub: explicit flag, else the logged-in cli.json hub, else the prod default.
 	hub := *hubFlag
@@ -1378,14 +1579,6 @@ func cmdUpdate(args []string) {
 	fmt.Printf("finch: installed new binary at %s\n", self)
 
 	// Bring the running serve onto the new binary.
-	mode := *restart
-	if mode == "auto" {
-		if finchTunnelActive() {
-			mode = "service"
-		} else {
-			mode = "self"
-		}
-	}
 	switch mode {
 	case "none":
 		fmt.Println("finch: binary swapped — restart your serve to apply.")
@@ -1412,9 +1605,28 @@ func cmdUpdate(args []string) {
 			fmt.Fprintf(os.Stderr, "finch: re-exec failed: %v (binary is updated; restart manually)\n", eerr)
 			os.Exit(1)
 		}
+	}
+}
+
+func resolveUpdateRestartMode(requested string, tunnelActive, currentProcessServes bool) (string, error) {
+	switch requested {
+	case "auto":
+		if tunnelActive {
+			return "service", nil
+		}
+		if currentProcessServes {
+			return "self", nil
+		}
+		return "none", nil
+	case "service", "none":
+		return requested, nil
+	case "self":
+		if !currentProcessServes {
+			return "", fmt.Errorf("--restart=self requires the current process to be serving; use service or none from a separate updater")
+		}
+		return "self", nil
 	default:
-		fmt.Fprintf(os.Stderr, "finch: unknown --restart mode %q (use auto|service|self|none)\n", mode)
-		os.Exit(1)
+		return "", fmt.Errorf("unknown --restart mode %q (use auto|service|self|none)", requested)
 	}
 }
 
@@ -1426,7 +1638,10 @@ func cmdUpdate(args []string) {
 // download source is ALWAYS the box's own hub — never caller-supplied — so a
 // forged trigger can at worst cause a re-download of the pinned release.
 func performUpdate(hub string, force bool) (self string, updated bool, err error) {
-	hub = strings.TrimRight(hub, "/")
+	hub, err = validateHubTransportURL(hub)
+	if err != nil {
+		return "", false, err
+	}
 	if !force {
 		if latest, verr := hubLatestVersion(hub); verr == nil && latest != "" && latest == agentVersion {
 			return "", false, nil
@@ -1496,11 +1711,18 @@ func updateArch() string {
 // can no-op when already current. Best-effort: any error → "" (caller updates
 // anyway). The hub exposes it at /api/version (public, unauthenticated).
 func hubLatestVersion(hub string) (string, error) {
-	req, err := http.NewRequest(http.MethodGet, hub+"/api/version", nil)
+	validatedHub, err := validateHubTransportURL(hub)
 	if err != nil {
 		return "", err
 	}
-	res, err := http.DefaultClient.Do(req)
+	hub = validatedHub
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, hub+"/api/version", nil)
+	if err != nil {
+		return "", err
+	}
+	res, err := secureRedirectHTTPClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -1508,27 +1730,59 @@ func hubLatestVersion(hub string) (string, error) {
 	if res.StatusCode != 200 {
 		return "", fmt.Errorf("hub %d", res.StatusCode)
 	}
+	payload, err := io.ReadAll(io.LimitReader(res.Body, maxVersionResponseBytes+1))
+	if err != nil {
+		return "", err
+	}
+	if int64(len(payload)) > maxVersionResponseBytes {
+		return "", fmt.Errorf("version response exceeded %d bytes", maxVersionResponseBytes)
+	}
 	var body struct {
 		Latest string `json:"latest"`
 	}
-	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+	if err := json.Unmarshal(payload, &body); err != nil {
 		return "", err
 	}
 	return body.Latest, nil
 }
+
+const (
+	maxVersionResponseBytes int64 = 64 << 10
+	maxAgentDownloadBytes   int64 = 256 << 20
+	agentDownloadTimeout          = 10 * time.Minute
+)
 
 // downloadAndSwap fetches url to a temp file NEXT TO dst (same dir → atomic
 // rename), makes it executable, then renames it over dst. Downloading to a temp
 // first means a failed/partial download never bricks the running binary; the
 // rename is atomic on POSIX so there's no torn-write window.
 func downloadAndSwap(url, dst string) error {
-	res, err := http.Get(url)
+	ctx, cancel := context.WithTimeout(context.Background(), agentDownloadTimeout)
+	defer cancel()
+	return downloadAndSwapWithLimit(ctx, url, dst, maxAgentDownloadBytes)
+}
+
+func downloadAndSwapWithLimit(ctx context.Context, url, dst string, limit int64) error {
+	if limit <= 0 {
+		return fmt.Errorf("invalid Finch update size limit")
+	}
+	if err := validateHTTPTransportURL(url); err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return err
+	}
+	res, err := secureRedirectHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}
 	defer res.Body.Close()
 	if res.StatusCode != 200 {
 		return fmt.Errorf("download %s: hub %d", url, res.StatusCode)
+	}
+	if res.ContentLength > limit {
+		return fmt.Errorf("download %s exceeds %d bytes", url, limit)
 	}
 	dir := filepath.Dir(dst)
 	tmp, err := os.CreateTemp(dir, ".finch-update-*")
@@ -1537,9 +1791,18 @@ func downloadAndSwap(url, dst string) error {
 	}
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName) // no-op after a successful rename
-	if _, err := io.Copy(tmp, res.Body); err != nil {
+	written, err := io.Copy(tmp, io.LimitReader(res.Body, limit+1))
+	if err != nil {
 		tmp.Close()
 		return err
+	}
+	if written == 0 {
+		tmp.Close()
+		return fmt.Errorf("download %s was empty", url)
+	}
+	if written > limit {
+		tmp.Close()
+		return fmt.Errorf("download %s exceeds %d bytes", url, limit)
 	}
 	if err := tmp.Close(); err != nil {
 		return err

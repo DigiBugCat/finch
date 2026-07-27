@@ -10,10 +10,21 @@ dist/
 /worker/dist-production/
 *.log
 
+# Python test/runtime caches
+__pycache__/
+*.py[cod]
+
 # Env / secrets
 .dev.vars
 .env
 *.local
+
+# Test scratch
+/web/.test-tmp/
+
+# Security scan/report artifacts (findings for unfixed issues stay out of history)
+/CLAUDE-SECURITY-*/
+/FINCH-SECURITY-REVIEW-*.md
 
 # OS
 .DS_Store

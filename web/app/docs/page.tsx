@@ -48,7 +48,9 @@ if __name__ == "__main__":
       </p>
 
       <h2>2. Install Finch</h2>
-      <Code>{`curl -fsSL finchmcp.com/install | sh`}</Code>
+      {/* Explicit https:// — a scheme-less host makes curl default to http://,
+          which would pipe an unauthenticated cleartext response into sh. */}
+      <Code>{`curl -fsSL https://finchmcp.com/install | sh`}</Code>
       <p>Works on macOS and Linux. Anything that stays on and runs a shell can run Finch.</p>
 
       <h2>3. Log in</h2>
@@ -134,6 +136,10 @@ finch call hello greet --args '{"name": "world"}'
         <Link className="docs-card" href="/docs/cli">
           <h3>CLI reference</h3>
           <p>Every command, with JSON output for scripting.</p>
+        </Link>
+        <Link className="docs-card" href="/docs/privacy">
+          <h3>Privacy &amp; data handling</h3>
+          <p>Transport encryption, the relay non-retention guarantee, retained metadata, and Test Chat.</p>
         </Link>
       </div>
     </>

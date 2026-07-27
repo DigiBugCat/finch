@@ -33,13 +33,48 @@ function enrollmentError(status: number, code: string, message: string): Respons
   return json(status, { error: { code, message } });
 }
 
+/** Read at most MAX_BODY_BYTES of the request body, counting bytes as they
+ *  arrive and cancelling the stream the moment the cap is passed. The
+ *  content-length pre-check alone is not a limit: a chunked request (or one
+ *  with a lying/absent header) carries no declared length, so `req.text()`
+ *  would materialize the whole attacker-controlled body before any check ran.
+ *  Mirrors readJson in api.ts:225; the only deliberate difference is the
+ *  failure signal — this module's callers turn `null` into a 400 invalid_json
+ *  rather than a 413, so oversized and malformed bodies stay indistinguishable
+ *  to an unauthenticated caller. */
 async function boundedJson(req: Request): Promise<Record<string, unknown> | null> {
-  const declared = Number(req.headers.get("content-length") || "0");
-  if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) return null;
-  const text = await req.text();
-  if (new TextEncoder().encode(text).length > MAX_BODY_BYTES) return null;
+  const declared = req.headers.get("content-length");
+  if (declared && /^\d+$/.test(declared) && Number(declared) > MAX_BODY_BYTES) {
+    return null;
+  }
+  if (!req.body) return null;
   try {
-    const value = JSON.parse(text);
+    const reader = req.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > MAX_BODY_BYTES) {
+          await reader.cancel("request body too large");
+          return null;
+        }
+        chunks.push(value);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    const value: unknown = JSON.parse(
+      new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes),
+    );
     return value && typeof value === "object" && !Array.isArray(value)
       ? (value as Record<string, unknown>)
       : null;
@@ -346,13 +381,19 @@ export async function handleAviaryEnrollmentApi(
 ): Promise<Response> {
   const path = new URL(req.url).pathname;
   if (req.method !== "POST") return enrollmentError(405, "method_not_allowed", "POST only");
+  // The per-IP throttle runs BEFORE the body is read. /start is unauthenticated,
+  // so buffering up to 16 KiB per request is itself the resource an attacker
+  // spends; a throttle placed after boundedJson would never bound that spend.
+  if (
+    path === "/api/aviary/device/start" &&
+    !(await rateLimitOk(env.JOIN_LIMIT, `aviary-start:${clientIp(req)}`))
+  ) {
+    return enrollmentError(429, "rate_limited", "too many enrollment attempts");
+  }
   const body = await boundedJson(req);
   if (!body) return enrollmentError(400, "invalid_json", "request must be a JSON object under 16 KiB");
 
   if (path === "/api/aviary/device/start") {
-    if (!(await rateLimitOk(env.JOIN_LIMIT, `aviary-start:${clientIp(req)}`))) {
-      return enrollmentError(429, "rate_limited", "too many enrollment attempts");
-    }
     if (body.protocol !== AVIARY_PROTOCOL) {
       return enrollmentError(400, "unsupported_protocol", "unsupported enrollment protocol");
     }

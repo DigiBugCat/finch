@@ -263,6 +263,13 @@ func TestPersistServiceEnrollmentGrant_PreservesDirectoryAndRejectsSymlink(t *te
 	if err := os.Mkdir(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	// Mkdir's mode is masked by the process umask, so under a restrictive umask
+	// (e.g. 077) this directory would be created 0700 and the 0755 assertion
+	// below would fail while blaming the credential writer. Set the mode
+	// explicitly so the test asserts what it means on any developer machine.
+	if err := os.Chmod(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	target := filepath.Join(t.TempDir(), "do-not-touch")
 	if err := os.WriteFile(target, []byte("sentinel"), 0o600); err != nil {
 		t.Fatal(err)

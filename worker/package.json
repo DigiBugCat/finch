@@ -12,11 +12,13 @@
     "deploy:dev": "node scripts/deploy-preflight.mjs dev && wrangler deploy --env dev",
     "typecheck": "tsc --noEmit",
     "build": "wrangler deploy --dry-run --outdir dist",
+    "privacy:test": "node --test scripts/check-privacy-invariants.test.mjs",
+    "privacy:check": "npm run privacy:test && node scripts/check-privacy-invariants.mjs",
     "validate:assertion-jwks": "node scripts/validate-assertion-jwks.mjs",
     "smoke:assertions": "node scripts/smoke-caller-assertions.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
-    "ci": "npm run typecheck && wrangler deploy --dry-run --env production && vitest run"
+    "ci": "npm run privacy:check && npm run typecheck && wrangler deploy --dry-run --env production && vitest run"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.16.15",

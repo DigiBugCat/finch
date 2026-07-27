@@ -89,7 +89,7 @@ func TestDynamicRegistry_PublishesCredentialTenantForCurrentLeaseOnly(t *testing
 
 func TestValidateRegistration_Routes(t *testing.T) {
 	good, _, err := validateRegistration(RegistrationRequest{
-		AppPath: "media", Upstream: "http://app:8000/", Routes: []string{"/birdz/", "/mcp", "/mcp", "/users/~me"},
+		AppPath: "media", Upstream: "https://app:8000/", Routes: []string{"/birdz/", "/mcp", "/mcp", "/users/~me"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -144,6 +144,43 @@ func TestDynamicRegistry_CapacityIsBounded(t *testing.T) {
 	}
 	if _, err := r.Register(RegistrationRequest{AppPath: "two", Upstream: "http://127.0.0.1:7002"}); err == nil {
 		t.Fatal("registry exceeded configured dynamic-service capacity")
+	}
+}
+
+func TestDynamicRegistry_RejectsOpaqueIDCollisionWithoutCorruptingOwner(t *testing.T) {
+	r := NewDynamicRegistry(nil)
+	first, err := r.Register(RegistrationRequest{AppPath: "one", Upstream: "http://127.0.0.1:7001"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.newLease = func() (string, error) { return first.LeaseID, nil }
+	if _, err := r.Register(RegistrationRequest{AppPath: "two", Upstream: "http://127.0.0.1:7002"}); err == nil {
+		t.Fatal("duplicate opaque lease ID was accepted")
+	}
+	if _, err := r.Renew(first.LeaseID); err != nil {
+		t.Fatalf("collision damaged incumbent lease: %v", err)
+	}
+	if services := r.Services(); len(services) != 1 || services[0].AppPath != "one" {
+		t.Fatalf("collision corrupted registry: %+v", services)
+	}
+}
+
+func TestDynamicRegistry_StatusSnapshotsDoNotAliasInternalRoutes(t *testing.T) {
+	staticRoutes := []string{"/mcp"}
+	r := NewDynamicRegistry([]StaticService{{AppPath: "static", Upstream: "https://static.example", Routes: staticRoutes}})
+	staticRoutes[0] = "/mutated-input"
+	created, err := r.Register(RegistrationRequest{AppPath: "dynamic", Upstream: "https://dynamic.example", Routes: []string{"/api"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	created.Routes[0] = "/mutated-return"
+	snapshot := r.Services()
+	for i := range snapshot {
+		snapshot[i].Routes[0] = "/mutated-snapshot"
+	}
+	fresh := r.Services()
+	if fresh[0].Routes[0] != "/api" || fresh[1].Routes[0] != "/mcp" {
+		t.Fatalf("caller mutated registry-owned routes: %+v", fresh)
 	}
 }
 

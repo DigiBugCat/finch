@@ -20,9 +20,43 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.4"
+          cache: false
+      - name: Lint workflow syntax and embedded shell
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.7 -no-color
+      - name: Validate release configuration
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "v2.16.0"
+          args: check
+      - name: Build every release target without publishing
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          distribution: goreleaser
+          version: "v2.16.0"
+          args: release --snapshot --parallelism 2
+      - name: Verify the installer-facing release asset names
+        run: |
+          diff -u \
+            <(printf '%s\n' \
+              finch-darwin-amd64 \
+              finch-darwin-arm64 \
+              finch-linux-amd64 \
+              finch-linux-arm64 \
+              finch-linux-armv6 \
+              finch-linux-armv7 | LC_ALL=C sort) \
+            <(awk '{print $2}' dist/checksums.txt | LC_ALL=C sort)
+      - run: node --test scripts/*.test.mjs
       - run: node scripts/check-versions.mjs
       - run: node scripts/check-assertion-vector-drift.mjs
       - run: python3 e2e/staging/test_safety.py
+      - name: Test the dependency-free examples
+        run: |
+          python3 -m unittest discover -s examples/hello-mcp -p 'test_*.py'
+          python3 -m unittest discover -s examples/docker-compose -p 'test_*.py'
 
   worker:
     runs-on: ubuntu-latest
@@ -37,6 +71,7 @@ jobs:
           cache: npm
           cache-dependency-path: worker/package-lock.json
       - run: npm ci
+      - run: npm run privacy:check
       - run: npm run typecheck
       - name: Exercise assertion-key pre-upload validation
         run: |
@@ -77,7 +112,7 @@ jobs:
           cache-dependency-path: agent/go.sum
       - run: go build ./...
       - run: go vet ./...
-      - run: go test ./...
+      - run: go test -race ./...
       - run: sh -n docker-entrypoint.sh docker-entrypoint_test.sh dependency-lock-sha256.sh
       - run: sh docker-entrypoint_test.sh
       - run: ./dependency-lock-sha256.sh "$(./dependency-lock-sha256.sh)"

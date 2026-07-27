@@ -3,6 +3,7 @@ package core
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -62,6 +63,28 @@ func TestResolveUpstream(t *testing.T) {
 		}
 		if got != c.want {
 			t.Errorf("%s: resolveUpstream(%q) = %q, want %q", c.comment, c.path, got, c.want)
+		}
+	}
+}
+
+func TestValidateRelayCommandArgRejectsUnknownPositional(t *testing.T) {
+	for _, accepted := range []string{"join", "run", "--hub", "-v"} {
+		if err := validateRelayCommandArg(accepted); err != nil {
+			t.Errorf("valid relay invocation %q rejected: %v", accepted, err)
+		}
+	}
+	if err := validateRelayCommandArg("typo"); err == nil {
+		t.Fatal("unknown positional command would silently start a relay")
+	}
+}
+
+func TestValidateRelayPositionalsRejectsArgumentsAfterFlagsOrDoubleDash(t *testing.T) {
+	if err := validateRelayPositionals(nil); err != nil {
+		t.Fatalf("empty trailing arguments rejected: %v", err)
+	}
+	for _, args := range [][]string{{"typo"}, {"typo", "extra"}} {
+		if err := validateRelayPositionals(args); err == nil {
+			t.Fatalf("trailing positionals accepted: %q", args)
 		}
 	}
 }
@@ -174,6 +197,21 @@ func TestRefresh_RejectsRedirectWithoutLeakingHubBody(t *testing.T) {
 	}
 }
 
+func TestJoinRejectsMismatchedOrUnsafeAssignment(t *testing.T) {
+	for _, jr := range []joinResp{
+		{OK: true, Service: "media", Box: "other-box", ConnectToken: "token"},
+		{OK: true, Service: "../../escape", Box: "requested-box", ConnectToken: "token"},
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode(jr)
+		}))
+		if _, err := joinContext(t.Context(), srv.URL, "ticket", "requested-box"); err == nil {
+			t.Errorf("unsafe join assignment accepted: %+v", jr)
+		}
+		srv.Close()
+	}
+}
+
 func TestRelayURL(t *testing.T) {
 	cases := []struct{ hub, want string }{
 		{"http://localhost:8787", "ws://localhost:8787/app/box/_connect"},
@@ -253,6 +291,61 @@ func TestSaveState_IsAtomicOwnerOnlyAndRejectsSymlinkTarget(t *testing.T) {
 	}
 }
 
+// The tenant-admin CLI token (cli.json) drives `finch keys mint`, `finch token`,
+// `finch domain` and `finch rm` — strictly more privileged than the per-box
+// refresh token in agent.json. It used to be written with os.WriteFile, which
+// follows an existing symlink and applies its mode only on creation, and read
+// with os.ReadFile, which checks nothing. It now shares agent.json's hardened
+// path; this pins that so the weaker handling cannot come back.
+func TestSaveCliCred_MatchesAgentStateHardening(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home) // os.UserHomeDir on Windows
+
+	cred := &cliCred{Hub: "https://finchmcp.com", Token: "tenant-admin-secret"}
+	if err := saveCliCred(cred); err != nil {
+		t.Fatal(err)
+	}
+	path := cliCredPath()
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("cli credential mode=%04o, want 0600", got)
+	}
+	if got, _ := os.Lstat(filepath.Dir(path)); got.Mode().Perm() != 0o700 {
+		t.Fatalf("cli credential directory mode=%04o, want 0700", got.Mode().Perm())
+	}
+
+	// A loosened credential must not be read back.
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadCliCred(); err == nil {
+		t.Fatal("world-readable cli credential was accepted")
+	}
+
+	// A pre-planted symlink must not be written through — that is how another
+	// local account would capture the token on a shared box.
+	target := filepath.Join(t.TempDir(), "captured")
+	if err := os.WriteFile(target, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, path); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveCliCred(cred); err == nil {
+		t.Fatal("symlinked cli credential path was accepted")
+	}
+	if got, _ := os.ReadFile(target); string(got) != "keep" {
+		t.Fatalf("symlink target was written through: %q", got)
+	}
+}
+
 func TestSaveState_BareRelativePathDoesNotChmodWorkingDirectory(t *testing.T) {
 	originalWD, err := os.Getwd()
 	if err != nil {
@@ -275,6 +368,22 @@ func TestSaveState_BareRelativePathDoesNotChmodWorkingDirectory(t *testing.T) {
 	}
 	if got := info.Mode().Perm(); got != 0o755 {
 		t.Fatalf("working directory mode changed to %04o", got)
+	}
+}
+
+func TestSaveState_RejectsCredentialItCannotReload(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "agent.json")
+	original := &agentState{Hub: "https://hub.example", RefreshToken: "valid"}
+	if err := saveState(p, original); err != nil {
+		t.Fatal(err)
+	}
+	oversized := &agentState{Hub: "https://hub.example", RefreshToken: strings.Repeat("x", credentialStateLimit)}
+	if err := saveState(p, oversized); err == nil {
+		t.Fatal("saved credential larger than loadState can read")
+	}
+	got, err := loadState(p)
+	if err != nil || got.RefreshToken != original.RefreshToken {
+		t.Fatalf("oversized save damaged prior credential: state=%+v err=%v", got, err)
 	}
 }
 

@@ -21,7 +21,7 @@ export default function Hero() {
           <div className="hero-trust">
             <span><i>✓</i> Speaks MCP: Claude, Cursor, any client</span>
             <span><i>✓</i> One command to set up</span>
-            <span><i>✓</i> Your keys, your box, your data</span>
+            <span><i>✓</i> Encrypted in transit · payloads not retained</span>
           </div>
         </div>
 

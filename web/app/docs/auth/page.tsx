@@ -78,10 +78,26 @@ finch call printer echo --args '{"text":"hi"}'   <span class="c"># invoke one to
 finch revoke-tokens  <span class="c"># de-authorize every CLI login, including this box</span>`}</Code>
       <p>
         <code>finch token</code> is how you enroll a second box without a browser:
-        pass its output to <code>finch login --token</code> on the new machine.
-        To revoke from the web instead, use the dashboard under
-        Settings &rarr; CLI access.
+        pipe its output into <code>finch login --token -</code> on the new machine
+        (<code>finch token | ssh newbox &quot;finch login --token -&quot;</code>), or set{' '}
+        <code>FINCH_CLI_TOKEN</code> there. Passing it as an argument works but puts a
+        tenant-admin credential in the remote process table and shell history.
       </p>
+      <p>
+        From the web, Settings &rarr; CLI access &rarr; <strong>Generate</strong> mints
+        one and <strong>Copy</strong> puts a ready-to-run block on your clipboard —
+        not a bare token. Paste the whole block on the box: it is{' '}
+        <code>finch login --token -</code> with the token as a quoted heredoc, so the
+        credential arrives on stdin and never becomes an argv word — argv is world-readable
+        via <code>/proc/&lt;pid&gt;/cmdline</code>. Pasting it at an interactive prompt does
+        still write it to your shell history (bash and zsh both save the full multi-line
+        entry); prefix the paste with a space, or use the piped form below from a box that
+        is already logged in, to keep it out of history as well. The same page revokes
+        every CLI token at once.
+      </p>
+      <Code>{`finch login --hub https://finchmcp.com --token - &lt;&lt;'FINCH_CLI_TOKEN'
+&lt;your token&gt;
+FINCH_CLI_TOKEN`}</Code>
 
       <h2>OAuth</h2>
       <p>
