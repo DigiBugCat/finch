@@ -1865,6 +1865,26 @@ export class TenantDO extends DurableObject<Env> {
    *
    *  Writes only when something actually changed, so the steady state is a
    *  scan and no save. */
+  /** Does `email` hold a direct, unlocked `user -> service` allow rule?
+   *
+   *  This is deliberately the DIRECT rule only — the same shape addAclState
+   *  writes and stripUserServiceGrantState removes. Access reachable through a
+   *  group, tag or `all` rule is not evidence that this principal is the one
+   *  an access request's grant was installed under, and stamping on that basis
+   *  would be the guess this check exists to refuse. */
+  private hasDirectGrant(s: StoredState, email: string, service: string): boolean {
+    const em = normalizeEmail(email);
+    const svc = service.toLowerCase();
+    return s.acl.some(
+      (r) =>
+        !r.locked &&
+        r.action === "allow" &&
+        r.src.type === "user" &&
+        normalizeEmail(r.src.name ?? "") === em &&
+        r.dst.some((d) => d.type === "service" && (d.name ?? "").toLowerCase() === svc),
+    );
+  }
+
   private async backfillGrantedTo(
     s: StoredState,
     member: TenantMember,
@@ -1887,6 +1907,14 @@ export class TenantDO extends DurableObject<Env> {
       // and leave the original grant live. Absent is the only safe trigger.
       if (r.status !== "granted" || r.grantedTo !== undefined) continue;
       if (!verified.has(normalizeEmail(r.email))) continue;
+      // A verified email is not proof that THIS member holds the grant. If the
+      // alias was dropped from identity A and later verified by member B before
+      // A's first post-upgrade sync, B arrives here first and would stamp their
+      // address onto a rule that still belongs to A — so revoking would strip B
+      // and leave A authorized. Require the candidate to actually hold a direct
+      // user -> service rule; otherwise leave the row unmigrated, which is
+      // simply the status quo rather than a new wrong answer.
+      if (!this.hasDirectGrant(s, canonical, r.service)) continue;
       r.grantedTo = canonical;
       changed = true;
     }
@@ -1998,7 +2026,14 @@ export class TenantDO extends DurableObject<Env> {
           // principal is authoritative and must never be rewritten, or an
           // alias that later moves to another identity would repoint a
           // post-upgrade row onto the wrong address.
-          if (r.grantedTo === undefined && list.includes(normalizeEmail(r.email))) {
+          if (
+            r.grantedTo === undefined &&
+            list.includes(normalizeEmail(r.email)) &&
+            // Same proof requirement as backfillGrantedTo: a verified email is
+            // not evidence that this member is the principal the legacy rule
+            // was installed under.
+            this.hasDirectGrant(s, canonical, r.service)
+          ) {
             r.grantedTo = canonical;
             changed = true;
           }
