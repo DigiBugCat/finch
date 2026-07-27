@@ -148,6 +148,38 @@ func invalid(msg string) error {
 	return &registryError{code: "invalid_registration", status: http.StatusBadRequest, msg: msg}
 }
 
+// appPathOwnerLocked finds any static or dynamic owner of `appPath`, matching
+// CASE-INSENSITIVELY. Returns the incumbent's app_path as stored plus its
+// source.
+//
+// The box-local app_path namespace has to be case-folded because a service's
+// refresh credential is a file named after its app_path (statePathFor), and on
+// a case-insensitive filesystem — macOS and Windows both, by default — `media`
+// and `Media` are one file. Exact-match lookups let both register, and then one
+// enrollment silently overwrites or loads the other's credential, leaving the
+// relays in manifest-mismatch or auth-failure states.
+//
+// loadConfig already enforces exactly this rule for finch.yml ingress entries,
+// unconditionally; this makes the dynamic path agree rather than inventing a
+// second convention. Folding regardless of the host filesystem is deliberate:
+// the same finch.yml and the same SDK calls should behave identically on Linux
+// and macOS, and a platform-dependent uniqueness rule is a worse surprise than
+// a slightly strict one. The maps are bounded (maxDynamic, and finch.yml is
+// hand-written), so the scan is free.
+func (r *DynamicRegistry) appPathOwnerLocked(appPath string) (string, string, bool) {
+	for path, status := range r.static {
+		if strings.EqualFold(path, appPath) {
+			return path, status.Source, true
+		}
+	}
+	for path, reg := range r.dynamic {
+		if strings.EqualFold(path, appPath) {
+			return path, reg.Source, true
+		}
+	}
+	return "", "", false
+}
+
 func (r *DynamicRegistry) expireLocked(now time.Time) {
 	for appPath, reg := range r.dynamic {
 		if !now.Before(reg.ExpiresAt) {
@@ -198,18 +230,11 @@ func (r *DynamicRegistry) Register(req RegistrationRequest) (ServiceStatus, erro
 	r.mu.Lock()
 	now := r.now()
 	r.expireLocked(now)
-	if incumbent, ok := r.static[clean.AppPath]; ok {
+	if incumbent, source, ok := r.appPathOwnerLocked(clean.AppPath); ok {
 		r.mu.Unlock()
 		return ServiceStatus{}, &registryError{
 			code: "app_path_conflict", status: http.StatusConflict,
-			msg: fmt.Sprintf("app_path %q is owned by %s", clean.AppPath, incumbent.Source),
-		}
-	}
-	if incumbent, ok := r.dynamic[clean.AppPath]; ok {
-		r.mu.Unlock()
-		return ServiceStatus{}, &registryError{
-			code: "app_path_conflict", status: http.StatusConflict,
-			msg: fmt.Sprintf("app_path %q already has an active %s lease", clean.AppPath, incumbent.Source),
+			msg: fmt.Sprintf("app_path %q conflicts with %q, owned by %s", clean.AppPath, incumbent, source),
 		}
 	}
 	if len(r.dynamic) >= r.maxDynamic {
@@ -405,6 +430,29 @@ func validateRegistration(req RegistrationRequest) (RegistrationRequest, time.Du
 	}
 	sort.Strings(cleanRoutes)
 	req.Routes = cleanRoutes
+
+	// ACCEPTED IMPLIES SERVABLE. The route allowlist and the upstream base-path
+	// confinement are independent gates in resolveUpstreamWithRoutes, and nothing
+	// used to check that a registration could satisfy both. An upstream carrying a
+	// path — http://127.0.0.1:7342/base — combined with the default route /mcp
+	// passed registration and could even report `live`, then failed the
+	// base-prefix check on EVERY request: a lease that can never serve traffic.
+	//
+	// Run the relay's own resolver rather than restating its rule here. Two copies
+	// of a path predicate around an SSRF chokepoint is exactly the drift that
+	// produces this class of bug; this way the invariant holds by construction.
+	//
+	// Not fixed by prepending the base path instead: an upstream base path is a
+	// confinement prefix, not a rewrite (resolveUpstream forwards the cleaned path
+	// verbatim), and inventing a second path-composition rule inside the one
+	// function that must stay obviously correct would change relay semantics for
+	// existing static configs too.
+	for _, route := range req.Routes {
+		if _, err := resolveUpstreamWithRoutes(u, route, false, req.Routes); err != nil {
+			return req, 0, invalid(fmt.Sprintf("route %q can never be served by upstream %q: %v", route, req.Upstream, err))
+		}
+	}
+
 	if req.EdgeAuth == "" {
 		req.EdgeAuth = "key"
 	}

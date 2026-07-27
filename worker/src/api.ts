@@ -574,7 +574,59 @@ async function handleApiInner(
       // not just self-inflicted resource growth. Keyed per user AND per IP so
       // neither a single account nor a single host can spin freely.
       if(!(await rateLimitOk(env.JOIN_LIMIT,`tcreate:${clerkUserId}`))||!(await rateLimitOk(env.JOIN_LIMIT,`tcreate:${clientIp(req)}`)))return json(429,{error:"rate limited"});
-      if(!body.email||!emails.includes(String(body.email).trim().toLowerCase()))return json(400,{error:"email must be verified"});const tenantId="ft_"+crypto.randomUUID().slice(0,8);const r=await tenantOpRaw(env,tenantId,"bootstrapMembers",{kind:"team",displayName:body.name,bootstrappedFrom:"fresh",members:[{clerkUserId,email:body.email,role:"owner",state:"active"}],claimantClerkUserId:clerkUserId});if(!r.ok)return cloneResponse(r);const out:any=await r.json();await directoryOp(env,"reindexTenant",{tenantId,members:out.members}).catch(error=>console.error("tenant directory reindex failed",{tenantId,error}));return json(200,{tenantId});}
+      if(!body.email||!emails.includes(String(body.email).trim().toLowerCase()))return json(400,{error:"email must be verified"});
+
+      // FULL UUID entropy, not the first 8 hex chars. That was 32 bits: by the
+      // birthday bound ~1% collision odds around 9,300 workspaces and 50% around
+      // 77,000. A collision is not benign — the id names the DO, so
+      // bootstrapMembers finds the EXISTING tenant and returns 409, and this
+      // path does not retry, so a legitimate creation just fails. Widening the
+      // id engineers the failure out instead of handling it; a retry loop
+      // cannot, because 409 is also the correct terminal answer for
+      // "member limit reached" and "duplicate member identity" and the DO's
+      // error contract carries no machine-readable code to tell them apart.
+      // Existing short ids keep working: nothing parses the suffix.
+      const tenantId="ft_"+crypto.randomUUID().replace(/-/g,"");
+      const r=await tenantOpRaw(env,tenantId,"bootstrapMembers",{kind:"team",displayName:body.name,bootstrappedFrom:"fresh",members:[{clerkUserId,email:body.email,role:"owner",state:"active"}],claimantClerkUserId:clerkUserId});
+      if(!r.ok)return cloneResponse(r);
+      const out:any=await r.json();
+
+      // Index the owner directly instead of calling reindexTenant. reindex
+      // exists to purge rows that reference a tenant before rewriting them, and
+      // it finds those by LISTING the whole u:/e: keyspace of the single global
+      // DirectoryDO that every sign-in contends for. For an id minted three
+      // lines ago no existing row can possibly reference it, so that scan is
+      // provably dead work: O(total platform identities) reads to delete
+      // nothing. upsertMembership writes a byte-identical row.
+      //
+      // Found by clerkUserId rather than by position: the roster is hardcoded to
+      // one member today, but this route already receives `emails`, so adding
+      // invitees is the obvious next change and an index keyed on [0] would
+      // silently drop their invite pointers.
+      const owner=(out.members??[]).find((m:any)=>m.clerkUserId===clerkUserId);
+      if(!owner)return json(502,{error:"invalid response from hub"});
+
+      // NOT swallowed. The directory row is the ONLY handle on this workspace:
+      // /api/user/sync enumerates exclusively through listForUser, and the sole
+      // self-heal there is the hardcoded personal tenant. A team tenant with no
+      // u: row is never listed, so the browser's active-tenant cookie is
+      // cleared on the next load and the committed workspace becomes permanently
+      // unreachable — while the user was told it was created. Reporting the
+      // failure lets them retry, which works.
+      //
+      // The tenant id rides along in the error body so the orphan is
+      // identifiable rather than lost; the web layer relays error bodies
+      // verbatim and the id is not sensitive. A failed index still leaves an
+      // unreferenced TenantDO behind, which is strictly better than today
+      // (same orphan, plus a false success) and is bounded by the rate limit
+      // above.
+      try{
+        await directoryOp(env,"upsertMembership",{clerkUserId,tenantId,memberId:owner.id,role:owner.role,state:owner.state});
+      }catch(error){
+        console.error("tenant directory index failed",{tenantId,error});
+        return json(503,{error:"workspace index unavailable — please retry",tenantId});
+      }
+      return json(200,{tenantId});}
     if(path==="/api/tenant-bootstrap"){const owner=(body.members??[]).find((m:any)=>m.role==="owner"&&m.state==="active");if(owner?.clerkUserId!==clerkUserId)return json(403,{error:"claimant must be owner"});const r=await tenantOpRaw(env,body.tenantId,"bootstrapMembers",{...body,claimantClerkUserId:clerkUserId});if(!r.ok)return cloneResponse(r);const out:any=await r.json();if(body.clerkOrgId)await directoryOp(env,"mapOrg",{clerkOrgId:body.clerkOrgId,tenantId:body.tenantId});await directoryOp(env,"reindexTenant",{tenantId:body.tenantId,members:out.members});return json(200,out);}
     if(path==="/api/adapter/org-member"){
       const map=await directoryOp<any>(env,"orgLookup",{clerkOrgId:body.clerkOrgId});

@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -135,6 +136,31 @@ func (c *ServiceEnrollmentCoordinator) Start(ctx context.Context, request LocalS
 		return LocalServiceEnrollmentStatus{}, &ServiceEnrollmentHTTPError{
 			Status: 409, Code: "manifest_conflict",
 			Detail: fmt.Sprintf("app_path %q already has a different pending manifest", request.AppPath),
+		}
+	}
+	// Refuse an app_path whose CREDENTIAL FILE already exists under a different
+	// case. This is the durable half of the case-folding rule that
+	// DynamicRegistry.appPathOwnerLocked enforces in memory.
+	//
+	// The registry check alone does not close the hole. byPath only ever holds
+	// other PENDING enrollments and is cleared on every terminal transition, so
+	// the damaging sequence slips straight past it: enroll "media", reach ready,
+	// byPath cleared — then enroll "Media", find no incumbent, and write
+	// Media.json, which IS media.json on a case-insensitive filesystem. That
+	// clobbers media's refresh credential, and its runner reloads into
+	// needs_enrollment with an approved-manifest mismatch. The relay-side check
+	// fires only afterwards, once the file is already gone.
+	//
+	// So the check is against the thing that actually collides — the credential
+	// directory — and it runs before the hub round-trip, so no one-shot ticket is
+	// burned on an enrollment that would corrupt a working service. It also
+	// covers the case where finch.yml owns "media": static services keep their
+	// credentials in this same directory.
+	if existing, clash := credentialCaseVariant(c.options.CredentialDirectory, request.AppPath); clash {
+		c.mu.Unlock()
+		return LocalServiceEnrollmentStatus{}, &ServiceEnrollmentHTTPError{
+			Status: 409, Code: "manifest_conflict",
+			Detail: fmt.Sprintf("app_path %q collides case-insensitively with the existing credential %q; app paths must be unique ignoring case", request.AppPath, existing),
 		}
 	}
 	if len(c.byID) >= 256 {
@@ -397,4 +423,31 @@ func writeServiceEnrollmentControlError(w http.ResponseWriter, err error) {
 		Code    string `json:"code"`
 		Message string `json:"message"`
 	}{Code: code, Message: detail}})
+}
+
+// credentialCaseVariant reports an existing credential file in `dir` whose name
+// differs from `appPath`.json only by case. Returns the app_path that owns it.
+//
+// An EXACT match is not a clash: re-enrolling the same service is the ordinary
+// renewal path and must keep working. Only a different spelling of the same
+// filename is a problem, and only because the filesystem folds it — which is why
+// this asks the directory rather than assuming a platform. An unreadable
+// directory yields no clash: it is also the state before the first enrollment,
+// and failing an enrollment because the directory does not exist yet would break
+// first run.
+func credentialCaseVariant(dir, appPath string) (string, bool) {
+	if dir == "" || appPath == "" {
+		return "", false
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return "", false
+	}
+	want := appPath + ".json"
+	for _, entry := range entries {
+		if name := entry.Name(); name != want && strings.EqualFold(name, want) {
+			return strings.TrimSuffix(name, ".json"), true
+		}
+	}
+	return "", false
 }

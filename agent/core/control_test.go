@@ -285,3 +285,64 @@ func TestControlHandler_SocketPossessionIsFullTrustBoundary(t *testing.T) {
 		t.Fatalf("unrelated lease was disrupted: %v", err)
 	}
 }
+
+// REGRESSION: registration accepted a route the relay could never serve. An
+// upstream carrying a base path confines requests to that prefix, but the route
+// allowlist is a separate gate, so `upstream=http://host/base` with the default
+// route `/mcp` passed registration -- and then every request failed the
+// base-prefix check. A lease that can never serve traffic.
+func TestRegisterRejectsRoutesOutsideTheUpstreamBasePath(t *testing.T) {
+	r := NewDynamicRegistry(nil)
+	if _, err := r.Register(RegistrationRequest{
+		AppPath: "media", Upstream: "http://127.0.0.1:7342/base", Routes: []string{"/mcp"},
+	}); err == nil {
+		t.Fatal("accepted a lease whose only route is outside the upstream base path")
+	}
+	// The SDK default triple is equally unservable under a base path.
+	if _, err := r.Register(RegistrationRequest{
+		AppPath: "media2", Upstream: "http://127.0.0.1:7342/base",
+	}); err == nil {
+		t.Fatal("accepted the default route set against a base-path upstream")
+	}
+	// A route UNDER the base path is fine, and so is a base-path-free upstream.
+	if _, err := r.Register(RegistrationRequest{
+		AppPath: "ok1", Upstream: "http://127.0.0.1:7342/base", Routes: []string{"/base/mcp"},
+	}); err != nil {
+		t.Fatalf("rejected a route under the upstream base path: %v", err)
+	}
+	if _, err := r.Register(RegistrationRequest{
+		AppPath: "ok2", Upstream: "http://127.0.0.1:7342", Routes: []string{"/mcp"},
+	}); err != nil {
+		t.Fatalf("rejected an ordinary registration: %v", err)
+	}
+}
+
+// REGRESSION: the app_path conflict checks were exact-case map lookups, but a
+// service's refresh credential is a FILE named after its app_path -- so on a
+// case-insensitive filesystem `media` and `Media` share one credential. Static
+// finch.yml config has always enforced the folded rule; the dynamic path did
+// not, so both could register and then fight over one file.
+func TestRegisterFoldsAppPathCaseAgainstStaticAndDynamicOwners(t *testing.T) {
+	r := NewDynamicRegistry([]StaticService{{AppPath: "printer", Upstream: "http://127.0.0.1:8000", Routes: []string{"/mcp"}}})
+	if _, err := r.Register(RegistrationRequest{
+		AppPath: "PRINTER", Upstream: "http://127.0.0.1:9000", Routes: []string{"/mcp"},
+	}); err == nil {
+		t.Fatal("a case variant of a static app_path was accepted")
+	}
+	if _, err := r.Register(RegistrationRequest{
+		AppPath: "media", Upstream: "http://127.0.0.1:9001", Routes: []string{"/mcp"},
+	}); err != nil {
+		t.Fatalf("first dynamic registration rejected: %v", err)
+	}
+	if _, err := r.Register(RegistrationRequest{
+		AppPath: "Media", Upstream: "http://127.0.0.1:9002", Routes: []string{"/mcp"},
+	}); err == nil {
+		t.Fatal("a case variant of a live dynamic app_path was accepted")
+	}
+	// An unrelated path still registers.
+	if _, err := r.Register(RegistrationRequest{
+		AppPath: "scraper", Upstream: "http://127.0.0.1:9003", Routes: []string{"/mcp"},
+	}); err != nil {
+		t.Fatalf("unrelated app_path rejected: %v", err)
+	}
+}
