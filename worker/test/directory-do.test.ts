@@ -4,4 +4,36 @@ async function op<T=any>(op:string,args:any={}){const stub=env.DIRECTORY.get(env
 describe("DirectoryDO discovery index",()=>{
   it("round-trips idempotent memberships and invite pointers",async()=>{const tenantId=`ft_${Date.now()}`,clerkUserId=`user_${Date.now()}`,email=`A${Date.now()}@Example.com`;await op("upsertMembership",{clerkUserId,tenantId,memberId:"m_1",role:"member",state:"active"});await op("upsertMembership",{clerkUserId,tenantId,memberId:"m_1",role:"member",state:"active"});expect((await op<any>("listForUser",{clerkUserId})).memberships).toHaveLength(1);await op("addInvitePointer",{email,tenantId});await op("addInvitePointer",{email,tenantId});expect((await op<any>("invitesForEmails",{emails:[email.toLowerCase()]})).tenantIds).toEqual([tenantId]);await op("clearInvitePointer",{email,tenantId});expect((await op<any>("invitesForEmails",{emails:[email]})).tenantIds).toEqual([]);});
   it("maps organizations and rebuilds a tenant snapshot",async()=>{const tenantId=`ft_re_${Date.now()}`,org=`org_${Date.now()}`,uid=`user_re_${Date.now()}`;await op("mapOrg",{clerkOrgId:org,tenantId});expect((await op<any>("orgLookup",{clerkOrgId:org})).tenantId).toBe(tenantId);await op("reindexTenant",{tenantId,members:[{id:"m_a",clerkUserId:uid,email:"x@example.com",role:"admin",state:"active"},{id:"m_b",clerkUserId:null,email:"invite@example.com",role:"member",state:"invited"}]});expect((await op<any>("listForUser",{clerkUserId:uid})).memberships[0].role).toBe("admin");expect((await op<any>("invitesForEmails",{emails:["invite@example.com"]})).tenantIds).toContain(tenantId);});
+
+  // reindexTenant is now prefix-scoped and only writes rows that actually
+  // reference the tenant (it used to list the whole keyspace and rewrite every
+  // u:/e: key unconditionally). Guard the correctness of that change-gating:
+  // stale references must still be dropped, and unrelated rows left intact.
+  it("drops stale references without disturbing unrelated rows",async()=>{
+    const stamp=Date.now();
+    const target=`ft_target_${stamp}`, other=`ft_other_${stamp}`;
+    const shared=`user_shared_${stamp}`, bystander=`user_bystander_${stamp}`;
+    const sharedEmail=`shared${stamp}@example.com`, bystanderEmail=`bystander${stamp}@example.com`;
+
+    // `shared` belongs to BOTH tenants; `bystander` only to `other`.
+    await op("upsertMembership",{clerkUserId:shared,tenantId:target,memberId:"m_t",role:"member",state:"active"});
+    await op("upsertMembership",{clerkUserId:shared,tenantId:other,memberId:"m_o",role:"admin",state:"active"});
+    await op("upsertMembership",{clerkUserId:bystander,tenantId:other,memberId:"m_b",role:"member",state:"active"});
+    await op("addInvitePointer",{email:sharedEmail,tenantId:target});
+    await op("addInvitePointer",{email:sharedEmail,tenantId:other});
+    await op("addInvitePointer",{email:bystanderEmail,tenantId:other});
+
+    // Reindex `target` with an empty roster: every reference to it must go.
+    await op("reindexTenant",{tenantId:target,members:[]});
+
+    const sharedRows=(await op<any>("listForUser",{clerkUserId:shared})).memberships;
+    expect(sharedRows.map((m:any)=>m.tenantId)).toEqual([other]);
+    expect(sharedRows[0].role).toBe("admin"); // untouched, not rewritten
+
+    const bystanderRows=(await op<any>("listForUser",{clerkUserId:bystander})).memberships;
+    expect(bystanderRows.map((m:any)=>m.tenantId)).toEqual([other]);
+
+    expect((await op<any>("invitesForEmails",{emails:[sharedEmail]})).tenantIds).toEqual([other]);
+    expect((await op<any>("invitesForEmails",{emails:[bystanderEmail]})).tenantIds).toEqual([other]);
+  });
 });

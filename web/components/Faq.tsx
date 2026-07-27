@@ -23,6 +23,10 @@ export default function Faq() {
       a: "Finch marks the endpoint \"offline\" so you always know, and reconnects it the moment the box is back. No re-running the installer, no re-pasting URLs.",
     },
     {
+      q: "Can Finch read or store my requests?",
+      a: "Finch is not end-to-end encrypted: its Cloudflare-hosted relay handles request and response plaintext in memory while forwarding it. Ordinary MCP request and response bodies aren't logged or stored. Finch retains operational metadata such as the timestamp, route, caller, status, and latency. Dashboard Test Chat is separate and sends chat and tool data to Cloudflare Workers AI.",
+    },
+    {
       q: "What can I actually expose through it?",
       a: "Anything you can wrap as an MCP tool: printing, transcription, a notes index, web fetch, home automation, your own scripts. Start from a ready-made ability or bring your own server.",
     },

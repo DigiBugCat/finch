@@ -20,12 +20,24 @@ alias finch=/tmp/finch
 
 ## 3. Expose it with finch
 
-Grab a CLI token from the dashboard → **Settings → CLI access → Generate**, then:
-
 ```bash
-finch login --hub <your-hub> <token>
+finch login                              # browser approval, once
 finch add hello --service http://127.0.0.1:8000 --name "Hello MCP"
 finch run
+```
+
+No browser on this box? Dashboard → **Settings → CLI access → Generate → Copy**
+gives you a ready-to-run block; paste the whole thing instead of
+`finch login`. It looks like this — the token rides in on stdin, so it never
+becomes an argv word (argv is world-readable via `/proc/<pid>/cmdline`). Note
+that pasting it interactively still lands in your shell history: prefix the
+paste with a space, or use `finch token | ssh box 'finch login --token -'` from
+an already-logged-in box, to avoid that too.
+
+```bash
+finch login --hub <your-hub> --token - <<'FINCH_CLI_TOKEN'
+<the token, filled in for you by Copy>
+FINCH_CLI_TOKEN
 ```
 
 `finch run` dials out, auto-approves (you're the admin), and prints the public

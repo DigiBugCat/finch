@@ -24,6 +24,7 @@ const GROUPS: { h: string; items: [string, string][] }[] = [
     h: 'Reference',
     items: [
       ['/docs/cli', 'CLI'],
+      ['/docs/privacy', 'Privacy & data handling'],
     ],
   },
 ];

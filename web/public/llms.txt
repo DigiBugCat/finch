@@ -25,7 +25,7 @@ if __name__ == "__main__":
 EOF
 python server.py &                                   # serves MCP on http://127.0.0.1:8000
 
-curl -fsSL finchmcp.com/install | sh                 # install finch (macOS/Linux)
+curl -fsSL https://finchmcp.com/install | sh         # install finch (macOS/Linux)
 finch login                                          # prints a link + code; open on any device (phone ok) — no local browser needed
 finch add hello --service http://127.0.0.1:8000      # writes finch.yml (no secrets)
 finch run                                            # -> https://<slug>.finchmcp.com/hello/
@@ -51,7 +51,7 @@ finch keys mint my-claude --service hello            # finch_ key, shown once
 
 ## Install
 
-- [Install script](https://finchmcp.com/install): `curl -fsSL finchmcp.com/install | sh` (macOS and Linux)
+- [Install script](https://finchmcp.com/install): `curl -fsSL https://finchmcp.com/install | sh` (macOS and Linux)
 
 ## Optional
 

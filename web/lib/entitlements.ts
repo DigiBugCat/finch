@@ -12,6 +12,8 @@
 
 import "server-only";
 
+import { validTenantId } from "./tenant-cookie";
+
 /** Gated capabilities. "sharing" = invite teammates + manage ACL access. */
 export type Feature = "sharing";
 
@@ -22,8 +24,11 @@ export type Feature = "sharing";
  * turn the seam on — no call site needs to change.
  */
 export async function hasFeature(
-  _tenant: string,
-  _feature: Feature,
+  tenant: string,
+  feature: Feature,
 ): Promise<boolean> {
-  return true; // BETA: all tenants entitled. Replace with a real plan lookup.
+  // TypeScript types disappear at runtime. Keep the beta permissive for every
+  // valid tenant, but fail closed if an untyped boundary supplies an unknown
+  // feature or a malformed tenant ID.
+  return validTenantId(tenant) && feature === "sharing";
 }

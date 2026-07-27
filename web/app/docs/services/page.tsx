@@ -143,7 +143,12 @@ finch run                                <span class="c"># resumes ticketless th
         step at all. <code>finch token</code> mints a fresh, revocable CLI token; the
         browser step is only ever needed for your first box.
       </p>
-      <Code>{`ssh user@newbox "finch login --token $(finch token)"
+      <div className="docs-note">
+        <b>Keep the CLI token off argv too.</b> It is a tenant-admin credential, so it
+        deserves at least the care a ticket gets: pipe it into <code>--token -</code>,
+        or set <code>FINCH_CLI_TOKEN</code>.
+      </div>
+      <Code>{`finch token | ssh user@newbox "finch login --token -"
 ssh user@newbox "finch add api --service http://127.0.0.1:9000 && finch run"`}</Code>
 
       <h2>Inspecting state</h2>

@@ -60,11 +60,12 @@ type ServiceEnrollmentCoordinatorOptions struct {
 }
 
 type localPendingEnrollment struct {
-	pollMu   sync.Mutex
-	nextPoll time.Time
-	request  LocalServiceEnrollmentRequest
-	pending  *PendingServiceEnrollment
-	status   LocalServiceEnrollmentStatus
+	pollMu      sync.Mutex
+	nextPoll    time.Time
+	request     LocalServiceEnrollmentRequest
+	pending     *PendingServiceEnrollment
+	ackDelivery string
+	status      LocalServiceEnrollmentStatus
 }
 
 // ServiceEnrollmentCoordinator owns in-memory proof keys and secret-free local
@@ -140,10 +141,23 @@ func (c *ServiceEnrollmentCoordinator) Start(ctx context.Context, request LocalS
 		c.mu.Unlock()
 		return LocalServiceEnrollmentStatus{}, &ServiceEnrollmentHTTPError{Status: 429, Code: "too_many_enrollments", Detail: "too many local Finch enrollment records"}
 	}
-	id, err := c.newID()
-	if err != nil {
+	var id string
+	for attempt := 0; attempt < maxIDGenerationTries; attempt++ {
+		id, err = c.newID()
+		if err != nil {
+			c.mu.Unlock()
+			return LocalServiceEnrollmentStatus{}, err
+		}
+		if id != "" {
+			if _, exists := c.byID[id]; !exists {
+				break
+			}
+		}
+		id = ""
+	}
+	if id == "" {
 		c.mu.Unlock()
-		return LocalServiceEnrollmentStatus{}, err
+		return LocalServiceEnrollmentStatus{}, fmt.Errorf("generating local enrollment id: repeated empty or duplicate values")
 	}
 	// Reserve the path before the remote round-trip so concurrent local calls
 	// cannot create orphaned hub device codes for the same service.
@@ -213,6 +227,10 @@ func (c *ServiceEnrollmentCoordinator) Status(ctx context.Context, enrollmentID 
 		c.mu.Unlock()
 		return status, nil
 	}
+	if status.State == "ack_pending" {
+		c.mu.Unlock()
+		return c.finishPendingAck(ctx, enrollmentID, entry)
+	}
 	if status.Authorization != nil && !c.now().Before(status.Authorization.ExpiresAt) {
 		status.State, status.Authorization = "expired", nil
 		entry.status = status
@@ -251,12 +269,6 @@ func (c *ServiceEnrollmentCoordinator) Status(ctx context.Context, enrollmentID 
 		if err := PersistServiceEnrollmentGrant(pending.hub, credentialPath, polled.Grant, pending.prompt.Manifest); err != nil {
 			return LocalServiceEnrollmentStatus{}, err
 		}
-		if err := AckServiceEnrollment(ctx, pending, polled.DeliveryID); err != nil {
-			return LocalServiceEnrollmentStatus{}, err
-		}
-		if c.options.OnCredential != nil {
-			c.options.OnCredential(appPath)
-		}
 		c.mu.Lock()
 		entry = c.byID[enrollmentID]
 		if entry == nil {
@@ -264,13 +276,12 @@ func (c *ServiceEnrollmentCoordinator) Status(ctx context.Context, enrollmentID 
 			return LocalServiceEnrollmentStatus{}, &ServiceEnrollmentHTTPError{Status: 404, Code: "enrollment_not_found", Detail: "enrollment disappeared"}
 		}
 		status = entry.status
-		status.State, status.Authorization = "ready", nil
+		status.State, status.Authorization = "ack_pending", nil
 		status.PublicURL = polled.Grant.PublicURL
 		status.ApprovedTenant = polled.Grant.Tenant
-		entry.pending, entry.status = nil, status
-		delete(c.byPath, appPath)
+		entry.ackDelivery, entry.status = polled.DeliveryID, status
 		c.mu.Unlock()
-		return status, nil
+		return c.finishPendingAck(ctx, enrollmentID, entry)
 	}
 	switch polled.Status {
 	case "pending":
@@ -280,6 +291,38 @@ func (c *ServiceEnrollmentCoordinator) Status(ctx context.Context, enrollmentID 
 		delete(c.byPath, entry.request.AppPath)
 	}
 	entry.status = status
+	c.mu.Unlock()
+	return status, nil
+}
+
+// finishPendingAck retries the same proof-bound delivery acknowledgement after
+// an ambiguous network failure. It must never poll again after persistence: the
+// Worker may already have consumed the grant even when the ACK response was
+// lost, and ACK is the idempotent operation for resolving that ambiguity.
+func (c *ServiceEnrollmentCoordinator) finishPendingAck(ctx context.Context, enrollmentID string, entry *localPendingEnrollment) (LocalServiceEnrollmentStatus, error) {
+	c.mu.Lock()
+	pending, deliveryID, appPath := entry.pending, entry.ackDelivery, entry.request.AppPath
+	status := entry.status
+	c.mu.Unlock()
+	if pending == nil || deliveryID == "" {
+		return LocalServiceEnrollmentStatus{}, fmt.Errorf("Finch enrollment acknowledgement state is incomplete")
+	}
+	if err := AckServiceEnrollment(ctx, pending, deliveryID); err != nil {
+		return status, err
+	}
+	if c.options.OnCredential != nil {
+		c.options.OnCredential(appPath)
+	}
+	c.mu.Lock()
+	current := c.byID[enrollmentID]
+	if current != entry {
+		c.mu.Unlock()
+		return LocalServiceEnrollmentStatus{}, &ServiceEnrollmentHTTPError{Status: 404, Code: "enrollment_not_found", Detail: "enrollment disappeared"}
+	}
+	status = entry.status
+	status.State = "ready"
+	entry.pending, entry.ackDelivery, entry.status = nil, "", status
+	delete(c.byPath, appPath)
 	c.mu.Unlock()
 	return status, nil
 }

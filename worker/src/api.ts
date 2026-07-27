@@ -114,13 +114,27 @@ const DEFAULT_BYO_CNAME_TARGET = "finchmcp.com";
 // Box-name clamp at the door (M1): bound length + charset before the name
 // ever reaches the registry. Mirrors tenant-do's cleanBoxName.
 const MAX_BOX_NAME = 64;
+const MAX_API_BODY_BYTES = 256 * 1024;
+const MAX_AGENT_METADATA_BYTES = 256;
 const BOX_NAME_RE = /^[A-Za-z0-9 ._\-]+$/;
+class BodyTooLargeError extends Error {}
+
 function cleanBox(raw: unknown): string | null {
   if (typeof raw !== "string") return null;
   const name = raw.trim();
   if (!name || name.length > MAX_BOX_NAME) return null;
+  if (name === "." || name === "..") return null;
   if (!BOX_NAME_RE.test(name)) return null;
   return name;
+}
+
+function cleanAgentMetadata(raw: unknown, fallback: string): string | null {
+  if (raw === undefined || raw === null || raw === "") return fallback;
+  if (typeof raw !== "string") return null;
+  const value = raw.trim();
+  return value && new TextEncoder().encode(value).byteLength <= MAX_AGENT_METADATA_BYTES
+    ? value
+    : null;
 }
 
 function normalizeHostname(raw: unknown): string {
@@ -208,10 +222,44 @@ export function isApiPath(path: string): boolean {
   );
 }
 
-async function readJson(req: Request): Promise<any> {
+async function readJson(req: Request): Promise<Record<string, any>> {
+  const declared = req.headers.get("content-length");
+  if (declared && /^\d+$/.test(declared) && Number(declared) > MAX_API_BODY_BYTES) {
+    throw new BodyTooLargeError();
+  }
   try {
-    return await req.json();
-  } catch {
+    if (!req.body) return {};
+    const reader = req.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.byteLength;
+        if (total > MAX_API_BODY_BYTES) {
+          await reader.cancel("request body too large");
+          throw new BodyTooLargeError();
+        }
+        chunks.push(value);
+      }
+    } finally {
+      reader.releaseLock();
+    }
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    const value: unknown = JSON.parse(
+      new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes),
+    );
+    return value && typeof value === "object" && !Array.isArray(value)
+      ? value as Record<string, any>
+      : {};
+  } catch (error) {
+    if (error instanceof BodyTooLargeError) throw error;
     return {};
   }
 }
@@ -229,6 +277,21 @@ function safeDecode(seg: string): string {
 }
 
 export async function handleApi(
+  req: Request,
+  env: Env,
+  host: string,
+): Promise<Response> {
+  try {
+    return await handleApiInner(req, env, host);
+  } catch (error) {
+    if (error instanceof BodyTooLargeError) {
+      return json(413, { error: "request body too large" });
+    }
+    throw error;
+  }
+}
+
+async function handleApiInner(
   req: Request,
   env: Env,
   host: string,
@@ -345,7 +408,7 @@ export async function handleApi(
     }
     // POST /api/cli/token — an already-authed box mints a FRESH CLI token, so a
     // new box can be provisioned with no human in the loop:
-    //   ssh newbox "finch login --token $(finch token)"
+    //   finch token | ssh newbox "finch login --token -"
     // No new capability (the caller already holds a tenant CLI token); the new
     // token is epoch-bound and dies on "revoke all CLI tokens".
     if (path === "/api/cli/token" && method === "POST") {
@@ -463,7 +526,7 @@ export async function handleApi(
   const userScoped = ["/api/user/sync","/api/tenant-create","/api/tenant-bootstrap","/api/adapter/org-member","/api/portal-grant"].includes(path);
   if (userScoped) {
     const clerkUserId=await verifyAssertion(assertion,env.FINCH_SERVICE_SECRET,"user");
-    if(!clerkUserId&&path!=="/api/portal-grant")return json(401,{error:"invalid user assertion"});
+    if(!clerkUserId)return json(401,{error:"invalid user assertion"});
     if(clerkUserId){
     const body=await readJson(req); const emails=Array.isArray(body.emails)?body.emails.map((x:any)=>String(x).trim().toLowerCase()):[];
     if(body.primaryEmail&&!emails.includes(String(body.primaryEmail).trim().toLowerCase()))return json(400,{error:"primaryEmail must be verified"});
@@ -501,7 +564,17 @@ export async function handleApi(
       for(const clerkOrgId of Array.isArray(body.adminOrgIds)?body.adminOrgIds:[]){const probe=await tenantOpRaw(env,String(clerkOrgId),"legacyClaimStatus");if(probe.ok){const status:any=await probe.json();if(!status.migrated&&status.hasState)claimable.push({clerkOrgId:String(clerkOrgId)});}}
       return json(200,{tenants:memberships,claimable});
     }
-    if(path==="/api/tenant-create"){if(!body.email||!emails.includes(String(body.email).trim().toLowerCase()))return json(400,{error:"email must be verified"});const tenantId="ft_"+crypto.randomUUID().slice(0,8);const r=await tenantOpRaw(env,tenantId,"bootstrapMembers",{kind:"team",displayName:body.name,bootstrappedFrom:"fresh",members:[{clerkUserId,email:body.email,role:"owner",state:"active"}],claimantClerkUserId:clerkUserId});if(!r.ok)return cloneResponse(r);const out:any=await r.json();await directoryOp(env,"reindexTenant",{tenantId,members:out.members}).catch(error=>console.error("tenant directory reindex failed",{tenantId,error}));return json(200,{tenantId});}
+    if(path==="/api/tenant-create"){
+      // THROTTLE WORKSPACE CREATION. This branch had no limiter at all, unlike
+      // /join, /refresh, device-approve, box-update and hostnames. Each create
+      // persists a TenantDO and reindexes the single global DirectoryDO that
+      // every sign-in reads, and each workspace can then hold 200 invited
+      // members whose e: pointers permanently enlarge that DO's keyspace --
+      // so unbounded creation was an availability lever against other users,
+      // not just self-inflicted resource growth. Keyed per user AND per IP so
+      // neither a single account nor a single host can spin freely.
+      if(!(await rateLimitOk(env.JOIN_LIMIT,`tcreate:${clerkUserId}`))||!(await rateLimitOk(env.JOIN_LIMIT,`tcreate:${clientIp(req)}`)))return json(429,{error:"rate limited"});
+      if(!body.email||!emails.includes(String(body.email).trim().toLowerCase()))return json(400,{error:"email must be verified"});const tenantId="ft_"+crypto.randomUUID().slice(0,8);const r=await tenantOpRaw(env,tenantId,"bootstrapMembers",{kind:"team",displayName:body.name,bootstrappedFrom:"fresh",members:[{clerkUserId,email:body.email,role:"owner",state:"active"}],claimantClerkUserId:clerkUserId});if(!r.ok)return cloneResponse(r);const out:any=await r.json();await directoryOp(env,"reindexTenant",{tenantId,members:out.members}).catch(error=>console.error("tenant directory reindex failed",{tenantId,error}));return json(200,{tenantId});}
     if(path==="/api/tenant-bootstrap"){const owner=(body.members??[]).find((m:any)=>m.role==="owner"&&m.state==="active");if(owner?.clerkUserId!==clerkUserId)return json(403,{error:"claimant must be owner"});const r=await tenantOpRaw(env,body.tenantId,"bootstrapMembers",{...body,claimantClerkUserId:clerkUserId});if(!r.ok)return cloneResponse(r);const out:any=await r.json();if(body.clerkOrgId)await directoryOp(env,"mapOrg",{clerkOrgId:body.clerkOrgId,tenantId:body.tenantId});await directoryOp(env,"reindexTenant",{tenantId:body.tenantId,members:out.members});return json(200,out);}
     if(path==="/api/adapter/org-member"){
       const map=await directoryOp<any>(env,"orgLookup",{clerkOrgId:body.clerkOrgId});
@@ -537,7 +610,7 @@ export async function handleApi(
   }
 
 
-  const membershipOps: Record<string,string>={"member-context":"memberContext","members/invite":"inviteMember","members/role":"setMemberRole","members/state":"setMemberState","members/remove":"removeMember","access/approve":"approveAccess"};
+  const membershipOps: Record<string,string>={"member-context":"memberContext","members/invite":"inviteMember","members/role":"setMemberRole","members/state":"setMemberState","members/remove":"removeMember","access/approve":"approveAccess","access/deny":"denyAccess","access/revoke":"revokeAccess"};
   const membershipKey=seg.join("/");
   if (method === "POST" && membershipOps[membershipKey]) {
     const body = await readJson(req);
@@ -574,9 +647,15 @@ export async function handleApi(
     return cloneResponse(res);
   }
 
-  // GET /api/state
+  // GET /api/state[?viewer=<memberId>] — the dashboard's read. `viewer` names
+  // the MEMBER on whose behalf the web is asking; the DO then returns only the
+  // services/boxes that member may reach (TenantDO.viewerFilter, the same rule
+  // the browser door applies). The id is a tenant-local member id and is
+  // resolved inside the DO against this tenant's active roster, so a wrong or
+  // stale one narrows to nothing rather than widening.
   if (method === "GET" && seg.length === 1 && seg[0] === "state") {
-    const state = await tenantOp<TenantState>(env, tenant, "getState");
+    const viewer = url.searchParams.get("viewer") ?? undefined;
+    const state = await tenantOp<TenantState>(env, tenant, "getState", { viewer });
     return json(200, state);
   }
 
@@ -825,7 +904,10 @@ export async function handleApi(
     return json(200, resp);
   }
 
-  // POST /api/boxes/:box/keys/revoke {service,key}
+  // POST /api/boxes/:box/keys/revoke
+  //   {service,key} — detach one box assignment
+  //   {key}         — revoke the tenant key globally (the path placeholder is
+  //                   ignored because no box scope was supplied)
   if (
     method === "POST" &&
     seg[0] === "boxes" &&
@@ -835,12 +917,16 @@ export async function handleApi(
   ) {
     const box = safeDecode(seg[1]);
     const body = await readJson(req);
-    if (!body.service || !body.key) {
-      return json(400, { error: "service and key required" });
+    if (typeof body.key !== "string" || !body.key) {
+      return json(400, { error: "key required" });
+    }
+    const hasService = body.service !== undefined;
+    if (hasService && (typeof body.service !== "string" || !body.service)) {
+      return json(400, { error: "service must be a non-empty string" });
     }
     const out = await tenantOp(env, tenant, "revokeBoxKey", {
-      service: body.service,
-      box,
+      service: hasService ? body.service : "",
+      box: hasService ? box : "",
       key: body.key,
     });
     return json(out?.ok === false ? 404 : 200, out);
@@ -1105,7 +1191,7 @@ async function handleJoin(
   }
 
   const body = await readJson(req);
-  if (!body.ticket || !body.box) {
+  if (typeof body.ticket !== "string" || typeof body.box !== "string") {
     return json(400, { error: "ticket and box required" });
   }
   // Validate + clamp the attacker-chosen box name (length + charset) before
@@ -1116,14 +1202,21 @@ async function handleJoin(
       error: "invalid box name (1-64 chars, [A-Za-z0-9 ._-] only)",
     });
   }
+  const os = cleanAgentMetadata(body.os, "unknown");
+  const version = cleanAgentMetadata(body.version, "0.0.0");
+  if (os === null || version === null) {
+    return json(400, { error: "os and version must be at most 256 UTF-8 bytes" });
+  }
   const payload = await verifyToken(body.ticket, env.TICKET_SECRET);
   // A join ticket is service-scoped — validateTicket already requires
   // `service` for non-browser kinds, but narrow it here for the type checker
   // (TicketPayload.service is optional for the browser portal/session kinds).
   if (
     !payload ||
-    (payload.kind !== undefined && payload.kind !== "join") ||
-    !payload.service
+    payload.kind !== "join" ||
+    !payload.service ||
+    typeof payload.jti !== "string" ||
+    !payload.jti
   ) {
     return json(401, { error: "invalid or expired ticket" });
   }
@@ -1138,9 +1231,6 @@ async function handleJoin(
   if (!claim.ok) {
     return json(409, { error: "ticket already used" });
   }
-
-  const os = typeof body.os === "string" ? body.os : "unknown";
-  const version = typeof body.version === "string" ? body.version : "0.0.0";
 
   const reg = await tenantOp<{ ok: boolean; error?: string }>(
     env,
@@ -1219,7 +1309,9 @@ async function handleRefresh(
   }
 
   const body = await readJson(req);
-  if (!body.refreshToken) return json(400, { error: "refreshToken required" });
+  if (typeof body.refreshToken !== "string" || !body.refreshToken) {
+    return json(400, { error: "refreshToken required" });
+  }
 
   const payload = await verifyToken(body.refreshToken, env.TICKET_SECRET);
   // A refresh token is service- AND box-scoped (browser kinds carry
@@ -1263,11 +1355,15 @@ async function handleRefresh(
   // new binary after a hub-pushed update and resumes HERE, never via /join —
   // without this the registry keeps the pre-update version forever). Older
   // agents send no version → no-op. Best-effort: never blocks the refresh.
-  if (typeof body.version === "string" && body.version) {
+  const version = cleanAgentMetadata(body.version, "");
+  if (version === null) {
+    return json(400, { error: "version must be at most 256 UTF-8 bytes" });
+  }
+  if (version) {
     await tenantOp(env, tenant, "boxVersion", {
       service,
       box,
-      version: body.version,
+      version,
     });
   }
 

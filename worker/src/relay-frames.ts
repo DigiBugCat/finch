@@ -92,6 +92,12 @@ export type AgentFrame =
 /** Decode a base64 (std alphabet, padded) chunk payload to raw bytes. atob
  *  yields a binary string (one char per byte); map back to a Uint8Array. */
 export function decodeChunk(data: string): Uint8Array {
+  if (
+    typeof data !== "string" ||
+    (data.length > 0 && !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(data))
+  ) {
+    throw new Error("invalid base64 chunk");
+  }
   const bin = atob(data);
   const out = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);

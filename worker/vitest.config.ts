@@ -26,5 +26,9 @@ export default defineConfig({
   test: {
     include: ["test/**/*.test.ts"],
     pool: cloudflarePool(workerOptions),
+    // Multiple workerd pools contend heavily for local runtime resources and
+    // can starve the 32-stream relay-cap teardown until Vitest's timeout. One
+    // worker is both faster for this suite and deterministic in CI.
+    maxWorkers: 1,
   },
 });

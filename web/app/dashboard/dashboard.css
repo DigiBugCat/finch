@@ -649,6 +649,9 @@ body::before{
 }
 
 /* Test-in-chat — a chat window inside the service detail */
+.chatd-privacy{margin:8px 0 12px;padding:10px 12px;border:1px solid var(--line2);border-left:3px solid var(--amber);
+  border-radius:9px;background:var(--amber-soft);color:var(--dim);font-size:12px;line-height:1.5}
+.chatd-privacy strong{color:var(--ink)}
 .chatd-win{margin-top:6px;border:1px solid var(--line2);border-radius:14px;overflow:hidden;
   background:#1a150d;display:flex;flex-direction:column;height:380px}
 .chatd-winbar{display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid var(--line);background:#1f190f}

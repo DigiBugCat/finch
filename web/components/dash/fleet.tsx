@@ -269,7 +269,13 @@ export function DetailView({ app, host, onBack, onRelease, onTags, onApprove, on
 
         {/* Boxes */}
         <Card className="boxes-card connect-card">
-          <SectionLabel hint="boxes serving this service · revoke keys here">boxes</SectionLabel>
+          {/* The × on a key chip DETACHES the chip from this box's display list; it
+              does NOT revoke the credential. Authorization reads s.keys (checkKey in
+              worker/src/tenant-do.ts) and never consults a box's key list, so a
+              detached key still authorizes. Revocation lives in Settings → Keys.
+              Say so here — a control labelled "revoke" that leaves the bearer live
+              is worse than no control, because the operator believes they acted. */}
+          <SectionLabel hint="boxes serving this service · detach key chips here (revoke in Settings → Keys)">boxes</SectionLabel>
           {app.boxes.length ? app.boxes.map((m: any) => (
             <div key={m.name} className="mach">
               <div className="mach-head">
@@ -285,7 +291,7 @@ export function DetailView({ app, host, onBack, onRelease, onTags, onApprove, on
                 <span className="mach-keys">
                   <span className="auth-sub dim">keys</span>
                   {m.keys.length ? m.keys.map((k: any) => (
-                    <span key={k} className="kchip mono">🔑 {k}{canManage && <button className="tag-x" title="revoke" onClick={() => onRevokeBoxKey(app.id, m.name, k)}>×</button>}</span>
+                    <span key={k} className="kchip mono">🔑 {k}{canManage && <button className="tag-x" title="detach from this box — does not revoke the key (Settings → Keys)" onClick={() => onRevokeBoxKey(app.id, m.name, k)}>×</button>}</span>
                   )) : <span className="dim">none</span>}
                 </span>
                 {m.outdated && (

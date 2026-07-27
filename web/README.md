@@ -31,6 +31,24 @@ The BFF never exposes the hub directly: each route checks the Clerk session,
 then calls the hub with the shared `FINCH_SERVICE_SECRET` **and** an HMAC-signed
 tenant assertion (so a leaked secret alone can't act as an arbitrary tenant).
 
+## Privacy behavior
+
+The ordinary MCP relay and Dashboard **Test in chat** have different data
+paths. Ordinary calls travel over HTTPS from the client and WSS from the Finch
+hub to the outbound box agent. Cloudflare terminates those encrypted
+connections, so this is transport encryption, not end-to-end encryption. Finch
+processes the payload transiently to relay it, but its application storage and
+logs do not retain ordinary request or response bodies. Recent-call and traffic
+views use operational metadata only: timestamp, tenant/service/route, caller
+label, response status, duration, and aggregate counters.
+
+Using **Test in chat** additionally sends the visible chat history, the
+service's tool names/descriptions/input schemas, model-selected tool arguments,
+and returned tool results to Cloudflare Workers AI. This is required for the
+model to decide which tool to call and compose an answer; it is not covered by
+the ordinary relay's no-body-retention guarantee. The full data-handling
+boundary is documented in [`../docs/privacy.md`](../docs/privacy.md).
+
 ## Setup
 
 ```bash

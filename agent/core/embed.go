@@ -60,9 +60,12 @@ func (o EmbedOptions) validate() (*url.URL, error) {
 	if o.CredentialPath == "" {
 		return nil, fmt.Errorf("CredentialPath is required")
 	}
-	up, err := url.Parse(strings.TrimRight(o.Upstream, "/"))
-	if err != nil || up.Scheme == "" || up.Host == "" {
-		return nil, fmt.Errorf("upstream %q is not a valid absolute URL", o.Upstream)
+	if _, err := validateHubTransportURL(o.hub()); err != nil {
+		return nil, err
+	}
+	up, err := parseUpstreamTransportURL(o.Upstream)
+	if err != nil {
+		return nil, err
 	}
 	return up, nil
 }
@@ -243,7 +246,15 @@ func Embed(ctx context.Context, o EmbedOptions, status func(state, detail string
 			}
 		}
 
-		wsURL := wsBase + "?ct=" + url.QueryEscape(connectToken)
+		wsURL, uerr := relayConnectURL(wsBase, connectToken)
+		if uerr != nil {
+			connectExp = time.Time{}
+			status("reconnecting", uerr.Error())
+			if !sleep() {
+				return nil
+			}
+			continue
+		}
 		start := time.Now()
 		status("connecting", "dialing Finch relay")
 		serr := serveWithRoutesStatus(ctx, wsURL, up, o.ForwardAll, o.Routes, hub, func() {

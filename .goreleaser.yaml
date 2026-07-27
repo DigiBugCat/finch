@@ -43,7 +43,7 @@ archives:
   # Serve un-tarred binaries named exactly finch-<os>-<arch> so the installer's
   # URL and the worker /releases redirect download a runnable binary directly.
   - id: raw
-    format: binary
+    formats: [binary]
     # `.Arm` is set only for goarch=arm (6/7), so 32-bit builds become
     # finch-linux-armv6 / finch-linux-armv7 while amd64/arm64 keep their plain
     # finch-<os>-<arch> names. The installer maps uname -m (armv6l/armv7l) to these.

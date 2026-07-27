@@ -17,6 +17,10 @@
     "SESSION_SECRET": "test-session-secret",
     "DEFAULT_TENANT": "dev-tenant",
     "DEV": "1",
+    // Tests intentionally use synthetic http:// hosts. Public environments omit
+    // this escape hatch and the Worker rejects insecure requests before reading
+    // their body.
+    "ALLOW_INSECURE_HTTP": "1",
     // The login wall 302s here; a stable test value lets the e2e assert the
     // Location host without depending on prod config.
     "WEB_URL": "https://web.test",

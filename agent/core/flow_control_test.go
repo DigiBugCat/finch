@@ -333,8 +333,8 @@ func TestServe_FakeDOBackpressureAndReset(t *testing.T) {
 		}
 		// coder/websocket defaults to a 32KiB read limit; a single 32KiB body read
 		// becomes a ~44KB base64+JSON chunk frame, so raise it to match the agent's
-		// 32MiB limit or the DO reader trips a protocol close mid-stream.
-		c.SetReadLimit(32 << 20)
+		// own frame limit or the DO reader trips a protocol close mid-stream.
+		c.SetReadLimit(maxRelayFrameBytes)
 		// NOT r.Context(): coder/websocket hijacks the conn in Accept, after which
 		// the request context is cancelled — using it for the WS reads/writes
 		// would close the link the instant Accept returns. Use an independent ctx.

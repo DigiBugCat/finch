@@ -25,7 +25,6 @@ jobs:
     env:
       E2E_ROOT: /tmp/finch-staging-e2e
       AVIARY_VERSION: ${{ vars.AVIARY_MCP_E2E_VERSION || '0.1.0rc6' }}
-      FINCH_CLI_JSON: ${{ secrets.FINCH_STAGING_E2E_CLI_JSON }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -36,12 +35,19 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Require the isolated staging login
-        run: test -n "$FINCH_CLI_JSON"
-
       - name: Prepare isolated credentials
+        env:
+          FINCH_CLI_JSON: ${{ secrets.FINCH_STAGING_E2E_CLI_JSON }}
         run: |
-          mkdir -p -m 700 \
+          test -n "$FINCH_CLI_JSON"
+          umask 077
+          mkdir -p \
+            "$E2E_ROOT/home/.finch" \
+            "$E2E_ROOT/credentials" \
+            "$E2E_ROOT/run"
+          chmod 700 \
+            "$E2E_ROOT" \
+            "$E2E_ROOT/home" \
             "$E2E_ROOT/home/.finch" \
             "$E2E_ROOT/credentials" \
             "$E2E_ROOT/run"
