@@ -33,6 +33,7 @@ import {
   type AclEntity,
   type AccessRequest,
   type LogEvent,
+  type StoredLogEvent,
   type Settings,
   type Overview,
   type Group,
@@ -69,7 +70,9 @@ interface StoredState {
   groups: Group[];
   acl: AclRule[];
   accessRequests: AccessRequest[];
-  logs: LogEvent[];
+  // StoredLogEvent, not LogEvent: rows carry the `svc` ACL subject that
+  // getState uses to narrow the log for a scoped viewer and then strips.
+  logs: StoredLogEvent[];
   settings: Settings;
   // Spent join-ticket ids (M1): jti -> the ticket's exp (epoch SECONDS). A jti
   // is recorded on first successful /join and rejected thereafter; entries are
@@ -99,6 +102,11 @@ const MAX_SERVICE_ID = 63;
 // Shared contract with the Go agent and web service routes: one ASCII URL
 // segment, with punctuation allowed only between alphanumeric endpoints.
 const SERVICE_ID_RE = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,61}[A-Za-z0-9])?$/;
+// A tenant subdomain is a single DNS label — no dots. Deliberately stricter
+// than router-do's isValidHostKey, which also accepts dotted host keys for the
+// BYO-hostname flow; that flow has its own authorization (vanity gate + CF DV
+// provisioning) which the settings path does not perform.
+const SUBDOMAIN_LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 // Access-request queue cap: resolved rows are evicted oldest-first to stay
 // under it; a queue full of live (pending/invited) rows refuses new ones.
 const MAX_ACCESS_REQUESTS = 200;
@@ -222,7 +230,7 @@ export class TenantDO extends DurableObject<Env> {
     try {
       switch (op) {
         case "getState":
-          return ok(await this.getState());
+          return ok(await this.getState(a.viewer));
         case "memberContext": return ok(await this.memberContext(a.clerkUserId, a.email));
         case "ensureOwner": return ok(await this.ensureOwner(a.clerkUserId, a.email));
         case "inviteMember": return this.opResponse(await this.inviteMember(a.email,a.role,a.actor));
@@ -450,7 +458,16 @@ export class TenantDO extends DurableObject<Env> {
     await this.ctx.storage.put("state", s);
   }
 
-  private log(s: StoredState, ev: Omit<LogEvent, "ago" | "ts">): void {
+  /** Append an audit row. `svc` is REQUIRED (see StoredLogEvent in types.ts):
+   *  every call site has to state which service the entry is about, because
+   *  that is what decides whether a scoped viewer may read it. It is a required
+   *  field rather than an optional one precisely so a new log site cannot
+   *  silently inherit a default — either default is wrong somewhere ("" leaks a
+   *  service-specific row, LOG_SVC_MANY hides a tenant-wide one). */
+  private log(
+    s: StoredState,
+    ev: Omit<StoredLogEvent, "ago" | "ts" | "svc"> & { svc: string },
+  ): void {
     const ts = Date.now();
     // `ago` is derived from `ts` on read (getState); store an empty placeholder
     // so a stale literal is never persisted.
@@ -463,7 +480,12 @@ export class TenantDO extends DurableObject<Env> {
   /** Build the public TenantState: flatten boxes, derive service.state
    *  from boxes, recompute `outdated`, compute the overview, strip key
    *  hashes. Never persisted — always recomputed from the stored record. */
-  private async getState(): Promise<TenantState> {
+  /** The tenant state the dashboard renders. `viewer` is an OPTIONAL member id:
+   *  when present, services/boxes/overview are narrowed to what that member may
+   *  actually reach (see viewerFilter). Every other caller — the CLI's
+   *  /api/cli/state, the internal host/member lookups — passes nothing and gets
+   *  the unnarrowed state exactly as before. */
+  private async getState(viewer?: unknown): Promise<TenantState> {
     const s = await this.load();
     // First dashboard load for a fresh tenant: hand out a default hub domain
     // so people start with a working <slug>.finchmcp.com instead of a claim
@@ -476,6 +498,7 @@ export class TenantDO extends DurableObject<Env> {
         action: "claimed default hub domain",
         target: s.settings.subdomain,
         ip: "",
+        svc: "",
       });
       await this.save(s);
     }
@@ -529,10 +552,22 @@ export class TenantDO extends DurableObject<Env> {
       };
     });
 
+    // Narrow the COLLECTIONS for a scoped viewer before anything is derived
+    // from them. This has to happen inside the DO: the ACL lives here, and the
+    // predicate must be the SAME one the door enforces (viewerFilter delegates
+    // to evalIdentAccess, as gateBrowser does) — a second copy of the rule in
+    // the web layer would drift and start hiding services a member can in fact
+    // call. Everything downstream (the boxes lens, overview's fleet totals and
+    // SLO numbers) is computed from `visible`, so a member's dashboard cannot
+    // re-derive the hidden fleet from an aggregate.
+    const viewerId = typeof viewer === "string" ? viewer.trim() : "";
+    const filter = viewerId ? this.viewerFilter(s, viewerId) : null;
+    const visible = filter ? services.filter(filter) : services;
+
     // Flattened boxes lens, annotated with the service's group/tags/owner
     // (the dashboard's Boxes view consumes this exact shape).
     const boxes: Box[] = [];
-    for (const a of services) {
+    for (const a of visible) {
       for (const m of a.boxes) {
         boxes.push({
           ...m,
@@ -545,16 +580,45 @@ export class TenantDO extends DurableObject<Env> {
 
     const publicKeys: PublicKey[] = s.keys.map(({ hash, ...rest }) => rest);
 
-    const logs: LogEvent[] = (s.logs ?? []).map((ev) => ({
-      ...ev,
-      ago: timeAgo(ev.ts, now),
-    }));
+    // The AUDIT LOG carries the same data services[] does — a `request` row is
+    // `${service} ${route}` + status, a `device` row is service→box, `set-auth`
+    // is `${id} → ${mode}` — so narrowing the collections without narrowing the
+    // log would just move the leak. Same viewerFilter, same place, one rule.
+    //
+    // The subject is read from the STRUCTURED `svc` field, never from the prose
+    // (see StoredLogEvent). A scoped viewer keeps a row ONLY when `svc` is a
+    // service that survived `filter`. Everything else fails closed: a released
+    // service (no longer checkable), a legacy row written before `svc` existed,
+    // and — deliberately — the tenant-wide rows too.
+    //
+    // Denying tenant-wide rows is the part worth justifying. They are the
+    // roster and settings history: "invited member <email>", "bound identity
+    // m_x <email>", "changed member role owner → admin", "changed setting
+    // subdomain → …". The web layer already refuses to show a member any of
+    // that (its MEMBER_LOG_CATEGORIES keeps only `device` and `request`, both of
+    // which are always service-scoped), so denying them here costs a member
+    // nothing they can see today — and it moves the boundary off that category
+    // list, which is a display convention, onto the ACL, which is the rule. It
+    // also makes a viewer that fails closed entirely (an unknown or disabled
+    // member id: viewerFilter admits nothing) get an EMPTY log, matching the
+    // empty services/boxes it already gets.
+    //
+    // `svc` is stripped on the way out for EVERY caller, scoped or not: it is
+    // ACL metadata, and dropping it keeps an admin's `logs` byte-for-byte what
+    // it was before this field existed.
+    const visibleIds = filter ? new Set(visible.map((a) => a.id)) : null;
+    const logs: LogEvent[] = (s.logs ?? [])
+      .filter((ev) => !visibleIds || (!!ev.svc && visibleIds.has(ev.svc)))
+      .map(({ svc: _svc, ...ev }) => ({
+        ...ev,
+        ago: timeAgo(ev.ts, now),
+      }));
 
     return {
       host: s.host,
       tenant: s.tenantMeta,
       members: s.members,
-      services,
+      services: visible,
       boxes,
       keys: publicKeys,
       groups: s.groups,
@@ -563,13 +627,38 @@ export class TenantDO extends DurableObject<Env> {
       logs,
       settings: s.settings,
       overview: this.overview(
-        services,
+        visible,
         s.keys,
         now,
         !!s.settings.enforceExpiry,
       ),
       latestAgent: LATEST_AGENT,
+      // Echoed whenever a viewer was named — the web treats a MISSING echo as
+      // "this hub does not scope" and empties the collections itself.
+      ...(viewerId ? { viewerScoped: true } : {}),
     };
+  }
+
+  /** The service-visibility predicate for a dashboard `viewer` (a member id),
+   *  or null when the viewer is not scoped at all.
+   *
+   *  Semantics are lifted verbatim from the door gate (gateBrowser): an
+   *  owner/admin is never narrowed (gateBrowser returns allowed for any
+   *  role !== "member"), a `public` service has no door so hiding it would hide
+   *  something the member can already call unauthenticated, and everything else
+   *  is the ordinary default-deny ACL walk over the member's user/group
+   *  identities. A viewer id that resolves to no ACTIVE member fails CLOSED —
+   *  the caller asked to be scoped, so an unrecognized one sees nothing rather
+   *  than everything. */
+  private viewerFilter(
+    s: StoredState,
+    viewerId: string,
+  ): ((service: Service) => boolean) | null {
+    const m = s.members.find((x) => x.id === viewerId && x.state === "active");
+    if (!m) return () => false;
+    if (m.role !== "member") return null;
+    const ident = this.userIdentities(s, m.email);
+    return (a) => a.auth === "public" || this.evalIdentAccess(s, ident, a.id);
   }
 
   private overview(
@@ -776,7 +865,7 @@ export class TenantDO extends DurableObject<Env> {
   private async revokeCliTokens(): Promise<{ ok: boolean; epoch: number }> {
     const s = await this.load();
     s.cliTokenEpoch = (s.cliTokenEpoch ?? 0) + 1;
-    this.log(s, { cat: "key", actor: "you", action: "revoked all CLI tokens", target: "cli access", ip: "" });
+    this.log(s, { cat: "key", actor: "you", action: "revoked all CLI tokens", target: "cli access", ip: "", svc: "" });
     await this.save(s);
     return { ok: true, epoch: s.cliTokenEpoch };
   }
@@ -795,7 +884,7 @@ export class TenantDO extends DurableObject<Env> {
   private async bumpSessionEpoch(): Promise<{ ok: boolean; epoch: number }> {
     const s = await this.load();
     s.sessionEpoch = (s.sessionEpoch ?? 0) + 1;
-    this.log(s, { cat: "access", actor: "you", action: "signed out all sessions", target: "web access", ip: "" });
+    this.log(s, { cat: "access", actor: "you", action: "signed out all sessions", target: "web access", ip: "", svc: "" });
     await this.save(s);
     return { ok: true, epoch: s.sessionEpoch };
   }
@@ -816,7 +905,7 @@ export class TenantDO extends DurableObject<Env> {
     if (old && old !== group && !s.services.some((a) => a.group === old)) {
       s.groups = s.groups.filter((g) => g.name !== old);
     }
-    this.log(s, { cat: "admin", actor: "you", action: "moved to group", target: `${id} → ${group || "—"}`, ip: "" });
+    this.log(s, { cat: "admin", actor: "you", action: "moved to group", target: `${id} → ${group || "—"}`, ip: "", svc: id });
     await this.save(s);
     return { ok: true };
   }
@@ -855,6 +944,7 @@ export class TenantDO extends DurableObject<Env> {
       action: "enrolled",
       target: id,
       ip: "",
+      svc: id,
     });
     await this.save(s);
     return { id };
@@ -929,6 +1019,7 @@ export class TenantDO extends DurableObject<Env> {
           action: "approved credential rotation",
           target: `${id}/${box} epoch ${nextEpoch}`,
           ip: "",
+          svc: id,
         });
         await this.save(s);
         return { ok: true, id, created: false, credentialEpoch: nextEpoch };
@@ -982,6 +1073,7 @@ export class TenantDO extends DurableObject<Env> {
       action: "approved service enrollment",
       target: `${id}/${box} ${digest.slice(-12)}`,
       ip: "",
+      svc: id,
     });
     await this.save(s);
     return { ok: true, id, created: true, credentialEpoch: 1 };
@@ -1033,6 +1125,7 @@ export class TenantDO extends DurableObject<Env> {
       action: "rolled back incomplete enrollment",
       target: `${appPath} ${manifestSha256.slice(-12)}`,
       ip: "",
+      svc: service.id,
     });
     await this.save(s);
     return { ok: true };
@@ -1078,6 +1171,7 @@ export class TenantDO extends DurableObject<Env> {
       action: "activated service credential",
       target: `${appPath}/${box} epoch ${credentialEpoch}`,
       ip: "",
+      svc: service.id,
     });
     await this.save(s);
     return { ok: true };
@@ -1094,6 +1188,7 @@ export class TenantDO extends DurableObject<Env> {
       action: "released",
       target: id,
       ip: "",
+      svc: id,
     });
     await this.save(s);
     return { ok: true };
@@ -1119,6 +1214,7 @@ export class TenantDO extends DurableObject<Env> {
       action: "approved",
       target: id,
       ip: "",
+      svc: id,
     });
     await this.save(s);
     return { ok: true };
@@ -1136,6 +1232,7 @@ export class TenantDO extends DurableObject<Env> {
       action: "declined",
       target: id,
       ip: "",
+      svc: id,
     });
     await this.save(s);
     return { ok: true };
@@ -1167,6 +1264,7 @@ export class TenantDO extends DurableObject<Env> {
       action: "set-auth",
       target: `${id} → ${mode}`,
       ip: "",
+      svc: id,
     });
     await this.save(s);
     return { ok: true };
@@ -1186,6 +1284,7 @@ export class TenantDO extends DurableObject<Env> {
       action: "set tags",
       target: `${id} → ${ap.tags.join(", ") || "(none)"}`,
       ip: "",
+      svc: id,
     });
     await this.save(s);
     return { ok: true };
@@ -1254,6 +1353,9 @@ export class TenantDO extends DurableObject<Env> {
       action: "minted key",
       target: label,
       ip: "",
+      // A key is a tenant credential; `scope` may list services, so no
+      // single subject.
+      svc: "",
     });
     await this.save(s);
     const { hash: _h, ...pub } = key;
@@ -1334,6 +1436,9 @@ export class TenantDO extends DurableObject<Env> {
         action: service && box ? "detached key" : "revoked key",
         target: `${target.label} @ ${service}/${box}`,
         ip: "",
+        // A detach names one service; a tenant-global revoke names none (and
+        // touches every service, so it has no single subject).
+        svc: service && box ? service : "",
       });
       await this.save(s);
     }
@@ -1374,6 +1479,8 @@ export class TenantDO extends DurableObject<Env> {
       action: "granted",
       target: `${aclLabel(src)} → ${rule.dst.map(aclLabel).join(", ")}`,
       ip: "",
+      // dst is a LIST (and may name groups, not services) — plural subject.
+      svc: "",
     });
     await this.save(s);
     return { id: rule.id };
@@ -1391,6 +1498,8 @@ export class TenantDO extends DurableObject<Env> {
       action: "removed policy",
       target: id,
       ip: "",
+      // `id` is the rule id; the rule it removed may have named many services.
+      svc: "",
     });
     await this.save(s);
     return { ok: true };
@@ -1459,6 +1568,7 @@ export class TenantDO extends DurableObject<Env> {
       action: "requested access",
       target: `${em} → ${svc}`,
       ip: "",
+      svc,
     });
     await this.save(s);
     return { ok: true, request: req };
@@ -1510,6 +1620,7 @@ export class TenantDO extends DurableObject<Env> {
       action: `access ${status}`,
       target: `${req.email} → ${req.service}`,
       ip: "",
+      svc: req.service,
     });
     await this.save(s);
     return { ok: true, request: req };
@@ -1555,6 +1666,7 @@ export class TenantDO extends DurableObject<Env> {
         action: "revoked",
         target: `user:${em} → ${svc}`,
         ip: "",
+        svc,
       });
       await this.save(s);
     }
@@ -1623,7 +1735,7 @@ export class TenantDO extends DurableObject<Env> {
     if(!uid||!em||uid!==this.tenantId()) return {error:"personal workspace owner mismatch",status:403};
     const now=Date.now(), member:TenantMember={id:"m_"+crypto.randomUUID().slice(0,8),tenantId:this.tenantId(),clerkUserId:uid,email:em,role:"owner",state:"active",createdAt:now,updatedAt:now,boundAt:now};
     s.tenantMeta={id:this.tenantId(),kind:"personal",displayName:this.tenantId(),createdAt:now,bootstrappedFrom:"legacy-personal",membershipVersion:1}; s.members=[member]; this.rewriteYou(s,em);
-    this.log(s,{cat:"access",actor:member.id,action:"bootstrapped workspace",target:em,ip:""}); await this.save(s); return {member,tenantMeta:s.tenantMeta};
+    this.log(s,{cat:"access",actor:member.id,action:"bootstrapped workspace",target:em,ip:"",svc:""}); await this.save(s); return {member,tenantMeta:s.tenantMeta};
   }
   private async memberContext(clerkUserId: unknown, email?: unknown): Promise<any> {
     const uid=typeof clerkUserId==="string"?clerkUserId:""; const s=await this.load();
@@ -1634,15 +1746,15 @@ export class TenantDO extends DurableObject<Env> {
     const em=typeof email==="string"?normalizeEmail(email):""; if(!em||!['admin','member'].includes(String(role))) return {error:"invalid email or role",status:400};
     const s=await this.load(), am=this.actorMember(s,actor); if(!am||am.role==="member") return {error:"admin role required",status:403};
     const old=s.members.find(m=>normalizeEmail(m.email)===em); if(old){if(old.state==="disabled") return {error:"member is disabled; re-enable instead",status:409}; return {ok:true,member:old};}
-    if(s.members.length>=MAX_MEMBERS)return {error:"member limit reached",status:409}; const now=Date.now(); const member:TenantMember={id:"m_"+crypto.randomUUID().slice(0,8),tenantId:this.tenantId(),clerkUserId:null,email:em,role:role as FinchRole,state:"invited",invitedBy:am.id,createdAt:now,updatedAt:now}; s.members.push(member);this.bump(s);this.log(s,{cat:"access",actor:am.id,action:"invited member",target:em,ip:""});await this.save(s);return {ok:true,member};
+    if(s.members.length>=MAX_MEMBERS)return {error:"member limit reached",status:409}; const now=Date.now(); const member:TenantMember={id:"m_"+crypto.randomUUID().slice(0,8),tenantId:this.tenantId(),clerkUserId:null,email:em,role:role as FinchRole,state:"invited",invitedBy:am.id,createdAt:now,updatedAt:now}; s.members.push(member);this.bump(s);this.log(s,{cat:"access",actor:am.id,action:"invited member",target:em,ip:"",svc:""});await this.save(s);return {ok:true,member};
   }
   private addAclState(s:StoredState,email:string,service:string):void{const src={type:"user",name:normalizeEmail(email)} as AclEntity,dst={type:"service",name:service} as AclEntity;if(!s.acl.some(r=>!r.locked&&entEq(r.src,src)&&r.dst.some(d=>entEq(d,dst))))s.acl.push({id:"r_"+crypto.randomUUID().slice(0,8),src,dst:[dst],action:"allow"});}
   private bindIdentityState(s:StoredState,uid:string,list:string[],source:unknown):any{
     if(s.members.some(m=>m.state==="disabled"&&(m.clerkUserId===uid||list.includes(normalizeEmail(m.email)))))return {error:"member is disabled",status:409,save:false};
-    const conflict=s.members.find(m=>m.clerkUserId&&m.clerkUserId!==uid&&list.includes(normalizeEmail(m.email)));if(conflict){this.log(s,{cat:"access",actor:uid,action:"bind-conflict",target:`${conflict.id} <${conflict.email}>`,ip:""});return {error:"email belongs to another identity",status:409,save:true};}
+    const conflict=s.members.find(m=>m.clerkUserId&&m.clerkUserId!==uid&&list.includes(normalizeEmail(m.email)));if(conflict){this.log(s,{cat:"access",actor:uid,action:"bind-conflict",target:`${conflict.id} <${conflict.email}>`,ip:"",svc:""});return {error:"email belongs to another identity",status:409,save:true};}
     let member=s.members.find(m=>m.clerkUserId===uid); const matches=s.members.filter(m=>m.state==="invited"&&list.includes(normalizeEmail(m.email))); let changed=false; const consumed:string[]=[];
     if(!member&&matches[0]) member=matches[0]; if(member){for(const dup of matches){if(dup!==member){s.members=s.members.filter(m=>m!==dup);changed=true;consumed.push(dup.email);}} if(member.clerkUserId!==uid||member.state!=="active"){member.clerkUserId=uid;member.state="active";member.boundAt=Date.now();member.updatedAt=Date.now();changed=true;consumed.push(member.email);} for(const r of s.accessRequests.filter(r=>r.status==="invited"&&list.includes(normalizeEmail(r.email)))){this.addAclState(s,member.email,r.service);r.status="granted";r.resolvedBy="identity-bind";r.resolvedAt=Date.now();changed=true;}}
-    if(changed){this.bump(s);this.log(s,{cat:"access",actor:uid,action:"bound identity",target:member?`${member.id} <${member.email}>`:String(source??"sync"),ip:""});} return {ok:true,changed,member,consumedEmails:[...new Set(consumed)],staleInviteEmails:list.filter(e=>!matches.some(m=>normalizeEmail(m.email)===e)),save:changed};
+    if(changed){this.bump(s);this.log(s,{cat:"access",actor:uid,action:"bound identity",target:member?`${member.id} <${member.email}>`:String(source??"sync"),ip:"",svc:""});} return {ok:true,changed,member,consumedEmails:[...new Set(consumed)],staleInviteEmails:list.filter(e=>!matches.some(m=>normalizeEmail(m.email)===e)),save:changed};
   }
   private async bindIdentity(clerkUserId:unknown,emails:unknown,source:unknown):Promise<any>{
     const uid=typeof clerkUserId==="string"?clerkUserId:"", list=Array.isArray(emails)?[...new Set(emails.filter((x):x is string=>typeof x==="string").map(normalizeEmail))]:[]; const s=await this.load();
@@ -1658,7 +1770,7 @@ export class TenantDO extends DurableObject<Env> {
     if(s.members.some(m=>m.state==="disabled"&&(m.clerkUserId===uid||list.includes(normalizeEmail(m.email)))))return {ok:true,skipped:"disabled"};
     let member=s.members.find(m=>m.clerkUserId===uid||list.includes(normalizeEmail(m.email)));
     let created=false;if(!member){if(s.members.length>=MAX_MEMBERS)return {error:"member limit reached",status:409};const now=Date.now();member={id:"m_"+crypto.randomUUID().slice(0,8),tenantId:this.tenantId(),clerkUserId:null,email:preferred,role:"member",state:"invited",createdAt:now,updatedAt:now};s.members.push(member);created=true;}
-    const out=this.bindIdentityState(s,uid,list,"clerk-org-adapter");if(out.error){if(out.save)await this.save(s);delete out.save;return out;}if(created&&!out.changed){this.bump(s);this.log(s,{cat:"access",actor:uid,action:"added organization member",target:`${member.id} <${member.email}>`,ip:""});out.changed=true;}if(created||out.save)await this.save(s);delete out.save;return out;
+    const out=this.bindIdentityState(s,uid,list,"clerk-org-adapter");if(out.error){if(out.save)await this.save(s);delete out.save;return out;}if(created&&!out.changed){this.bump(s);this.log(s,{cat:"access",actor:uid,action:"added organization member",target:`${member.id} <${member.email}>`,ip:"",svc:""});out.changed=true;}if(created||out.save)await this.save(s);delete out.save;return out;
   }
   private async approveAccess(id: unknown, actor: any): Promise<any> {
     const s = await this.load();
@@ -1712,6 +1824,7 @@ export class TenantDO extends DurableObject<Env> {
       action: `access ${r.status}`,
       target: `${r.email} → ${r.service}`,
       ip: "",
+      svc: r.service,
     });
     await this.save(s);
     return {
@@ -1754,6 +1867,7 @@ export class TenantDO extends DurableObject<Env> {
       action: "access denied",
       target: `${r.email} → ${r.service}`,
       ip: "",
+      svc: r.service,
     });
     await this.save(s);
     return { ok: true, status: "denied" };
@@ -1834,13 +1948,14 @@ export class TenantDO extends DurableObject<Env> {
         action: "revoked access",
         target: `user:${email} → ${service}`,
         ip: "",
+        svc: service,
       });
       await this.save(s);
     }
     return { ok: true, removed, denied };
   }
   private authority(s:StoredState,actor:any,target?:TenantMember,ownerEdge=false):TenantMember|any{const am=this.actorMember(s,actor);if(!am||am.role==="member")return {error:"admin role required",status:403};if((ownerEdge||target?.role==="owner")&&am.role!=="owner")return {error:"owner role required",status:403};return am;}
-  private async setMemberRole(memberId:unknown,role:unknown,actor:any):Promise<any>{if(!['owner','admin','member'].includes(String(role)))return {error:"invalid role",status:400};const s=await this.load(),t=s.members.find(m=>m.id===memberId);if(!t)return {error:"member not found",status:404};const am=this.authority(s,actor,t,t.role==="owner"||role==="owner");if(am.error)return am;if(t.role===role)return {ok:true,member:t};if(am.id===t.id&&!(t.role==="owner"&&role!=="owner"&&this.activeOwners(s).length>1))return {error:"cannot change own role",status:409};if(t.role==="owner"&&role!=="owner"&&this.activeOwners(s).length<=1)return {error:"last active owner",status:409};const prior=t.role;t.role=role as FinchRole;t.updatedAt=Date.now();this.bump(s);this.log(s,{cat:"access",actor:am.id,action:`changed member role ${prior} → ${t.role}`,target:`${t.id} <${t.email}>`,ip:""});await this.save(s);return {ok:true,member:t};}
+  private async setMemberRole(memberId:unknown,role:unknown,actor:any):Promise<any>{if(!['owner','admin','member'].includes(String(role)))return {error:"invalid role",status:400};const s=await this.load(),t=s.members.find(m=>m.id===memberId);if(!t)return {error:"member not found",status:404};const am=this.authority(s,actor,t,t.role==="owner"||role==="owner");if(am.error)return am;if(t.role===role)return {ok:true,member:t};if(am.id===t.id&&!(t.role==="owner"&&role!=="owner"&&this.activeOwners(s).length>1))return {error:"cannot change own role",status:409};if(t.role==="owner"&&role!=="owner"&&this.activeOwners(s).length<=1)return {error:"last active owner",status:409};const prior=t.role;t.role=role as FinchRole;t.updatedAt=Date.now();this.bump(s);this.log(s,{cat:"access",actor:am.id,action:`changed member role ${prior} → ${t.role}`,target:`${t.id} <${t.email}>`,ip:"",svc:""});await this.save(s);return {ok:true,member:t};}
   private stripGrants(s: StoredState, email: string): void {
     const principal = normalizeEmail(email);
     s.acl = s.acl.flatMap((rule) => {
@@ -1851,8 +1966,8 @@ export class TenantDO extends DurableObject<Env> {
       return dst.length ? [{ ...rule, dst }] : [];
     });
   }
-  private async setMemberState(memberId:unknown,state:unknown,revoke:boolean,actor:any):Promise<any>{if(state!=="active"&&state!=="disabled")return {error:"invalid state",status:400};const s=await this.load(),t=s.members.find(m=>m.id===memberId);if(!t)return {error:"member not found",status:404};if(t.state==="invited")return {error:"invited member must be canceled",status:409};const am=this.authority(s,actor,t);if(am.error)return am;if(t.state===state)return {ok:true,member:t};if(am.id===t.id)return {error:"cannot change own membership",status:409};if(state==="disabled"&&t.role==="owner"&&t.state==="active"&&this.activeOwners(s).length<=1)return {error:"last active owner",status:409};const prior=t.state;t.state=state;t.updatedAt=Date.now();if(state==="disabled")t.disabledAt=Date.now();else delete t.disabledAt;if(revoke)this.stripGrants(s,t.email);this.bump(s);this.log(s,{cat:"access",actor:am.id,action:`changed member state ${prior} → ${t.state}${revoke?" and revoked grants":""}`,target:`${t.id} <${t.email}>`,ip:""});await this.save(s);return {ok:true,member:t};}
-  private async removeMember(memberId:unknown,revoke:boolean,actor:any):Promise<any>{const s=await this.load(),t=s.members.find(m=>m.id===memberId);if(!t)return {error:"member not found",status:404};const am=this.authority(s,actor,t);if(am.error)return am;if(am.id===t.id)return {error:"cannot change own membership",status:409};if(t.role==="owner"&&t.state==="active"&&this.activeOwners(s).length<=1)return {error:"last active owner",status:409};let removed="disabled";if(t.state==="invited"){s.members=s.members.filter(m=>m!==t);removed="canceled";}else{t.state="disabled";t.disabledAt=Date.now();t.updatedAt=Date.now();}if(revoke)this.stripGrants(s,t.email);this.bump(s);this.log(s,{cat:"access",actor:am.id,action:`${removed==="canceled"?"canceled invitation":"disabled member"}${revoke?" and revoked grants":""}`,target:`${t.id} <${t.email}>`,ip:""});await this.save(s);return {ok:true,removed,member:t};}
+  private async setMemberState(memberId:unknown,state:unknown,revoke:boolean,actor:any):Promise<any>{if(state!=="active"&&state!=="disabled")return {error:"invalid state",status:400};const s=await this.load(),t=s.members.find(m=>m.id===memberId);if(!t)return {error:"member not found",status:404};if(t.state==="invited")return {error:"invited member must be canceled",status:409};const am=this.authority(s,actor,t);if(am.error)return am;if(t.state===state)return {ok:true,member:t};if(am.id===t.id)return {error:"cannot change own membership",status:409};if(state==="disabled"&&t.role==="owner"&&t.state==="active"&&this.activeOwners(s).length<=1)return {error:"last active owner",status:409};const prior=t.state;t.state=state;t.updatedAt=Date.now();if(state==="disabled")t.disabledAt=Date.now();else delete t.disabledAt;if(revoke)this.stripGrants(s,t.email);this.bump(s);this.log(s,{cat:"access",actor:am.id,action:`changed member state ${prior} → ${t.state}${revoke?" and revoked grants":""}`,target:`${t.id} <${t.email}>`,ip:"",svc:""});await this.save(s);return {ok:true,member:t};}
+  private async removeMember(memberId:unknown,revoke:boolean,actor:any):Promise<any>{const s=await this.load(),t=s.members.find(m=>m.id===memberId);if(!t)return {error:"member not found",status:404};const am=this.authority(s,actor,t);if(am.error)return am;if(am.id===t.id)return {error:"cannot change own membership",status:409};if(t.role==="owner"&&t.state==="active"&&this.activeOwners(s).length<=1)return {error:"last active owner",status:409};let removed="disabled";if(t.state==="invited"){s.members=s.members.filter(m=>m!==t);removed="canceled";}else{t.state="disabled";t.disabledAt=Date.now();t.updatedAt=Date.now();}if(revoke)this.stripGrants(s,t.email);this.bump(s);this.log(s,{cat:"access",actor:am.id,action:`${removed==="canceled"?"canceled invitation":"disabled member"}${revoke?" and revoked grants":""}`,target:`${t.id} <${t.email}>`,ip:"",svc:""});await this.save(s);return {ok:true,removed,member:t};}
   private async bootstrapMembers(a: any): Promise<any> {
     const s = await this.load();
     if (s.tenantMeta) {
@@ -1885,7 +2000,7 @@ export class TenantDO extends DurableObject<Env> {
     s.tenantMeta = { id: this.tenantId(), kind: "team", displayName: String(a.displayName || this.tenantId()), createdAt: now, clerkOrgId: a.clerkOrgId, bootstrappedFrom: a.bootstrappedFrom, membershipVersion: 1 };
     s.members = members;
     this.rewriteYou(s, owner.email);
-    this.log(s,{cat:"access",actor:owner.id,action:"bootstrapped workspace",target:`${this.tenantId()} (${members.map(m=>`${m.id} <${m.email}>`).join(", ")})`,ip:""});
+    this.log(s,{cat:"access",actor:owner.id,action:"bootstrapped workspace",target:`${this.tenantId()} (${members.map(m=>`${m.id} <${m.email}>`).join(", ")})`,ip:"",svc:""});
     await this.save(s);
     return { ok: true, members, tenantMeta: s.tenantMeta };
   }
@@ -1909,6 +2024,18 @@ export class TenantDO extends DurableObject<Env> {
     if (key === "subdomain") {
       const slug =
         typeof val === "string" ? val.trim().toLowerCase() : "";
+      // A subdomain is a BARE DNS LABEL — `${slug}.finchmcp.com` below only
+      // makes sense for one. isValidHostKey (router-do) accepts any dotted name
+      // outside the finchmcp.com/workers.dev families, so without this check a
+      // dotted value registered an arbitrary HOST KEY in the shared RouterDO,
+      // routing around everything /api/hostnames enforces: the vanity-tier gate
+      // (VANITY_TENANT), the Cloudflare-for-SaaS provisioning that ties a BYO
+      // name to a validated owner, and the JOIN_LIMIT throttle. Registrations
+      // are first-come and non-owners cannot unregister, so a squat was durable.
+      // Mirrors SLUG_RE in web/app/api/finch/slug-check.
+      if (slug && !SUBDOMAIN_LABEL_RE.test(slug)) {
+        return { ok: false, error: "invalid subdomain" };
+      }
       if (slug) {
         let res: { ok: boolean; reason?: string; owner?: string };
         try {
@@ -1943,6 +2070,7 @@ export class TenantDO extends DurableObject<Env> {
       action: "changed setting",
       target: `${key} → ${String(val)}`,
       ip: "",
+      svc: "",
     });
     await this.save(s);
     return { ok: true };
@@ -2151,6 +2279,7 @@ export class TenantDO extends DurableObject<Env> {
       action: requireApproval ? "requested approval" : "joined",
       target: box,
       ip: "",
+      svc: service,
     });
     await this.save(s);
     return { ok: true, state: m.state };
@@ -2192,6 +2321,7 @@ export class TenantDO extends DurableObject<Env> {
       action: connected ? "came online" : "went offline",
       target: box,
       ip: "",
+      svc: service,
     });
     await this.save(s);
     return { ok: true };
@@ -2279,6 +2409,7 @@ export class TenantDO extends DurableObject<Env> {
       action: "called",
       target: `${service} ${route}`,
       ip: "",
+      svc: service,
       result: status,
     });
     await this.save(s);

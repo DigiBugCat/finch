@@ -101,8 +101,18 @@ func isLocalServiceHost(host string) bool {
 		return true
 	}
 	// Docker Compose and similar container networks expose services through
-	// single-label DNS names. Dotted DNS names and non-loopback IPs remain TLS-
-	// only so this exception cannot silently cover a LAN or Internet endpoint.
+	// single-label DNS names, so those are allowed over plaintext. Dotted DNS
+	// names and non-loopback IPs remain TLS-only.
+	//
+	// NOTE: a single label is NOT proof of an on-box endpoint. Such names
+	// routinely resolve off-box via /etc/hosts, a DNS search domain
+	// ("nas" -> nas.corp.example, possibly a public IP), or LLMNR/NBNS. So
+	// `service: http://nas` IS relayed in cleartext across the LAN, carrying
+	// request/response bodies and the hub-signed X-Finch-Assertion header.
+	// That is the documented, operator-chosen behaviour (see README on
+	// plaintext http upstreams) -- the upstream always comes from local config,
+	// never from the hub or a relay peer -- but do not read this exception as a
+	// guarantee that the endpoint is local.
 	if host == "" || strings.Contains(host, ".") || net.ParseIP(host) != nil {
 		return false
 	}

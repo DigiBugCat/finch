@@ -29,8 +29,8 @@ export default function CliReference() {
           </thead>
           <tbody>
             <tr>
-              <td><code>finch login [--hub URL] [--token t]</code></td>
-              <td>Log in. With no token it opens the browser to approve a short code. With <code>--token</code> it uses a token minted by <code>finch token</code>, no browser.</td>
+              <td><code>finch login [--hub URL] [--token -]</code></td>
+              <td>Log in. With no token it opens the browser to approve a short code. With <code>--token -</code> it reads a token minted by <code>finch token</code> from stdin (or set <code>FINCH_CLI_TOKEN</code>), no browser. Passing the token as an argument still works but warns: it lands in the process table and shell history.</td>
             </tr>
             <tr>
               <td><code>finch add &lt;app_path&gt; --service &lt;url&gt;</code></td>
@@ -50,7 +50,7 @@ export default function CliReference() {
       <p>
         Enrolling a second box needs no browser. From a box that is already logged in:
       </p>
-      <Code>{`ssh user@newbox "finch login --token $(finch token)"
+      <Code>{`finch token | ssh user@newbox "finch login --token -"
 ssh user@newbox "finch add api --service http://127.0.0.1:9000 && finch run"`}</Code>
 
       <h2>Inspect</h2>

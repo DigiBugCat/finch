@@ -39,6 +39,60 @@ function mockOwnerThen(response: Response) {
     .mockResolvedValueOnce(response);
 }
 
+function memberContext(userId: string): Response {
+  return Response.json({
+    member: { id: "member_plain", role: "member", state: "active", email: "member@example.com" },
+    tenantMeta: { id: userId },
+  });
+}
+
+function mockMemberThen(response: Response) {
+  const userId = `user_routes_${userSequence++}`;
+  authMock.mockResolvedValue({ userId });
+  return vi.spyOn(globalThis, "fetch")
+    .mockResolvedValueOnce(memberContext(userId))
+    .mockResolvedValueOnce(response);
+}
+
+/** State whose admin-only collections are all populated, so a projection
+ *  regression shows up as real data crossing the role boundary. Pass
+ *  `{ viewerScoped: true }` to stand in for a hub that HAS applied the
+ *  ?viewer= narrowing — without that echo the route fails closed. */
+function sensitiveState(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return validState({
+    keys: [
+      { id: "k1", label: "prod", owner: "owner@example.com", scope: "svc", last4: "ab12" },
+    ],
+    acl: [
+      { id: "a1", src: { type: "user", id: "m2" }, dst: [{ type: "service", id: "svc" }], action: "allow" },
+    ],
+    accessRequests: [{ id: "r1", email: "outsider@example.com", service: "svc" }],
+    settings: { org: "Fallback", subdomain: "demo" },
+    // The audit log re-supplies in PROSE exactly what the collections above
+    // carry. A fixture whose only entry names nobody lets a leak pass unnoticed,
+    // so every category that embeds an identity is represented here.
+    logs: [
+      { ago: "1m", ts: 6, cat: "access", actor: "m1", action: "invited member", target: "invited@example.com", ip: "" },
+      { ago: "2m", ts: 5, cat: "access", actor: "m1", action: "granted", target: "user:invited@example.com → svc", ip: "" },
+      { ago: "3m", ts: 4, cat: "key", actor: "owner@example.com", action: "minted key", target: "prod", ip: "" },
+      { ago: "4m", ts: 3, cat: "admin", actor: "you", action: "changed setting", target: "subdomain → demo", ip: "" },
+      { ago: "5m", ts: 2, cat: "device", actor: "svc", action: "box online", target: "svc/b1", ip: "" },
+      { ago: "6m", ts: 1, cat: "request", actor: "prod", action: "GET", target: "/mcp", ip: "", result: 200 },
+    ],
+    services: [
+      {
+        id: "svc",
+        label: "Service",
+        keys: ["prod"],
+        recentCalls: [{ ts: 1, route: "/mcp", status: 200, ms: 12, caller: "prod" }],
+        boxes: [{ name: "b1", keys: ["prod"], address: "100.64.0.1", relay: "iad" }],
+      },
+    ],
+    boxes: [{ name: "b1", keys: ["prod"], address: "100.64.0.1", relay: "iad" }],
+    ...overrides,
+  });
+}
+
 function validState(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     host: "demo.finchmcp.com",
@@ -254,6 +308,44 @@ describe("settings route contract", () => {
       key: "subdomain", val: "Finch-Team",
     });
   });
+
+  // REGRESSION: a DOTTED subdomain registered an arbitrary host key in the
+  // shared RouterDO, routing around everything /api/finch/hostnames enforces --
+  // the vanity-tier gate (VANITY_TENANT), the CF-for-SaaS provisioning that
+  // ties a BYO name to a validated owner, and the JOIN_LIMIT throttle. It also
+  // produced a nonsense host ("ops.aviary.run" -> ops.aviary.run.finchmcp.com).
+  it.each([
+    "ops.aviary.run",
+    "app.somecustomer.com",
+    "a.b",
+    "-leading",
+    "trailing-",
+    "has space",
+  ])("rejects %s as a subdomain without calling the hub", async (val) => {
+    const userId = `user_settings_slug_${userSequence++}`;
+    authMock.mockResolvedValue({ userId });
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(ownerContext(userId));
+
+    const response = await settings(
+      jsonRequest("/api/finch/settings", "PUT", { key: "subdomain", val }),
+    );
+
+    expect(response.status).toBe(400);
+    // Only the member-context call — the mutation never reached the hub.
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["demo", "Finch-Team", "a", "a1-b2"])(
+    "still accepts the valid label %s",
+    async (val) => {
+      const fetchSpy = mockOwnerThen(Response.json({ ok: true }));
+      const response = await settings(
+        jsonRequest("/api/finch/settings", "PUT", { key: "subdomain", val }),
+      );
+      expect(response.status).toBe(200);
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
+    },
+  );
 });
 
 describe("state route upstream corruption handling", () => {
@@ -298,5 +390,130 @@ describe("state route upstream corruption handling", () => {
     expect(response.status).toBe(503);
     expect(response.headers.get("content-type")).toBe("text/plain; charset=utf-8");
     expect(await response.text()).toBe("temporarily unavailable");
+  });
+
+  // REGRESSION: /api/finch/state gated only on resolveTenant() and returned the
+  // hub's getState() verbatim, so any active `member` -- the role approveAccess
+  // mints for an OUTSIDER granted a single service -- read the whole workspace.
+  // It was a strict superset of the requireSharing()-gated /api/finch/access,
+  // and the boundary existed only in the browser (DashboardApp hid the tabs).
+  it("withholds admin-only workspace data from a member", async () => {
+    const fetchSpy = mockMemberThen(Response.json(sensitiveState({ viewerScoped: true })));
+
+    const response = await state();
+    // The fleet itself is narrowed by the HUB, which holds the ACL: the read is
+    // made on behalf of this member id and the DO answers with only the
+    // services that member may reach (worker TenantDO.viewerFilter).
+    expect(String(fetchSpy.mock.calls[1][0])).toBe(
+      "https://hub.example.com/api/state?viewer=member_plain",
+    );
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as Record<string, any>;
+
+    expect(body.callerRole).toBe("member");
+    expect(body.keys).toEqual([]);
+    expect(body.acl).toEqual([]);
+    expect(body.accessRequests).toEqual([]);
+    expect(body.members).toEqual([]);
+    expect(body.users).toEqual([]);
+    expect(body.settings).toEqual({});
+
+    // Per-object operator detail is stripped too: key labels say which
+    // credential reaches which service; address/relay are box infrastructure.
+    expect(body.services[0].keys).toEqual([]);
+    expect(body.services[0].boxes[0].keys).toEqual([]);
+    expect(body.services[0].boxes[0].address).toBe("");
+    expect(body.boxes[0].relay).toBe("");
+
+    // The audit log must not re-supply what the collections above strip.
+    // Members keep the device/request narrative; access/key/admin entries embed
+    // emails, key labels + owners, ACL edges, and setting values.
+    const cats = body.logs.map((l: any) => l.cat);
+    expect(new Set(cats)).toEqual(new Set(["device", "request"]));
+    // A request actor is the finch_ key label — the identifier removed above.
+    expect(body.logs.find((l: any) => l.cat === "request").actor).toBe("");
+    // ...and so is recentCalls[].caller, which is strictly more revealing than
+    // services[].keys (labels vs ids).
+    expect(body.services[0].recentCalls[0].caller).toBe("");
+    expect(body.services[0].recentCalls[0].status).toBe(200); // feed still useful
+
+    // Nothing from the roster, the ACL, the key set, or settings survives
+    // anywhere in the payload — including inside log prose.
+    const serialized = JSON.stringify(body);
+    expect(serialized).not.toContain("invited@example.com");
+    expect(serialized).not.toContain("outsider@example.com");
+    expect(serialized).not.toContain("owner@example.com");
+    expect(serialized).not.toContain("ab12");
+    expect(serialized).not.toContain("prod"); // key label, via any channel
+    expect(serialized).not.toContain("subdomain → demo");
+  });
+
+  // REGRESSION (the other half of the projection above): blanking FIELDS never
+  // narrowed the COLLECTIONS, so a member granted one service still received
+  // every service and box in the tenant — ids, owners, routes, traffic and
+  // latency histories, and the per-route call feed — for services the relay
+  // gate denies them. The narrowing is the hub's (it holds the ACL) and this
+  // route refuses to serve a fleet the hub did not confirm it scoped.
+  it("empties the fleet when the hub did not confirm it scoped the read", async () => {
+    mockMemberThen(Response.json(sensitiveState())); // no viewerScoped echo
+
+    const response = await state();
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as Record<string, any>;
+
+    expect(body.services).toEqual([]);
+    expect(body.boxes).toEqual([]);
+    // The LOG goes with them. An un-narrowed logs[] re-supplies the same fleet
+    // in prose — `device` rows are service/box pairs and `request` rows are
+    // `${service} ${route}` + status, 500 deep — so emptying services[] while
+    // shipping the log would just move the leak.
+    expect(body.logs).toEqual([]);
+    const serialized = JSON.stringify(body);
+    expect(serialized).not.toContain("100.64.0.1");
+    expect(serialized).not.toContain("svc/b1");
+  });
+
+  // The narrowing of logs[] belongs to the hub for the same reason services[]
+  // does — it is an ACL question. This route's category filter is the coarser
+  // second layer, and it must not silently drop what the hub already cleared.
+  it("passes the hub's narrowed log through for a member", async () => {
+    mockMemberThen(
+      Response.json(
+        sensitiveState({
+          viewerScoped: true,
+          // What a scoped hub read returns: only rows about a service this
+          // member may see (worker TenantDO.getState, keyed on StoredLogEvent.svc).
+          logs: [
+            { ago: "1m", ts: 2, cat: "device", actor: "svc", action: "came online", target: "b1", ip: "" },
+            { ago: "2m", ts: 1, cat: "request", actor: "prod", action: "called", target: "svc /mcp", ip: "", result: 200 },
+          ],
+        }),
+      ),
+    );
+
+    const response = await state();
+    const body = (await response.json()) as Record<string, any>;
+    expect(body.logs.map((l: any) => l.target)).toEqual(["b1", "svc /mcp"]);
+    expect(body.logs[1].actor).toBe(""); // still the finch_ key label
+  });
+
+  it("still returns the full workspace to an admin", async () => {
+    const fetchSpy = mockOwnerThen(Response.json(sensitiveState()));
+
+    const response = await state();
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as Record<string, any>;
+
+    // An admin's read is unchanged: no viewer, so the hub takes its
+    // unnarrowed path and no fail-closed check applies.
+    expect(String(fetchSpy.mock.calls[1][0])).toBe("https://hub.example.com/api/state");
+    expect(body.callerRole).toBe("owner");
+    expect(body.keys).toHaveLength(1);
+    expect(body.acl).toHaveLength(1);
+    expect(body.accessRequests).toHaveLength(1);
+    expect(body.users).toHaveLength(2);
+    expect(body.settings).toMatchObject({ subdomain: "demo" });
+    expect(body.services[0].keys).toEqual(["prod"]);
+    expect(body.boxes[0].address).toBe("100.64.0.1");
   });
 });

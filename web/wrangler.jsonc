@@ -83,6 +83,11 @@
       // /api/* is handled before tenant resolution, so no registration needed.
       "vars": {
         "HUB_URL": "https://hub.finchmcp.com",
+        // The ONLY origin whose Clerk session tokens middleware.ts accepts
+        // (the `azp` claim must equal it). Must stay the exact app origin —
+        // never a wildcard, or a tenant's <slug>.finchmcp.com token would be
+        // replayable against the dashboard. deploy-preflight enforces this.
+        "NEXT_PUBLIC_APP_ORIGIN": "https://finchmcp.com",
         // Production Clerk instance (clerk.finchmcp.com). Publishable key is
         // PUBLIC; the secret half (CLERK_SECRET_KEY) is a wrangler secret.
         "NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY": "pk_live_Y2xlcmsuZmluY2htY3AuY29tJA",

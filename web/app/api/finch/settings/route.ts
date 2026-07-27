@@ -5,6 +5,8 @@ import { relayHubJson } from "../services/_contract";
 
 const STRING_LIMITS = { org: 100, subdomain: 63, defaultGroup: 100, keyExpiry: 32 } as const;
 const BOOLEAN_KEYS = new Set(["requireApproval", "enforceExpiry", "require2fa"]);
+// Mirrors SLUG_RE in ../slug-check and SUBDOMAIN_LABEL_RE in the hub's tenant-do.
+const SUBDOMAIN_LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
 function parseSetting(body: Record<string, unknown>): { key: string; val: string | boolean } {
   if (Object.keys(body).some((key) => key !== "key" && key !== "val")) {
@@ -22,6 +24,15 @@ function parseSetting(body: Record<string, unknown>): { key: string; val: string
       throw new HttpError(400, "setting value is too long");
     }
     if (/\p{Cc}/u.test(value)) throw new HttpError(400, "setting value contains control characters");
+    // A subdomain is a bare DNS label. A dotted value would register an
+    // arbitrary host key in the shared RouterDO, bypassing the vanity-tier gate
+    // and CF provisioning that /api/finch/hostnames enforces. The hub rejects
+    // this too (tenant-do updateSetting) — this is the second layer.
+    // Compare lowercased: the hub lowercases before validating, so "Demo" is a
+    // legitimate slug and must not be rejected here.
+    if (body.key === "subdomain" && value && !SUBDOMAIN_LABEL_RE.test(value.toLowerCase())) {
+      throw new HttpError(400, "subdomain must be a single label (letters, digits, hyphens)");
+    }
     return { key: body.key, val: value };
   }
   throw new HttpError(400, "invalid setting key");

@@ -14,6 +14,7 @@
 import type { Env } from "./index";
 import { serviceOk, verifyAssertion } from "./auth";
 import { rateLimitOk, clientIp } from "./index";
+import { readBoundedBody } from "./box-do";
 
 const MODEL = "@cf/google/gemma-4-26b-a4b-it";
 const CONTEXT_CHAR_BUDGET = 8000 * 3; // ~8k tokens, roughly 3 chars/token
@@ -42,14 +43,18 @@ async function chatCompletion(req: Request, env: Env, origin: string): Promise<R
     return json(429, { error: "rate limited" });
   }
   // Enforce the body cap on the ACTUAL bytes (content-length is client-controlled
-  // and absent for chunked) — buffer then check, like relayMcp does.
-  let raw: ArrayBuffer;
+  // and absent for chunked) WHILE reading, like relayMcp does. arrayBuffer() would
+  // have materialized the whole upload before the check, so a chunked POST could
+  // park ~100 MB in a 128 MB isolate and kill co-resident in-flight requests;
+  // readBoundedBody cancels the reader as soon as the running total would exceed
+  // the cap, so at most MAX_BODY_BYTES is ever held.
+  let raw: Uint8Array | undefined;
   try {
-    raw = await req.arrayBuffer();
+    raw = await readBoundedBody(req, MAX_BODY_BYTES);
   } catch {
     return json(400, { error: "invalid body" });
   }
-  if (raw.byteLength > MAX_BODY_BYTES) {
+  if (raw === undefined) {
     return json(413, { error: "request body too large" });
   }
   let body: any;

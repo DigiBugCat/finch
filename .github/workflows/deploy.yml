@@ -116,6 +116,10 @@ jobs:
           fi
 
   web:
+    # `needs: hub` is load-bearing, not just tidy sequencing. The member state
+    # projection (web/app/api/finch/state/route.ts) fails CLOSED when the hub
+    # does not echo `viewerScoped`: web ahead of hub = every member sees a blank
+    # fleet until the hub catches up. Never relax this edge to parallelise.
     needs: [target, hub]
     runs-on: ubuntu-latest
     environment: ${{ needs.target.outputs.env }}

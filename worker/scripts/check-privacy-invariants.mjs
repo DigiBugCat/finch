@@ -9,63 +9,15 @@ import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
+// Shared with deploy-preflight so the two gates cannot drift, and so both
+// agree with wrangler on where a line comment ends (CR as well as LF).
+import { readJsonc } from "./jsonc.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..");
 
 function fail(message) {
   throw new Error(`privacy invariant failed: ${message}`);
-}
-
-/** Quote-aware JSONC parser. Comments in route documentation contain `/*`, so
- * a regular-expression comment stripper is not safe here. */
-export function readJsonc(path) {
-  const raw = readFileSync(path, "utf8");
-  let out = "";
-  let inString = false;
-  let escaped = false;
-  let lineComment = false;
-  let blockComment = false;
-  for (let i = 0; i < raw.length; i++) {
-    const ch = raw[i];
-    const next = raw[i + 1];
-    if (lineComment) {
-      if (ch === "\n") {
-        lineComment = false;
-        out += ch;
-      }
-      continue;
-    }
-    if (blockComment) {
-      if (ch === "*" && next === "/") {
-        blockComment = false;
-        i++;
-      } else if (ch === "\n") {
-        out += ch;
-      }
-      continue;
-    }
-    if (inString) {
-      out += ch;
-      if (escaped) escaped = false;
-      else if (ch === "\\") escaped = true;
-      else if (ch === '"') inString = false;
-      continue;
-    }
-    if (ch === '"') {
-      inString = true;
-      out += ch;
-    } else if (ch === "/" && next === "/") {
-      lineComment = true;
-      i++;
-    } else if (ch === "/" && next === "*") {
-      blockComment = true;
-      i++;
-    } else {
-      out += ch;
-    }
-  }
-  return JSON.parse(out);
 }
 
 function assertNoExportedTelemetry(label, cfg) {

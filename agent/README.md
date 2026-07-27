@@ -49,8 +49,10 @@ change meaning.
 ## Provision a new box from an already-authed one (no human)
 
 ```bash
-# on the authed box, mint a token and hand it to the new box over SSH:
-ssh user@newbox "finch login --token $(finch token)"
+# on the authed box, mint a token and pipe it to the new box over SSH.
+# `--token -` reads stdin, so this tenant-admin token never reaches the remote
+# argv (/proc/<pid>/cmdline, world-readable) or either shell's history:
+finch token | ssh user@newbox "finch login --token -"
 ssh user@newbox "finch add api --service http://127.0.0.1:9000 && finch run"
 ```
 
@@ -192,9 +194,13 @@ owner-only (`0700`/`0600`).
 ## Auth & credentials
 
 - **`finch login`** saves a long-lived **CLI token** (a tenant credential, ~90
-  days) to `~/.finch/cli.json` (`0600`). You can also paste one directly:
-  `finch login --hub <hub> <token>` (mint it in the dashboard → **Settings →
-  CLI access → Generate**). The browser flow is the easy path.
+  days) to `~/.finch/cli.json` (`0600`). The browser flow is the easy path. For a
+  box without one, the dashboard → **Settings → CLI access → Generate → Copy**
+  puts a ready-to-run block on your clipboard — `finch login --hub <hub> --token -`
+  followed by the token as a quoted heredoc, so the credential is delivered on
+  stdin rather than as an argument. Paste it whole. `FINCH_CLI_TOKEN` in the
+  environment works too. Passing the token as an argument still works but warns —
+  argv is world-readable and persists in shell history.
 - **`finch add`** uses that token to enroll services — no dashboard tickets to
   copy.
 - **`finch run`** holds the relay open and **auto-approves** the services it

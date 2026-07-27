@@ -173,7 +173,20 @@ export class BoxDO extends DurableObject<Env> {
     const relPath = "/" + parts.slice(2).join("/") + (url.search || "");
 
     // ---- Agent registration: the box dials in here with a WS upgrade. ----
+    // PATH ALONE IS NOT TRUST (same reasoning as /_control below). The public
+    // relay forwards ARBITRARY client paths into this DO, so /<service>/_connect
+    // arrives here as relPath /_connect having never passed the edge's
+    // connect-token check — that check keys on parts[2], which is undefined for
+    // a two-segment path. Without the secret below, any caller who could reach
+    // the relay (unauthenticated, for a public service) would evict the real
+    // agent and take over the box's socket. Only index.ts's authenticated
+    // _connect branch sets this header, and relayMcp strips caller-supplied
+    // copies. Fail closed (404) so the surface isn't advertised.
     if (relPath.startsWith("/_connect")) {
+      const connectSecret = this.env.FINCH_SERVICE_SECRET;
+      if (!connectSecret || req.headers.get("X-Finch-Service") !== connectSecret) {
+        return json(404, { error: "not found" });
+      }
       if (req.headers.get("Upgrade") !== "websocket") {
         return new Response("expected websocket upgrade", { status: 426 });
       }
@@ -405,7 +418,11 @@ export class BoxDO extends DurableObject<Env> {
     // `?? []` tolerates a head whose `headers` key is absent (the agent omits it
     // when no headers survive the hop-by-hop filter) — iterating undefined throws.
     for (const [k, v] of first.headers ?? []) {
-      if (!HOP_BY_HOP.has(k.toLowerCase())) headers.append(k, v);
+      const name = k.toLowerCase();
+      if (HOP_BY_HOP.has(name)) continue;
+      // Set-Cookie is the one response header whose VALUE crosses a trust
+      // boundary (see hostScopedSetCookie) — everything else is re-emitted as-is.
+      headers.append(k, name === "set-cookie" ? hostScopedSetCookie(v, url.hostname) : v);
     }
 
     // Fetch forbids a body on these otherwise-valid upstream statuses. Retire
@@ -805,11 +822,63 @@ export class BoxDO extends DurableObject<Env> {
   }
 }
 
+/** Confine a box-supplied Set-Cookie to the exact host that was requested.
+ *
+ * The box agent is CUSTOMER-OPERATED, so every byte of its `head` frame is
+ * attacker-controlled: validHead bounds only the header count and total size,
+ * never names or values. Tenants share one parent domain
+ * (<slug>.finchmcp.com), so a cookie carrying `Domain=finchmcp.com` is stored
+ * against the PARENT and is then sent to the dashboard and to every sibling
+ * tenant's host, where it shadows a victim's host-only login-wall cookie and
+ * hands the attacker login-CSRF / session fixation on any host under the
+ * parent. The session cookie now carries the `__Host-` prefix (index.ts:202),
+ * which makes that unforgeable at the jar for THAT name, and browserGate ranks
+ * the prefixed name above the legacy one (index.ts:394) — but this pass is the
+ * independent half: it also covers the transitional legacy name and every
+ * OTHER first-party cookie a box could try to plant on a sibling host.
+ *
+ * FAIL CLOSED: keep the Domain attribute only when it parses unambiguously and
+ * names exactly the request host (such a cookie is no broader than the host the
+ * box already speaks for). A parent domain, a leading-dot form, an empty or
+ * repeated attribute — anything we cannot confidently accept — has the attribute
+ * STRIPPED, which yields a host-only cookie, i.e. exactly the shape of an
+ * ordinary Set-Cookie that never named a Domain. The name=value pair and all
+ * other attributes pass through untouched, so the common legitimate case (a
+ * host-only cookie) is byte-identical after this pass.
+ *
+ * Splitting on ";" is safe here rather than merely convenient: RFC 6265's
+ * cookie-value grammar excludes ";" (even inside DQUOTEs), so no attribute
+ * boundary can be forged from within the value. */
+function hostScopedSetCookie(value: string, host: string): string {
+  const parts = value.split(";");
+  // Nothing after the name=value pair means there is no Domain attribute.
+  if (parts.length < 2) return value;
+  let sawDomain = false;
+  const kept = parts.filter((part, i) => {
+    if (i === 0) return true; // the name=value pair is never an attribute
+    const eq = part.indexOf("=");
+    const attr = (eq === -1 ? part : part.slice(0, eq)).trim().toLowerCase();
+    if (attr !== "domain") return true;
+    // Repeated Domain attributes are ambiguous across parsers (RFC 6265 says
+    // last-wins; not every stack agrees), so drop every occurrence past the
+    // first instead of reasoning about which one a browser will honor.
+    if (sawDomain) return false;
+    sawDomain = true;
+    const domain = eq === -1
+      ? ""
+      // A leading "." is legacy syntax for the same domain-match, so it makes
+      // the cookie no narrower — normalize it away before comparing.
+      : part.slice(eq + 1).trim().replace(/^\./, "").toLowerCase();
+    return domain !== "" && domain === host;
+  });
+  return kept.join(";");
+}
+
 /** Read an incoming relay body without allowing arrayBuffer()/text() to consume
  * an unbounded chunked upload before the limit is checked. `undefined` means
  * the byte limit was exceeded; read failures still throw so fetch() can return
  * a distinct malformed-request response. */
-async function readBoundedBody(
+export async function readBoundedBody(
   req: Request,
   maxBytes: number,
 ): Promise<Uint8Array | undefined> {
