@@ -626,9 +626,21 @@ export class TenantDO extends DurableObject<Env> {
       accessRequests: s.accessRequests,
       logs,
       settings: s.settings,
+      // Every other Overview field is derived from `visible`, so narrowing
+      // services[] narrows them too. `keysActive` is the exception: it counts
+      // the tenant's KEYS, which have no service dimension to narrow by — a
+      // key's reach is a KeyScope resolved through the ACL, not a service id.
+      //
+      // A scoped viewer therefore gets 0, not a filtered count. Zeroing rather
+      // than approximating is the honest option twice over: the alternative
+      // would fork the ACL walk into a second, key-shaped predicate (the exact
+      // duplication viewerFilter exists to avoid), and a member has no keys
+      // view to feed anyway — the web projection already empties keys[] for
+      // them. Leaving it unnarrowed handed a member the tenant-wide credential
+      // count through the one field services[] narrowing could not reach.
       overview: this.overview(
         visible,
-        s.keys,
+        filter ? [] : s.keys,
         now,
         !!s.settings.enforceExpiry,
       ),

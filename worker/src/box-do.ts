@@ -422,7 +422,7 @@ export class BoxDO extends DurableObject<Env> {
       if (HOP_BY_HOP.has(name)) continue;
       // Set-Cookie is the one response header whose VALUE crosses a trust
       // boundary (see hostScopedSetCookie) — everything else is re-emitted as-is.
-      headers.append(k, name === "set-cookie" ? hostScopedSetCookie(v, url.hostname) : v);
+      headers.append(k, name === "set-cookie" ? hostScopedSetCookie(v) : v);
     }
 
     // Fetch forbids a body on these otherwise-valid upstream statuses. Retire
@@ -837,39 +837,37 @@ export class BoxDO extends DurableObject<Env> {
  * independent half: it also covers the transitional legacy name and every
  * OTHER first-party cookie a box could try to plant on a sibling host.
  *
- * FAIL CLOSED: keep the Domain attribute only when it parses unambiguously and
- * names exactly the request host (such a cookie is no broader than the host the
- * box already speaks for). A parent domain, a leading-dot form, an empty or
- * repeated attribute — anything we cannot confidently accept — has the attribute
- * STRIPPED, which yields a host-only cookie, i.e. exactly the shape of an
- * ordinary Set-Cookie that never named a Domain. The name=value pair and all
- * other attributes pass through untouched, so the common legitimate case (a
- * host-only cookie) is byte-identical after this pass.
+ * EVERY Domain attribute is stripped — including one naming exactly the request
+ * host. `Domain=foo.example.com` is NOT equivalent to a host-only cookie: per
+ * RFC 6265 §5.1.3 a domain-match covers the domain AND all of its subdomains,
+ * so that cookie is also sent to `bar.foo.example.com`. Custom hostnames are
+ * customer-supplied and nesting is not prevented (ownership is unverified —
+ * docs/hostname-ownership-design.md), so preserving it would let the tenant
+ * holding a parent hostname plant cookies into a child tenant's requests: the
+ * same session-fixation / login-CSRF this function exists to deny, one level
+ * down. A host-only cookie is what the box actually speaks for.
+ *
+ * The narrowing is free in the only case that matters: for a request to the
+ * exact host, a host-only cookie and a `Domain=<that host>` cookie behave
+ * identically. What is lost is solely the box's ability to reach hosts BELOW
+ * its own — which is the capability being withdrawn, not collateral.
+ *
+ * The name=value pair and all other attributes pass through untouched, so the
+ * common legitimate case (a Set-Cookie that never named a Domain) is
+ * byte-identical after this pass.
  *
  * Splitting on ";" is safe here rather than merely convenient: RFC 6265's
  * cookie-value grammar excludes ";" (even inside DQUOTEs), so no attribute
  * boundary can be forged from within the value. */
-function hostScopedSetCookie(value: string, host: string): string {
+function hostScopedSetCookie(value: string): string {
   const parts = value.split(";");
   // Nothing after the name=value pair means there is no Domain attribute.
   if (parts.length < 2) return value;
-  let sawDomain = false;
   const kept = parts.filter((part, i) => {
     if (i === 0) return true; // the name=value pair is never an attribute
     const eq = part.indexOf("=");
     const attr = (eq === -1 ? part : part.slice(0, eq)).trim().toLowerCase();
-    if (attr !== "domain") return true;
-    // Repeated Domain attributes are ambiguous across parsers (RFC 6265 says
-    // last-wins; not every stack agrees), so drop every occurrence past the
-    // first instead of reasoning about which one a browser will honor.
-    if (sawDomain) return false;
-    sawDomain = true;
-    const domain = eq === -1
-      ? ""
-      // A leading "." is legacy syntax for the same domain-match, so it makes
-      // the cookie no narrower — normalize it away before comparing.
-      : part.slice(eq + 1).trim().replace(/^\./, "").toLowerCase();
-    return domain !== "" && domain === host;
+    return attr !== "domain";
   });
   return kept.join(";");
 }
