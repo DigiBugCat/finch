@@ -77,6 +77,11 @@ type ServiceEnrollmentCoordinator struct {
 
 	mu     sync.Mutex
 	byID   map[string]*localPendingEnrollment
+	// byPath is keyed by the CASE-FOLDED app_path (foldAppPath). Two pending
+	// enrollments differing only in case would otherwise both reserve, both be
+	// approved, and both write the same credential file on a case-insensitive
+	// filesystem — the one window the credential-directory check in Start
+	// cannot see, because at reservation time neither file exists yet.
 	byPath map[string]string
 	now    func() time.Time
 	newID  func() (string, error)
@@ -121,7 +126,7 @@ func (c *ServiceEnrollmentCoordinator) Start(ctx context.Context, request LocalS
 			delete(c.byID, terminalID)
 		}
 	}
-	if id := c.byPath[request.AppPath]; id != "" {
+	if id := c.byPath[foldAppPath(request.AppPath)]; id != "" {
 		incumbent := c.byID[id]
 		if incumbent != nil && reflect.DeepEqual(incumbent.request, request) {
 			if incumbent.pending == nil && incumbent.status.Authorization == nil {
@@ -187,7 +192,7 @@ func (c *ServiceEnrollmentCoordinator) Start(ctx context.Context, request LocalS
 	}
 	// Reserve the path before the remote round-trip so concurrent local calls
 	// cannot create orphaned hub device codes for the same service.
-	c.byPath[request.AppPath] = id
+	c.byPath[foldAppPath(request.AppPath)] = id
 	c.byID[id] = &localPendingEnrollment{
 		request: request,
 		status:  LocalServiceEnrollmentStatus{EnrollmentID: id, State: "needs_enrollment", Manifest: request},
@@ -204,7 +209,7 @@ func (c *ServiceEnrollmentCoordinator) Start(ctx context.Context, request LocalS
 	})
 	if err != nil {
 		c.mu.Lock()
-		delete(c.byPath, request.AppPath)
+		delete(c.byPath, foldAppPath(request.AppPath))
 		delete(c.byID, id)
 		c.mu.Unlock()
 		return LocalServiceEnrollmentStatus{}, err
@@ -220,7 +225,7 @@ func (c *ServiceEnrollmentCoordinator) Start(ctx context.Context, request LocalS
 	}
 	c.mu.Lock()
 	entry := c.byID[id]
-	if entry == nil || c.byPath[request.AppPath] != id {
+	if entry == nil || c.byPath[foldAppPath(request.AppPath)] != id {
 		c.mu.Unlock()
 		return LocalServiceEnrollmentStatus{}, &ServiceEnrollmentHTTPError{Status: 409, Code: "enrollment_replaced", Detail: "local Finch enrollment reservation disappeared"}
 	}
@@ -260,7 +265,7 @@ func (c *ServiceEnrollmentCoordinator) Status(ctx context.Context, enrollmentID 
 	if status.Authorization != nil && !c.now().Before(status.Authorization.ExpiresAt) {
 		status.State, status.Authorization = "expired", nil
 		entry.status = status
-		delete(c.byPath, entry.request.AppPath)
+		delete(c.byPath, foldAppPath(entry.request.AppPath))
 		c.mu.Unlock()
 		return status, nil
 	}
@@ -314,7 +319,7 @@ func (c *ServiceEnrollmentCoordinator) Status(ctx context.Context, enrollmentID 
 		status.State = "pending"
 	case "denied", "expired":
 		status.State, status.Detail, status.Authorization = polled.Status, polled.Detail, nil
-		delete(c.byPath, entry.request.AppPath)
+		delete(c.byPath, foldAppPath(entry.request.AppPath))
 	}
 	entry.status = status
 	c.mu.Unlock()
@@ -348,7 +353,7 @@ func (c *ServiceEnrollmentCoordinator) finishPendingAck(ctx context.Context, enr
 	status = entry.status
 	status.State = "ready"
 	entry.pending, entry.ackDelivery, entry.status = nil, "", status
-	delete(c.byPath, appPath)
+	delete(c.byPath, foldAppPath(appPath))
 	c.mu.Unlock()
 	return status, nil
 }
@@ -451,3 +456,11 @@ func credentialCaseVariant(dir, appPath string) (string, bool) {
 	}
 	return "", false
 }
+
+// foldAppPath is the box-local app_path identity: case-insensitive, because a
+// service's refresh credential is a file named after its app_path and macOS and
+// Windows fold filenames. The same rule is enforced by loadConfig for finch.yml
+// and by DynamicRegistry.appPathOwnerLocked for live leases; this is the third
+// place it has to hold — the pending-enrollment reservation — so that `media`
+// and `Media` cannot both be in flight before either has written a credential.
+func foldAppPath(appPath string) string { return strings.ToLower(appPath) }
