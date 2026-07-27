@@ -455,7 +455,14 @@ describe("state route upstream corruption handling", () => {
   // gate denies them. The narrowing is the hub's (it holds the ACL) and this
   // route refuses to serve a fleet the hub did not confirm it scoped.
   it("empties the fleet when the hub did not confirm it scoped the read", async () => {
-    mockMemberThen(Response.json(sensitiveState())); // no viewerScoped echo
+    mockMemberThen(
+      Response.json(
+        sensitiveState({
+          // An unnarrowed hub derives `overview` from the WHOLE fleet.
+          overview: { total: 9, callsToday: 4242, activeNow: 7, p50: 12, errRate: 0.5 },
+        }),
+      ),
+    ); // no viewerScoped echo
 
     const response = await state();
     expect(response.status).toBe(200);
@@ -463,6 +470,11 @@ describe("state route upstream corruption handling", () => {
 
     expect(body.services).toEqual([]);
     expect(body.boxes).toEqual([]);
+    // ...and so does `overview`. It is computed by the hub over the services it
+    // chose to return, so an unnarrowed hub makes it fleet-wide magnitudes —
+    // the shape of an estate this branch exists to withhold.
+    expect(body.overview).toEqual({});
+    expect(JSON.stringify(body)).not.toContain("4242");
     // The LOG goes with them. An un-narrowed logs[] re-supplies the same fleet
     // in prose — `device` rows are service/box pairs and `request` rows are
     // `${service} ${route}` + status, 500 deep — so emptying services[] while

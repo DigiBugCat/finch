@@ -163,6 +163,13 @@ function projectForMember(state: Record<string, unknown>): Record<string, unknow
     out.services = [];
     out.boxes = [];
     out.logs = [];
+    // `overview` is derived by the hub from the services it decided to return.
+    // An unnarrowed hub computes it over the WHOLE fleet, so leaving it here
+    // would leak fleet-wide magnitudes — total, callsToday, activeNow, p50/p95,
+    // errRate, keysActive and the 24h charts — through the very branch that
+    // exists to withhold the fleet. No names or routes, but still the shape of
+    // an estate the member was fenced out of.
+    out.overview = {};
     return out;
   }
   if (Array.isArray(out.services)) {
