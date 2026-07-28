@@ -104,22 +104,9 @@ const SAFE_CONSOLE_MESSAGES = new Set([
   "caller assertion signing failed",
   // Renamed from "tenant directory reindex failed" when /api/tenant-create
   // stopped calling reindexTenant (the whole-keyspace scan) in favour of a
-  // single upsertMembership. Reviewed: the arguments are { tenantId, error } —
-  // a tenant id and a DO failure, no member email, no request body.
+  // single upsertMembership. Same sanitized-error-only shape as the others;
+  // the tenant id goes in the route's 503 response, never the log.
   "tenant directory index failed",
-]);
-const SENSITIVE_LOG_IDENTIFIERS = new Set([
-  "body",
-  "bodyBytes",
-  "data",
-  "frame",
-  "headers",
-  "payload",
-  "raw",
-  "req",
-  "request",
-  "res",
-  "response",
 ]);
 
 function bindingIdentifiers(name) {
@@ -242,49 +229,6 @@ function isReviewedErrorReference(reference, call, bindings) {
   return binding.kind === "catch" || (binding.kind === "parameter" && isCatchCallback(binding.owner));
 }
 
-function originatesFromSensitiveValue(node, bindings, seen = new Set()) {
-  let sensitive = false;
-  walk(node, (part) => {
-    if (sensitive) return;
-    if (
-      ts.isPropertyAccessExpression(part) &&
-      SENSITIVE_LOG_IDENTIFIERS.has(part.name.text)
-    ) {
-      sensitive = true;
-      return;
-    }
-    if (
-      ts.isElementAccessExpression(part) &&
-      ts.isStringLiteral(part.argumentExpression) &&
-      SENSITIVE_LOG_IDENTIFIERS.has(part.argumentExpression.text)
-    ) {
-      sensitive = true;
-      return;
-    }
-    if (!ts.isIdentifier(part)) return;
-    if (
-      (ts.isPropertyAccessExpression(part.parent) && part.parent.name === part) ||
-      (ts.isPropertyAssignment(part.parent) && part.parent.name === part)
-    ) {
-      return;
-    }
-    if (SENSITIVE_LOG_IDENTIFIERS.has(part.text)) {
-      sensitive = true;
-      return;
-    }
-    const binding = resolveBinding(part, bindings);
-    if (
-      binding?.kind === "variable" &&
-      binding.initializer &&
-      !seen.has(binding) &&
-      originatesFromSensitiveValue(binding.initializer, bindings, new Set([...seen, binding]))
-    ) {
-      sensitive = true;
-    }
-  });
-  return sensitive;
-}
-
 function sanitizedErrorReference(node) {
   if (
     ts.isConditionalExpression(node) &&
@@ -310,31 +254,16 @@ function sanitizedErrorReference(node) {
   return undefined;
 }
 
-function directoryErrorMetadata(node) {
-  if (!ts.isObjectLiteralExpression(node) || node.properties.length !== 2) return undefined;
-  const fields = new Map();
-  for (const property of node.properties) {
-    if (!ts.isShorthandPropertyAssignment(property) || property.objectAssignmentInitializer) {
-      return undefined;
-    }
-    fields.set(property.name.text, property.name);
-  }
-  if (fields.size !== 2 || !fields.has("tenantId") || !fields.has("error")) return undefined;
-  return fields;
-}
-
+// Every reviewed message shares ONE argument shape: the sanitized error
+// message, nothing else. There used to be a second, richer shape for the
+// tenant-create failure log ({ tenantId, error }) with its own data-flow rule;
+// once the tenant id became derived from the client's idempotency key, keeping
+// it loggable would have meant teaching this gate which derivations launder
+// request data (digests, presence bits, ...) — a growing carve-out surface in
+// a gate whose value is being blunt. The id moved to the route's 503 response
+// instead, and the special case was DELETED rather than refined.
 function isReviewedArguments(message, args, call, bindings) {
   if (args.length !== 2) return false;
-  if (message === "tenant directory index failed") {
-    const fields = directoryErrorMetadata(args[1]);
-    if (!fields || !isReviewedErrorReference(fields.get("error"), call, bindings)) return false;
-    const tenantBinding = resolveBinding(fields.get("tenantId"), bindings);
-    return (
-      tenantBinding?.kind === "variable" &&
-      tenantBinding.initializer !== undefined &&
-      !originatesFromSensitiveValue(tenantBinding.initializer, bindings)
-    );
-  }
   const error = sanitizedErrorReference(args[1]);
   return error !== undefined && isReviewedErrorReference(error, call, bindings);
 }
