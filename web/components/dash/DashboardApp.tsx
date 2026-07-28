@@ -58,10 +58,17 @@ const CREATE_ATTEMPT_PREFIX = "finch.workspace-create-attempt";
 // Total, injective encoding of ANY JS string into [0-9a-f]. encodeURIComponent
 // is not total: the create route accepts any printable name, which includes an
 // unpaired UTF-16 surrogate, and encodeURIComponent THROWS on those — before
-// the try blocks, so the create silently never fired. Fixed-width code-unit
-// hex handles every string the route accepts and cannot collide.
-const encodeAttemptSegment = (value: string) =>
-  Array.from(value, (ch) => ch.charCodeAt(0).toString(16).padStart(4, "0")).join("");
+// the try blocks, so the create silently never fired. Fixed-width hex over
+// EVERY UTF-16 code unit handles every string the route accepts and cannot
+// collide. Indexed loop, not Array.from: Array.from iterates code POINTS, so
+// an astral character arrives as a two-unit string and charCodeAt(0) would
+// record only its high surrogate — making "\u{1F600}" and "\u{1F601}"
+// (shared high surrogate) collide into one storage key.
+const encodeAttemptSegment = (value: string) => {
+  let out = "";
+  for (let i = 0; i < value.length; i++) out += value.charCodeAt(i).toString(16).padStart(4, "0");
+  return out;
+};
 const createAttemptStorageKey = (userId: string, name: string) =>
   `${CREATE_ATTEMPT_PREFIX}.${encodeAttemptSegment(userId)}.${encodeAttemptSegment(name)}`;
 function takeCreateAttemptKey(userId: string, name: string): string {
@@ -318,11 +325,25 @@ export default function DashboardApp() {
     // within moments of the dashboard rendering.
     if (!user?.id) { flash("still signing in — try again in a moment"); return; }
     const uid = user.id;
-    const key = takeCreateAttemptKey(uid, name);
-    const res = await fetch("/api/finch/tenants/create", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, idempotencyKey: key }) });
-    const body = await res.json().catch(() => ({}));
-    if (res.ok) { clearCreateAttemptKey(uid, name); window.location.reload(); }
-    else flash(body.error || "couldn't create workspace");
+    const run = async () => {
+      const key = takeCreateAttemptKey(uid, name);
+      const res = await fetch("/api/finch/tenants/create", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, idempotencyKey: key }) });
+      const body = await res.json().catch(() => ({}));
+      if (res.ok) { clearCreateAttemptKey(uid, name); window.location.reload(); }
+      else flash(body.error || "couldn't create workspace");
+    };
+    // Web Locks serialize the WHOLE create across this origin's tabs. Without
+    // it, two tabs creating the same name could both read an empty entry,
+    // mint different keys, and overwrite each other — and if the overwritten
+    // tab's request committed but 503'd while the winner succeeded and
+    // cleared the entry, the loser's retry would mint a third key and
+    // duplicate its committed workspace. Under the lock the second tab runs
+    // after the first has settled: a pending 503 entry is reused (replay), a
+    // cleared entry means a genuinely fresh attempt. Browsers without the
+    // API degrade to today's unserialized behaviour rather than losing the
+    // create.
+    if (navigator.locks?.request) await navigator.locks.request("finch.workspace-create", run);
+    else await run();
   };
   const claimWorkspace = async (clerkOrgId: string) => {
     if (!window.confirm("Import this legacy Clerk organization into Finch? Roles become a Finch-owned snapshot.")) return;
