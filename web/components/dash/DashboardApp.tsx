@@ -19,6 +19,72 @@ import { isOnline, Card } from './primitives';
 import { useFinchState } from './useFinchState';
 import type { AccessInfo } from './data';
 
+// One idempotency key per creation ATTEMPT, held until THAT attempt succeeds.
+// If the hub commits a workspace but fails to index it, it returns 503 — and
+// because a retry of the same attempt reuses its key, the hub derives the SAME
+// tenant id and repairs the original workspace instead of bootstrapping a
+// duplicate.
+//
+// Storage design, each choice load-bearing:
+//   - localStorage, not component state: the 503 ends in a flash and likely a
+//     reload, and an in-memory key dies with the page — the retry would mint a
+//     fresh key and recreate the duplicate.
+//   - ONE storage entry PER attempt, not a shared JSON map: a map means
+//     read-modify-write of the whole snapshot, and two tabs creating different
+//     workspaces would each write their own snapshot, the later one silently
+//     dropping the other tab's pending key. Independent entries cannot clobber
+//     each other. It also keeps workspace names out of object property slots,
+//     where a user legitimately naming a workspace "__proto__" would hit the
+//     prototype setter and never persist at all.
+//   - namespaced by the signed-in USER: the hub derives the tenant from
+//     (caller, key), so the same name under a different account is a different
+//     attempt — an origin-wide entry would let account B consume and clear
+//     account A's pending key.
+//   - keyed by NAME deliberately, accepting one conflation: while an attempt
+//     for "Acme" is unresolved, a second intentional "Acme" create reuses its
+//     key and replays to the first tenant. This is the only re-enterable
+//     handle a retry has — after a 503 and a reload, the name is all the user
+//     types back in — so any attempt id that ISN'T the name would make
+//     retries unfindable and reopen the duplicate-on-retry hole, which is the
+//     P1 this design exists to close. The conflation's worst case is benign
+//     and self-correcting: the replay returns the existing workspace, the
+//     entry clears on that success, and the very next "Acme" create gets a
+//     fresh key and a second workspace.
+//
+// Entries are removed only when their own attempt succeeds. Storage being
+// unavailable degrades to a per-call key: the create still works; only
+// cross-reload retry identity is lost.
+const CREATE_ATTEMPT_PREFIX = "finch.workspace-create-attempt";
+// Total, injective encoding of ANY JS string into [0-9a-f]. encodeURIComponent
+// is not total: the create route accepts any printable name, which includes an
+// unpaired UTF-16 surrogate, and encodeURIComponent THROWS on those — before
+// the try blocks, so the create silently never fired. Fixed-width hex over
+// EVERY UTF-16 code unit handles every string the route accepts and cannot
+// collide. Indexed loop, not Array.from: Array.from iterates code POINTS, so
+// an astral character arrives as a two-unit string and charCodeAt(0) would
+// record only its high surrogate — making "\u{1F600}" and "\u{1F601}"
+// (shared high surrogate) collide into one storage key.
+const encodeAttemptSegment = (value: string) => {
+  let out = "";
+  for (let i = 0; i < value.length; i++) out += value.charCodeAt(i).toString(16).padStart(4, "0");
+  return out;
+};
+const createAttemptStorageKey = (userId: string, name: string) =>
+  `${CREATE_ATTEMPT_PREFIX}.${encodeAttemptSegment(userId)}.${encodeAttemptSegment(name)}`;
+function takeCreateAttemptKey(userId: string, name: string): string {
+  const storageKey = createAttemptStorageKey(userId, name);
+  try {
+    const existing = window.localStorage.getItem(storageKey);
+    if (existing && /^[A-Za-z0-9_-]{8,64}$/.test(existing)) return existing;
+  } catch { /* degrade */ }
+  const key = crypto.randomUUID();
+  try { window.localStorage.setItem(storageKey, key); } catch { /* degrade */ }
+  return key;
+}
+function clearCreateAttemptKey(userId: string, name: string): void {
+  try { window.localStorage.removeItem(createAttemptStorageKey(userId, name)); } catch { /* degrade */ }
+}
+
 export default function DashboardApp() {
   const { user } = useUser();
   const { state, tenants, loading, error, refetch } = useFinchState();
@@ -252,9 +318,32 @@ export default function DashboardApp() {
   const createWorkspace = async () => {
     const name = window.prompt("Workspace name")?.trim();
     if (!name) return;
-    const res = await fetch("/api/finch/tenants/create", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name }) });
-    const body = await res.json().catch(() => ({}));
-    if (res.ok) window.location.reload(); else flash(body.error || "couldn't create workspace");
+    // The attempt namespace must be the STABLE signed-in id. Before Clerk's
+    // hook resolves, any placeholder id would mint a fresh namespace — and a
+    // fresh key — per call, so a retry after a 503 would duplicate the
+    // committed workspace. Refuse instead of guessing; the hook resolves
+    // within moments of the dashboard rendering.
+    if (!user?.id) { flash("still signing in — try again in a moment"); return; }
+    const uid = user.id;
+    const run = async () => {
+      const key = takeCreateAttemptKey(uid, name);
+      const res = await fetch("/api/finch/tenants/create", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, idempotencyKey: key }) });
+      const body = await res.json().catch(() => ({}));
+      if (res.ok) { clearCreateAttemptKey(uid, name); window.location.reload(); }
+      else flash(body.error || "couldn't create workspace");
+    };
+    // Web Locks serialize the WHOLE create across this origin's tabs. Without
+    // it, two tabs creating the same name could both read an empty entry,
+    // mint different keys, and overwrite each other — and if the overwritten
+    // tab's request committed but 503'd while the winner succeeded and
+    // cleared the entry, the loser's retry would mint a third key and
+    // duplicate its committed workspace. Under the lock the second tab runs
+    // after the first has settled: a pending 503 entry is reused (replay), a
+    // cleared entry means a genuinely fresh attempt. Browsers without the
+    // API degrade to today's unserialized behaviour rather than losing the
+    // create.
+    if (navigator.locks?.request) await navigator.locks.request("finch.workspace-create", run);
+    else await run();
   };
   const claimWorkspace = async (clerkOrgId: string) => {
     if (!window.confirm("Import this legacy Clerk organization into Finch? Roles become a Finch-owned snapshot.")) return;

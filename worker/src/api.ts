@@ -576,20 +576,79 @@ async function handleApiInner(
       if(!(await rateLimitOk(env.JOIN_LIMIT,`tcreate:${clerkUserId}`))||!(await rateLimitOk(env.JOIN_LIMIT,`tcreate:${clientIp(req)}`)))return json(429,{error:"rate limited"});
       if(!body.email||!emails.includes(String(body.email).trim().toLowerCase()))return json(400,{error:"email must be verified"});
 
-      // FULL UUID entropy, not the first 8 hex chars. That was 32 bits: by the
-      // birthday bound ~1% collision odds around 9,300 workspaces and 50% around
-      // 77,000. A collision is not benign — the id names the DO, so
-      // bootstrapMembers finds the EXISTING tenant and returns 409, and this
-      // path does not retry, so a legitimate creation just fails. Widening the
-      // id engineers the failure out instead of handling it; a retry loop
-      // cannot, because 409 is also the correct terminal answer for
-      // "member limit reached" and "duplicate member identity" and the DO's
-      // error contract carries no machine-readable code to tell them apart.
-      // Existing short ids keep working: nothing parses the suffix.
-      const tenantId="ft_"+crypto.randomUUID().replace(/-/g,"");
+      // THE IDEMPOTENCY KEY IS REQUIRED — there is no unkeyed path. Creation
+      // must be idempotent because the failure this design exists for is:
+      // bootstrapMembers commits, the directory index write fails, we return
+      // 503, the user retries. A retry that mints a fresh id bootstraps a
+      // SECOND workspace and leaves the first committed and permanently
+      // unindexed — the retry advice manufacturing the very orphan-plus-
+      // duplicate it was meant to prevent. An optional key would keep exactly
+      // that failure alive for every unkeyed caller (a dashboard tab from
+      // before this deploy, a direct API user, a malformed key), so the
+      // contract is strict: no valid key, no state created, 400 with the
+      // recipe. "Sometimes idempotent" is not idempotent.
+      //
+      // The id is derived from (caller, key): 128 bits of SHA-256, the same
+      // 32-hex shape as a UUID, so a retry lands on the SAME tenant —
+      // bootstrap replays as the 409 recognized below and the index write
+      // repairs itself. Deriving from a client-chosen key is safe because the
+      // caller's clerkUserId is mixed in AND the replay branch authorizes via
+      // the TENANT'S OWN membership: it proceeds only when the caller is that
+      // tenant's active owner. Someone who somehow occupied the derived id
+      // first just makes this create 409 — they cannot hand the caller a
+      // foreign workspace. (Full-width ids also bury the old 32-bit birthday
+      // problem: the previous 8-hex ids collided at ~1% by 9,300 workspaces,
+      // and a collision failed the create outright. Existing short ids keep
+      // working — nothing parses the suffix.)
+      const idemKey=typeof body.idempotencyKey==="string"&&/^[A-Za-z0-9_-]{8,64}$/.test(body.idempotencyKey)?body.idempotencyKey:null;
+      if(!idemKey)return json(400,{error:"idempotencyKey required: 8-64 characters of [A-Za-z0-9_-], held constant across retries of the same creation attempt"});
+      // The name is validated HERE, before any state exists, because it is
+      // also the replay fingerprint. bootstrapMembers persists
+      // String(displayName || tenantId), so a falsy or non-string name would
+      // bootstrap under a FALLBACK value the fingerprint can never match —
+      // the caller's own identical retry would 409 and the committed
+      // workspace would be stranded unindexed, defeating the retry guarantee.
+      // Requiring a non-empty string makes persisted === sent, exactly.
+      if(typeof body.name!=="string"||!body.name.trim())return json(400,{error:"name required"});
+      const tenantId="ft_"+[...new Uint8Array(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(`${clerkUserId}:${idemKey}`)))].slice(0,16).map(b=>b.toString(16).padStart(2,"0")).join("");
       const r=await tenantOpRaw(env,tenantId,"bootstrapMembers",{kind:"team",displayName:body.name,bootstrappedFrom:"fresh",members:[{clerkUserId,email:body.email,role:"owner",state:"active"}],claimantClerkUserId:clerkUserId});
-      if(!r.ok)return cloneResponse(r);
-      const out:any=await r.json();
+      let owner:any;
+      if(!r.ok){
+        // Replay of our own earlier create: the derived id already bootstrapped.
+        // Discriminated by the tenant's membership, not by parsing the error
+        // text — the DO's contract carries no machine-readable code, and "this
+        // caller is the active owner of exactly the tenant this key derives"
+        // is the stronger claim anyway.
+        if(r.status===409){
+          const ctxRes=await tenantOpRaw(env,tenantId,"memberContext",{clerkUserId});
+          if(ctxRes.ok){
+            const ctx:any=await ctxRes.json();
+            const m=ctx?.member;
+            if(m&&m.role==="owner"&&m.state==="active"){
+              // A replay must be a replay of the SAME creation, so fingerprint
+              // it against the persisted display name. Without this, reusing
+              // workspace A's key while asking for workspace "B" would return
+              // 200 with A's id — the bridge would then activate A and report
+              // B created, silently ignoring body.name. Same key + different
+              // data is a caller bug, and it gets a loud conflict, not a
+              // quietly wrong workspace.
+              if(ctx?.tenantMeta?.displayName!==body.name){
+                return json(409,{error:"idempotencyKey was already used to create a different workspace — use a fresh key for a new workspace"});
+              }
+              owner=m;
+            }
+          }
+        }
+        if(!owner)return cloneResponse(r);
+      }else{
+        const out:any=await r.json();
+        // Found by clerkUserId rather than by position: the roster is hardcoded
+        // to one member today, but this route already receives `emails`, so
+        // adding invitees is the obvious next change and an index keyed on [0]
+        // would silently drop their invite pointers.
+        owner=(out.members??[]).find((m:any)=>m.clerkUserId===clerkUserId);
+        if(!owner)return json(502,{error:"invalid response from hub"});
+      }
 
       // Index the owner directly instead of calling reindexTenant. reindex
       // exists to purge rows that reference a tenant before rewriting them, and
@@ -598,13 +657,6 @@ async function handleApiInner(
       // lines ago no existing row can possibly reference it, so that scan is
       // provably dead work: O(total platform identities) reads to delete
       // nothing. upsertMembership writes a byte-identical row.
-      //
-      // Found by clerkUserId rather than by position: the roster is hardcoded to
-      // one member today, but this route already receives `emails`, so adding
-      // invitees is the obvious next change and an index keyed on [0] would
-      // silently drop their invite pointers.
-      const owner=(out.members??[]).find((m:any)=>m.clerkUserId===clerkUserId);
-      if(!owner)return json(502,{error:"invalid response from hub"});
 
       // NOT swallowed. The directory row is the ONLY handle on this workspace:
       // /api/user/sync enumerates exclusively through listForUser, and the sole
@@ -622,21 +674,30 @@ async function handleApiInner(
       // tenantId before appending — so re-running it is always safe, including
       // when a previous attempt actually committed and only its response was
       // lost.
+      // The log carries only the sanitized error message — the same reviewed
+      // shape as every other console site. The tenant id deliberately does NOT
+      // go to the log: it is now derived from the client's idempotency key
+      // (request data), and rather than teaching the privacy gate which
+      // derivations launder and which do not, the id travels in the 503
+      // RESPONSE below — where it reaches the one party who can act on it, and
+      // where the idempotent retry makes the orphan self-repairing anyway.
       let indexed=false;
       for(let attempt=0;attempt<3&&!indexed;attempt++){
         try{
           await directoryOp(env,"upsertMembership",{clerkUserId,tenantId,memberId:owner.id,role:owner.role,state:owner.state});
           indexed=true;
         }catch(error){
-          if(attempt===2)console.error("tenant directory index failed",{tenantId,error});
+          if(attempt===2)console.error("tenant directory index failed",error instanceof Error?error.message:String(error));
         }
       }
       // Still failing after retries: report it, and hand back the id so the
       // workspace is identifiable rather than lost (the web layer relays error
-      // bodies verbatim and the id is not sensitive). The residual is a
-      // committed-but-unindexed TenantDO — strictly better than the old
-      // behaviour, which left the same orphan AND claimed success — and it is
-      // bounded by the per-user and per-IP rate limits above.
+      // bodies verbatim and the id is not sensitive). When the client sent an
+      // idempotency key, "please retry" is now genuinely true: the retry
+      // derives the SAME tenant id, the bootstrap replay is recognized above,
+      // and this index write runs again — recovery, not duplication. Without a
+      // key the residual is a committed-but-unindexed TenantDO, bounded by the
+      // per-user and per-IP rate limits above.
       if(!indexed)return json(503,{error:"workspace index unavailable — please retry",tenantId});
       return json(200,{tenantId});}
     if(path==="/api/tenant-bootstrap"){const owner=(body.members??[]).find((m:any)=>m.role==="owner"&&m.state==="active");if(owner?.clerkUserId!==clerkUserId)return json(403,{error:"claimant must be owner"});const r=await tenantOpRaw(env,body.tenantId,"bootstrapMembers",{...body,claimantClerkUserId:clerkUserId});if(!r.ok)return cloneResponse(r);const out:any=await r.json();if(body.clerkOrgId)await directoryOp(env,"mapOrg",{clerkOrgId:body.clerkOrgId,tenantId:body.tenantId});await directoryOp(env,"reindexTenant",{tenantId:body.tenantId,members:out.members});return json(200,out);}
