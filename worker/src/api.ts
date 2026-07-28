@@ -602,6 +602,14 @@ async function handleApiInner(
       // working — nothing parses the suffix.)
       const idemKey=typeof body.idempotencyKey==="string"&&/^[A-Za-z0-9_-]{8,64}$/.test(body.idempotencyKey)?body.idempotencyKey:null;
       if(!idemKey)return json(400,{error:"idempotencyKey required: 8-64 characters of [A-Za-z0-9_-], held constant across retries of the same creation attempt"});
+      // The name is validated HERE, before any state exists, because it is
+      // also the replay fingerprint. bootstrapMembers persists
+      // String(displayName || tenantId), so a falsy or non-string name would
+      // bootstrap under a FALLBACK value the fingerprint can never match —
+      // the caller's own identical retry would 409 and the committed
+      // workspace would be stranded unindexed, defeating the retry guarantee.
+      // Requiring a non-empty string makes persisted === sent, exactly.
+      if(typeof body.name!=="string"||!body.name.trim())return json(400,{error:"name required"});
       const tenantId="ft_"+[...new Uint8Array(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(`${clerkUserId}:${idemKey}`)))].slice(0,16).map(b=>b.toString(16).padStart(2,"0")).join("");
       const r=await tenantOpRaw(env,tenantId,"bootstrapMembers",{kind:"team",displayName:body.name,bootstrappedFrom:"fresh",members:[{clerkUserId,email:body.email,role:"owner",state:"active"}],claimantClerkUserId:clerkUserId});
       let owner:any;

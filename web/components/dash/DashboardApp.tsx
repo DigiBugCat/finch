@@ -40,13 +40,30 @@ import type { AccessInfo } from './data';
 //     (caller, key), so the same name under a different account is a different
 //     attempt — an origin-wide entry would let account B consume and clear
 //     account A's pending key.
+//   - keyed by NAME deliberately, accepting one conflation: while an attempt
+//     for "Acme" is unresolved, a second intentional "Acme" create reuses its
+//     key and replays to the first tenant. This is the only re-enterable
+//     handle a retry has — after a 503 and a reload, the name is all the user
+//     types back in — so any attempt id that ISN'T the name would make
+//     retries unfindable and reopen the duplicate-on-retry hole, which is the
+//     P1 this design exists to close. The conflation's worst case is benign
+//     and self-correcting: the replay returns the existing workspace, the
+//     entry clears on that success, and the very next "Acme" create gets a
+//     fresh key and a second workspace.
 //
 // Entries are removed only when their own attempt succeeds. Storage being
 // unavailable degrades to a per-call key: the create still works; only
 // cross-reload retry identity is lost.
 const CREATE_ATTEMPT_PREFIX = "finch.workspace-create-attempt";
+// Total, injective encoding of ANY JS string into [0-9a-f]. encodeURIComponent
+// is not total: the create route accepts any printable name, which includes an
+// unpaired UTF-16 surrogate, and encodeURIComponent THROWS on those — before
+// the try blocks, so the create silently never fired. Fixed-width code-unit
+// hex handles every string the route accepts and cannot collide.
+const encodeAttemptSegment = (value: string) =>
+  Array.from(value, (ch) => ch.charCodeAt(0).toString(16).padStart(4, "0")).join("");
 const createAttemptStorageKey = (userId: string, name: string) =>
-  `${CREATE_ATTEMPT_PREFIX}.${encodeURIComponent(userId)}.${encodeURIComponent(name)}`;
+  `${CREATE_ATTEMPT_PREFIX}.${encodeAttemptSegment(userId)}.${encodeAttemptSegment(name)}`;
 function takeCreateAttemptKey(userId: string, name: string): string {
   const storageKey = createAttemptStorageKey(userId, name);
   try {

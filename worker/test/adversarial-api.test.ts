@@ -395,6 +395,26 @@ describe("/api/tenant-create", () => {
     expect(listed.memberships[0].tenantId).toBe(tenantId);
   });
 
+  // REGRESSION (round 6): the fingerprint must never strand a retry. A
+  // missing name used to bootstrap under the DO's fallback displayName, and
+  // the identical retry then failed the fingerprint against that fallback —
+  // 409, workspace committed and unindexed forever. The name is now required
+  // before any state exists, so persisted === sent, exactly.
+  it("requires a name before bootstrapping, so the fingerprint cannot strand a retry", async () => {
+    const clerkUserId = `user_name_${crypto.randomUUID()}`;
+    const headers = await userHeaders(clerkUserId);
+    for (const name of [undefined, "", "   ", 42]) {
+      const res = await call(
+        "/api/tenant-create",
+        JSON.stringify({ ...(name === undefined ? {} : { name }), email: "n@example.test", emails: ["n@example.test"], idempotencyKey: crypto.randomUUID() }),
+        headers,
+      );
+      expect(res.status).toBe(400);
+      expect((((await res.json()) as any).error ?? "")).toContain("name");
+    }
+    expect((await listForUser(clerkUserId)).memberships).toEqual([]);
+  });
+
   // REGRESSION (round 5): a replay must be a replay of the SAME creation.
   // Reusing workspace A's key while asking for "B" used to return 200 with
   // A's id — the bridge would then activate A and report B created, silently
