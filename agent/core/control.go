@@ -463,7 +463,12 @@ func validateRegistration(req RegistrationRequest) (RegistrationRequest, time.Du
 		if len(prefix) > len(probe) {
 			probe = prefix
 		}
-		if _, err := resolveUpstreamWithRoutes(u, probe, false, req.Routes); err != nil {
+		// The allowlist handed to the resolver is THIS route alone. With the
+		// full list, a valid sibling satisfies the allowlist on behalf of the
+		// route under test — upstream /base with routes [/a, /base] probed /a's
+		// deeper path /base against the whole list, /base vouched for it, and
+		// the permanently unservable /a was accepted anyway.
+		if _, err := resolveUpstreamWithRoutes(u, probe, false, []string{route}); err != nil {
 			return req, 0, invalid(fmt.Sprintf("route %q can never be served by upstream %q: %v", route, req.Upstream, err))
 		}
 	}
