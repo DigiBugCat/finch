@@ -325,6 +325,15 @@ func TestRegisterRejectsRoutesOutsideTheUpstreamBasePath(t *testing.T) {
 	}); err == nil {
 		t.Fatal("accepted a route on a divergent branch (/a vs /ab)")
 	}
+	// Each route must hold on its OWN: a valid sibling in the same request
+	// must not vouch for an unservable one. With the full list passed to the
+	// resolver, /base satisfied the allowlist for /a's probe and the dead /a
+	// route was accepted.
+	if _, err := r.Register(RegistrationRequest{
+		AppPath: "bad3", Upstream: "http://127.0.0.1:7342/base", Routes: []string{"/a", "/base"},
+	}); err == nil {
+		t.Fatal("a valid sibling route vouched for an unservable one")
+	}
 	if _, err := r.Register(RegistrationRequest{
 		AppPath: "ok2", Upstream: "http://127.0.0.1:7342", Routes: []string{"/mcp"},
 	}); err != nil {
