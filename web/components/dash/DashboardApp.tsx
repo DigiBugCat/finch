@@ -294,9 +294,13 @@ export default function DashboardApp() {
   const createWorkspace = async () => {
     const name = window.prompt("Workspace name")?.trim();
     if (!name) return;
-    // No signed-in id (should not happen behind auth) degrades to a per-call
-    // key rather than sharing an anonymous namespace across accounts.
-    const uid = user?.id ?? crypto.randomUUID();
+    // The attempt namespace must be the STABLE signed-in id. Before Clerk's
+    // hook resolves, any placeholder id would mint a fresh namespace — and a
+    // fresh key — per call, so a retry after a 503 would duplicate the
+    // committed workspace. Refuse instead of guessing; the hook resolves
+    // within moments of the dashboard rendering.
+    if (!user?.id) { flash("still signing in — try again in a moment"); return; }
+    const uid = user.id;
     const key = takeCreateAttemptKey(uid, name);
     const res = await fetch("/api/finch/tenants/create", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, idempotencyKey: key }) });
     const body = await res.json().catch(() => ({}));

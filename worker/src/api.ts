@@ -616,7 +616,19 @@ async function handleApiInner(
           if(ctxRes.ok){
             const ctx:any=await ctxRes.json();
             const m=ctx?.member;
-            if(m&&m.role==="owner"&&m.state==="active")owner=m;
+            if(m&&m.role==="owner"&&m.state==="active"){
+              // A replay must be a replay of the SAME creation, so fingerprint
+              // it against the persisted display name. Without this, reusing
+              // workspace A's key while asking for workspace "B" would return
+              // 200 with A's id — the bridge would then activate A and report
+              // B created, silently ignoring body.name. Same key + different
+              // data is a caller bug, and it gets a loud conflict, not a
+              // quietly wrong workspace.
+              if(ctx?.tenantMeta?.displayName!==body.name){
+                return json(409,{error:"idempotencyKey was already used to create a different workspace — use a fresh key for a new workspace"});
+              }
+              owner=m;
+            }
           }
         }
         if(!owner)return cloneResponse(r);

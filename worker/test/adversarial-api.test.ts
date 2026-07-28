@@ -234,8 +234,8 @@ describe("/api/tenant-create", () => {
       ),
     };
   }
-  const createBody = (email: string, idempotencyKey?: string) =>
-    JSON.stringify({ name: "Acme", email, emails: [email], ...(idempotencyKey ? { idempotencyKey } : {}) });
+  const createBody = (email: string, idempotencyKey?: string, name = "Acme") =>
+    JSON.stringify({ name, email, emails: [email], ...(idempotencyKey ? { idempotencyKey } : {}) });
 
   const listForUser = async (clerkUserId: string) =>
     env.DIRECTORY.get(env.DIRECTORY.idFromName("global"))
@@ -393,6 +393,31 @@ describe("/api/tenant-create", () => {
     const listed = await listForUser(clerkUserId);
     expect(listed.memberships).toHaveLength(1);
     expect(listed.memberships[0].tenantId).toBe(tenantId);
+  });
+
+  // REGRESSION (round 5): a replay must be a replay of the SAME creation.
+  // Reusing workspace A's key while asking for "B" used to return 200 with
+  // A's id — the bridge would then activate A and report B created, silently
+  // ignoring the requested name. Same key + different data is a caller bug
+  // and must be a loud conflict.
+  it("rejects a key replayed with a different workspace name", async () => {
+    const clerkUserId = `user_fp_${crypto.randomUUID()}`;
+    const headers = await userHeaders(clerkUserId);
+    const key = crypto.randomUUID();
+
+    const a = await call("/api/tenant-create", createBody("fp@example.test", key, "Acme"), headers);
+    expect(a.status).toBe(200);
+    const idA = ((await a.json()) as any).tenantId;
+
+    const b = await call("/api/tenant-create", createBody("fp@example.test", key, "Beta"), headers);
+    expect(b.status).toBe(409);
+    expect((((await b.json()) as any).error ?? "")).toContain("idempotencyKey");
+
+    // The true replay (same name) still works and still maps to A.
+    const c = await call("/api/tenant-create", createBody("fp@example.test", key, "Acme"), headers);
+    expect(c.status).toBe(200);
+    expect(((await c.json()) as any).tenantId).toBe(idA);
+    expect((await listForUser(clerkUserId)).memberships).toHaveLength(1);
   });
 
   // REGRESSION (P1, round 3): the key used to be OPTIONAL, and the unkeyed
