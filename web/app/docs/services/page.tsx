@@ -102,21 +102,21 @@ finch run`}</Code>
         ways to update it:
       </p>
       <p>
-        <b>From the dashboard</b> — open the service and click <b>update now</b> on the
+        <b>From the dashboard.</b> Open the service and click <b>update now</b> on the
         box. The hub pushes an update command down the box&apos;s existing connection: the
         agent downloads the new binary from the hub, swaps it in place, and restarts
-        itself — no SSH, no second process, about a second of downtime. The box comes
-        back on the new version within a few seconds. (An offline box can&apos;t receive
-        the push; the dashboard shows the command to run instead.)
+        itself. No SSH, no second process, about a second of downtime. The box comes
+        back on the new version within a few seconds. An offline box can&apos;t receive
+        the push; the dashboard shows the command to run instead.
       </p>
       <p>
-        <b>On the box</b> — run:
+        <b>On the box.</b> Run:
       </p>
       <Code>{`finch update`}</Code>
       <p>
         Same swap, run locally. If a systemd service manages the agent it restarts
         cleanly; otherwise the process replaces itself in place. Either way the update
-        is atomic — a failed download never touches the running binary.
+        is atomic: a failed download never touches the running binary.
       </p>
 
       <h2>Enrolling another box</h2>
