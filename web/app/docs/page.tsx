@@ -65,20 +65,19 @@ if __name__ == "__main__":
   Waiting for approval… ✓ logged in as you@example.com</span>`}</Code>
       <p>
         Finch prints a link and a code, then waits. Open the link on{' '}
-        <strong>any device</strong> — the box you run this on doesn&apos;t need a browser
+        <strong>any device</strong>. The box you run this on doesn&apos;t need a browser
         or even a screen, so a headless server (a Mini, a Pi, a VPS) logs in fine:
         open the link on your phone, confirm the code, and the waiting box gets its
         credential. This is the only human step; every other command is
         non-interactive and supports <code>--json</code>. On a screenless box reached
-        over SSH, use <code>finch login --headless</code> — same flow, but it skips
+        over SSH, use <code>finch login --headless</code>. Same flow, but it skips
         the (pointless) local browser and flushes the link straight to your terminal.
       </p>
       <p>
-        Fully unattended (CI, imaging a fleet) with no human at all? Mint a one-shot
-        ticket on a machine that&apos;s already logged in with <code>finch token</code>{' '}
-        (or in the dashboard under <em>Add box</em>) and hand it to the new box:{' '}
-        <code>finch run --ticket -</code>. For a single box you&apos;re setting up
-        yourself, <code>finch login</code> from your phone is the easy path.
+        Setting up boxes with no human at all (CI, imaging a fleet)?{' '}
+        <Link href="/docs/services">Services &amp; boxes</Link> covers tickets and
+        token-piped logins. For the box in front of you, the phone flow above is
+        the easy path.
       </p>
 
       <h2>4. Add the service</h2>

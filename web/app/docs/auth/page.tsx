@@ -85,19 +85,23 @@ finch revoke-tokens  <span class="c"># de-authorize every CLI login, including t
       </p>
       <p>
         From the web, Settings &rarr; CLI access &rarr; <strong>Generate</strong> mints
-        one and <strong>Copy</strong> puts a ready-to-run block on your clipboard —
-        not a bare token. Paste the whole block on the box: it is{' '}
-        <code>finch login --token -</code> with the token as a quoted heredoc, so the
-        credential arrives on stdin and never becomes an argv word — argv is world-readable
-        via <code>/proc/&lt;pid&gt;/cmdline</code>. Pasting it at an interactive prompt does
-        still write it to your shell history (bash and zsh both save the full multi-line
-        entry); prefix the paste with a space, or use the piped form below from a box that
-        is already logged in, to keep it out of history as well. The same page revokes
-        every CLI token at once.
+        one and <strong>Copy</strong> puts a ready-to-run block on your clipboard,
+        not a bare token. Paste the whole block on the box and you are logged in.
+        The same page revokes every CLI token at once.
       </p>
       <Code>{`finch login --hub https://finchmcp.com --token - &lt;&lt;'FINCH_CLI_TOKEN'
 &lt;your token&gt;
 FINCH_CLI_TOKEN`}</Code>
+      <div className="docs-note">
+        <b>Why the block looks like that.</b> It is <code>finch login --token -</code>{' '}
+        with the token as a quoted heredoc, so the credential arrives on stdin and
+        never becomes an argv word, which would be world-readable via{' '}
+        <code>/proc/&lt;pid&gt;/cmdline</code>. Pasting at an interactive prompt does
+        still write it to shell history (bash and zsh both save the full multi-line
+        entry); prefix the paste with a space, or use the piped{' '}
+        <code>finch token | ssh ...</code> form from a box that is already logged in,
+        to keep it out of history as well.
+      </div>
 
       <h2>OAuth</h2>
       <p>

@@ -18,6 +18,8 @@ export default function AviaryMCPDocs() {
         AviaryMCP is Finch&apos;s opinionated Python SDK for new MCP services. Define a
         tool once and get the MCP transport, typed REST endpoints, OpenAPI, Finch
         enrollment, and the same authorization decision across every interface.
+        Steps 1&ndash;4 are enough to try it; <a href="#production-boundaries">Production
+        boundaries</a> is for taking it to production.
       </p>
 
       <div className="docs-note">
@@ -27,11 +29,12 @@ export default function AviaryMCPDocs() {
         </a>{' '}
         and requires the Finch 1.6 agent. The normal Finch CLI and <code>finch.yml</code>{' '}
         remain supported for existing, non-Python, and non-SDK services.
-        {' '}Machine-readable guidance is available in the hosted{' '}
-        <a href="/llms.txt">llms.txt</a> and AviaryMCP&apos;s{' '}
+        {' '}Agents can read the hosted <a href="/llms.txt">llms.txt</a> and
+        AviaryMCP&apos;s{' '}
         <a href="/aviarymcp-llms.txt">
           project llms.txt
-        </a>.
+        </a>{' '}
+        for the same guidance in machine-readable form.
       </div>
 
       <h2>When to use it</h2>
@@ -174,10 +177,10 @@ mcp = AviaryMCP("aviary")
 mcp.mount(weather, namespace="weather")`}</Code>
       <p>
         The mounted tool becomes <code>weather_forecast</code> in MCP, REST, and
-        OpenAPI. Namespaces keep tools from different birds from colliding.
+        OpenAPI. Namespaces keep tools from different servers from colliding.
       </p>
 
-      <h2>Production boundaries</h2>
+      <h2 id="production-boundaries">Production boundaries</h2>
       <ul>
         <li>Use one Finch sidecar/control socket per mutually trusted application group.</li>
         <li>Gate rollout on <code>/birdz/ready</code>, not liveness alone.</li>
