@@ -18,7 +18,8 @@ export default function CliReference() {
       <div className="docs-note">
         <b>Driving finch with an agent?</b> <code>finch guide</code> prints a complete,
         self-contained operating manual. Point an agent at it once and it can run the
-        whole loop: serve, test, grant and revoke access.
+        whole loop: serve, test, grant and revoke access. The same guidance is hosted
+        at <a href="/llms.txt">/llms.txt</a>.
       </div>
 
       <h2>Setup</h2>

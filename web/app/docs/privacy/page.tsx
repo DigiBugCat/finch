@@ -21,8 +21,8 @@ export default function PrivacyAndDataHandling() {
         the box agent to your service, is your configuration choice: the agent
         allows plaintext HTTP to a loopback address and to single-label hosts
         (such as a Docker Compose service name). Single-label names can resolve
-        off the box, and when they do that hop crosses your network in the clear
-        — so use <code>https://</code> for any upstream that is not on the box
+        off the box, and when they do, that hop crosses your network in the clear.
+        Use <code>https://</code> for any upstream that is not on the box
         itself.
       </p>
       <div className="docs-note">
