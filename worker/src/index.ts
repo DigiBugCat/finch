@@ -167,6 +167,11 @@ export function secureTransport(req: Request, env: Env): boolean {
 // from summing past DO heap. Enforced here pre-stub AND in BoxDO.fetch.
 const MAX_RELAY_BODY_BYTES = 4 * 1024 * 1024; // 4 MiB
 
+// Max body accepted by the legacy /register fallback. That branch runs BEFORE
+// tenant resolution and RELAY_LIMIT, so it is the cheapest unauthenticated path
+// into this Worker; RFC 7591 client metadata is a handful of fields.
+const MAX_DCR_BODY_BYTES = 64 * 1024; // 64 KiB
+
 // Browser login-wall session cookie lifetime (12h). The cookie is the long-lived
 // proof a browser already cleared the Clerk wall; the portal hand-off grant that
 // mints it is short (~60s, single-use). 12h balances "don't re-login constantly"
@@ -873,8 +878,8 @@ export default {
         // included) and records Clerk's `issuer` — the same value Clerk stamps
         // on the authorization response as `iss` (RFC 9207). A finch-hosted AS
         // document with any other issuer fails that check and current MCP SDKs
-        // abort the flow, so the hub serves no AS metadata and no /register
-        // proxy of its own. Clients that DCR without a `scope` get Clerk's
+        // abort the flow, so the hub serves no AS metadata of its own (only a
+        // byte-for-byte legacy /register fallback, below). Clients that DCR without a `scope` get Clerk's
         // instance default_scopes (must include openid + email — an instance
         // setting, not something the hub can inject any more).
         // Trailing slash stripped: the pointer must equal Clerk's `issuer`.
@@ -893,6 +898,34 @@ export default {
           "content-type": "application/json",
           "access-control-allow-origin": "*",
         },
+      });
+    }
+
+    // ---- Legacy DCR fallback. Some Claude builds ignore the discovered
+    //      registration_endpoint and POST /register on the MCP resource's own
+    //      origin. Forward those, byte for byte, to Clerk's registration
+    //      endpoint so they still get a Clerk client_id. No scope injection any
+    //      more: Clerk's instance default_scopes covers scope-less clients.
+    //      This runs before tenant resolution and rate limiting, so the body
+    //      is capped tight; a real RFC 7591 document is a few KB. ----
+    if (
+      req.method === "POST" &&
+      parts.length === 1 &&
+      parts[0] === "register" &&
+      env.CLERK_ISSUER
+    ) {
+      let raw: Uint8Array | undefined;
+      try {
+        raw = await readBoundedBody(req, MAX_DCR_BODY_BYTES);
+      } catch {
+        return json(400, { error: "invalid request body" });
+      }
+      if (raw === undefined) return json(413, { error: "request body too large" });
+      return fetch(`${env.CLERK_ISSUER.replace(/\/+$/, "")}/oauth/register`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: raw,
+        redirect: "manual",
       });
     }
 

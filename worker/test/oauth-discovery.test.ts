@@ -6,11 +6,11 @@
 //      priority-2 source; without either, claude.ai requests EVERYTHING the AS
 //      supports — metadata scopes included — bloating consent + overgranting),
 //   3. that the AS pointer names Clerk ITSELF and the hub serves no AS metadata
-//      or /register of its own. Clerk stamps its own issuer on the
+//      of its own (only a byte-for-byte legacy /register fallback). Clerk stamps its own issuer on the
 //      authorization response (RFC 9207 `iss`); a hub-hosted AS doc with a
 //      different `issuer` made current MCP SDKs abort every flow with an
 //      issuer mismatch.
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import {
   env,
   createExecutionContext,
@@ -176,18 +176,47 @@ describe("no hub-hosted authorization server", () => {
     });
   }
 
-  it("does not proxy POST /register to Clerk", async () => {
-    // Clients register at Clerk's own registration_endpoint now. The old
-    // proxy forwarded to CLERK_ISSUER (a dead origin in this env), so a
-    // regression would surface as a 5xx from the failed upstream fetch.
+  it("forwards a legacy POST /register to Clerk byte for byte, with no scope injection", async () => {
+    // Some Claude builds POST /register on the resource origin instead of the
+    // discovered registration_endpoint. The hub hands those to Clerk unchanged.
+    const doc = JSON.stringify({ redirect_uris: ["https://client.test/cb"], client_name: "c" });
+    const seen: { url: string; body: string; redirect?: string }[] = [];
+    const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = typeof input === "string" ? input : (input as Request).url;
+      seen.push({
+        url,
+        body: new TextDecoder().decode(init?.body as Uint8Array),
+        redirect: init?.redirect,
+      });
+      return new Response(JSON.stringify({ client_id: "cid" }), {
+        status: 201,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    try {
+      const res = await call(
+        new Request(`${BASE}/register`, {
+          method: "POST",
+          headers: { host: HOST, "content-type": "application/json" },
+          body: doc,
+        }),
+        { CLERK_ISSUER: "https://clerk.test/" },
+      );
+      expect(res.status).toBe(201);
+      expect(seen).toEqual([{ url: "https://clerk.test/oauth/register", body: doc, redirect: "manual" }]);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("caps the legacy /register body", async () => {
     const res = await call(
       new Request(`${BASE}/register`, {
         method: "POST",
         headers: { host: HOST, "content-type": "application/json" },
-        body: JSON.stringify({ redirect_uris: ["https://client.test/cb"] }),
+        body: "x".repeat(64 * 1024 + 1),
       }),
     );
-    expect(res.status).toBeGreaterThanOrEqual(400);
-    expect(res.status).toBeLessThan(500);
+    expect(res.status).toBe(413);
   });
 });
