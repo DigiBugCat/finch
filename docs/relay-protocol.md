@@ -133,6 +133,53 @@ that emits a progress event every ~15s stays alive indefinitely; a genuinely
 silent stream is reaped. Cloudflare allows this — an actively-streaming Worker
 response has no duration limit.
 
+### Long-lived event streams (shipped)
+
+The idle rule is wrong for one class of response: an event stream that is
+*supposed* to be silent. MCP 2026-07-28's `subscriptions/listen` (and the older
+standalone `GET /mcp`) is a single `text/event-stream` response held open until
+the server pushes; closing it is how the client cancels. So, in `BoxDO`
+(`worker/src/box-do.ts`):
+
+- **Classification is by media type only.** When a head's `content-type` is
+  `text/event-stream` (parameters and case ignored), the stream is moved into a
+  separate **event-stream budget** (`MAX_EVENT_STREAMS_PER_BOX` = 16). The relay
+  still never reads the body, so an SSE-framed `tools/call` response is treated
+  the same way — harmless, it ends when the tool does.
+- **No idle timer** while in that budget. It ends on a real teardown: upstream
+  `end`/`reset`, agent socket death, or client disconnect (the response body's
+  `cancel()` → `reset` to the agent).
+- **Off the ordinary cap.** Admitted event streams don't count against
+  `MAX_STREAMS_PER_BOX` (32), so open subscribers can't 429 ordinary calls. The
+  agent's `maxRelayInFlight` is the sum of the two budgets (48); a Go test reads
+  both worker constants to keep them in lockstep.
+- **Budget full →** the event stream silent the longest is reset *if* it has
+  been silent ≥ `RELAY_IDLE_MS`; otherwise the new stream is still delivered but
+  stays an ordinary stream (counted against the ordinary cap, idle-reaped) —
+  i.e. the pre-budget behaviour. It is never refused at head time, because its
+  request has already run upstream.
+- **No hub-injected keep-alives.** The relay never writes into the byte stream.
+  The cost, measured in workerd: a client disconnect reaches `cancel()` only when
+  the stream next carries a byte. A silent stream whose client has gone lingers
+  until the upstream writes (most SSE servers send periodic `:` comments; the MCP
+  Python SDK does every 15s), the agent link drops, or its slot is reclaimed as
+  above. Such zombies are confined to the event budget, and while one is open
+  it keeps the BoxDO resident.
+- The **agent** has no idle or total timeout on a forward (only the WS
+  keep-alive ping and per-frame write deadline), so nothing on the box side cuts
+  a quiet stream either.
+
+## Header fidelity
+
+The relay forwards request headers byte-for-byte except those the hub accepts a
+credential in: `Authorization`, `Proxy-Authorization`, every `X-Finch-*` header
+(the namespace is hub-reserved; `X-Finch-Assertion` is minted afterwards), and
+the login-wall cookie pairs inside `Cookie`. The scrub is by **name**, never by
+value — MCP 2026-07-28's `Mcp-Name` / `Mcp-Param-*` mirror the JSON-RPC body,
+and deleting one because a tool or argument happened to contain `finch_` makes
+the server reject the call as a header/body mismatch (400, -32020). Unknown
+`Mcp-*` headers, and `GET` / `DELETE`, pass through untouched.
+
 ## Session affinity
 
 The relay does **not** parse MCP bodies, but it may read the `Mcp-Session-Id`
@@ -151,7 +198,8 @@ trivially. (Do **not** use cookie affinity — MCP clients drop `Set-Cookie`.)
   `new Response(readableStream, {status, headers})` fed from `HEAD`+`DATA(down)`.
 - `index.ts`: drop the `MAX_RELAY_BODY_BYTES` whole-body cap and the
   `req.arrayBuffer()` buffer in `relayMcp`; stream `req.body` into `DATA(up)`.
-  Keep the finch_ auth + key-strip exactly as-is (that's the trust boundary).
+  Keep the finch_ auth + key-strip (that's the trust boundary; the strip is now
+  by header name — see Header fidelity above).
 - `agent/main.go`: replace the `frame{…Body string}` model + `io.ReadAll`
   (`forward()`) with a yamux session + `httputil.ReverseProxy` (streams natively,
   no buffering). `--upstream` becomes a `route → upstream` table (multi-server).

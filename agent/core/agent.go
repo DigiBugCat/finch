@@ -974,15 +974,18 @@ type outStream struct {
 const (
 	maxRelayRequestIDBytes = 256
 
-	// maxRelayInFlight mirrors MAX_STREAMS_PER_BOX in worker/src/box-do.ts. Keep
-	// the two in lockstep: the DO admits that many concurrent streams per box
-	// precisely to cover a page's subresource burst, so a SMALLER agent-side cap
-	// is not extra safety — it is a hole. The DO has already accepted requests
-	// 17..32 and is holding their clients when the agent answers each with a
-	// terminal 429 ("too many in-flight relay requests"), so the advertised
-	// capacity is unreachable and an ordinary multi-resource page fails well
-	// inside the limit the relay was sized for.
-	maxRelayInFlight = 32
+	// maxRelayInFlight mirrors MAX_STREAMS_PER_BOX + MAX_EVENT_STREAMS_PER_BOX in
+	// worker/src/box-do.ts. Keep them in lockstep: the DO admits that many
+	// concurrent streams per box — the ordinary pool sized to cover a page's
+	// subresource burst, plus a separate budget for long-lived text/event-stream
+	// responses (MCP subscriptions/listen) so idle subscribers can't starve
+	// request/response calls. A SMALLER agent-side cap is not extra safety — it
+	// is a hole. The DO has already accepted the extra requests and is holding
+	// their clients when the agent answers each with a terminal 429 ("too many
+	// in-flight relay requests"), so the advertised capacity is unreachable; and
+	// since the agent can't tell an event stream from an ordinary one at `req`
+	// time, open subscribers would again crowd out ordinary calls here.
+	maxRelayInFlight = 48
 
 	// maxRelayBodyBytes mirrors MAX_RELAY_BODY_BYTES in worker/src/box-do.ts (and
 	// worker/src/index.ts): the largest request body the Worker will ever hand to
@@ -1245,8 +1248,11 @@ const relayChunkSize = 32 << 10
 // the relay is otherwise an SSRF foothold into the box's loopback.
 //
 // There is NO total timeout: a long-running ("thinking") tool or an open SSE
-// stream may legitimately run for minutes. The relay ctx still cancels the
-// upstream request when the link drops (the DO's idle timeout fires the abort).
+// stream may legitimately run for minutes, and an MCP subscriptions/listen
+// event stream may sit silent indefinitely. There is no idle timeout here
+// either: the relay ctx cancels the upstream request when the link drops or
+// the DO sends `reset` (client disconnect, or its idle timeout for a
+// non-event-stream response).
 //
 // Backpressure: `os` carries the flow-control state set by inbound `window`
 // frames. BEFORE sending each body chunk forward() blocks while os.paused (on

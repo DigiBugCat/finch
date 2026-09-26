@@ -1282,6 +1282,26 @@ async function callerLabel(
   }
 }
 
+/** The relay's OAuth `WWW-Authenticate: Bearer` challenge (RFC 6750 §3), for the
+ *  401 (no credential) and the 403 insufficient_scope step-up.
+ *
+ *  resource_metadata names the metadata document for the resource the client
+ *  ACTUALLY requested — `/.well-known/oauth-protected-resource` + the request
+ *  path, still percent-encoded — so the .well-known handler answers with
+ *  `resource` equal to that URL. The MCP auth spec requires a client to reject
+ *  metadata discovered this way whose `resource` differs from the URL it
+ *  called; the old hard-coded `/<svc>/mcp` broke that for a pinned
+ *  /<svc>/<box>/mcp and for every non-/mcp route. */
+function relayBearerChallenge(req: Request, error?: string): string {
+  const u = new URL(req.url);
+  const params = [
+    ...(error ? [`error="${error}"`] : []),
+    `resource_metadata="https://${u.host}/.well-known/oauth-protected-resource${u.pathname}"`,
+    `scope="${MCP_SCOPES.join(" ")}"`,
+  ];
+  return `Bearer ${params.join(", ")}`;
+}
+
 /** Extract a Bearer finch_ key, check it against the tenant's TenantDO, relay to
  *  the per-box BoxDO, and record the call. 401 if the key is absent or
  *  not allowed for this service. `boxOrPool` is a single box name (the
@@ -1358,7 +1378,22 @@ async function relayMcp(
       if (who && id) {
         const gate = await tenantOp<{allowed:boolean;reason?:string}>(env,tenant,"gateOauth",{clerkUserId:id,email:(who.email||"").trim().toLowerCase(),orgIdClaim:who.org_id,service});
         if (!gate.allowed) {
-          if ((gate.reason === "no-email" || gate.reason === "needs-email") && !who.email) return json(403,{error:"token has no email claim — reconnect this connector so it can request the email scope"});
+          // A token that verified but lacks the email claim is a SCOPE problem the
+          // client can fix by re-authorizing, so say so in the machine-readable
+          // step-up form (RFC 6750 §3.1 insufficient_scope) rather than a bare
+          // JSON 403 that MCP clients treat as terminal.
+          if ((gate.reason === "no-email" || gate.reason === "needs-email") && !who.email) {
+            return new Response(
+              JSON.stringify({ error: "token has no email claim — reconnect this connector so it can request the email scope" }),
+              {
+                status: 403,
+                headers: {
+                  "content-type": "application/json",
+                  "www-authenticate": relayBearerChallenge(req, "insufficient_scope"),
+                },
+              },
+            );
+          }
           return json(403,{error:"your account is not granted access to this app"});
         }
         oauthAuthed=true; caller=`oauth:${id}`; edgeCaller={sub:`user:${id}`,authMethod:"oauth"};
@@ -1404,10 +1439,7 @@ async function relayMcp(
           // scope is the client's PRIORITY-1 source for what to request
           // (claude.ai: challenge scope > resource-metadata scopes_supported >
           // everything the AS supports) — identity only, see MCP_SCOPES.
-          headers["www-authenticate"] =
-            `Bearer resource_metadata="https://${new URL(req.url).host}` +
-            `/.well-known/oauth-protected-resource/${service}/mcp", ` +
-            `scope="${MCP_SCOPES.join(" ")}"`;
+          headers["www-authenticate"] = relayBearerChallenge(req);
         }
         return new Response(
           JSON.stringify({ error: "missing or malformed finch_ bearer key" }),
@@ -1439,15 +1471,31 @@ async function relayMcp(
     typeof boxOrPool === "string" ? [boxOrPool] : boxOrPool;
 
   // KEY-STRIP: the caller's finch_ key must NEVER cross the trust boundary into
-  // the box's local upstream. Clone the headers and delete the Authorization
-  // header (and any header that still carries a finch_ value) BEFORE building
-  // the relay request. The agent strips hop-by-hop headers as defense-in-depth,
-  // but the credential must be gone at the source. (If a box upstream needs its
-  // own auth, inject a per-service secret downstream — never the caller key.)
+  // the box's local upstream. Clone the headers and delete every header the hub
+  // accepts a credential in BEFORE building the relay request. The agent strips
+  // Authorization again as defense-in-depth, but the credential must be gone at
+  // the source. (If a box upstream needs its own auth, inject a per-service
+  // secret downstream — never the caller key.)
+  //
+  // The scrub is BY NAME, not by value. The hub reads a finch_ key or OAuth
+  // token only from `Authorization: Bearer`, the login-wall session only from
+  // the finch_session cookie, and the dashboard's service secret + tenant
+  // assertion only from X-Finch-Service / X-Finch-Auth — so those are what go.
+  // Every other header is forwarded byte-for-byte. This used to also delete ANY
+  // header whose value merely contained "finch_", which dropped MCP
+  // 2026-07-28's Mcp-Name / Mcp-Param-* mirrors for a tool or argument named
+  // like `finch_search`; the server then rejects the call as a header/body
+  // mismatch (400 -32020). Those headers mirror the JSON-RPC body, which the
+  // relay forwards untouched anyway, so scrubbing them protected nothing.
   const relayHeaders = new Headers(req.headers);
   relayHeaders.delete("authorization");
-  relayHeaders.delete("x-finch-service"); // never leak the service secret to a box
-  relayHeaders.delete("x-finch-auth");
+  relayHeaders.delete("proxy-authorization");
+  // The whole X-Finch-* namespace is hub-reserved: X-Finch-Service (the service
+  // secret), X-Finch-Auth, and the identity headers stripped at the edge. The
+  // only one a box may ever see, X-Finch-Assertion, is minted AFTER this runs.
+  for (const name of [...relayHeaders.keys()]) {
+    if (name.startsWith("x-finch-")) relayHeaders.delete(name);
+  }
   // Surgically remove ONLY the finch_session login-wall cookie from the Cookie
   // header, leaving the hosted app's own cookies (e.g. app_sid) intact. (#1)
   const cookieHeader = relayHeaders.get("cookie");
@@ -1455,13 +1503,6 @@ async function relayMcp(
     const remaining = stripSessionCookie(cookieHeader);
     if (remaining) relayHeaders.set("cookie", remaining);
     else relayHeaders.delete("cookie");
-  }
-  for (const [name, value] of [...relayHeaders.entries()]) {
-    // SKIP the cookie header — it's already sanitized above, and a hosted app's
-    // own cookie value could legitimately contain "finch_"; only a bearer KEY is
-    // the real secret. Strip any OTHER header still carrying a finch_ value.
-    if (name === "cookie") continue;
-    if (value.includes("finch_")) relayHeaders.delete(name);
   }
   // Buffer the body ONCE so we can replay it across failover candidates (a
   // streaming body can't be re-sent). Enforce the real size cap here too, since

@@ -258,23 +258,28 @@ func TestJoinStillRejectsDifferentBoxAfterNormalization(t *testing.T) {
 	}
 }
 
-// The DO admits MAX_STREAMS_PER_BOX concurrent streams per box; a smaller
+// The DO admits MAX_STREAMS_PER_BOX ordinary streams plus
+// MAX_EVENT_STREAMS_PER_BOX long-lived event streams per box; a smaller
 // agent-side cap is not extra safety but a hole — the DO accepts requests the
 // agent then answers with a terminal 429, so the advertised relay capacity is
-// unreachable. Read the worker's constant rather than restating it, so the two
-// cannot drift silently.
+// unreachable. Read the worker's constants rather than restating them, so the
+// two cannot drift silently.
 func TestRelayInFlightLimitMatchesTheWorker(t *testing.T) {
 	src, err := os.ReadFile("../../worker/src/box-do.ts")
 	if err != nil {
 		t.Skipf("worker source not present: %v", err)
 	}
-	m := regexp.MustCompile(`MAX_STREAMS_PER_BOX\s*=\s*(\d+)`).FindSubmatch(src)
-	if m == nil {
-		t.Fatal("MAX_STREAMS_PER_BOX not found in worker/src/box-do.ts")
-	}
-	want, err := strconv.Atoi(string(m[1]))
-	if err != nil {
-		t.Fatalf("unparsable MAX_STREAMS_PER_BOX: %v", err)
+	want := 0
+	for _, name := range []string{"MAX_STREAMS_PER_BOX", "MAX_EVENT_STREAMS_PER_BOX"} {
+		m := regexp.MustCompile(`const ` + name + `\s*=\s*(\d+)`).FindSubmatch(src)
+		if m == nil {
+			t.Fatalf("%s not found in worker/src/box-do.ts", name)
+		}
+		n, err := strconv.Atoi(string(m[1]))
+		if err != nil || n <= 0 {
+			t.Fatalf("unparsable %s: %q", name, m[1])
+		}
+		want += n
 	}
 	if maxRelayInFlight != want {
 		t.Errorf("maxRelayInFlight = %d, but the DO admits %d streams per box", maxRelayInFlight, want)
