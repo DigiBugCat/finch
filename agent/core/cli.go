@@ -1,22 +1,22 @@
 package core
 
 // finch CLI setup commands — `finch login` and `finch add`. Together they let a
-// box enroll services and build its finch.yml with no dashboard round-trips
-// after one browser approval (cloudflared's `tunnel login` + `tunnel create`):
+// box enroll services and build its finch.yml with no web round-trips after
+// one browser approval (cloudflared's `tunnel login` + `tunnel create`):
 //
 //	finch login                                  # one browser approval, FIRST box only
 //	finch add printer --service http://:8000     # enroll + append an ingress rule
 //	finch run                                    # serve everything in finch.yml
 //
 // On a FRESH box `finch login` is the only bootstrap: `finch token` cannot be,
-// because cmdToken (cli.go:1009) opens with loadCliCred(), which exits "not
-// logged in" (cli.go:278) when no credential exists yet — `finch token | finch
-// login --token -` is circular on box #1. Every LATER box skips the browser by
+// because cmdToken opens with loadCliCred(), which exits "not logged in" when
+// no credential exists yet — `finch token | finch login --token -` is circular
+// on box #1. Every LATER box skips the browser by
 // piping a token from a box that is already logged in:
 //
 //	finch token | ssh newbox "finch login --token -"   # token never hits argv
 //
-// The CLI token is a long-lived tenant assertion the dashboard issues; the box
+// The CLI token is a long-lived tenant assertion the hub issues; the box
 // presents it as `Authorization: Bearer <token>` to /api/cli/*.
 
 import (
@@ -51,12 +51,13 @@ finch publishes a LOCAL service on the public internet — authenticated, with N
 open ports. The box dials OUT to the finch hub; clients reach it at a stable
 https://<your-slug>.finchmcp.com/<app_path>/ URL. finch is a protocol-agnostic
 tunnel: the service can be an MCP server, a website, or any HTTP/WebSocket app.
-You (an agent) drive everything from this CLI. Every command is non-interactive
-and supports --json.
+You (an agent) drive everything from this CLI on macOS or Linux. Every command
+is non-interactive and supports --json.
 
 ## The only human step
-'finch login' needs a human ONCE (it opens a browser to approve a short code).
-After that you operate freely. Already logged in? Check:  finch status --json
+'finch login' needs a human ONCE (it prints a link + code to approve on any
+device). After that you operate freely. Already logged in? Check:
+  finch status --json
 
 ## Host a service (the core loop)
 1. Make sure your service is running locally over HTTP, e.g. http://127.0.0.1:8000
@@ -69,15 +70,6 @@ After that you operate freely. Already logged in? Check:  finch status --json
 more services with more 'finch add' calls — one process fronts them all, and it
 auto-approves while you are logged in).
 
-## Enroll on another box (no CLI login there)
-Mint a ticket in the dashboard (Add box), then on the box:
-  finch enroll printer --ticket <ticket>     # writes the credential, one time
-  finch run                                  # resumes ticketless thereafter
-Tickets are one-shot credentials — they live on disk via enroll, NEVER in finch.yml.
-Keep the ticket off the remote argv/shell history: pipe it to stdin with
-'--ticket -' (or set FINCH_TICKET), e.g.
-  echo <ticket> | ssh newbox "finch enroll printer --ticket -"
-
 ## Test an endpoint
   finch test printer                          # list the service's MCP tools
   finch call printer echo --args '{"text":"hi"}'   # invoke one tool
@@ -89,6 +81,9 @@ A caller (another agent/app) reaches your server with a finch_ bearer key:
   finch keys revoke <id>                            # access stops immediately
 The client then calls:
   POST https://<slug>.finchmcp.com/printer/mcp   with header  Authorization: Bearer finch_...
+OAuth-capable MCP clients (e.g. claude.ai custom connectors) can use the same URL
+with no key: they sign in to finch with your account. To serve with NO auth:
+  finch auth printer public                       # 'finch auth printer key' to undo
 
 ## Provision ANOTHER box, no human in the loop
 From a box that is already logged in:
@@ -115,8 +110,8 @@ world-readable on the remote box and kept in shell/SSH history.
 
 ## Good to know
 - --json works on add / token / status / fleet / keys / test / call for parsing.
-- The CLI token is a tenant-admin credential (~30 days). Revoke everything with:
-    finch revoke-tokens   (or the dashboard -> Settings -> CLI access)
+- The CLI token is a tenant-admin credential (~30 days). Revoke every CLI login
+  at once with:  finch revoke-tokens
 - 'finch rm <service>' removes a service; 'finch approve <app_path>' is only
   needed if you are not logged in (otherwise 'finch run' approves automatically).
 - See 'finch help' for the flag-level reference.
@@ -127,23 +122,21 @@ world-readable on the remote box and kept in shell/SSH history.
 // (Go's flag package only prints per-flag usage; this ties it together.)
 func printUsage() {
 	fmt.Print(`finch — publish local services (MCP servers, web apps, any HTTP/WS) through the
-finch hub. Your box dials OUT, so nothing listens and no ports are opened.
+finch hub from macOS or Linux. Your box dials OUT, so nothing listens and no
+ports are opened.
 
 Usage:
   finch version [--json]              Show this binary's version and platform
-  finch login [--hub URL]              Log in (opens the browser to approve a code)
+  finch login [--hub URL]              Log in (prints a link + code to approve on any device)
   finch login --token -                Log in with a token piped on stdin (or FINCH_CLI_TOKEN);
                                           keeps the tenant-admin token off argv/history
-  finch login --headless               Log in on a screenless box over SSH: prints a link
+  finch login --headless               Log in on a screenless box over SSH: prints the link
                                           + code (approve on your phone), no local browser
   finch add <app_path> --service <url> Enroll a service and append it to finch.yml
                                           <app_path> becomes the URL: <slug>.finchmcp.com/<app_path>/
-  finch enroll <app_path> --ticket <t> Save a box-side credential from a dashboard ticket (one time)
   finch run [--config finch.yml]       Serve every ingress rule (auto-approves when logged in)
   finch approve <app_path>             Approve a service (clear the pending gate)
-  finch aviary serve                   SDK-owned zero-config control runtime
-  finch aviary describe <code>         Inspect a pending Aviary device enrollment
-  finch aviary approve <code> [--public]   Approve it (private by default)
+  finch auth <app_path> public|key     Make a service open to anyone, or require a finch_ key
   finch token [--json|--login]         Mint a fresh CLI token (provision a new box, no browser)
   finch status [--json]                Show login + what finch.yml serves
   finch fleet [--json]   (alias: ls)   List this account's services + state
@@ -154,7 +147,6 @@ Usage:
   finch rm <service>                 Remove a service
   finch update [--force]               Self-update this binary + restart the serve cleanly
   finch revoke-tokens                  De-authorize every CLI login (incl. this box)
-  finch join --ticket <t> --upstream <url>   Run one service straight from flags
   finch guide                          Full agent operating manual (point an AI agent at this)
   finch help                           Show this help
 
@@ -162,14 +154,14 @@ Driving finch with an AI agent? Run 'finch guide' for a complete manual it can
 follow, or just tell it: "use finch — run 'finch guide' first."
 
 Typical first-time setup:
-  finch login --hub https://finchmcp.com   # browser approval, once
+  finch login --hub https://finchmcp.com   # approve a code, once
   finch add printer --service http://127.0.0.1:8000
   finch run
 
 Automation / driving finch from an agent (after the one-time 'finch login'):
-  Everything below is non-interactive and supports --json. No browser, no
-  dashboard. The CLI token is a tenant-admin credential, so an agent can do the
-  whole loop: introspect, serve, test, and grant/revoke access.
+  Everything below is non-interactive and supports --json. No browser needed.
+  The CLI token is a tenant-admin credential, so an agent can do the whole
+  loop: introspect, serve, test, and grant/revoke access.
 
   Introspect:
     finch status --json            # am I logged in? what does finch.yml serve?
@@ -193,6 +185,9 @@ Automation / driving finch from an agent (after the one-time 'finch login'):
   Provision a NEW box from this already-authed one, zero human in the loop:
     finch token | ssh user@newbox 'finch login --token -'   # token never hits argv
     ssh user@newbox 'finch add api --service http://127.0.0.1:9000 && finch run'
+
+Boxes enrolled with the original one-liner keep working: 'finch join --upstream
+<url>' (optionally '--ticket') serves a single service from ~/.finch/agent.json.
 
 Run 'finch <command> -h' for a command's own flags.
 `)
@@ -275,7 +270,7 @@ func loadCliCred() (*cliCred, error) {
 		return nil, err
 	}
 	if b == nil {
-		return nil, fmt.Errorf("not logged in — run `finch login` first (no browser here? the dashboard → Settings → CLI access → Generate → Copy gives a ready-to-run `finch login` block to paste)")
+		return nil, fmt.Errorf("not logged in — run `finch login` first (no browser here? `finch login --headless` prints a link to approve on any device, or pipe a token from a logged-in box: finch token | ssh thisbox 'finch login --token -')")
 	}
 	var c cliCred
 	if err := json.Unmarshal(b, &c); err != nil {
@@ -376,76 +371,6 @@ func cmdApprove(args []string) {
 	}
 }
 
-// cliAviaryDecision applies a tenant-admin decision to the proof-bound Aviary
-// service enrollment transaction. The short code only identifies the pending
-// request; authorization comes exclusively from the saved, revocable CLI token.
-func cliAviaryDecision(cred *cliCred, action, userCode string, publicApproved bool) (map[string]any, error) {
-	body := map[string]any{"user_code": strings.TrimSpace(userCode)}
-	if action == "approve" {
-		body["public_approved"] = publicApproved
-	}
-	return cliRequest("POST", cred.Hub, "/api/cli/aviary/"+action, cred.Token, body)
-}
-
-// cmdAviary provides the headless counterpart to the browser enrollment page.
-// Public Internet exposure is never implied: a public manifest is approved only
-// when the operator supplies the conspicuous --public capability flag.
-func cmdAviary(args []string) {
-	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: finch aviary [serve | describe <code> | approve <code> [--public] [--json]]")
-		os.Exit(2)
-	}
-	action, args := args[0], args[1:]
-	if action == "serve" {
-		runAviaryServe(args)
-		return
-	}
-	if action != "describe" && action != "approve" {
-		fmt.Fprintln(os.Stderr, "usage: finch aviary [serve | describe <code> | approve <code> [--public] [--json]]")
-		os.Exit(2)
-	}
-	fs := flag.NewFlagSet("aviary "+action, flag.ExitOnError)
-	publicApproved := fs.Bool("public", false, "explicitly approve a public Internet endpoint")
-	asJSON := fs.Bool("json", false, "JSON output")
-	userCode := ""
-	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-		userCode, args = args[0], args[1:]
-	}
-	_ = fs.Parse(args)
-	if userCode == "" && fs.NArg() > 0 {
-		userCode = fs.Arg(0)
-	}
-	if strings.TrimSpace(userCode) == "" {
-		fmt.Fprintf(os.Stderr, "usage: finch aviary %s <code>%s\n", action, func() string {
-			if action == "approve" {
-				return " [--public] [--json]"
-			}
-			return " [--json]"
-		}())
-		os.Exit(2)
-	}
-	if action == "describe" && *publicApproved {
-		fmt.Fprintln(os.Stderr, "finch: --public is only valid with `finch aviary approve`")
-		os.Exit(2)
-	}
-	cred, err := loadCliCred()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
-		os.Exit(1)
-	}
-	out, err := cliAviaryDecision(cred, action, userCode, *publicApproved)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "finch: Aviary enrollment %s failed: %v\n", action, err)
-		os.Exit(1)
-	}
-	if *asJSON || action == "describe" {
-		b, _ := json.MarshalIndent(out, "", "  ")
-		fmt.Println(string(b))
-		return
-	}
-	fmt.Printf("finch: Aviary enrollment %s (%s)\n", out["status"], strings.ToUpper(strings.TrimSpace(userCode)))
-}
-
 // cliSetAuth flips a service's public-relay access mode ("key" | "public").
 func cliSetAuth(cred *cliCred, appPath, mode string) error {
 	_, err := cliRequest("POST", cred.Hub, "/api/cli/auth", cred.Token, map[string]string{"service": appPath, "mode": mode})
@@ -472,9 +397,9 @@ func cmdAuth(args []string) {
 }
 
 // resolveCliToken applies argv-free intake for the CLI token, mirroring
-// resolveTicket (cli.go:1131): "-" reads the token from stdin and FINCH_CLI_TOKEN
+// resolveTicket: "-" reads the token from stdin and FINCH_CLI_TOKEN
 // is the env fallback. It matters strictly MORE here than for a ticket — the CLI
-// token is a ~30-day TENANT-ADMIN assertion (see saveCliCred, cli.go:249), while a
+// token is a ~30-day TENANT-ADMIN assertion (see saveCliCred), while a
 // ticket is one-shot and scoped to a single service — yet until now it could only
 // arrive on argv, where it is readable by any local user via /proc/<pid>/cmdline
 // and is persisted verbatim into shell/SSH history.
@@ -553,7 +478,7 @@ func cmdLogin(args []string) {
 }
 
 // deviceLogin runs the browser device-authorization flow (`finch login` with no
-// token): start a code, point the user at the dashboard to approve it, poll until
+// token): start a code, point the user at the hub's /cli page to approve it, poll until
 // approved, and return the issued token plus the approver's email (for the account
 // label; may be ""). Exits on error/expiry/timeout.
 //
@@ -629,8 +554,6 @@ func openBrowser(u string) {
 	switch runtime.GOOS {
 	case "darwin":
 		name, args = "open", []string{u}
-	case "windows":
-		name, args = "rundll32", []string{"url.dll,FileProtocolHandler", u}
 	default:
 		name, args = "xdg-open", []string{u}
 	}
@@ -813,7 +736,7 @@ func cmdDomain(args []string) {
 
 // cmdKeys: finch keys [list|mint|revoke] — manage the client finch_ keys that
 // callers present to reach your services. The control plane an agent uses to
-// grant + REVOKE access without the dashboard.
+// grant + REVOKE access.
 func cmdKeys(args []string) {
 	sub := "list"
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
@@ -976,16 +899,15 @@ func cmdRevokeTokens(args []string) {
 const loginHeredocDelimiter = "FINCH_CLI_TOKEN"
 
 // loginCommand renders a copy-pasteable `finch login` that keeps the ~30-day
-// tenant-admin token OFF argv, for the two places that hand a user a whole
-// command instead of a bare token: `finch token --login` (below) and the
-// dashboard's Settings → CLI access copy button (web/components/dash/settings.tsx).
+// tenant-admin token OFF argv, for `finch token --login` (below), which hands a
+// user a whole command instead of a bare token.
 //
 // The obvious form — `finch login --hub <hub> <token>` — leaks: argv is
 // world-readable via /proc/<pid>/cmdline for the life of the process, and the
 // pasted line is persisted verbatim into ~/.bash_history / ~/.zsh_history. It
 // leaked worst exactly where it was most used, since callers pipe a printed
 // command straight into a shell. A heredoc instead delivers the token on the
-// login process's STDIN (resolveCliToken, cli.go:485, reads "-" from stdin), so
+// login process's STDIN (resolveCliToken reads "-" from stdin), so
 // nothing but the hub is ever visible in the process table.
 //
 // The heredoc body is written by the shell itself, so this stays a single
@@ -1056,7 +978,6 @@ func cmdStatus(args []string) {
 		Tenant   string          `json:"tenant,omitempty"`
 		Config   string          `json:"config,omitempty"`
 		Ingress  []ingressStatus `json:"ingress"`
-		Services []ServiceStatus `json:"services,omitempty"`
 	}{Ingress: []ingressStatus{}}
 
 	if cred := loadCliCredQuiet(); cred != nil {
@@ -1075,9 +996,6 @@ func cmdStatus(args []string) {
 		for _, ing := range cfg.Ingress {
 			st.Ingress = append(st.Ingress, ingressStatus{AppPath: ing.AppPath, Service: ing.Service})
 		}
-	}
-	if services, err := readRuntimeServices(); err == nil {
-		st.Services = services
 	}
 
 	if *asJSON {
@@ -1102,12 +1020,6 @@ func cmdStatus(args []string) {
 		}
 	} else {
 		fmt.Println("no finch.yml here — `finch add <app_path> --service <url>` to create one")
-	}
-	if len(st.Services) > 0 {
-		fmt.Printf("running agent has %d effective service(s):\n", len(st.Services))
-		for _, service := range st.Services {
-			fmt.Printf("  • %-16s → %-12s (%s, %s)\n", service.AppPath, service.State, service.Source, service.Upstream)
-		}
 	}
 }
 
@@ -1209,16 +1121,11 @@ func cmdAdd(args []string) {
 	fmt.Printf("       wrote rule to %s — run `finch run` to serve it\n", *configPath)
 }
 
-// cmdEnroll: finch enroll <app_path> --ticket <t> [--hub …] [--box …] [--credentials-dir …]
-//
-// The one-time, imperative enrollment step: it trades a one-shot dashboard ticket
-// for the long-lived box-side refresh credential and writes it to
-// <credentials-dir>/<app_path>.json. After this, `finch run` resumes ticketless.
-// Tickets are a credential, so they live here / on disk — never in finch.yml.
-// resolveTicket applies argv-free intake for an enrollment ticket: "-" reads it
-// from stdin and FINCH_TICKET from the env — so a one-shot ticket (which mints
-// the long-lived refresh token) need not land on the remote process table /
-// shell history. A literal value passes through unchanged.
+// resolveTicket applies argv-free intake for a single-service `finch join`
+// enrollment ticket: "-" reads it from stdin and FINCH_TICKET from the env — so
+// a one-shot ticket (which mints the long-lived refresh token) need not land on
+// the remote process table / shell history. A literal value passes through
+// unchanged.
 func resolveTicket(ticket string) string {
 	if ticket == "-" {
 		b, err := io.ReadAll(io.LimitReader(os.Stdin, 4096))
@@ -1238,81 +1145,14 @@ func resolveTicket(ticket string) string {
 	return ticket
 }
 
-func cmdEnroll(args []string) {
-	fs := flag.NewFlagSet("enroll", flag.ExitOnError)
-	ticket := fs.String("ticket", "", "one-shot enrollment ticket from the dashboard (required; '-' reads it from stdin, or set FINCH_TICKET)")
-	hub := fs.String("hub", "https://finchmcp.com", "finch hub base URL")
-	// Default --box to finch.yml's `box:` when a manifest is present, so the
-	// box registers under the name the manifest declares; else the hostname.
-	host, _ := os.Hostname()
-	box := fs.String("box", configBox("finch.yml", host), "this box's name")
-	credDir := fs.String("credentials-dir", defaultCredentialsDir(), "directory the saved credential is written to")
-
-	appPath := ""
-	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-		appPath = args[0]
-		args = args[1:]
-	}
-	_ = fs.Parse(args)
-	if appPath == "" && fs.NArg() > 0 {
-		appPath = fs.Arg(0)
-	}
-	ticketVal := resolveTicket(*ticket)
-	if appPath == "" || ticketVal == "" {
-		fmt.Fprintln(os.Stderr, "usage: finch enroll <app_path> --ticket <t>")
-		fmt.Fprintln(os.Stderr, "  mint the ticket in the dashboard (Add box); <app_path> is the service/URL segment")
-		fmt.Fprintln(os.Stderr, "  keep it off argv/history: 'echo <t> | finch enroll <app_path> --ticket -' or set FINCH_TICKET")
-		os.Exit(2)
-	}
-	if err := validateServiceID(appPath); err != nil {
-		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
-		os.Exit(2)
-	}
-
-	// Join FIRST so we can name the credential by the hub's slugified service id
-	// (the relay resolves the service by THAT id, so `finch enroll Printer` must
-	// land as "printer", not the raw arg, or its URL/credential never matches).
-	jr, err := join(*hub, ticketVal, *box)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "finch: enroll failed: %v\n", err)
-		os.Exit(1)
-	}
-	id := jr.Service
-	if err := validateServiceID(id); err != nil {
-		fmt.Fprintf(os.Stderr, "finch: unsafe service id returned by hub: %v\n", err)
-		os.Exit(1)
-	}
-	statePath := filepath.Join(expandHome(*credDir), id+".json")
-	if _, err := persistJoin(*hub, jr, statePath); err != nil {
-		fmt.Fprintf(os.Stderr, "finch: enroll failed: %v\n", err)
-		os.Exit(1)
-	}
-	if id != appPath {
-		fmt.Printf("finch: note: %q was registered as %q (host-safe slug)\n", appPath, id)
-	}
-	fmt.Printf("finch: enrolled %q — credential saved to %s\n", id, statePath)
-	fmt.Printf("       add it to finch.yml and run `finch run`:\n")
-	fmt.Printf("         ingress:\n           - app_path: %s\n             service: http://127.0.0.1:8000\n", id)
-}
-
 // defaultCredentialsDir mirrors loadConfig's default: ~/.finch (cwd-relative
-// .finch if there's no home dir), so `finch add`/`finch enroll` write the
-// credential where `finch run` will look for it.
+// .finch if there's no home dir), so `finch add` writes the credential where
+// `finch run` will look for it.
 func defaultCredentialsDir() string {
 	if home, err := os.UserHomeDir(); err == nil && home != "" {
 		return filepath.Join(home, ".finch")
 	}
 	return ".finch"
-}
-
-// configBox returns the finch.yml `box:` at configPath, or host when the
-// manifest is absent / sets no box — so `finch enroll`/`finch add` register
-// the box under the name the manifest declares (matching the run-time log line).
-func configBox(configPath, host string) string {
-	if c, err := loadConfig(configPath, host); err == nil && c.Box != "" {
-		return c.Box
-	}
-	return host
 }
 
 // addPaths resolves the box name + credentials dir `finch add` should use,
@@ -1366,7 +1206,7 @@ func validateManifestMutationTarget(configPath string) error {
 // rather than unmarshaling into the fixed `config` struct and re-marshaling. An
 // existing rule with the same app_path is updated in place; hub/box are filled
 // only when absent. A missing file is created from the managed header + a minimal
-// struct marshal. No ticket is written — the credential is saved separately by enroll.
+// struct marshal. No ticket is written — the credential is saved separately by enrollToState.
 func appendIngress(configPath, hub, appPath, service, box string) error {
 	manifestMutationMu.Lock()
 	defer manifestMutationMu.Unlock()

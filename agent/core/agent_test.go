@@ -131,21 +131,6 @@ func TestResolveUpstream_BasePath(t *testing.T) {
 	}
 }
 
-func TestResolveUpstream_RouteAllowlistUsesSegmentBoundaries(t *testing.T) {
-	base := mustParse(t, "http://127.0.0.1:8000")
-	routes := []string{"/mcp", "/api/v1", "/birdz"}
-	for _, allowed := range []string{"/mcp", "/mcp/tools", "/api/v1", "/api/v1/tools?x=1", "/birdz"} {
-		if _, err := resolveUpstreamWithRoutes(base, allowed, false, routes); err != nil {
-			t.Errorf("allowlisted path %q rejected: %v", allowed, err)
-		}
-	}
-	for _, rejected := range []string{"/", "/api", "/api/v10", "/birdz-old", "/mcpish", "/mcp/../admin", "//evil/x", "https://evil/x"} {
-		if _, err := resolveUpstreamWithRoutes(base, rejected, false, routes); err == nil {
-			t.Errorf("non-allowlisted path %q accepted", rejected)
-		}
-	}
-}
-
 func TestTokenExp(t *testing.T) {
 	enc := func(s string) string { return base64.RawURLEncoding.EncodeToString([]byte(s)) }
 	valid := enc(`{"exp":1700000000}`) + ".sig"
@@ -466,17 +451,13 @@ func TestLoadState_RejectsOversizedCredential(t *testing.T) {
 	}
 }
 
-func TestZeroConfigRunDefaultsHonorContainerEnvironment(t *testing.T) {
+func TestRunDefaultsHonorContainerEnvironment(t *testing.T) {
 	t.Setenv("FINCH_HUB", "https://staging.finch.example")
-	t.Setenv("FINCH_BOX", "aviary-container")
-	t.Setenv("FINCH_CREDENTIALS_DIR", "/data/scoped-credentials")
+	t.Setenv("FINCH_BOX", "finch-container")
 	if got := agentDefaultHub(); got != "https://staging.finch.example" {
 		t.Fatalf("hub default=%q", got)
 	}
-	if got := agentDefaultBox("hostname"); got != "aviary-container" {
+	if got := agentDefaultBox("hostname"); got != "finch-container" {
 		t.Fatalf("box default=%q", got)
-	}
-	if got := dynamicCredentialsDir(); got != "/data/scoped-credentials" {
-		t.Fatalf("credentials default=%q", got)
 	}
 }

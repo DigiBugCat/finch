@@ -67,8 +67,8 @@ ingress:
 	}
 }
 
-// addPaths/configBox must honor the finch.yml `box:` + `credentials-dir:`
-// so `finch add`/`finch enroll` register under the manifest name and write the
+// addPaths must honor the finch.yml `box:` + `credentials-dir:`
+// so `finch add` registers under the manifest name and writes the
 // credential where `finch run` looks (findings #3 + #13).
 func TestAddPaths(t *testing.T) {
 	p := writeYAML(t, `
@@ -95,18 +95,6 @@ ingress:
 	}
 }
 
-func TestConfigBox(t *testing.T) {
-	p := writeYAML(t, "box: lab-mini\n")
-	if got := configBox(p, "host"); got != "lab-mini" {
-		t.Errorf("configBox = %q, want lab-mini", got)
-	}
-	if got := configBox(filepath.Join(t.TempDir(), "nope.yml"), "host"); got != "host" {
-		t.Errorf("configBox(missing) = %q, want host", got)
-	}
-}
-
-// appendIngress edits through a yaml.Node, so hand-written comments and keys finch
-// doesn't model SURVIVE a `finch add` (finding #9).
 func TestAppendIngress_PreservesComments(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "finch.yml")
 	original := `# my hand-written finch.yml
