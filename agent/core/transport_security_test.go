@@ -99,7 +99,7 @@ func TestSecureRedirectPolicyRejectsTLSDowngrade(t *testing.T) {
 }
 
 func TestControlPlaneRejectsRemotePlaintextBeforeRequest(t *testing.T) {
-	if _, err := refresh("http://hub.example.invalid", "secret"); err == nil || !strings.Contains(err.Error(), "HTTPS is required") {
+	if _, err := refreshContext(context.Background(), "http://hub.example.invalid", "secret"); err == nil || !strings.Contains(err.Error(), "HTTPS is required") {
 		t.Fatalf("refresh remote plaintext error = %v", err)
 	}
 	if _, err := cliRequest(http.MethodGet, "http://hub.example.invalid", "/api/cli/state", "secret", nil); err == nil || !strings.Contains(err.Error(), "HTTPS is required") {
