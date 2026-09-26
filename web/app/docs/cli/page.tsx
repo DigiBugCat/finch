@@ -180,7 +180,7 @@ finch call printer echo --args '{"text":"hi"}'
 <span class="o">{</span>
 <span class="o">  "loggedIn": true,</span>
 <span class="o">  "hub": "https://finchmcp.com",</span>
-<span class="o">  "tenant": "your-slug",</span>
+<span class="o">  "tenant": "user_2abc…",</span>
 <span class="o">  "config": "finch.yml",</span>
 <span class="o">  "ingress": [{ "app_path": "printer", "service": "http://127.0.0.1:8000" }]</span>
 <span class="o">}</span>`}</Code>

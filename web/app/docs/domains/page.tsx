@@ -24,8 +24,9 @@ export default function Domains() {
       <p>
         A slug is assigned automatically the first time a box enrolls, so your account
         always has a working public host. Slugs are lowercase letters, digits, and
-        hyphens, at least 3 characters. <code>finch status</code> shows the one your
-        account uses.
+        hyphens, at least 3 characters. <code>finch add</code> prints each service&apos;s
+        public endpoint, slug included (the <code>url</code> field with{' '}
+        <code>--json</code>).
       </p>
 
       <h2>Custom domains</h2>
