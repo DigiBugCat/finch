@@ -589,18 +589,19 @@ const RELEASE_ASSET_RE =
 
 // The OAuth scopes the MCP resource actually needs — identity only.
 // verifyClerkOAuthToken reads sub/user_id/org_id from Clerk's userinfo, so
-// `openid` covers verification. Advertised in BOTH the 401 WWW-Authenticate
-// scope hint and the RFC 9728 scopes_supported (single const so the two can't
-// drift). Without these, claude.ai falls back to requesting every scope the AS
-// supports — including public/private metadata the hub never reads — which
-// both bloats the consent screen and overgrants the issued token.
+// `openid` covers verification; `offline_access` keeps connectors connected via
+// refresh tokens. Advertised in BOTH the 401 WWW-Authenticate scope hint and
+// the RFC 9728 scopes_supported (single const so the two can't drift). Without
+// these, claude.ai falls back to requesting every scope the AS supports —
+// including public/private metadata the hub never reads — which both bloats
+// the consent screen and overgrants the issued token.
 // `email` is needed at the door: the relay enforces per-app user grants for
 // org members by matching the token's email against the tenant's ACL.
-// NOT `offline_access`: the MCP auth spec says servers SHOULD NOT put it in the
-// challenge scope or scopes_supported — refresh tokens are the client's call.
-// Clerk still advertises it in its own AS metadata and registers it on every
-// DCR client, so a client that wants refresh can request it.
-const MCP_SCOPES = ["openid", "email"];
+// `offline_access` stays despite the MCP auth spec's SHOULD NOT: the v1 SDK
+// (@modelcontextprotocol/sdk) sends the challenge scope to /authorize verbatim
+// and never adds it itself, so dropping it would leave those connectors with no
+// refresh token — a manual reconnect every time the access token expires.
+const MCP_SCOPES = ["openid", "email", "offline_access"];
 
 /** Percent-decode a path segment, tolerating a malformed encoding (a raw "%"
  *  in a name would make decodeURIComponent throw). Falls back to the raw value
