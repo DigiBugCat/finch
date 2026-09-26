@@ -1282,8 +1282,7 @@ async function callerLabel(
   }
 }
 
-/** The relay's OAuth `WWW-Authenticate: Bearer` challenge (RFC 6750 §3), for the
- *  401 (no credential) and the 403 insufficient_scope step-up.
+/** The relay's 401 OAuth `WWW-Authenticate: Bearer` challenge (RFC 6750 §3).
  *
  *  resource_metadata names the metadata document for the resource the client
  *  ACTUALLY requested — `/.well-known/oauth-protected-resource` + the request
@@ -1292,14 +1291,13 @@ async function callerLabel(
  *  metadata discovered this way whose `resource` differs from the URL it
  *  called; the old hard-coded `/<svc>/mcp` broke that for a pinned
  *  /<svc>/<box>/mcp and for every non-/mcp route. */
-function relayBearerChallenge(req: Request, error?: string): string {
+function relayBearerChallenge(req: Request): string {
   const u = new URL(req.url);
-  const params = [
-    ...(error ? [`error="${error}"`] : []),
-    `resource_metadata="https://${u.host}/.well-known/oauth-protected-resource${u.pathname}"`,
-    `scope="${MCP_SCOPES.join(" ")}"`,
-  ];
-  return `Bearer ${params.join(", ")}`;
+  return (
+    `Bearer resource_metadata="https://${u.host}` +
+    `/.well-known/oauth-protected-resource${u.pathname}", ` +
+    `scope="${MCP_SCOPES.join(" ")}"`
+  );
 }
 
 /** Extract a Bearer finch_ key, check it against the tenant's TenantDO, relay to
@@ -1378,22 +1376,7 @@ async function relayMcp(
       if (who && id) {
         const gate = await tenantOp<{allowed:boolean;reason?:string}>(env,tenant,"gateOauth",{clerkUserId:id,email:(who.email||"").trim().toLowerCase(),orgIdClaim:who.org_id,service});
         if (!gate.allowed) {
-          // A token that verified but lacks the email claim is a SCOPE problem the
-          // client can fix by re-authorizing, so say so in the machine-readable
-          // step-up form (RFC 6750 §3.1 insufficient_scope) rather than a bare
-          // JSON 403 that MCP clients treat as terminal.
-          if ((gate.reason === "no-email" || gate.reason === "needs-email") && !who.email) {
-            return new Response(
-              JSON.stringify({ error: "token has no email claim — reconnect this connector so it can request the email scope" }),
-              {
-                status: 403,
-                headers: {
-                  "content-type": "application/json",
-                  "www-authenticate": relayBearerChallenge(req, "insufficient_scope"),
-                },
-              },
-            );
-          }
+          if ((gate.reason === "no-email" || gate.reason === "needs-email") && !who.email) return json(403,{error:"token has no email claim — reconnect this connector so it can request the email scope"});
           return json(403,{error:"your account is not granted access to this app"});
         }
         oauthAuthed=true; caller=`oauth:${id}`; edgeCaller={sub:`user:${id}`,authMethod:"oauth"};

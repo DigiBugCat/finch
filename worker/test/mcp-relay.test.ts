@@ -10,8 +10,6 @@
 //   3. The 401 challenge's resource_metadata names the metadata document for
 //      the URL the client actually requested, and that document's `resource`
 //      equals it (pinned /<svc>/<box>/mcp and non-/mcp routes included).
-//   4. A verified OAuth token missing the email claim gets a 403 step-up
-//      challenge (error="insufficient_scope"), not a bare JSON 403.
 import { describe, it, expect } from "vitest";
 import {
   env,
@@ -293,66 +291,6 @@ describe("401 resource_metadata matches the requested resource (RFC 9728 §3.3)"
     const { service, agent } = await liveService("route");
     const { resource } = await challengeFor(`/${service}/api/v1/things`);
     expect(resource).toBe(`https://${HOST}/${service}/api/v1/things`);
-    agent.close();
-  });
-});
-
-describe("OAuth step-up: verified token without an email claim", () => {
-  it("403s with error=insufficient_scope, the scope set, and resource_metadata", async () => {
-    const { service, agent } = await liveService("stepup");
-    const token = `oauth-no-email-${Date.now()}`;
-    const seen: string[] = [];
-    // Strict userinfo double: answers ONLY the exact request verifyClerkOAuthToken
-    // must make for this token; anything else is a 401, so a wrong URL or a
-    // missing/mangled bearer fails the test instead of silently authorizing.
-    const userinfo = {
-      async fetch(input: RequestInfo | URL, init?: RequestInit) {
-        const url = String(input);
-        const auth = new Headers(init?.headers).get("authorization");
-        seen.push(url);
-        if (url !== `${env.CLERK_ISSUER}/oauth/userinfo` || auth !== `Bearer ${token}`) {
-          return new Response("unauthorized", { status: 401 });
-        }
-        // An org-scoped identity for this tenant with NO email claim: the
-        // gate needs the email to evaluate per-app grants → reason "no-email".
-        return Response.json({ sub: "user_noemail", org_id: TENANT });
-      },
-    };
-    const path = `/${service}/mcp`;
-    const res = await call(
-      new Request(`${BASE}${path}`, {
-        method: "POST",
-        headers: {
-          host: HOST,
-          "content-type": "application/json",
-          authorization: `Bearer ${token}`,
-        },
-        body: "{}",
-      }),
-      { ...env, CLERK_USERINFO: userinfo },
-    );
-    expect(seen).toEqual([`${env.CLERK_ISSUER}/oauth/userinfo`]);
-    expect(res.status).toBe(403);
-    const chal = res.headers.get("www-authenticate") || "";
-    expect(chal.startsWith("Bearer ")).toBe(true);
-    expect(challengeParam(chal, "error")).toBe("insufficient_scope");
-    expect(challengeParam(chal, "resource_metadata")).toBe(
-      `https://${HOST}/.well-known/oauth-protected-resource${path}`,
-    );
-    const scope = (challengeParam(chal, "scope") || "").split(" ");
-    expect(scope).toContain("email");
-    expect(scope).toContain("openid");
-    // Same scope set the 401 challenge advertises (one source: MCP_SCOPES).
-    const unauth = await call(
-      new Request(`${BASE}${path}`, {
-        method: "POST",
-        headers: { host: HOST, "content-type": "application/json" },
-        body: "{}",
-      }),
-    );
-    expect(challengeParam(unauth.headers.get("www-authenticate") || "", "scope"))
-      .toBe(scope.join(" "));
-    expect(((await res.json()) as { error: string }).error).toMatch(/email/);
     agent.close();
   });
 });

@@ -2,7 +2,6 @@ import { describe, it, expect } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
 import vectors from "./relay-vectors.json";
 import {
-  MAX_EVENT_STREAMS_PER_BOX,
   MAX_PENDING_RELAY_BODY_BYTES,
   MAX_RELAY_BODY_BYTES,
   MAX_STREAMS_PER_BOX,
@@ -680,14 +679,13 @@ describe("BoxDO streaming relay — idle timeout", () => {
     );
     const { id } = await reqSeen;
 
-    // Head + one chunk, then the agent stalls (no end). An ordinary streamed
-    // body — an event stream is exempt from the idle kill (see below).
+    // Head + one chunk, then the agent stalls (no end).
     agent.send(
       JSON.stringify({
         id,
         type: "head",
         status: 200,
-        headers: [["content-type", "application/x-ndjson"]],
+        headers: [["content-type", "text/event-stream"]],
       }),
     );
     agent.send(JSON.stringify({ id, type: "chunk", data: "aGVsbG8=" }));
@@ -707,171 +705,6 @@ describe("BoxDO streaming relay — idle timeout", () => {
     expect(reset.id).toBe(id);
     expect(await bodyErr).toBeInstanceOf(Error);
   });
-});
-
-describe("BoxDO streaming relay — long-lived event streams", () => {
-  // MCP 2026-07-28 subscriptions/listen (and a legacy standalone GET /mcp) is
-  // one text/event-stream response that stays open, silent, until the server
-  // pushes. The relay must not reap it on RELAY_IDLE_MS, and open subscribers
-  // must not eat the MAX_STREAMS_PER_BOX slots ordinary calls need.
-
-  /** Relay one request and answer it with an SSE head; returns the live id and
-   *  the (still-open) streaming Response. */
-  async function openEventStream(
-    stub: Stub,
-    agent: WebSocket,
-    m: { service: string; box: string },
-    contentType = "text/event-stream",
-  ): Promise<{ id: string; res: Response }> {
-    const reqSeen = waitForFrame(agent, (f) => f.type === "req");
-    const resPromise = stub.fetch(
-      new Request(relayUrl(m), { method: "POST", body: "{}" }),
-    );
-    const { id } = await reqSeen;
-    agent.send(
-      JSON.stringify({
-        id,
-        type: "head",
-        status: 200,
-        headers: [["content-type", contentType]],
-      }),
-    );
-    const res = await resPromise;
-    expect(res.status).toBe(200);
-    return { id, res };
-  }
-
-  async function isEventStream(stub: Stub, id: string): Promise<boolean> {
-    return (await runInDO(stub, (instance) =>
-      !!instance.streams.get(id)?.eventStream)) as boolean;
-  }
-
-  it("keeps a silent event stream open past the idle timeout, then delivers the push", async () => {
-    const m = freshBox();
-    const stub = stubFor(m);
-    const agent = await connectAgent(stub, m);
-    // Media-type parameters and case must not defeat the classification.
-    const { id, res } = await openEventStream(
-      stub,
-      agent,
-      m,
-      "Text/Event-Stream; charset=utf-8",
-    );
-    expect(await isEventStream(stub, id)).toBe(true);
-
-    // Idle fires (as if 300s passed with nothing to say) → nothing happens: no
-    // reset to the agent, the stream stays registered.
-    const frames: any[] = [];
-    agent.addEventListener("message", ((ev: MessageEvent) => {
-      frames.push(JSON.parse(ev.data as string));
-    }) as EventListener);
-    await fireIdle(stub, id);
-    expect(await streamCount(stub)).toBe(1);
-
-    // A chunk must not re-arm an idle timer on it either.
-    agent.send(JSON.stringify({ id, type: "chunk", data: btoa("data: 1\n\n") }));
-    await fireIdle(stub, id);
-    expect(await streamCount(stub)).toBe(1);
-    expect(frames.filter((f) => f.type === "reset")).toEqual([]);
-
-    agent.send(JSON.stringify({ id, type: "chunk", data: btoa("data: 2\n\n") }));
-    agent.send(JSON.stringify({ id, type: "end" }));
-    expect(await res.text()).toBe("data: 1\n\ndata: 2\n\n");
-    expect(await streamCount(stub)).toBe(0);
-  });
-
-  it("tears an event stream down (and resets the agent) once its client has gone and the upstream next writes", async () => {
-    const m = freshBox();
-    const stub = stubFor(m);
-    const agent = await connectAgent(stub, m);
-    const { id, res } = await openEventStream(stub, agent, m);
-    expect(await isEventStream(stub, id)).toBe(true);
-
-    const resetSeen = waitForFrame(
-      agent,
-      (f) => f.type === "reset" && f.id === id,
-    );
-    await res.body!.cancel("client went away");
-    // workerd (1.20260611) surfaces the disconnect to the DO's cancel() only on
-    // the next write, so a silent stream stays registered until then (the
-    // zombie case RELAY_IDLE_MS documents and admitEventStream reclaims). Not
-    // asserted here: that is runtime behaviour, not ours. The upstream's next byte (e.g. a server `:` keep-alive) finds the dead
-    // consumer: the DO tears the stream down and aborts the agent's upstream.
-    agent.send(JSON.stringify({ id, type: "chunk", data: btoa(":\n\n") }));
-    const reset = await resetSeen;
-    expect(reset.message).toBe("client cancelled");
-    expect(await streamCount(stub)).toBe(0);
-  });
-
-  it("gives event streams their own budget: ordinary calls keep every slot; a stale subscriber is reclaimed, else overflow stays ordinary", async () => {
-    const m = freshBox();
-    const stub = stubFor(m);
-    const agent = await connectAgent(stub, m);
-
-    // Fill the event-stream budget with open subscribers.
-    const subs: { id: string; res: Response }[] = [];
-    for (let i = 0; i < MAX_EVENT_STREAMS_PER_BOX; i++) {
-      subs.push(await openEventStream(stub, agent, m));
-    }
-    for (const s of subs) expect(await isEventStream(stub, s.id)).toBe(true);
-
-    // One more SSE response past the budget is still DELIVERED, as an ordinary
-    // stream: it is not an event stream, and the idle timer reaps it.
-    const overflow = await openEventStream(stub, agent, m);
-    expect(await isEventStream(stub, overflow.id)).toBe(false);
-    const overflowReset = waitForFrame(
-      agent,
-      (f) => f.type === "reset" && f.id === overflow.id,
-    );
-    const overflowErr = drainExpectingError(overflow.res);
-    await fireIdle(stub, overflow.id);
-    await overflowReset;
-    expect(await overflowErr).toBeInstanceOf(Error);
-
-    // A subscriber silent for RELAY_IDLE_MS (a likely zombie: its client may be
-    // gone without the DO being told) is reclaimed to admit a new one. Only the
-    // quietest goes, and only once it has been quiet that long.
-    const stale = subs[0];
-    await runInDO(stub, (instance) => {
-      instance.streams.get(stale.id).lastActivity = Date.now() - RELAY_IDLE_MS;
-    });
-    const staleReset = waitForFrame(
-      agent,
-      (f) => f.type === "reset" && f.id === stale.id,
-    );
-    const staleErr = drainExpectingError(stale.res);
-    const fresh = await openEventStream(stub, agent, m);
-    expect(await isEventStream(stub, fresh.id)).toBe(true);
-    expect((await staleReset).message).toBe("idle event stream reclaimed");
-    expect(await staleErr).toBeInstanceOf(Error);
-    subs[0] = fresh;
-    for (const s of subs) expect(await isEventStream(stub, s.id)).toBe(true);
-
-    // With every subscriber still open, ALL of the ordinary slots are free.
-    const parkedIds: string[] = [];
-    const parked: Promise<Response>[] = [];
-    for (let i = 0; i < MAX_STREAMS_PER_BOX; i++) {
-      const reqSeen = waitForFrame(agent, (f) => f.type === "req");
-      parked.push(
-        stub.fetch(new Request(relayUrl(m), { method: "POST", body: "x" })),
-      );
-      parkedIds.push((await reqSeen).id);
-    }
-    const over = await stub.fetch(
-      new Request(relayUrl(m), { method: "POST", body: "x" }),
-    );
-    expect(over.status).toBe(429);
-    expect(over.headers.get("X-Finch-Offline")).toBeNull();
-
-    // Teardown: finish the parked calls and close the subscribers.
-    for (const id of parkedIds) {
-      agent.send(JSON.stringify({ id, type: "err", status: 502, message: "done" }));
-    }
-    for (const r of await Promise.all(parked)) expect(r.status).toBe(502);
-    for (const s of subs) agent.send(JSON.stringify({ id: s.id, type: "end" }));
-    for (const s of subs) expect(await s.res.text()).toBe("");
-    expect(await streamCount(stub)).toBe(0);
-  }, 20_000);
 });
 
 describe("BoxDO streaming relay — reset / offline", () => {

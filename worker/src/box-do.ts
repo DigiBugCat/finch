@@ -76,14 +76,6 @@ interface Stream {
    *  this id and not yet resumed it. Drives the pause/resume edge-detection so we
    *  send exactly one window frame per transition (not one per chunk/pull). */
   paused?: boolean;
-  /** True once the head declared `text/event-stream` AND the stream was admitted
-   *  to the event-stream budget (MAX_EVENT_STREAMS_PER_BOX). Such a stream has
-   *  NO idle timer and does not count against MAX_STREAMS_PER_BOX — see
-   *  RELAY_IDLE_MS for why and for how it is still torn down. */
-  eventStream?: boolean;
-  /** Date.now() of the last head/chunk. Only read for event streams, to find a
-   *  reclaimable one when that budget is full (see MAX_EVENT_STREAMS_PER_BOX). */
-  lastActivity: number;
 }
 
 // Per-stream idle timeout. Armed on `req` send, RESET on every head/chunk for
@@ -91,25 +83,6 @@ interface Stream {
 // readable + send `reset` to the agent. This REPLACES the old 30s total cap —
 // a long-running ("thinking") tool that keeps streaming never trips it; only a
 // genuinely stalled link does.
-//
-// EXCEPT for an event stream (head content-type text/event-stream, admitted to
-// MAX_EVENT_STREAMS_PER_BOX): there, silence is the protocol working — an MCP
-// 2026-07-28 `subscriptions/listen` stream (or a legacy standalone GET /mcp)
-// sits open with nothing to say until the server pushes a notification, and
-// closing it is how the client cancels. Killing it after 300s quiet would
-// force every subscriber to reconnect on a timer, so an admitted event stream
-// gets no idle timer at all. It ends on every real teardown: the upstream ends
-// or resets it, the agent socket dies, or the client disconnects (the Response
-// body's cancel() → `reset` to the agent).
-//
-// Caveat, measured in workerd: a client disconnect reaches cancel() only when
-// the stream next carries a byte — a silent stream whose client has gone stays
-// open until the upstream writes (most SSE servers send periodic `:` comments;
-// the MCP Python SDK does every 15s) or the agent link drops. The hub does NOT
-// inject keep-alives to probe for that: the relay never writes into the byte
-// stream. Such "zombies" are bounded instead: they only ever occupy the event
-// budget, and one silent for RELAY_IDLE_MS is reclaimed as soon as another
-// event stream needs its slot (admitEventStream).
 export const RELAY_IDLE_MS = 300_000;
 
 // PRE-HEAD timeout (S1): the initial timer armed at `req` send, before any
@@ -127,21 +100,6 @@ export const RELAY_HEAD_TIMEOUT_MS = 120_000;
 // box on an idle sibling — acceptable for the single-box deployment,
 // and a failover here would just spread the flood).
 export const MAX_STREAMS_PER_BOX = 32;
-
-// Separate budget for long-lived EVENT streams (see RELAY_IDLE_MS). When a head
-// declares text/event-stream, the stream moves OUT of the MAX_STREAMS_PER_BOX
-// pool into this one, so idle subscribers can never 429 ordinary
-// request/response calls. When the budget is full, the event stream that has
-// been silent longest is reclaimed (reset) IF it has been silent for at least
-// RELAY_IDLE_MS — the most it could have lived under the ordinary rule, and the
-// signature of a zombie whose client has gone. Otherwise the new event-stream
-// response is still delivered, as an ordinary stream (counted against
-// MAX_STREAMS_PER_BOX, reaped by the idle timer) — exactly the pre-budget
-// behaviour; refusing it at head time would discard a response whose request
-// (maybe a tools/call with side effects) already ran. Memory stays bounded by
-// RELAY_TOTAL_BUFFER_HARD_CAP_BYTES across both pools. The agent's in-flight
-// cap (maxRelayInFlight) must equal the SUM of the two budgets.
-export const MAX_EVENT_STREAMS_PER_BOX = 16;
 
 // Streaming backpressure high-water-mark (#: no-backpressure OOM). The response
 // ReadableStream uses a ByteLengthQueuingStrategy with this HWM; once the
@@ -323,9 +281,8 @@ export class BoxDO extends DurableObject<Env> {
     // PER-BOX STREAM CAP (S1): bound concurrent in-flight relays BEFORE
     // buffering the request body or registering a stream. 429 is terminal —
     // deliberately NO X-Finch-Offline header, so the LB path never "fails over"
-    // a saturated box's load onto a sibling or marks it offline. Admitted event
-    // streams live in their own budget and don't count here.
-    if (this.countStreams(false) + this.pendingBodyReads >= MAX_STREAMS_PER_BOX) {
+    // a saturated box's load onto a sibling or marks it offline.
+    if (this.streams.size + this.pendingBodyReads >= MAX_STREAMS_PER_BOX) {
       return json(
         429,
         { error: "too many concurrent requests for this box" },
@@ -408,7 +365,6 @@ export class BoxDO extends DurableObject<Env> {
           resolveHead: resolve,
           timer,
           headSettled: false,
-          lastActivity: Date.now(),
         });
         try {
           agent.send(JSON.stringify(frame));
@@ -477,13 +433,6 @@ export class BoxDO extends DurableObject<Env> {
       this.streams.delete(id);
       return new Response(null, { status: first.status, headers });
     }
-
-    // Long-lived event stream? Move it into the event-stream budget (no idle
-    // timer, off the ordinary cap) when it can get a slot; otherwise it stays an
-    // ordinary stream. Decided on the response media type alone — the relay
-    // never parses MCP — so it covers subscriptions/listen, a legacy standalone
-    // GET, and an SSE-framed tools/call response alike. (See RELAY_IDLE_MS.)
-    if (isEventStream(headers.get("content-type"))) this.admitEventStream(id);
 
     // The ReadableStream is fed by chunk frames (base64-decoded) and closed on
     // end. Its `start` captures the controller into the live stream entry so
@@ -717,48 +666,10 @@ export class BoxDO extends DurableObject<Env> {
     resolve(frame);
   }
 
-  /** Re-arm the idle timer for a live stream (called on every head/chunk). An
-   *  admitted event stream has no idle timer, so this only keeps it cleared. */
+  /** Re-arm the idle timer for a live stream (called on every head/chunk). */
   private rearm(s: Stream, id: string): void {
     clearTimeout(s.timer);
-    s.lastActivity = Date.now();
-    if (s.eventStream) return;
     s.timer = setTimeout(() => this.onIdle(id), RELAY_IDLE_MS);
-  }
-
-  /** Move stream `id` (whose head declared text/event-stream) into the
-   *  event-stream budget: drop its idle timer and take it off the ordinary cap.
-   *  With the budget full, first reclaim the longest-silent event stream if it
-   *  has been silent for RELAY_IDLE_MS; failing that, leave `id` an ordinary
-   *  stream. See MAX_EVENT_STREAMS_PER_BOX. */
-  private admitEventStream(id: string): void {
-    const s = this.streams.get(id);
-    if (!s || s.eventStream) return;
-    if (this.countStreams(true) >= MAX_EVENT_STREAMS_PER_BOX) {
-      let quietest: [string, Stream] | undefined;
-      for (const entry of this.streams) {
-        if (entry[1].eventStream &&
-          (!quietest || entry[1].lastActivity < quietest[1].lastActivity)) {
-          quietest = entry;
-        }
-      }
-      if (!quietest || Date.now() - quietest[1].lastActivity < RELAY_IDLE_MS) return;
-      this.resetStream(quietest[0], "idle event stream reclaimed", true);
-    }
-    s.eventStream = true;
-    clearTimeout(s.timer);
-  }
-
-  /** How many in-flight streams are in the event-stream budget (true) or the
-   *  ordinary MAX_STREAMS_PER_BOX pool (false). The map is at most the sum of
-   *  the two budgets, so a scan is cheaper than keeping a counter in step with
-   *  every deletion path. */
-  private countStreams(eventStream: boolean): number {
-    let n = 0;
-    for (const s of this.streams.values()) {
-      if (!!s.eventStream === eventStream) n++;
-    }
-    return n;
   }
 
   /** Idle timeout fired for `id`: no traffic in RELAY_IDLE_MS. If we never got a
@@ -766,9 +677,7 @@ export class BoxDO extends DurableObject<Env> {
    *  the agent to abort (it may still be blocked reading a dead upstream). */
   private onIdle(id: string): void {
     const s = this.streams.get(id);
-    // An admitted event stream is exempt from the idle kill (RELAY_IDLE_MS); a
-    // timer that fired in the same turn as its promotion must not reap it.
-    if (!s || s.eventStream) return;
+    if (!s) return;
     if (!s.headSettled) {
       this.settleHead(id, {
         id,
@@ -961,13 +870,6 @@ function hostScopedSetCookie(value: string): string {
     return attr !== "domain";
   });
   return kept.join(";");
-}
-
-/** True when a response Content-Type names the SSE media type, ignoring
- *  parameters (`text/event-stream; charset=utf-8`) and case. */
-function isEventStream(contentType: string | null): boolean {
-  if (!contentType) return false;
-  return contentType.split(";")[0].trim().toLowerCase() === "text/event-stream";
 }
 
 /** Read an incoming relay body without allowing arrayBuffer()/text() to consume
