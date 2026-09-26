@@ -5,11 +5,12 @@
 //   2. the RFC 9728 protected-resource metadata (incl. scopes_supported, the
 //      priority-2 source; without either, claude.ai requests EVERYTHING the AS
 //      supports — metadata scopes included — bloating consent + overgranting),
-//   3. the AS-metadata proxy's fail-closed path (502 when Clerk is unreachable —
-//      this test env's CLERK_ISSUER is a fake origin, and this pool-workers
-//      build has no fetchMock, so the proxy's happy path is verified live via
-//      curl against staging/prod instead; see the deploy verification notes).
-import { describe, it, expect } from "vitest";
+//   3. that the AS pointer names Clerk ITSELF and the hub serves no AS metadata
+//      of its own (only a byte-for-byte legacy /register fallback). Clerk stamps its own issuer on the
+//      authorization response (RFC 9207 `iss`); a hub-hosted AS doc with a
+//      different `issuer` made current MCP SDKs abort every flow with an
+//      issuer mismatch.
+import { describe, it, expect, vi } from "vitest";
 import {
   env,
   createExecutionContext,
@@ -24,9 +25,12 @@ const BASE = `http://${HOST}`;
 
 const nowSec = () => Math.floor(Date.now() / 1000);
 
-async function call(req: Request): Promise<Response> {
+async function call(
+  req: Request,
+  envOverride: Record<string, unknown> = {},
+): Promise<Response> {
   const ctx = createExecutionContext();
-  const res = await worker.fetch(req, env as any, ctx);
+  const res = await worker.fetch(req, { ...env, ...envOverride } as any, ctx);
   await waitOnExecutionContext(ctx);
   return res;
 }
@@ -108,7 +112,9 @@ describe("401 WWW-Authenticate challenge", () => {
     expect(chal).toContain(
       `/.well-known/oauth-protected-resource/${enroll.id}/mcp"`,
     );
-    // The scope hint is the client's priority-1 source — identity only.
+    // The scope hint is the client's priority-1 source — identity only, plus
+    // offline_access: v1 SDK clients send this string to /authorize verbatim,
+    // so without it they never get a refresh token.
     expect(chal).toContain(`scope="openid email offline_access"`);
     agent.close();
   });
@@ -124,34 +130,93 @@ describe("RFC 9728 protected-resource metadata", () => {
     expect(res.status).toBe(200);
     const doc = (await res.json()) as any;
     expect(doc.resource).toBe(`https://${HOST}/svc/mcp`);
-    // The AS pointer names THIS host, not Clerk directly, so a spec-compliant
-    // client (ChatGPT) fetches AS metadata from us — routing its DCR through the
-    // /register scope-injection proxy instead of straight to Clerk (which would
-    // omit `openid` and 401 at /authorize). The proxied AS doc rewrites `issuer`
-    // to match; authorize/token/jwks inside still point at Clerk. That issuer
-    // rewrite is verified live via curl (CLERK_ISSUER is a fake origin here, so
-    // the proxy happy-path can't run in this pool-workers build — see header).
-    expect(doc.authorization_servers).toEqual([`https://${HOST}`]);
+    // The AS pointer is Clerk's issuer, byte for byte. The client validates
+    // Clerk's metadata `issuer` against this value (RFC 8414 §3.3) and then
+    // the authorization response's `iss` against that metadata (RFC 9207);
+    // pointing anywhere else is what broke the flow.
+    expect(doc.authorization_servers).toEqual([env.CLERK_ISSUER]);
+    expect(doc.authorization_servers).not.toContain(`https://${HOST}`);
     expect(doc.bearer_methods_supported).toEqual(["header"]);
     expect(doc.scopes_supported).toEqual(["openid", "email", "offline_access"]);
   });
+
+  it("strips a trailing slash so the pointer equals Clerk's issuer", async () => {
+    // Clerk's metadata says "issuer": "https://clerk.finchmcp.com" (no slash).
+    // A configured "https://…/" must not leak through as a different string.
+    const res = await call(
+      new Request(`${BASE}/.well-known/oauth-protected-resource/svc/mcp`, {
+        headers: { host: HOST },
+      }),
+      { CLERK_ISSUER: "https://clerk.example.test/" },
+    );
+    expect(res.status).toBe(200);
+    const doc = (await res.json()) as any;
+    expect(doc.authorization_servers).toEqual(["https://clerk.example.test"]);
+  });
 });
 
-describe("AS metadata proxy on the resource origin", () => {
+describe("no hub-hosted authorization server", () => {
   for (const spelling of [
     "oauth-authorization-server",
     "openid-configuration",
   ]) {
-    it(`fails closed (502) at /.well-known/${spelling} when the upstream AS is unreachable`, async () => {
-      // CLERK_ISSUER is a fake origin here, so the upstream metadata fetch
-      // cannot succeed — the proxy must answer 502, never a relay fallthrough
-      // (the pre-v1.5.6 behavior was a confusing 503 from the relay plane).
+    it(`serves no AS metadata at /.well-known/${spelling}`, async () => {
+      // The hub used to serve Clerk's doc here with `issuer` rewritten to the
+      // hub host — which Clerk's `iss` could never match. Now the path is not
+      // ours: it falls through to the relay plane and must end in a 4xx (MCP
+      // SDKs skip a 4xx discovery candidate but abort on a 5xx), and in
+      // particular must never be a 200 claiming an issuer other than Clerk's.
       const res = await call(
         new Request(`${BASE}/.well-known/${spelling}`, {
-          headers: { host: HOST },
+          headers: { host: HOST, accept: "application/json" },
         }),
       );
-      expect(res.status).toBe(502);
+      expect(res.status).toBeGreaterThanOrEqual(400);
+      expect(res.status).toBeLessThan(500);
     });
   }
+
+  it("forwards a legacy POST /register to Clerk byte for byte, with no scope injection", async () => {
+    // Some Claude builds POST /register on the resource origin instead of the
+    // discovered registration_endpoint. The hub hands those to Clerk unchanged.
+    const doc = JSON.stringify({ redirect_uris: ["https://client.test/cb"], client_name: "c" });
+    const seen: { url: string; body: string; redirect?: string }[] = [];
+    const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const url = typeof input === "string" ? input : (input as Request).url;
+      seen.push({
+        url,
+        body: new TextDecoder().decode(init?.body as Uint8Array),
+        redirect: init?.redirect,
+      });
+      return new Response(JSON.stringify({ client_id: "cid" }), {
+        status: 201,
+        headers: { "content-type": "application/json" },
+      });
+    });
+    try {
+      const res = await call(
+        new Request(`${BASE}/register`, {
+          method: "POST",
+          headers: { host: HOST, "content-type": "application/json" },
+          body: doc,
+        }),
+        { CLERK_ISSUER: "https://clerk.test/" },
+      );
+      expect(res.status).toBe(201);
+      expect(seen).toEqual([{ url: "https://clerk.test/oauth/register", body: doc, redirect: "manual" }]);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("caps the legacy /register body", async () => {
+    const res = await call(
+      new Request(`${BASE}/register`, {
+        method: "POST",
+        headers: { host: HOST, "content-type": "application/json" },
+        body: "x".repeat(64 * 1024 + 1),
+      }),
+    );
+    expect(res.status).toBe(413);
+  });
 });

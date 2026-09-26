@@ -11,7 +11,7 @@
 //   - /join is the ONE exception — it's TICKET-authed (the box presents the
 //     stateless join ticket it was handed at enroll). No service secret.
 
-import { rateLimitOk, clientIp, json, tenantOp, boxStub, type Env } from "./index";
+import { rateLimitOk, clientIp, serviceClientIp, json, tenantOp, boxStub, type Env } from "./index";
 import {
   serviceOk,
   signToken,
@@ -572,8 +572,10 @@ async function handleApiInner(
       // members whose e: pointers permanently enlarge that DO's keyspace --
       // so unbounded creation was an availability lever against other users,
       // not just self-inflicted resource growth. Keyed per user AND per IP so
-      // neither a single account nor a single host can spin freely.
-      if(!(await rateLimitOk(env.JOIN_LIMIT,`tcreate:${clerkUserId}`))||!(await rateLimitOk(env.JOIN_LIMIT,`tcreate:${clientIp(req)}`)))return json(429,{error:"rate limited"});
+      // neither a single account nor a single host can spin freely. The IP is
+      // the browser's, forwarded by the web (serviceClientIp): the request
+      // itself arrives over a service binding with no client IP of its own.
+      if(!(await rateLimitOk(env.JOIN_LIMIT,`tcreate:${clerkUserId}`))||!(await rateLimitOk(env.JOIN_LIMIT,`tcreate:${serviceClientIp(req)}`)))return json(429,{error:"rate limited"});
       if(!body.email||!emails.includes(String(body.email).trim().toLowerCase()))return json(400,{error:"email must be verified"});
 
       // THE IDEMPOTENCY KEY IS REQUIRED — there is no unkeyed path. Creation

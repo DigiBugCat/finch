@@ -13,10 +13,12 @@
     "directory": ".open-next/assets",
     "binding": "ASSETS"
   },
-  // Distinct worker names per env (finch-web-dev / finch-web-prod) so deploys
+  // Distinct worker names per env (finch-web-dev / -staging / -prod) so deploys
   // are isolated. Each env's WORKER_SELF_REFERENCE must point at its OWN name,
-  // and FINCH_HUB binds to the matching hub worker (finch-dev / finch-prod) so
-  // the web→hub trust call rides a service binding, not the public wire.
+  // and FINCH_HUB binds to the matching hub worker (finch-dev / finch-staging /
+  // finch-prod): lib/hub.ts sends every web→hub call over that binding, not the
+  // public wire. HUB_URL is still required — it is the URL (and so the host)
+  // the hub sees on those calls, and the origin shown in install one-liners.
   // FINCH_SERVICE_SECRET + CLERK_SECRET_KEY + CLERK_WEBHOOK_SECRET are SECRETS — set via
   // `wrangler secret put … --env <env>`, never here.
   "env": {

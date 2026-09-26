@@ -133,6 +133,17 @@ that emits a progress event every ~15s stays alive indefinitely; a genuinely
 silent stream is reaped. Cloudflare allows this — an actively-streaming Worker
 response has no duration limit.
 
+## Header fidelity
+
+The relay forwards request headers byte-for-byte except those the hub accepts a
+credential in: `Authorization`, `Proxy-Authorization`, every `X-Finch-*` header
+(the namespace is hub-reserved; `X-Finch-Assertion` is minted afterwards), and
+the login-wall cookie pairs inside `Cookie`. The scrub is by **name**, never by
+value — MCP 2026-07-28's `Mcp-Name` / `Mcp-Param-*` mirror the JSON-RPC body,
+and deleting one because a tool or argument happened to contain `finch_` makes
+the server reject the call as a header/body mismatch (400, -32020). Unknown
+`Mcp-*` headers, and `GET` / `DELETE`, pass through untouched.
+
 ## Session affinity
 
 The relay does **not** parse MCP bodies, but it may read the `Mcp-Session-Id`
@@ -151,7 +162,8 @@ trivially. (Do **not** use cookie affinity — MCP clients drop `Set-Cookie`.)
   `new Response(readableStream, {status, headers})` fed from `HEAD`+`DATA(down)`.
 - `index.ts`: drop the `MAX_RELAY_BODY_BYTES` whole-body cap and the
   `req.arrayBuffer()` buffer in `relayMcp`; stream `req.body` into `DATA(up)`.
-  Keep the finch_ auth + key-strip exactly as-is (that's the trust boundary).
+  Keep the finch_ auth + key-strip (that's the trust boundary; the strip is now
+  by header name — see Header fidelity above).
 - `agent/main.go`: replace the `frame{…Body string}` model + `io.ReadAll`
   (`forward()`) with a yamux session + `httputil.ReverseProxy` (streams natively,
   no buffering). `--upstream` becomes a `route → upstream` table (multi-server).
