@@ -22,10 +22,10 @@ export default function Domains() {
       <Code>{`https://<slug>.finchmcp.com/<app_path>/
 <span class="c"># an MCP server answers at /<app_path>/mcp</span>`}</Code>
       <p>
-        A slug is assigned automatically the first time you open the dashboard or a box
-        enrolls, so your account always has a working public host. Change it in the
-        dashboard under Settings, in the Hub domain row. Availability is checked live as
-        you type. Slugs are lowercase letters, digits, and hyphens, at least 3 characters.
+        A slug is assigned automatically the first time a box enrolls, so your account
+        always has a working public host. Slugs are lowercase letters, digits, and
+        hyphens, at least 3 characters. <code>finch status</code> shows the one your
+        account uses.
       </p>
 
       <h2>Custom domains</h2>
@@ -34,7 +34,7 @@ export default function Domains() {
         recommended naming is one hostname per box, with the service in the path:
       </p>
       <Code>{`https://<box>.yourdomain.com/<service>/`}</Code>
-      <p>Setup is three steps, all in dashboard Settings under Custom domains:</p>
+      <p>Setup is three steps, all with <code>finch domain</code>:</p>
       <div className="docs-table-wrap">
         <table>
           <thead>
@@ -43,11 +43,11 @@ export default function Domains() {
           <tbody>
             <tr>
               <td>1. Add the hostname</td>
-              <td>Name it after the box it reaches, for example <code>pelican.yourdomain.com</code>.</td>
+              <td><code>finch domain add pelican.yourdomain.com</code>. Name it after the box it reaches.</td>
             </tr>
             <tr>
               <td>2. Create the DNS record</td>
-              <td>After adding, the dashboard shows the exact CNAME record to create at your DNS provider. It points your hostname at Finch.</td>
+              <td>The command prints the exact CNAME record to create at your DNS provider. It points your hostname at Finch.</td>
             </tr>
             <tr>
               <td>3. Wait for DNS</td>
@@ -56,21 +56,17 @@ export default function Domains() {
           </tbody>
         </table>
       </div>
-      <div className="docs-note">
-        <b>Removal is immediate.</b> Removing a hostname stops traffic on it right away.
-        Your hub domain keeps working; custom domains are additional names, not replacements.
-      </div>
-
-      <h2>From the CLI</h2>
-      <p>Custom hostnames can also be managed with <code>finch domain</code>:</p>
       <Code>{`finch domain ls                    <span class="c"># list custom hostnames on this account</span>
 finch domain add mcp.example.com   <span class="c"># add one; prints the CNAME to configure</span>
 finch domain rm mcp.example.com    <span class="c"># remove one; traffic stops immediately</span>`}</Code>
       <p>
         <code>finch domain ls</code> supports <code>--json</code> for scripting. Removal
-        only works for hostnames on your account; the hub slug itself is changed in the
-        dashboard, not the CLI.
+        only works for hostnames on your account.
       </p>
+      <div className="docs-note">
+        <b>Removal is immediate.</b> Removing a hostname stops traffic on it right away.
+        Your hub domain keeps working; custom domains are additional names, not replacements.
+      </div>
 
       <div className="docs-foot">
         <Link href="/docs/acls">← Access control</Link>

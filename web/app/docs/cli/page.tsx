@@ -43,7 +43,7 @@ export default function CliReference() {
             </tr>
             <tr>
               <td><code>finch enroll &lt;app_path&gt; --ticket &lt;t&gt;</code></td>
-              <td>One-time: trade a dashboard ticket for a saved box credential. Use <code>--ticket -</code> to read the ticket from stdin, or set <code>FINCH_TICKET</code>.</td>
+              <td>One-time: trade a one-shot enrollment ticket for a saved box credential. Use <code>--ticket -</code> to read the ticket from stdin, or set <code>FINCH_TICKET</code>. Most boxes never need this: <code>finch login</code> or <code>finch token</code> (below) covers them.</td>
             </tr>
           </tbody>
         </table>
