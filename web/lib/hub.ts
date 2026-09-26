@@ -12,16 +12,17 @@
 // replayed for an arbitrary tenant.
 //
 // This module centralizes (a) resolving the tenant from the Clerk session and
-// (b) calling the hub with the right headers. Route handlers stay thin.
+// (b) calling the hub with the right headers. Route handlers stay thin. The
+// web's only hub-backed surface is the `finch login` approval page (/cli), and
+// its caller always acts as the owner of their own tenant.
 
 import "server-only";
 import { auth, clerkClient } from "@clerk/nextjs/server";
 import { cache } from "react";
-import { readActiveTenant, clearActiveTenant, validTenantId } from "./tenant-cookie";
 // The assertion signer lives in its own dependency-free module so it can be
 // contract-tested against the hub's verifyAssertion (worker/src/auth.ts).
 import { signAssertion } from "./assertion";
-import { hasFeature } from "./entitlements";
+
 
 /** A thrown HttpError short-circuits a route handler with a JSON response. */
 export class HttpError extends Error {
@@ -68,38 +69,182 @@ async function hubBinding(): Promise<HubBinding | undefined> {
   return undefined;
 }
 
-/** Public accessor for runtimeEnv — routes that need a non-hub secret (e.g.
- *  the Clerk webhook signing secret) read it through the same CF-or-process
- *  fallback the hub bridge uses. */
-export async function readRuntimeEnv(name: string): Promise<string | undefined> {
-  return runtimeEnv(name);
+const TENANT_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
+/** True for a string the hub accepts as a tenant (or Clerk user) id. */
+function validTenantId(value: unknown): value is string {
+  return typeof value === "string" && TENANT_RE.test(value);
 }
 
-/** The hub origin a box should install from and `finch login` against — the
- *  HUB_URL runtime var (trailing slash trimmed). This is the ACTUAL hub the web
- *  talks to (e.g. the staging hub on staging), unlike a tenant's stored slug
- *  host, so the connect one-liner always targets the right environment. Throws
- *  500 if unset. */
-export async function getHubUrl(): Promise<string> {
-  const hubUrl = await runtimeEnv("HUB_URL");
-  if (!hubUrl) throw new HttpError(500, "HUB_URL is not configured");
-  return normalizeHubUrl(hubUrl);
+/** The signed-in user's Finch tenant context, revalidated against the hub on
+ *  every request. */
+export interface ResolvedTenant {
+  tenant: string;
+  userId: string;
+  memberId: string;
+  email: string;
+  role: "owner" | "admin" | "member";
+  isAdmin: boolean;
+  /** The account a CLI token minted for this context acts as, for the
+   *  approval screen. */
+  account: { name: string; kind: "personal" | "team" };
 }
 
-/** Native Finch tenant context, revalidated against TenantDO per request. */
-export interface ResolvedTenant { tenant:string; userId:string; memberId:string; email:string; role:"owner"|"admin"|"member"; isAdmin:boolean; }
+async function readHubJson(res: Response): Promise<any> {
+  try {
+    return await res.json();
+  } catch {
+    throw new HttpError(502, "invalid response from hub");
+  }
+}
 
-async function resolveTenantUncached():Promise<ResolvedTenant>{
-  const {userId}=await auth(); if(!userId)throw new HttpError(401,"unauthenticated");
-  let selected:string|null=null; try{selected=await readActiveTenant();}catch{/* unit callers may inject no Next request store */} const tenant=selected??userId;
-  let res=await hubFetchAs(tenant,"/api/member-context",{method:"POST",body:JSON.stringify({clerkUserId:userId})});
-  if(!res.ok)throw new HttpError(res.status,"could not resolve workspace membership");
-  let data:any;try{data=await res.json();}catch{throw new HttpError(502,"invalid response from hub");}
-  if(!data||typeof data!=="object")throw new HttpError(502,"invalid response from hub");
-  if(data.needsBootstrap===true&&tenant===userId){const clerk=await clerkClient();const u=await clerk.users.getUser(userId);const verified=u.emailAddresses.filter(e=>e.verification?.status==="verified");const primary=verified.find(e=>e.id===u.primaryEmailAddressId)??verified[0];if(!primary)throw new HttpError(403,"verify your email to finish setting up your workspace");res=await hubFetchAs(tenant,"/api/member-context",{method:"POST",body:JSON.stringify({clerkUserId:userId,email:primary.emailAddress})});if(!res.ok)throw new HttpError(res.status,"could not bootstrap workspace membership");try{data=await res.json();}catch{throw new HttpError(502,"invalid response from hub");}}
-  if(!data||typeof data!=="object"||!("member" in data))throw new HttpError(502,"invalid response from hub");
-  if(data.member===null){if(selected)try{await clearActiveTenant();}catch{}throw new HttpError(403,"not an active member of this workspace");}
-  if(typeof data.member!=="object"||Array.isArray(data.member))throw new HttpError(502,"invalid response from hub");
+/** A tenant the signed-in user could act as: their personal tenant or one
+ *  they actively own. */
+interface Candidate {
+  tenant: string;
+  name: string;
+  kind: "personal" | "team";
+}
+
+/** A hub-supplied display name if it is safe to show, else undefined. */
+function displayName(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const name = value.trim();
+  if (!name || name.length > 200 || /[\u0000-\u001f\u007f]/.test(name)) return undefined;
+  return name;
+}
+
+/**
+ * The tenants other than their personal one that `userId` actively OWNS, in
+ * the order the hub lists them.
+ *
+ * Asked of the hub's user-scoped /api/user/sync, the one place that knows
+ * which tenants a user belongs to. Only its `tenants` list is read, never a
+ * `tenant` pick: an older hub (full membership list) and a hub that has cut
+ * workspaces both answer with the list, and the choice between the tenants is
+ * made here from what they hold (see chooseTenant). Rows where the user is
+ * not an active owner are dropped; co-owning a team counts as owning it.
+ */
+async function ownedTenants(userId: string): Promise<Candidate[]> {
+  // No emails: this is a lookup, not an identity sync. An older hub binds
+  // pending invitations for the emails it is sent, and there are none to bind.
+  const res = await userFetch(userId, "/api/user/sync", {
+    method: "POST",
+    body: JSON.stringify({ emails: [] }),
+  });
+  if (!res.ok) throw new HttpError(res.status, "could not resolve your Finch account");
+  const data = await readHubJson(res);
+  if (!data || typeof data !== "object" || Array.isArray(data) || !Array.isArray(data.tenants)) {
+    throw new HttpError(502, "invalid response from hub");
+  }
+  const owned: Candidate[] = [];
+  for (const row of data.tenants) {
+    if (
+      !row || typeof row !== "object" ||
+      row.tenantId === userId || !validTenantId(row.tenantId) ||
+      row.role !== "owner" || row.state !== "active" ||
+      owned.some((c) => c.tenant === row.tenantId)
+    ) {
+      continue;
+    }
+    owned.push({ tenant: row.tenantId, name: displayName(row.name) ?? row.tenantId, kind: "team" });
+  }
+  return owned;
+}
+
+/** True when `tenant` holds something its owner would lose track of: a
+ *  service (and with it its boxes) or a finch_ key. */
+async function holdsFleet(tenant: string): Promise<boolean> {
+  const res = await hubFetchAs(tenant, "/api/state", { method: "GET" });
+  if (!res.ok) throw new HttpError(res.status, "could not resolve your Finch account");
+  const state = await readHubJson(res);
+  if (
+    !state || typeof state !== "object" ||
+    !Array.isArray(state.services) || !Array.isArray(state.keys)
+  ) {
+    throw new HttpError(502, "invalid response from hub");
+  }
+  return state.services.length > 0 || state.keys.length > 0;
+}
+
+/**
+ * The one tenant the signed-in user acts as. Workspace switching is gone, so
+ * the choice must be deterministic and must never strand anyone's services
+ * away from the CLI, which is now the only way to manage them:
+ *
+ * - Owns nothing beyond the personal tenant (almost everyone): the personal
+ *   tenant, their Clerk user id, as before. Nothing is probed.
+ * - Otherwise, whichever one of personal + owned holds services or keys. An
+ *   empty team never displaces a personal tenant that holds the user's fleet,
+ *   and a populated team wins over an empty personal tenant.
+ * - None of them holds anything: the personal tenant, as before.
+ * - More than one holds something: refuse rather than pick one silently.
+ */
+async function chooseTenant(userId: string): Promise<Candidate> {
+  const personal: Candidate = { tenant: userId, name: userId, kind: "personal" };
+  const owned = await ownedTenants(userId);
+  if (owned.length === 0) return personal;
+  const populated: Candidate[] = [];
+  for (const candidate of [personal, ...owned]) {
+    if (await holdsFleet(candidate.tenant)) populated.push(candidate);
+  }
+  if (populated.length === 0) return personal;
+  if (populated.length === 1) return populated[0];
+  const names = populated
+    .map((c) => (c.kind === "personal" ? "your personal account" : `"${c.name}"`))
+    .join(", ");
+  throw new HttpError(
+    409,
+    `you own more than one Finch account with services or keys (${names}), ` +
+      "and Finch now has one account per sign-in, so it cannot choose which one to log in to",
+  );
+}
+
+/**
+ * Resolve the signed-in Clerk user to one tenant (chooseTenant), then revalidate
+ * their membership there with /api/member-context (request and response shape
+ * unchanged). A tenant other than the personal one is accepted only for its
+ * active owner, so a hub bug can never hand anyone else's tenant to this user.
+ *
+ * A personal tenant that has never been set up answers `needsBootstrap`; the
+ * web then retries with the user's verified primary email, which makes the hub
+ * create it with this user as its owner.
+ */
+async function resolveTenantUncached(): Promise<ResolvedTenant> {
+  const { userId } = await auth();
+  if (!userId) throw new HttpError(401, "unauthenticated");
+
+  const chosen = await chooseTenant(userId);
+  const tenant = chosen.tenant;
+  let res = await hubFetchAs(tenant, "/api/member-context", {
+    method: "POST",
+    body: JSON.stringify({ clerkUserId: userId }),
+  });
+  if (!res.ok) throw new HttpError(res.status, "could not resolve your Finch account");
+  let data = await readHubJson(res);
+  if (!data || typeof data !== "object") throw new HttpError(502, "invalid response from hub");
+
+  if (data.needsBootstrap === true && tenant === userId) {
+    const clerk = await clerkClient();
+    const user = await clerk.users.getUser(userId);
+    const verified = user.emailAddresses.filter((e) => e.verification?.status === "verified");
+    const primary = verified.find((e) => e.id === user.primaryEmailAddressId) ?? verified[0];
+    if (!primary) throw new HttpError(403, "verify your email to finish setting up your account");
+    res = await hubFetchAs(tenant, "/api/member-context", {
+      method: "POST",
+      body: JSON.stringify({ clerkUserId: userId, email: primary.emailAddress }),
+    });
+    if (!res.ok) throw new HttpError(res.status, "could not set up your Finch account");
+    data = await readHubJson(res);
+  }
+
+  if (!data || typeof data !== "object" || !("member" in data)) {
+    throw new HttpError(502, "invalid response from hub");
+  }
+  if (data.member === null) throw new HttpError(403, "not an active member of this account");
+  if (typeof data.member !== "object" || Array.isArray(data.member)) {
+    throw new HttpError(502, "invalid response from hub");
+  }
   const { id, email, role, state } = data.member;
   if (
     typeof id !== "string" || !id ||
@@ -109,41 +254,24 @@ async function resolveTenantUncached():Promise<ResolvedTenant>{
   ) {
     throw new HttpError(502, "invalid response from hub");
   }
-  if(state!=="active"){if(selected)try{await clearActiveTenant();}catch{}throw new HttpError(403,"not an active member of this workspace");}
-  return {tenant,userId,memberId:id,email,role,isAdmin:role!=="member"};
+  if (state !== "active") throw new HttpError(403, "not an active member of this account");
+  if (tenant !== userId && role !== "owner") {
+    throw new HttpError(403, "not the owner of this account");
+  }
+  // A personal tenant's display name is just the Clerk user id, so it is
+  // labelled with the member's email instead.
+  const account = { name: chosen.kind === "personal" ? email : chosen.name, kind: chosen.kind };
+  return { tenant, userId, memberId: id, email, role, isAdmin: role !== "member", account };
 }
 export const resolveTenant = process.env.NODE_ENV === "test" ? resolveTenantUncached : cache(resolveTenantUncached);
-export async function requireAdmin():Promise<ResolvedTenant>{const ctx=await resolveTenant();if(!ctx.isAdmin)throw new HttpError(403,"admin role required");return ctx;}
-export async function requireSharing():Promise<ResolvedTenant>{const ctx=await requireAdmin();if(!(await hasFeature(ctx.tenant,"sharing")))throw new HttpError(402,"a Team plan is required to share");return ctx;}
 
-/** Mint a long-lived CLI token for the admin's tenant — the credential the
- *  `finch` CLI presents to /api/cli/*. Admin-only. The HUB mints it (epoch-bound,
- *  kind:"cli") so it can be revoked via cli-revoke without rotating the secret. */
-export async function mintCliToken(): Promise<{
-  token: string;
-  hub: string;
-  expiresAt: number;
-}> {
-  const ctx = await requireAdmin();
-  const res = await hubFetchAs(ctx.tenant, "/api/cli-mint", { method: "POST", body: "{}" });
-  if (!res.ok) throw new HttpError(res.status, "could not mint CLI token");
-  return (await res.json()) as { token: string; hub: string; expiresAt: number };
+/** The resolved tenant, refusing a member without admin rights. */
+export async function requireAdmin(): Promise<ResolvedTenant> {
+  const ctx = await resolveTenant();
+  if (!ctx.isAdmin) throw new HttpError(403, "admin role required");
+  return ctx;
 }
 
-/** Invalidate every outstanding CLI token for the admin's tenant. */
-export async function revokeCliTokens(): Promise<Response> {
-  const ctx = await requireAdmin();
-  return hubFetchAs(ctx.tenant, "/api/cli-revoke", { method: "POST", body: "{}" });
-}
-
-/** Sign out every live login-wall web session across the admin's tenant — the
- *  hub bumps the tenant's sessionEpoch, invalidating all outstanding
- *  finch_session cookies so every browser must re-authenticate at the
- *  service gate. Admin-only, mirroring revokeCliTokens. */
-export async function revokeSessions(): Promise<Response> {
-  const ctx = await requireAdmin();
-  return hubFetchAs(ctx.tenant, "/api/sessions-revoke", { method: "POST", body: "{}" });
-}
 
 /** Return a canonical origin, or throw unless `hubUrl` is https: or a
  *  localhost/127.0.0.1 dev URL. Credentials and URL suffixes are refused so
@@ -206,25 +334,11 @@ function validateHubPath(path: string): void {
 }
 
 /**
- * Call the hub control API for the current tenant. Resolves the tenant from
- * the Clerk session, attaches the service secret + tenant headers, and fetches
- * `${HUB_URL}${path}` — over the FINCH_HUB service binding when deployed (see
- * fetchHubNoRedirect). Returns the raw Response (caller decides how to read it).
- */
-export async function hubFetch(
-  path: string,
-  init: RequestInit = {},
-): Promise<Response> {
-  const { tenant } = await resolveTenant();
-  return hubFetchAs(tenant, path, init);
-}
-
-/**
- * Like hubFetch, but for a caller-supplied tenant instead of the Clerk
- * session's. ONLY for server-to-server entry points that carry their own
- * authenticated tenant identity — e.g. the Clerk webhook, where the verified
- * Svix payload names the org and there is no session at all. Never pass a
- * tenant taken from an unauthenticated request body.
+ * Call the hub control API as `tenant`: attach the service secret and a signed
+ * assertion for that tenant, and fetch `${HUB_URL}${path}` — over the FINCH_HUB
+ * service binding when deployed (see fetchHubNoRedirect). Returns the raw
+ * Response (caller decides how to read it). Pass only a tenant the server
+ * resolved itself (resolveTenant), never one taken from a request body.
  */
 export async function hubFetchAs(
   tenant: string,
@@ -261,6 +375,31 @@ export async function hubFetchAs(
 }
 
 /**
+ * Like hubFetchAs, but signs a USER-scoped assertion (kind "user") naming the
+ * Clerk user rather than a tenant. The hub accepts it only on its user-scoped
+ * routes (here, /api/user/sync) and never as a tenant credential.
+ */
+export async function userFetch(
+  clerkUserId: string,
+  path: string,
+  init: RequestInit = {},
+): Promise<Response> {
+  const hubUrl = await runtimeEnv("HUB_URL");
+  const secret = await runtimeEnv("FINCH_SERVICE_SECRET");
+  if (!hubUrl || !secret) throw new HttpError(500, "hub is not configured");
+  const hubOrigin = normalizeHubUrl(hubUrl);
+  validateHubRequestIdentity(clerkUserId, "Clerk user id");
+  validateHubPath(path);
+  const headers = new Headers(init.headers);
+  headers.set("X-Finch-Service", secret);
+  headers.set("X-Finch-Auth", await signAssertion(clerkUserId, secret, undefined, "user"));
+  if (init.body != null && !headers.has("content-type")) {
+    headers.set("content-type", "application/json");
+  }
+  return fetchHubNoRedirect(`${hubOrigin}${path}`, { ...init, headers });
+}
+
+/**
  * Fetch the hub with redirect-following disabled.
  *
  * `redirect: "error"` is NOT implemented by workers.dev's runtime — workerd
@@ -289,120 +428,6 @@ async function fetchHubNoRedirect(
     throw new HttpError(502, "hub returned a redirect");
   }
   return response;
-}
-
-export async function userFetch(clerkUserId:string,path:string,init:RequestInit={}):Promise<Response>{const hubUrl=await runtimeEnv("HUB_URL"),secret=await runtimeEnv("FINCH_SERVICE_SECRET");if(!hubUrl||!secret)throw new HttpError(500,"hub is not configured");const hubOrigin=normalizeHubUrl(hubUrl);validateHubRequestIdentity(clerkUserId,"Clerk user id");validateHubPath(path);const headers=new Headers(init.headers);headers.set("X-Finch-Service",secret);headers.set("X-Finch-Auth",await signAssertion(clerkUserId,secret,undefined,"user"));if(init.body!=null&&!headers.has("content-type"))headers.set("content-type","application/json");return fetchHubNoRedirect(`${hubOrigin}${path}`,{...init,headers});}
-
-// ---- access sharing helpers -----------------------------------------------
-// Thin typed wrappers over the hub's /api/access* + /api/acl surface, shared
-// by the access routes and the Clerk webhook (which has no session, hence the
-// explicit-tenant *As shape). The DO owns the queue; these only orchestrate.
-
-/** One row of the tenant DO's accessRequests queue (worker/src/types.ts). */
-export interface AccessRow {
-  id: string;
-  email: string;
-  service: string;
-  requestedBy: string;
-  status: "pending" | "invited" | "granted" | "denied";
-  created: number;
-  resolvedBy?: string;
-  resolvedAt?: number;
-}
-
-/** A user→service ACL grant as listAccess returns it. */
-export interface AccessGrant {
-  id: string;
-  src: { type: string; name?: string };
-  dst: { type: string; name?: string }[];
-}
-
-/** Read the tenant's access lens: request rows + user→service ACL grants. */
-export async function listAccessAs(
-  tenant: string,
-): Promise<{ requests: AccessRow[]; grants: AccessGrant[] }> {
-  const res = await hubFetchAs(tenant, "/api/access", { method: "GET" });
-  if (!res.ok) throw new HttpError(res.status, "could not list access");
-  return (await res.json()) as { requests: AccessRow[]; grants: AccessGrant[] };
-}
-
-/** Ensure a user→service ACL grant exists. Idempotence lives in the DO's
- *  addAcl (an identical rule is returned, never duplicated), so this is safe
- *  under racing writers (approve route vs Clerk webhook) — no read-then-write. */
-export async function ensureUserGrantAs(
-  tenant: string,
-  email: string,
-  service: string,
-): Promise<{ id: string }> {
-  const res = await hubFetchAs(tenant, "/api/acl", {
-    method: "POST",
-    body: JSON.stringify({
-      src: { type: "user", name: email.toLowerCase() },
-      dst: [{ type: "service", name: service }],
-    }),
-  });
-  if (!res.ok) throw new HttpError(res.status, "could not add grant");
-  return (await res.json()) as { id: string };
-}
-
-/** Surgically revoke ONE user→service grant in the DO (multi-dst rules keep
- *  their other services). `stillAllowed` reports coverage by a broader rule
- *  (all/tag/group/locked) that a per-service revoke cannot narrow. */
-export async function removeUserGrantAs(
-  tenant: string,
-  email: string,
-  service: string,
-): Promise<{ removed: boolean; stillAllowed: boolean }> {
-  const res = await hubFetchAs(tenant, "/api/access/revoke-grant", {
-    method: "POST",
-    body: JSON.stringify({ email: email.toLowerCase(), service }),
-  });
-  if (!res.ok) throw new HttpError(res.status, "could not remove grant");
-  return (await res.json()) as { removed: boolean; stillAllowed: boolean };
-}
-
-/** Native caller label from the live member row. */
-export async function callerLabel(_userId?:string):Promise<string>{return (await resolveTenant()).email;}
-
-/** Call the hub and pass its JSON body + status straight back to the client. */
-export async function hubProxy(
-  path: string,
-  init: RequestInit = {},
-): Promise<Response> {
-  const res = await hubFetch(path, init);
-  const text = await res.text();
-  return new Response(text, {
-    status: res.status,
-    headers: {
-      "content-type": res.headers.get("content-type") ?? "application/json",
-    },
-  });
-}
-
-/** Admin-only passthrough: require admin, then forward the request body to a
- *  hub path verbatim. Collapses the handful of routes that are pure proxies
- *  (acl, enroll, keys, settings, tags) into one call + a try/catch. */
-export async function adminProxy(
-  req: Request,
-  hubPath: string,
-  method: string,
-): Promise<Response> {
-  const ctx = await requireAdmin();
-  const res = await hubFetchAs(ctx.tenant, hubPath, { method, body: await req.text() });
-  return new Response(await res.text(), { status: res.status, headers: { "content-type": res.headers.get("content-type") ?? "application/json" } });
-}
-
-/** Like adminProxy, but gates on the "sharing" entitlement (requireSharing)
- *  rather than admin alone. Used by the ACL routes — managing access is a paid
- *  Team capability. */
-export async function sharingProxy(
-  req: Request,
-  hubPath: string,
-  method: string,
-): Promise<Response> {
-  const ctx = await requireSharing();
-  const res = await hubFetchAs(ctx.tenant, hubPath, { method, body: await req.text() });
-  return new Response(await res.text(), { status: res.status, headers: { "content-type": res.headers.get("content-type") ?? "application/json" } });
 }
 
 /** Turn a thrown HttpError (or anything) into a JSON Response for a handler.

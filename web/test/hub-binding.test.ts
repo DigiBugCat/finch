@@ -64,6 +64,26 @@ describe("hub bridge transport", () => {
     expect(headers.get("content-type")).toBe("application/json");
   });
 
+  it("overwrites caller-supplied auth headers on the binding path too", async () => {
+    const binding = { fetch: workerdFetch(() => Response.json({ ok: true })) };
+    vi.stubGlobal("fetch", workerdFetch(() => Response.json({ ok: true })));
+    restoreContext = installCloudflareContext(deployedEnv({ FINCH_HUB: binding }));
+
+    await hubFetchAs("user_1", "/api/member-context", {
+      method: "POST",
+      body: "{}",
+      headers: { "X-Finch-Service": "attacker", "X-Finch-Auth": "attacker" },
+    });
+
+    expect(fetch).not.toHaveBeenCalled();
+    const [url, init] = binding.fetch.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("https://hub.example.test/api/member-context");
+    expect(init.redirect).toBe("manual");
+    const headers = new Headers(init.headers);
+    expect(headers.get("x-finch-service")).toBe(SECRET);
+    expect(await verifyAssertion(headers.get("x-finch-auth")!, SECRET)).toBe("user_1");
+  });
+
   it("sends user-scoped assertions over the binding too", async () => {
     const binding = { fetch: workerdFetch(() => Response.json({ ok: true })) };
     vi.stubGlobal("fetch", workerdFetch(() => Response.json({ ok: true })));

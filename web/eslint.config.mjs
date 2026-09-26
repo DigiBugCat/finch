@@ -28,14 +28,13 @@ const config = [
   ...compat.extends("next/core-web-vitals"),
   {
     rules: {
-      // The dashboard view components are intentionally prop-driven with `any`
-      // boundaries (see DashboardApp/panels comments); we don't want lint to
-      // fail the build on those pre-existing, deliberate `any`s. Type safety at
-      // the data contract is enforced by tsc + the new KeyScope types instead.
+      // Untyped hub JSON and caught errors are read through deliberate `any`
+      // boundaries and validated field by field right after (see lib/hub.ts);
+      // we don't want lint to fail the build on those.
       "@typescript-eslint/no-explicit-any": "off",
 
-      // PRE-EXISTING findings in the marketing/landing components + dashboard
-      // chrome (not introduced by the auth-fix work). Demoted to warnings so the
+      // PRE-EXISTING findings in the marketing/landing components (not
+      // introduced by the auth-fix work). Demoted to warnings so the
       // `lint` CI gate is meaningful (it goes red on NEW violations in changed
       // code) without forcing a sweeping rewrite of copy/markup we don't own the
       // intent of in this change. Tighten back to "error" in a dedicated cleanup.

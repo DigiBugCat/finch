@@ -4,7 +4,6 @@ import ClientStrip from '@/components/ClientStrip';
 import ValuePillars from '@/components/ValuePillars';
 import HowItWorks from '@/components/HowItWorks';
 import Abilities from '@/components/Abilities';
-import FlockSplit from '@/components/FlockSplit';
 import Safety from '@/components/Safety';
 import Beta from '@/components/Beta';
 import Faq from '@/components/Faq';
@@ -21,7 +20,6 @@ export default function Home() {
       <ValuePillars />
       <HowItWorks />
       <Abilities />
-      <FlockSplit />
       <Safety />
       <Beta />
       <Faq />

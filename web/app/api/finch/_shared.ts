@@ -1,13 +1,5 @@
 import { HttpError } from "@/lib/hub";
-import { readJsonObject as readBoundedJsonObject } from "@/lib/request-body";
-
-export const MAX_API_JSON_BYTES = 4 * 1024;
-
-export type JsonObject = Record<string, unknown>;
-
-export function isJsonObject(value: unknown): value is JsonObject {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
-}
+import { isJsonObject, type JsonObject } from "./cli-contract";
 
 async function readBoundedResponseBytes(
   response: Response,
@@ -67,14 +59,6 @@ function requireJsonContentType(response: Response): string {
   return contentType;
 }
 
-/** Finch's small control messages use a tighter cap than the shared default. */
-export async function readJsonObject(
-  req: Request,
-  maxBytes = MAX_API_JSON_BYTES,
-): Promise<JsonObject> {
-  return readBoundedJsonObject(req, maxBytes);
-}
-
 /** Read a bounded, UTF-8 JSON object from the trusted hub. */
 export async function readHubJsonObject(
   response: Response,
@@ -90,57 +74,6 @@ export async function readHubJsonObject(
   }
   if (!isJsonObject(value)) throw new HttpError(502, "invalid response from hub");
   return value;
-}
-
-/** Validate a bounded JSON response while preserving its status and bytes. */
-export async function relayHubJson(
-  response: Response,
-  maxBytes = 64 * 1024,
-): Promise<Response> {
-  const contentType = requireJsonContentType(response);
-  const bytes = await readBoundedResponseBytes(response, maxBytes);
-  let value: unknown;
-  try {
-    value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
-  } catch {
-    throw new HttpError(502, "invalid response from hub");
-  }
-  if (!isJsonObject(value)) throw new HttpError(502, "invalid response from hub");
-  return new Response(bytes.buffer as ArrayBuffer, {
-    status: response.status,
-    headers: { "content-type": contentType },
-  });
-}
-
-/** Relay a bounded JSON hub response with a route-specific success contract.
- * Malformed successes are a 502. Malformed error bodies retain the upstream
- * status but are replaced with safe JSON so callers never receive HTML or
- * corrupt bytes mislabeled as JSON. */
-export async function relayValidatedHubJson(
-  response: Response,
-  validSuccess: (value: JsonObject) => boolean,
-  maxBytes = 64 * 1024,
-): Promise<Response> {
-  if (response.ok) requireJsonContentType(response);
-  const bytes = await readBoundedResponseBytes(response, maxBytes);
-  let value: unknown;
-  try {
-    value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
-  } catch {
-    value = undefined;
-  }
-  if (!isJsonObject(value)) {
-    if (response.ok) throw new HttpError(502, "invalid response from hub");
-    return Response.json({ error: "hub request failed" }, { status: response.status });
-  }
-  if (response.ok && !validSuccess(value)) {
-    throw new HttpError(502, "invalid response from hub");
-  }
-  if (!response.ok) return Response.json(value, { status: response.status });
-  return new Response(bytes.buffer as ArrayBuffer, {
-    status: response.status,
-    headers: { "content-type": response.headers.get("content-type")! },
-  });
 }
 
 /** Forward only the response body, status, and content type from the trusted hub. */

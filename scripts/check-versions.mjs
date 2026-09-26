@@ -1,11 +1,10 @@
-// Version-sync assert — the agent version lives in three independent files that
-// must agree, or the dashboard's "update available" tooltip shows a stale
-// version on drift. There's no shared build artifact across Go + two TS workers,
-// so instead of a single import we make the three literals a CI invariant.
+// Version-sync assert — the agent version lives in two independent files that
+// must agree, or the hub advertises a stale "latest" to `finch update` on drift.
+// There's no shared build artifact across Go + the TS worker, so instead of a
+// single import we make the two literals a CI invariant.
 //
-//   agent/core/agent.go         var agentVersion = "x.y.z"   (canonical default)
-//   worker/src/types.ts         export const LATEST_AGENT = "x.y.z"
-//   web/components/dash/data.ts export const LATEST_AGENT = "x.y.z"
+//   agent/core/agent.go   var agentVersion = "x.y.z"   (canonical default)
+//   worker/src/types.ts   export const LATEST_AGENT = "x.y.z"
 //
 // A release workflow can additionally bind a tag to these literals with:
 //
@@ -40,11 +39,6 @@ export const versionSources = [
   {
     label: "worker/src/types.ts (LATEST_AGENT)",
     file: "worker/src/types.ts",
-    re: /^[ \t]*export[ \t]+const[ \t]+LATEST_AGENT(?:[ \t]*:[ \t]*string)?[ \t]*=[ \t]*"([^"\r\n]+)"[ \t]*;?[ \t]*$/gm,
-  },
-  {
-    label: "web/components/dash/data.ts (LATEST_AGENT)",
-    file: "web/components/dash/data.ts",
     re: /^[ \t]*export[ \t]+const[ \t]+LATEST_AGENT(?:[ \t]*:[ \t]*string)?[ \t]*=[ \t]*"([^"\r\n]+)"[ \t]*;?[ \t]*$/gm,
   },
 ];
@@ -247,7 +241,7 @@ export function checkVersions({ root = repoRoot, expectedTag } = {}) {
       .map((entry) => `    ${entry.version.padEnd(MAX_AGENT_VERSION_LENGTH)}  ${entry.label}`)
       .join("\n");
     throw new VersionCheckError(
-      `check-versions FAILED: agent version literals are out of sync:\n${details}\n\n  Update all three to the same value.`,
+      `check-versions FAILED: agent version literals are out of sync:\n${details}\n\n  Update both to the same value.`,
       1,
     );
   }
@@ -280,7 +274,7 @@ export function main(args = process.argv.slice(2)) {
     const result = checkVersions({ expectedTag });
     const tagNote = expectedTag === undefined ? "" : ` and release tag ${expectedTag}`;
     console.log(
-      `check-versions OK: all three agent-version literals${tagNote} are ${result.version}.`,
+      `check-versions OK: both agent-version literals${tagNote} are ${result.version}.`,
     );
   } catch (error) {
     console.error(error.message);

@@ -3,7 +3,7 @@ import Link from 'next/link';
 
 export const metadata: Metadata = {
   title: 'AviaryMCP | Finch docs',
-  description: 'Build one Python tool surface and publish it through MCP, REST, and OpenAPI with Finch.',
+  description: 'Build one Python tool surface for MCP, REST, and OpenAPI, and publish it with the Finch CLI.',
 };
 
 function Code({ children }: { children: string }) {
@@ -15,21 +15,18 @@ export default function AviaryMCPDocs() {
     <>
       <h1>AviaryMCP</h1>
       <p className="docs-lede">
-        AviaryMCP is Finch&apos;s opinionated Python SDK for new MCP services. Define a
-        tool once and get the MCP transport, typed REST endpoints, OpenAPI, Finch
-        enrollment, and the same authorization decision across every interface.
-        Steps 1&ndash;4 are enough to try it; <a href="#production-boundaries">Production
-        boundaries</a> is for taking it to production.
+        AviaryMCP is an opinionated Python SDK for new MCP services. Define a tool
+        once and get the MCP transport, typed REST endpoints, and OpenAPI from the
+        same registry. Run it on loopback like any other local service, then publish
+        it with the Finch CLI.
       </p>
 
       <div className="docs-note">
         <b>Public release candidate.</b> Version <code>0.1.0rc6</code> is available on{' '}
         <a href="https://pypi.org/project/aviary-mcp/0.1.0rc6/" target="_blank" rel="noreferrer">
           PyPI
-        </a>{' '}
-        and requires the Finch 1.6 agent. The normal Finch CLI and <code>finch.yml</code>{' '}
-        remain supported for existing, non-Python, and non-SDK services.
-        {' '}Agents can read the hosted <a href="/llms.txt">llms.txt</a> and
+        </a>
+        . Agents can read the hosted <a href="/llms.txt">llms.txt</a> and
         AviaryMCP&apos;s{' '}
         <a href="/aviarymcp-llms.txt">
           project llms.txt
@@ -45,12 +42,12 @@ export default function AviaryMCPDocs() {
           </thead>
           <tbody>
             <tr>
-              <td>A new Python MCP service</td>
-              <td>AviaryMCP. The application owns its tools, routes, and Finch registration.</td>
+              <td>A new Python MCP service that should also speak REST</td>
+              <td>AviaryMCP, published with <code>finch add</code>.</td>
             </tr>
             <tr>
               <td>An existing HTTP/MCP service, or another language</td>
-              <td>The <Link href="/docs">Finch quickstart</Link> and <code>finch.yml</code>.</td>
+              <td>The <Link href="/docs">Finch quickstart</Link> as is.</td>
             </tr>
             <tr>
               <td>Several existing FastMCP servers</td>
@@ -62,24 +59,16 @@ export default function AviaryMCPDocs() {
 
       <h2>1. Install the release candidate</h2>
       <p>
-        AviaryMCP is published publicly on PyPI. Pin the release candidate while
-        evaluating it so a future prerelease does not change underneath your service.
+        Pin the release candidate while evaluating it so a future prerelease does
+        not change underneath your service.
       </p>
       <Code>{`python -m pip install 'aviary-mcp==0.1.0rc6'`}</Code>
 
       <h2>2. Define the service</h2>
       <p>Save this as <code>server.py</code>:</p>
-      <Code>{`from aviary_mcp import AviaryMCP, Finch
+      <Code>{`from aviary_mcp import AviaryMCP
 
-service = "calculator"
-
-mcp = AviaryMCP(
-    service,
-    finch=Finch.local(
-        path=service,
-        binary="/usr/local/bin/finch",
-    ),
-)
+mcp = AviaryMCP("calculator")
 
 @mcp.tool
 def add(a: int, b: int) -&gt; int:
@@ -87,52 +76,22 @@ def add(a: int, b: int) -&gt; int:
     return a + b
 
 if __name__ == "__main__":
-    mcp.run()`}</Code>
+    mcp.run(transport="http", host="127.0.0.1", port=8000)`}</Code>
       <p>
-        <code>Finch.local</code> starts a dedicated zero-config Finch child and keeps
-        its approval scoped to this project. Pass the absolute Finch 1.6+ binary path;
-        the SDK never downloads or silently selects executable code from <code>PATH</code>.
-        The tenant is bound to the account that approves the first-run device prompt.
+        By default AviaryMCP binds only to loopback, which is exactly what the Finch
+        agent on the same box needs. It serves MCP at <code>/mcp</code>, the REST
+        API under <code>/api/v1</code>, and liveness at <code>/birdz</code>.
       </p>
 
-      <h3>Use an existing Finch agent instead</h3>
+      <h2>3. Publish it with Finch</h2>
       <p>
-        For sidecars, system services, and shared container groups, choose the other
-        explicit mode and name the permissioned Unix socket:
+        From here it is an ordinary Finch service. With the CLI installed and
+        logged in (see the <Link href="/docs">quickstart</Link>):
       </p>
-      <Code>{`mcp = AviaryMCP(
-    "calculator",
-    finch=Finch.agent(
-        path="calculator",
-        socket="/run/finch/control.sock",
-    ),
-)
-mcp.run()`}</Code>
-      <p>
-        Both modes publish the same application at <code>/mcp</code>, <code>/api/v1</code>,
-        and <code>/birdz</code>. Ordinary FastMCP tool decorators need no Finch route code.
-      </p>
-
-      <h2>3. Start and approve it</h2>
-      <Code>{`python server.py
-<span class="o">AviaryMCP is not enrolled with Finch.</span>
-<span class="o">  Open: https://finchmcp.com/aviary/authorize?code=ABCD-EFGH</span>
-<span class="o">  Code: ABCD-EFGH</span>
-<span class="o">  Service: calculator (calculator)</span>
-<span class="o">  Routes: /mcp, /api/v1, /birdz</span>
-<span class="o">  Edge auth: key</span>`}</Code>
-      <p>
-        Open the printed URL on any signed-in device. Finch shows the exact service,
-        routes, edge mode, and device-key fingerprint before you approve it. Finch
-        stores the resulting service-scoped credential; your application never
-        receives a CLI token, device secret, or caller key. On later starts, the saved
-        approval is reused and the service registers automatically.
-      </p>
-      <div className="docs-note">
-        <b>No duplicate configuration.</b> Do not also add this <code>app_path</code>{' '}
-        to <code>finch.yml</code>. AviaryMCP holds a renewable dynamic registration;
-        <code>finch.yml</code> is for services the SDK does not manage.
-      </div>
+      <Code>{`python server.py &amp;
+finch add calculator --service http://127.0.0.1:8000
+finch run
+<span class="o">✓ https://your-slug.finchmcp.com/calculator/</span>`}</Code>
 
       <h2>4. Use MCP or REST</h2>
       <p>The same <code>add</code> tool is available through each generated interface:</p>
@@ -146,21 +105,22 @@ mcp.run()`}</Code>
             <tr><td>Tool catalog</td><td><code>/calculator/api/v1/tools</code></td></tr>
             <tr><td>Call a tool</td><td><code>/calculator/api/v1/tools/add</code></td></tr>
             <tr><td>OpenAPI 3.1</td><td><code>/calculator/api/v1/openapi.json</code></td></tr>
-            <tr><td>Liveness / readiness</td><td><code>/calculator/birdz</code> and <code>/calculator/birdz/ready</code></td></tr>
+            <tr><td>Liveness</td><td><code>/calculator/birdz</code></td></tr>
           </tbody>
         </table>
       </div>
-      <Code>{`curl -X POST \\
+      <Code>{`finch test calculator
+finch call calculator add --args '{"a": 20, "b": 22}'
+
+curl -X POST \\
   https://your-slug.finchmcp.com/calculator/api/v1/tools/add \\
   -H 'Authorization: Bearer finch_...' \\
   -H 'content-type: application/json' \\
   -d '{"a": 20, "b": 22}'`}</Code>
       <p>
-        A caller still authenticates to Finch with a <code>finch_</code> key or OAuth.
-        Finch validates that credential at the edge, strips it, and signs a short-lived
-        assertion bound to the exact method, path, query, body, tenant, and service.
-        AviaryMCP&apos;s automatically configured assertion verifier checks it before MCP
-        or REST can invoke the tool.
+        A caller authenticates to Finch with a <code>finch_</code> key or OAuth.
+        Finch validates that credential at the edge and strips it before the request
+        reaches your box, so the service never sees the caller&apos;s key.
       </p>
 
       <h2>Compose existing FastMCP servers</h2>
@@ -179,15 +139,6 @@ mcp.mount(weather, namespace="weather")`}</Code>
         The mounted tool becomes <code>weather_forecast</code> in MCP, REST, and
         OpenAPI. Namespaces keep tools from different servers from colliding.
       </p>
-
-      <h2 id="production-boundaries">Production boundaries</h2>
-      <ul>
-        <li>Use one Finch sidecar/control socket per mutually trusted application group.</li>
-        <li>Gate rollout on <code>/birdz/ready</code>, not liveness alone.</li>
-        <li>Keep the Finch state volume persistent so approval survives restarts.</li>
-        <li>Use a shared atomic replay store before running multiple application workers.</li>
-        <li>Keep private edge auth as the default; public exposure requires separate explicit approval.</li>
-      </ul>
 
       <div className="docs-foot">
         <Link href="/docs">&larr; Quickstart</Link>

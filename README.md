@@ -137,20 +137,15 @@ signed `X-Finch-Assertion` for assertion-aware services; see
 
 ## Use it
 
-For a new Python service, the private Aviary pilot can use
-[AviaryMCP](https://finchmcp.com/docs/aviarymcp): define a tool once, expose it
-through MCP and generated REST/OpenAPI routes, and let the application register
-itself with Finch. Existing services and other languages use the CLI flow below.
-
 Three commands on the box, from a logged-in CLI (see
 [`agent/README.md`](agent/README.md) for the full reference):
 
 ```bash
-# 1. log in — opens the dashboard to approve a short code (like `gh auth login`)
+# 1. log in — prints a link + short code to approve on any device (like `gh auth login`)
 finch login --hub https://finchmcp.com
 
 # 2. expose a local MCP server (running on :8000) as the service "printer"
-finch add printer --service http://127.0.0.1:8000 --name "Label Printer"
+finch add printer --service http://127.0.0.1:8000
 
 # 3. serve it — dials out, auto-approves, prints the public URL
 finch run            #  → https://<your-slug>.finchmcp.com/printer/mcp
@@ -159,14 +154,11 @@ finch run            #  → https://<your-slug>.finchmcp.com/printer/mcp
 `finch add` writes a [`finch.yml`](agent/finch.example.yml) manifest; `finch
 run` serves every rule in it (add more services with more `finch add` calls —
 one process fronts them all). Then point any MCP client at the printed URL with
-a `finch_` key (mint one in the dashboard → **Keys**), or test it right in the
-dashboard with the service's **"test in chat"** panel.
+a `finch_` key (`finch keys mint <label> --service printer`), or check it from
+the terminal with `finch test printer` / `finch call printer <tool>`.
 
 A runnable end-to-end example lives in
 [`examples/hello-mcp/`](examples/hello-mcp/).
-
-> No CLI yet? You can also enroll a single box from the dashboard ("Add box")
-> and run `finch join --ticket … --upstream …` — see the agent README.
 
 ## Local dev
 

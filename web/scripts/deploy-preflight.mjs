@@ -12,8 +12,6 @@
 //     pk_test_/sk_test_ in the build env (or shipped vars) is rejected.
 //   - .dev.vars.example must keep REPLACE_… stubs (never real dev secrets that
 //     someone might `secret put` verbatim into prod).
-//   - the sibling hub source implements the `viewerScoped` echo the member
-//     projection fails closed on (deploy-order guard, see below).
 //
 // Usage: node scripts/deploy-preflight.mjs <env>   (env = production | dev)
 import { readFileSync, existsSync } from "node:fs";
@@ -126,42 +124,6 @@ if (isProd) {
   if (parsed.protocol !== "https:" || parsed.origin !== appOrigin) {
     fail(`[env.production].vars.NEXT_PUBLIC_APP_ORIGIN must be a bare https origin with no path (got ${appOrigin}).`);
   }
-}
-
-// Deploy-order guard: hub BEFORE web.
-//
-// app/api/finch/state/route.ts fails CLOSED for a member when the hub does not
-// echo `viewerScoped` — it hands back an empty fleet rather than an unnarrowed
-// one. That is the right security choice and stays; the cost is that shipping
-// web ahead of the hub blanks every member's dashboard.
-//
-// CI already orders the two (deploy.yml: the `web` job `needs: hub`). This
-// covers the case CI doesn't: a hand-run `npm run deploy` from a checkout whose
-// worker/ predates — or has reverted — the narrowing. It is a source check, not
-// a probe of the live hub: web and worker deploy from ONE tree, so a tree that
-// can't produce the echo can't have deployed a hub that emits it. A live probe
-// isn't available here either — /api/state needs tenant credentials this script
-// deliberately has no access to.
-const hubStatePath = join(root, "..", "worker", "src", "tenant-do.ts");
-if (existsSync(hubStatePath)) {
-  const hubSource = readFileSync(hubStatePath, "utf8");
-  // Match the ECHO itself (`viewerScoped: true`), not the bare identifier — a
-  // renamed/negated leftover mentioning the word would otherwise satisfy this.
-  if (!/\bviewerScoped\s*:\s*true\b/.test(hubSource)) {
-    fail(
-      "worker/src/tenant-do.ts does not emit the `viewerScoped` echo. The member " +
-        "state projection fails closed without it, so deploying this web build " +
-        "would blank every member's dashboard. Deploy the hub first (and from a " +
-        "tree that has the ACL narrowing).",
-    );
-  }
-} else {
-  // A standalone web checkout can't be checked; say so loudly rather than
-  // passing silently, since the fail-closed branch still applies at runtime.
-  console.warn(
-    "  finch-web deploy-preflight WARNING: worker/src/tenant-do.ts not found — " +
-      "cannot verify the hub emits `viewerScoped`. Confirm the hub is deployed FIRST.",
-  );
 }
 
 // Known dev secret values must never leak into shippable `vars`.
