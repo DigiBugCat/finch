@@ -12,22 +12,15 @@
   "vars": {
     "FINCH_SERVICE_SECRET": "test-service-secret",
     "TICKET_SECRET": "test-ticket-secret",
-    // SEPARATE login-wall session signer (kind:"session" cookies). Distinct from
-    // TICKET_SECRET so the tests exercise the real two-secret split.
-    "SESSION_SECRET": "test-session-secret",
     "DEFAULT_TENANT": "dev-tenant",
     "DEV": "1",
     // Tests intentionally use synthetic http:// hosts. Public environments omit
     // this escape hatch and the Worker rejects insecure requests before reading
     // their body.
     "ALLOW_INSECURE_HTTP": "1",
-    // The login wall 302s here; a stable test value lets the e2e assert the
-    // Location host without depending on prod config.
+    // `finch login` device-page origin; a stable test value lets tests assert
+    // verification_uri without depending on prod config.
     "WEB_URL": "https://web.test",
-    "AVIARY_VERIFICATION_ORIGINS": "https://web.test",
-    // Proves an environment-specific relay origin wins over the TenantDO's
-    // automatically claimed *.finchmcp.com hostname in enrollment grants.
-    "AVIARY_PUBLIC_ORIGIN": "https://relay.test",
     "VANITY_SUFFIXES": "aviary.run",
     "VANITY_TENANT": "tenant_vanity",
     "BYO_CNAME_TARGET": "finchmcp.com",
@@ -41,8 +34,7 @@
       { "name": "BOX", "class_name": "BoxDO" },
       { "name": "TENANT", "class_name": "TenantDO" },
       { "name": "ROUTER", "class_name": "RouterDO" },
-      { "name": "AVIARY_ENROLLMENT", "class_name": "AviaryEnrollmentDO" },
-          { "name": "DIRECTORY", "class_name": "DirectoryDO" }
+      { "name": "DIRECTORY", "class_name": "DirectoryDO" }
     ]
   },
   "migrations": [
@@ -51,6 +43,6 @@
     { "tag": "v3", "new_sqlite_classes": ["RouterDO"] },
     { "tag": "v4", "renamed_classes": [{ "from": "ApplianceDO", "to": "BoxDO" }] },
     { "tag": "v5", "new_sqlite_classes": ["AviaryEnrollmentDO"] },
-        { "tag": "v6", "new_sqlite_classes": ["DirectoryDO"] }
+    { "tag": "v6", "new_sqlite_classes": ["DirectoryDO"] }
   ]
 }

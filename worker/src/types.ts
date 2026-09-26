@@ -4,6 +4,9 @@
 // mock ROOST_DATA so the UI renders unchanged).
 
 
+// Tenancy is single-user: only an "owner" member authorizes anything. The
+// "admin"/"member" roles, "invited"/"disabled" states and "team" tenants
+// survive only as stored rows written before the team features were removed.
 export type FinchRole = "owner" | "admin" | "member";
 export type MemberState = "invited" | "active" | "disabled";
 export const normalizeEmail = (raw: string): string => raw.trim().toLowerCase();
@@ -157,38 +160,19 @@ export interface LogEvent {
   result?: number;
 }
 
-/** The form a log entry is STORED in. `svc` is the entry's ACL subject — the
- *  single service the entry is about — and exists so the audit log can be
- *  narrowed by the same viewerFilter that narrows services[]
- *  (worker/src/tenant-do.ts getState). It is metadata, not display data:
- *  getState strips it on the way out, so an admin's `logs` payload is
- *  byte-for-byte what it always was.
- *
- *  The subject cannot be recovered from the prose: `target` is free text like
- *  `scraper /run`, `scraper → public` or `dave@x.com → scraper`, and
- *  substring-matching a service id against it would both miss (an entry that
- *  names the service by label) and over-match (a service id that is a substring
- *  of another id, of an email, or of a route). So it is recorded structurally at
- *  write time, and there are exactly two readings:
- *
- *    "<service id>" — about exactly that service. A scoped viewer sees the row
- *                     iff that service survives their viewerFilter.
- *    ""             — no single service subject: either tenant-wide (settings,
- *                     roster, epochs) or plural (an ACL rule's whole dst list).
- *                     Never shown to a scoped viewer — see getState for why the
- *                     tenant-wide half is denied too.
- *    undefined      — a row written before this field existed. Reads exactly
- *                     like "": its prose may name any service, so a scoped
- *                     viewer must not see it. Legacy rows need no migration;
- *                     they age out of the 500-entry ring on their own.
- */
+/** The form a log entry is STORED in. `svc` is the entry's subject — the
+ *  single service the entry is about, or "" for a tenant-wide / multi-service
+ *  row (undefined on rows written before the field existed). It is recorded
+ *  structurally at write time because it cannot be recovered from the free-text
+ *  `target`. getState strips it on the way out, so `logs` on the wire is
+ *  exactly LogEvent. */
 export interface StoredLogEvent extends LogEvent {
   svc?: string;
 }
 
-/** A row in the app-level access-sharing queue. Clerk stays authentication-
- *  only; the web hub orchestrates approve/deny and reuses addAcl/removeAcl for
- *  the actual grant — the DO just owns the queue. */
+/** A row from the retired app-level access-sharing queue. Nothing writes
+ *  these any more; existing rows are kept in storage and still reported in
+ *  TenantState.accessRequests so the wire shape is unchanged. */
 export interface AccessRequest {
   id: string;
   email: string; // lowercased
@@ -200,18 +184,6 @@ export interface AccessRequest {
   resolvedBy?: string;
   resolvedByUserId?: string;
   resolvedAt?: number; // epoch ms
-  // The email the ACL rule for this request was actually installed under.
-  //
-  // Normally identical to `email`. It differs when the request was raised
-  // against an ALIAS of a member who is (or becomes) bound under a different
-  // canonical address: identity binding grants the service to the member's
-  // canonical email, because that is what gateBrowser evaluates. Revocation
-  // must then strip the rule under the CANONICAL email — searching the alias
-  // finds nothing and silently leaves access in place.
-  //
-  // Optional because rows written before this field existed do not carry it;
-  // revokeAccess falls back to `email`, which for those rows is what the
-  // grant path used at the time.
   grantedTo?: string;
 }
 
@@ -261,13 +233,6 @@ export interface TenantState {
   settings: Settings;
   overview: Overview;
   latestAgent: string;
-  /** Set iff the request named a `viewer` and this hub evaluated it, so
-   *  services/boxes/overview cover only what that viewer may reach. The web's
-   *  member projection REQUIRES this echo and empties the collections without
-   *  it — web and hub deploy independently, and a hub that predates viewer
-   *  scoping would otherwise answer a member's scoped request with the whole
-   *  fleet. */
-  viewerScoped?: boolean;
 }
 
 /** A key as exposed to the dashboard — no hash, no plaintext. */

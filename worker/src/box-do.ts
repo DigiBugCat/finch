@@ -828,14 +828,11 @@ export class BoxDO extends DurableObject<Env> {
  * attacker-controlled: validHead bounds only the header count and total size,
  * never names or values. Tenants share one parent domain
  * (<slug>.finchmcp.com), so a cookie carrying `Domain=finchmcp.com` is stored
- * against the PARENT and is then sent to the dashboard and to every sibling
- * tenant's host, where it shadows a victim's host-only login-wall cookie and
- * hands the attacker login-CSRF / session fixation on any host under the
- * parent. The session cookie now carries the `__Host-` prefix (index.ts:202),
- * which makes that unforgeable at the jar for THAT name, and browserGate ranks
- * the prefixed name above the legacy one (index.ts:394) — but this pass is the
- * independent half: it also covers the transitional legacy name and every
- * OTHER first-party cookie a box could try to plant on a sibling host.
+ * against the PARENT and is then sent to the web app on the apex and to every
+ * sibling tenant's host, where it can shadow that host's own cookies and hand
+ * the attacker login-CSRF / session fixation on any host under the parent.
+ * This pass denies every first-party cookie a box could try to plant on a
+ * sibling host.
  *
  * EVERY Domain attribute is stripped — including one naming exactly the request
  * host. `Domain=foo.example.com` is NOT equivalent to a host-only cookie: per

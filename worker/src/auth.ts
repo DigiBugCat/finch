@@ -81,11 +81,8 @@ export function last4(plaintext: string): string {
 
 export interface TicketPayload {
   tenant: string;
-  // `service` is required for the agent-channel grants (join/connect/refresh)
-  // but ABSENT on the browser login-wall grants (portal/session), which are
-  // scoped to a slug-host, not a single service. Optional at the type level;
-  // verifyToken still requires it for the agent kinds via its shape validator.
-  service?: string;
+  // Every ticket grant is service-scoped; verifyToken rejects one without it.
+  service: string;
   exp: number; // epoch SECONDS; verifyToken rejects once Date.now()/1000 > exp
   // `kind` distinguishes the HMAC grants that share this signer:
   //   - "join"    (or absent) — the short, single-use enroll ticket presented at
@@ -96,45 +93,17 @@ export interface TicketPayload {
   //                 reconnection never re-uses the one-shot join ticket.
   //   - "connect" — the short-lived (~120s) per-box grant the agent presents
   //                 on the /_connect WS dial (?ct=…). Bound to a single box.
-  //   - "portal"  — the short-lived (~60s), SINGLE-USE (jti) hand-off the hub
-  //                 mints (POST /api/portal-grant) for a Clerk-authed browser. The
-  //                 browser carries it to GET /__finch/cb on the slug host, which
-  //                 burns the jti and sets the long-lived session cookie. Scoped
-  //                 to {tenant,slug,userId}, NOT a service.
-  //   - "session" — the long-lived (~12h) browser login-wall cookie minted at
-  //                 /__finch/cb. Signed with the SEPARATE SESSION_SECRET (see
-  //                 signSession/verifySession) so a leaked session signer can't
-  //                 forge join/connect/portal grants. Carries {tenant,slug,userId,
-  //                 epoch}; browserGate checks epoch === the tenant's current
-  //                 sessionEpoch so "sign everyone out" invalidates live cookies.
-  kind?: "join" | "connect" | "refresh" | "portal" | "session";
+  // (The browser login wall's "portal"/"session" kinds were removed; a token
+  // carrying either kind no longer verifies.)
+  kind?: "join" | "connect" | "refresh";
   box?: string; // present (and verified) for kind:"connect"|"refresh" tokens
-  // The routing host key a portal/session grant is bound to. For legacy
-  // <slug>.finchmcp.com hosts this is the bare slug; for custom hostnames it is
-  // the full lowercase hostname. The field stays named `slug` for wire compat.
-  // Present (and verified) ONLY for kind:"portal"|"session"; the agent kinds
-  // bind a service instead. Ties the browser grant to a single host.
-  slug?: string;
-  // The Clerk user id the portal/session grant was minted for (login-wall audit /
-  // identity). Present for kind:"portal"|"session".
-  userId?: string;
-  mid?: string;
-  // The caller's primary email + org-admin bit, stamped by the Clerk-authed web
-  // at portal-grant time (kind:"portal"|"session" only). browserGate uses them
-  // to enforce per-app user grants at the door: admin → every service; member →
-  // only services a user→service ACL rule grants. A session cookie missing BOTH
-  // predates this scheme and is re-minted via the portal (fail closed).
-  email?: string;
-  admin?: boolean;
-  // The tenant's sessionEpoch at session-mint time (kind:"session" only). The hub
-  // rejects the cookie once the tenant bumps that epoch ("sign everyone out"),
-  // mirroring the cliTokenEpoch revocation path. (Distinct from a join jti.)
+  // Per-box credential epoch on refresh tokens issued by the retired Aviary
+  // device flow. /refresh rejects one whose epoch no longer matches the box's
+  // stored epoch. Tokens minted by /join carry none.
   epoch?: number;
   // Random one-time id. On a join ticket the hub records it (TenantDO used-set)
   // at first /join and rejects any replay until exp, so a captured ticket can't
-  // be reused for its whole TTL. Also carried on a kind:"portal" grant: the slug
-  // host's /__finch/cb burns it (claimTicket) so a captured portal grant can't be
-  // replayed to mint a second session. Connect tokens don't carry one (they're
+  // be reused for its whole TTL. Connect tokens don't carry one (they're
   // already bound to a single box + a ~120s window and are dialed repeatedly).
   jti?: string;
 }
@@ -224,14 +193,10 @@ export function signToken(
   return signEnvelope(payload, secret);
 }
 
-/** Shared shape-validator for the HMAC ticket envelope. Used by BOTH verifyToken
- *  (TICKET_SECRET grants: join/connect/refresh/portal) and verifySession
- *  (SESSION_SECRET grants: session) — they ride the same envelope and payload
- *  shape, differing only in the SECRET they were signed with. The browser kinds
- *  (portal/session) carry {slug,userId} and NO service; the agent kinds carry
- *  a service and NO slug. We enforce kind ∈ the known set, require `service`
- *  for the agent kinds, and type-check the optional fields; the per-callsite
- *  predicate (e.g. _connect's kind==="connect" check) does the rest. */
+/** Shape-validator for the HMAC ticket envelope (TICKET_SECRET grants:
+ *  join/connect/refresh). We enforce kind ∈ the known set, require `service`,
+ *  and type-check the optional fields; the per-callsite predicate (e.g.
+ *  _connect's kind==="connect" check) does the rest. */
 function validateTicket(p: any): TicketPayload | null {
   if (
     typeof p.tenant !== "string" ||
@@ -244,22 +209,10 @@ function validateTicket(p: any): TicketPayload | null {
     kind === undefined ||
     kind === "join" ||
     kind === "connect" ||
-    kind === "refresh" ||
-    kind === "portal" ||
-    kind === "session";
+    kind === "refresh";
   if (!knownKind) return null;
-  // The agent-channel grants (join/connect/refresh, and the legacy undefined
-  // kind) are service-scoped — `service` MUST be a string. The browser grants
-  // (portal/session) are slug-scoped and carry no service.
-  const isBrowserKind = kind === "portal" || kind === "session";
-  if (!isBrowserKind && (typeof p.service !== "string" || !p.service)) return null;
-  if (p.service !== undefined && (typeof p.service !== "string" || !p.service)) return null;
+  if (typeof p.service !== "string" || !p.service) return null;
   if (p.box !== undefined && typeof p.box !== "string") return null;
-  if (p.slug !== undefined && typeof p.slug !== "string") return null;
-  if (p.userId !== undefined && typeof p.userId !== "string") return null;
-  if (p.mid !== undefined && typeof p.mid !== "string") return null;
-  if (p.email !== undefined && typeof p.email !== "string") return null;
-  if (p.admin !== undefined && typeof p.admin !== "boolean") return null;
   if (
     p.epoch !== undefined &&
     (typeof p.epoch !== "number" || !Number.isFinite(p.epoch))
@@ -277,33 +230,6 @@ export function verifyToken(
   secret: string,
 ): Promise<TicketPayload | null> {
   return verifyEnvelope<TicketPayload>(ticket, secret, validateTicket);
-}
-
-// ---- browser login-wall session (SESSION_SECRET) -------------------------
-//
-// The session cookie minted at /__finch/cb is the long-lived (~12h) proof a
-// browser already cleared the Clerk login wall. It rides the SAME HMAC envelope
-// as the ticket grants but is signed with a SEPARATE secret (env.SESSION_SECRET)
-// so a leaked session signer can NOT be turned into a forged join/connect/portal
-// grant (those are signed with TICKET_SECRET) and vice-versa. The payload is a
-// kind:"session" TicketPayload carrying {tenant,slug,userId,epoch}.
-
-/** Sign a kind:"session" login-wall cookie with the SESSION_SECRET. */
-export function signSession(
-  payload: TicketPayload,
-  secret: string,
-): Promise<string> {
-  return signEnvelope(payload, secret);
-}
-
-/** Verify + decode a login-wall session cookie (SESSION_SECRET). Returns the
- *  payload, or null if it's malformed/forged/expired/wrong-shape. The caller
- *  (browserGate) still asserts kind==="session" + tenant/slug/epoch match. */
-export function verifySession(
-  token: string,
-  secret: string,
-): Promise<TicketPayload | null> {
-  return verifyEnvelope<TicketPayload>(token, secret, validateTicket);
 }
 
 // ---- service-to-service auth --------------------------------------------
@@ -412,7 +338,6 @@ export async function verifyAssertion(
 export type CallerAuthMethod =
   | "finch_key"
   | "oauth"
-  | "browser"
   | "service";
 
 /** Claims injected into X-Finch-Assertion after successful edge auth. */
@@ -434,7 +359,6 @@ export interface CallerAssertionClaims {
   nbf: number;
   exp: number;
   jti: string;
-  session_id?: string;
   actor?: string;
   key_id?: string;
   key_label?: string;
@@ -760,7 +684,7 @@ export async function verifyCallerAssertion(
   ) return null;
   if (claims.exp - claims.iat > 300) return null; // assertions are always short-lived
   if (
-    !["finch_key", "oauth", "browser", "service"].includes(
+    !["finch_key", "oauth", "service"].includes(
       claims.auth_method,
     )
   ) {

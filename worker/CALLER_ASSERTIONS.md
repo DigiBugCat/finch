@@ -2,8 +2,8 @@
 
 Finch can pass an authenticated caller identity to a hosted AviaryMCP service
 without forwarding the caller's credential. After the Worker accepts a Finch
-key, Clerk OAuth token, browser login-wall session, or first-party service
-assertion, it signs a 60-second ES256 compact JWS. The JWS travels in the
+key, a Clerk OAuth token for the tenant owner, or the first-party service
+assertion (`POST /api/cli/call`), it signs a 60-second ES256 compact JWS. The JWS travels in the
 dedicated Worker-to-agent `req.assertion` field. The agent removes every
 reserved caller-identity header and sets `X-Finch-Assertion` from that field
 only.
@@ -31,16 +31,17 @@ The payload contains:
 - `iss`: stable Finch issuer configured for the environment.
 - `sub`: `key:<id>`, `user:<id>`, or `service:finch-dashboard`.
 - `tenant`, `service`, and `aud` (`finch:<tenant>:<service>`).
-- `auth_method`: `finch_key`, `oauth`, `browser`, or `service`.
+- `auth_method`: `finch_key`, `oauth`, or `service`. (`browser` belonged to
+  the retired login wall; it is no longer issued and verifiers reject it.)
 - `method`, `upstream_path` (the exact local path plus query), and
   `public_path` (the normalized path at the edge).
 - `body_sha256`: base64url SHA-256 of the raw request body.
 - `iat`, `nbf`, `exp`, and random `jti` for a short replay window.
-- `session_id`, key metadata, and actor where that auth path provides them.
+- key metadata and actor where that auth path provides them.
 
-For browser and OAuth authentication, `sub` is the stable Clerk user identifier
-`user:<id>`, not the email address that Finch uses for app-level ACL checks.
-Birds must never derive ACL identity from assertion claims.
+For OAuth authentication, `sub` is the stable Clerk user identifier
+`user:<id>` of the tenant owner. Birds must never derive ACL identity from
+assertion claims.
 
 An application must verify ES256, select a known `kid`, validate issuer,
 audience, tenant, service, expiry/clock skew, method, upstream path, body digest,
