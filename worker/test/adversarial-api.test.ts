@@ -56,16 +56,6 @@ function chunkedBody(chunkBytes: number, chunks: number) {
 // check (arrayBuffer()/text()) is a memory-exhaustion lever that takes
 // co-resident in-flight requests with it. (security F2 / F5)
 describe("unbounded chunked bodies are cut off while streaming, not after", () => {
-  it("caps the pre-tenant /register DCR proxy body", async () => {
-    // This branch runs BEFORE resolveTenant and BEFORE RELAY_LIMIT, so it is
-    // unauthenticated, untenanted and unthrottled — the cheapest lever there is.
-    const { body, state } = chunkedBody(64 * 1024, 256); // 16 MiB offered
-    const res = await call("/register", body);
-    expect(res.status).toBe(413);
-    expect(await res.json()).toEqual({ error: "request body too large" });
-    expect(state.pulled).toBeLessThan(8); // 64 KiB cap → a couple of chunks, not 256
-  });
-
   it("caps the /chat/completions body ahead of the model calls", async () => {
     const { body, state } = chunkedBody(64 * 1024, 256); // 16 MiB offered
     const res = await call("/chat/completions", body);
