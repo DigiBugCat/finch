@@ -163,8 +163,9 @@ What actually ships, with the exact secrets/vars/routes per worker.
 
 Relay routing uses a single **host key** namespace in RouterDO: `<slug>.finchmcp.com` stores the
 bare slug (`pelican`), while vanity and BYO domains store the full lowercase hostname
-(`pelican.aviary.run`, `mcp.acme.com`). Unknown host keys fail closed with 404, and the browser
-login-wall cookie remains host-scoped with no `Domain` attribute.
+(`pelican.aviary.run`, `mcp.acme.com`). Unknown host keys fail closed with 404. The hub sets no
+cookies on relay hosts (the browser login wall was removed), and a box's own `Set-Cookie` is
+stripped of any `Domain` attribute so it stays host-only.
 
 Vanity hostnames are gated by `VANITY_SUFFIXES` and `VANITY_TENANT`: production sets
 `VANITY_SUFFIXES="aviary.run"`, and `VANITY_TENANT` must be set to the only tenant allowed to
@@ -316,39 +317,74 @@ vars, and secrets), separate Clerk instances, and `DEFAULT_TENANT` confined to d
 
 ---
 
-## 5. Native Finch tenancy migration
+## 5. Single-user tenancy
 
-`TenantDO.tenantMeta` is the per-tenant migration marker. Its absence preserves
-the narrow legacy door behavior; its presence means `TenantDO.members` is the
-only membership and role authority. Existing tenant IDs and every dependent DO
-name remain unchanged. Personal workspaces migrate lazily when their authenticated
-Clerk subject supplies a server-verified email. Legacy organization-shaped
-workspaces migrate only through the explicit, server-verified org-admin claim
-flow. The one-time bootstrap rewrites the locked `user:you` owner principal,
-key owners, and group members atomically to the owner's normalized email.
+Finch is single-user: each tenant has exactly one owner, and the hub
+authorizes only three kinds of relay caller — a `finch_` key, a Clerk OAuth
+token whose user OWNS the tenant, or the first-party service assertion used by
+`POST /api/cli/call` — plus anyone at all on a service marked `public`. A
+browser without a key on a key-gated service gets a plain JSON 401; there is no
+login-wall redirect, portal grant, or session cookie.
 
-`DirectoryDO` (binding `DIRECTORY`, migration `v6`) is a disposable discovery
-index only. Every directory write follows a successful TenantDO commit;
-authorization never reads the directory. `reindexTenant` is the repair operation
-for missing workspace or invite pointers.
+A signed-in Clerk user acts on their personal tenant (their Clerk user id) or a
+tenant they own, whichever holds their fleet:
 
-| Door | tenantMeta absent | tenantMeta present |
-| --- | --- | --- |
-| Dashboard | personal subject may bootstrap; org tenant must be claimed | active native member required |
-| Browser | subject==tenant, otherwise email ACL | active member; owners/admins bypass ACL, members require ACL |
-| OAuth | subject==tenant, or org-id equality plus email ACL | active member; owners/admins bypass ACL, members require ACL |
+- `POST /api/user/sync` (user-scoped assertion) returns
+  `{tenant, tenants, claimable}`. `tenants` lists every tenant the user owns
+  plus the personal one; owned tenants are found through
+  `DirectoryDO.listForUser` (and the `adminOrgIds` the web sends), and each
+  candidate is re-verified against the TenantDO, so a stale directory row
+  never grants anything. `tenant` is the only one of them holding services or
+  `finch_` keys, the personal tenant when none does, and `null` when more than
+  one does — an empty workspace never displaces a personal tenant that holds
+  the user's boxes. The web's `chooseTenant` applies the same rule.
+- `POST /api/member-context` keeps its request/response shape; it returns the
+  member only for the tenant's owner and `{member:null}` for anyone else. A
+  personal tenant bootstraps its owner row from the first verified email.
+- A tenant has ONE owner. A pre-cut team with several active owners honours
+  only the one the locked `r_owner` rule names (else the earliest-created);
+  the other owner rows stay in storage but authorize nothing, since there is
+  no longer a way to remove a co-owner.
+- CLI tokens name a tenant and its `cliTokenEpoch`, not a person, so on the
+  first request after the cut each TenantDO bumps its epoch once if anyone
+  besides that owner could have minted one: another member row that ever got
+  past an invitation, any team workspace, or any Clerk-org tenant. Every
+  outstanding CLI token there dies and the owner runs `finch login` again. A
+  personal tenant with only its owner is left alone. A `cliSingleUserCut` flag
+  in the stored state keeps it from repeating; tenants created later are born
+  with it set.
+- The OAuth door (`TenantDO.gateOauth`) admits that owner of a bootstrapped
+  tenant, or the Clerk user whose personal tenant it is. For a legacy Clerk-org
+  tenant nobody has claimed yet, it also admits a token scoped to that org
+  (`org_id` = the tenant id) with the org admin role.
 
-The active-workspace cookie is an unsigned pointer, not a capability, and is
-revalidated against live TenantDO membership on every privileged request. Clerk
-supplies identity and currently verified emails only. Clerk organization roles
-never authorize. `user.created`, `user.updated`, and
-`organizationMembership.created` are the configured webhook events; login-time
-identity sync remains the correctness path when webhooks are delayed or absent.
+Data written by the retired team features — `tenantMeta`, member rows
+(admins, members, invitations), access requests, user→service ACL rules,
+`sessionEpoch`, and every `DirectoryDO` key — is left in storage untouched and
+is still reported by `GET /api/state`. None of it authorizes anyone except the
+owner. The key gate is unchanged: `checkKey` still evaluates key scope,
+expiry, and the stored ACL rules exactly as before, so no key gains or loses
+access; rule-editing endpoints are gone, and keys minted by the CLI are owned
+by the tenant owner, whom the locked `r_owner` rule always admits. Legacy
+Clerk-org tenants that were claimed before the cut resolve for their owner like
+any other owned tenant. An unclaimed one that holds state (services, keys or a
+subdomain) is claimed at sign-in, with no UI step: when `/api/user/sync`
+receives the org in `adminOrgIds` (the orgs Clerk says the user administers)
+along with a verified `primaryEmail`, the hub records that user as its single
+owner (`tenantMeta.kind = "team"`, `bootstrappedFrom = "legacy-org"`) and
+indexes it in the directory. The first admin to sign in becomes the owner;
+without an email the org is reported in `claimable` instead.
 
-Rollback anchors must be recorded from `wrangler deployments list --env
-production` immediately before release. Deploy worker before web. Migration v6
-is additive; rolling back code leaves DirectoryDO dormant and old TenantDO code
-preserves unknown `tenantMeta`/`members` fields through its state spread. On
-roll-forward, reindex the affected tenant. The legacy portal-grant body is kept
-only for the worker-before-web deployment window and removed after live
-acceptance.
+Retired Durable Object: `AviaryEnrollmentDO` (migration `v5`) is a 410 stub
+kept only so the migrated class stays exported; its binding was removed and its
+stored enrollment/audit rows are kept, minus their secrets: an expiry alarm
+still armed at deploy time (or any request) nulls `grant_json` (the issued
+refresh token) and `approval_nonce` in every row and disarms the alarm, since
+the retired cleanup that used to null them is gone. Deleting the rows requires an
+explicit `deleted_classes` migration, which deploy preflight refuses until
+someone deliberately changes that guard. Boxes enrolled through the old device
+flow keep refreshing: `/refresh` still honors their per-box credential epoch,
+and the edge still enforces their manifest route prefixes.
+
+`SESSION_SECRET` is no longer read; an already-set secret is harmless and can
+be deleted as a separate step.

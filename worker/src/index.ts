@@ -21,13 +21,9 @@ import { RouterDO, routerLookup } from "./router-do";
 import { AviaryEnrollmentDO } from "./aviary-enrollment-do";
 import { DirectoryDO } from "./directory-do";
 import { handleApi, isApiPath } from "./api";
-import { handleChat } from "./chat";
 import {
   hashKey,
-  genJti,
   verifyToken,
-  verifySession,
-  signSession,
   serviceOk,
   verifyAssertion,
   verifyClerkOAuthToken,
@@ -36,12 +32,12 @@ import {
   selfTestCallerAssertion,
   signCallerAssertion,
 } from "./auth";
-import type {
-  CallerAssertionClaims,
-  CallerAuthMethod,
-  TicketPayload,
-} from "./auth";
+import type { CallerAssertionClaims, CallerAuthMethod } from "./auth";
 
+// AviaryEnrollmentDO is a retired stub (it answers 410). It stays exported
+// because wrangler migration v5 declared the class: dropping the export would
+// fail the deploy, and deleting the class would delete its stored data. Remove
+// it only with an explicit, deliberate deleted_classes migration.
 export { BoxDO, TenantDO, RouterDO, AviaryEnrollmentDO, DirectoryDO };
 
 export interface Env {
@@ -49,34 +45,20 @@ export interface Env {
   BOX: DurableObjectNamespace; // per-box WS relay (BoxDO)
   TENANT: DurableObjectNamespace; // per-tenant control-plane state (TenantDO)
   ROUTER: DurableObjectNamespace; // singleton slug→tenantId index (RouterDO)
-  AVIARY_ENROLLMENT: DurableObjectNamespace;
-  DIRECTORY: DurableObjectNamespace; // proof-bound service enrollment state
+  // Global clerkUserId → tenant index (DirectoryDO). Read-only now: consulted
+  // only to resolve which tenant a signed-in Clerk user OWNS.
+  DIRECTORY: DurableObjectNamespace;
 
   // Secrets / vars (wrangler vars in dev via .dev.vars; secrets in prod).
   FINCH_SERVICE_SECRET: string; // web-app -> control API shared secret
   TICKET_SECRET: string; // HMAC key for join tickets + per-box connect-tokens
-  // SEPARATE HMAC key for the browser login-wall session cookie (kind:"session").
-  // Kept distinct from TICKET_SECRET so a leaked session signer can NOT forge a
-  // join/connect/portal grant (and vice-versa). Set per env via
-  //   wrangler secret put SESSION_SECRET --env <staging|production>
-  // In dev/test it's injected as a var fixture (see wrangler.test.jsonc).
-  SESSION_SECRET: string;
   DEFAULT_TENANT?: string; // DEV-ONLY tenant fallback when no slug resolves
   DEV?: string; // "1" in the dev env; gates the DEFAULT_TENANT fallback
   // Explicit local-test escape hatch for plain HTTP. It is effective only when
   // DEV=1 as well; production and staging intentionally omit both values, so
   // the public hub fails closed before reading an unencrypted request body.
   ALLOW_INSECURE_HTTP?: string;
-  WEB_URL?: string; // dashboard base URL — the `finch login` device page lives at <WEB_URL>/cli
-  // Comma-separated HTTPS origins permitted when Aviary verification lives on
-  // a different origin than the hub. WEB_URL must be the hub origin unless it
-  // appears here; arbitrary response/manifest-provided origins are never used.
-  AVIARY_VERIFICATION_ORIGINS?: string;
-  // Canonical public relay origin returned in Aviary enrollment grants. This
-  // lets staging use its workers.dev relay even when the tenant has a
-  // production-shaped vanity host. It must be an exact HTTP(S) origin (no
-  // path, credentials, query, or fragment); an invalid value fails approval.
-  AVIARY_PUBLIC_ORIGIN?: string;
+  WEB_URL?: string; // web base URL — the `finch login` device page lives at <WEB_URL>/cli
   CLERK_ISSUER?: string; // Clerk OAuth AS base (e.g. https://<slug>.clerk.accounts.dev) — enables the MCP OAuth plane (RFC 9728 discovery + Clerk-token bearers); unset = feature off
   CLERK_USERINFO?: Fetcher; // optional service binding; tests/local deployments may avoid public userinfo fetches
   // ES256 caller assertions injected into requests after Finch authenticates
@@ -91,8 +73,9 @@ export interface Env {
   CF_API_TOKEN?: string; // secret: Cloudflare for SaaS API token (never log)
   CF_SAAS_ZONE_ID?: string; // finchmcp.com zone id for SaaS custom-hostname provisioning
   BYO_CNAME_TARGET?: string; // CNAME target shown to BYO-domain customers
-  AI: Ai; // Workers AI binding — powers the /chat test interface
-  SELF: Fetcher; // self service-binding — /chat relays MCP back through our own service path
+  // Self service-binding: POST /api/cli/call relays an MCP call back through
+  // our own public relay path (a direct fetch to our own host is blocked).
+  SELF: Fetcher;
 
   // Agent release binaries, served directly at GET /releases/<asset> (uploaded
   // by the release workflow). Preferred over RELEASES_BASE: the repo is private,
@@ -107,7 +90,7 @@ export interface Env {
   // Cloudflare Rate Limiting bindings (unsafe.bindings ratelimit). Optional so
   // tests / `wrangler dev` without the binding still run (limiter() no-ops when
   // absent). RELAY_LIMIT gates per-(tenant,IP) on the MCP relay BEFORE any DO
-  // round-trip (login-wall probe + checkKey); its budget (600/60s) is sized for a
+  // round-trip (box pin / route check / checkKey); its budget (600/60s) is sized for a
   // web page's sub-resource burst — one HTML hit fans out to many asset requests
   // that all share the (tenant,IP) bucket. JOIN_LIMIT gates per-IP on /join.
   RELAY_LIMIT?: RateLimiter;
@@ -143,18 +126,6 @@ export function clientIp(req: Request): string {
   );
 }
 
-/** The end-user IP a first-party caller (the web dashboard) forwards in
- *  X-Finch-Client-IP, falling back to clientIp. Web→hub calls ride the
- *  FINCH_HUB service binding, which carries no CF-Connecting-IP, so without
- *  this every dashboard user shares one rate-limit bucket. ONLY call this after
- *  serviceOk(): the header is caller-supplied and trusted solely because the
- *  caller proved it holds FINCH_SERVICE_SECRET. */
-export function serviceClientIp(req: Request): string {
-  const forwarded = (req.headers.get("x-finch-client-ip") || "").trim();
-  if (forwarded.length <= 45 && /^[0-9A-Fa-f.:]+$/.test(forwarded)) return forwarded;
-  return clientIp(req);
-}
-
 /** Finch's public transport boundary. Cloudflare normally presents production
  * requests as HTTPS/WSS, but enforcing that assumption here prevents a route,
  * zone, or client misconfiguration from silently turning plain HTTP into an
@@ -184,40 +155,12 @@ const MAX_RELAY_BODY_BYTES = 4 * 1024 * 1024; // 4 MiB
 // into this Worker; RFC 7591 client metadata is a handful of fields.
 const MAX_DCR_BODY_BYTES = 64 * 1024; // 64 KiB
 
-// Browser login-wall session cookie lifetime (12h). The cookie is the long-lived
-// proof a browser already cleared the Clerk wall; the portal hand-off grant that
-// mints it is short (~60s, single-use). 12h balances "don't re-login constantly"
-// against the blast radius of a stolen cookie (also revocable via sessionEpoch).
-const SESSION_TTL_SECONDS = 12 * 60 * 60;
-
-// The login-wall cookie name. HttpOnly + Secure + SameSite=Lax + Path=/, and
-// HOST-scoped (no Domain attribute) so a cookie minted for one host key
-// (<slug>.finchmcp.com, <box>.aviary.run, or a BYO hostname) can't be
-// replayed against a sibling tenant's host.
-//
-// The `__Host-` prefix is what MAKES that host-scoping unforgeable rather than
-// merely intended. Every tenant gets HTML execution on its own host under the
-// shared parent (a service with auth "public" skips the login wall entirely —
-// index.ts:456 — and the relay is protocol-agnostic, so it will happily serve
-// text/html). finchmcp.com is not a public suffix, so without the prefix that
-// page can run `document.cookie = "finch_session=…; domain=finchmcp.com;
-// path=/<svc>"` and plant a SECOND cookie of the same name in a victim's jar on
-// a sibling host — HttpOnly does not protect it, because a different
-// domain/path key is a DISTINCT cookie, not an overwrite. RFC 6265 §5.4 sorts
-// the longer-path cookie FIRST, so the injected value leads the Cookie header:
-// denial of the login wall for the victim, and session fixation. Browsers
-// REJECT any `__Host-` cookie that carries a Domain attribute or a Path other
-// than "/", which kills that whole class at the jar — no sibling can create a
-// cookie under this name at all. Same prefix the dashboard already uses for its
-// tenant cookie (web/lib/tenant-cookie.ts:5).
-const SESSION_COOKIE = "__Host-finch_session";
-
-// The pre-prefix cookie name. Renaming a cookie invalidates every live session,
-// so we still ACCEPT this one (browserGate ranks it below the prefixed name —
-// see readSessionCookies) and CLEAR it whenever we mint or expire a session.
-// It can be deleted once the 12h SESSION_TTL_SECONDS window has passed since
-// the deploy that introduced the prefixed name: no legacy cookie outlives it.
-const LEGACY_SESSION_COOKIE = "finch_session";
+// The retired browser login wall's cookie names. The hub no longer mints or
+// reads them, but a browser may still carry one (they lived up to 12h) and a
+// signed session envelope names its Clerk user — so the relay keeps scrubbing
+// both names out of the Cookie header it forwards to the box. Safe to delete
+// once every pre-cut cookie has expired.
+const STALE_SESSION_COOKIES = new Set(["__Host-finch_session", "finch_session"]);
 
 // Caller-controlled copies are removed before any relay authentication runs;
 // only the Worker may inject this header after a successful auth decision.
@@ -258,15 +201,9 @@ function stripUntrustedCallerIdentity(headers: Headers): void {
   }
 }
 
-interface BrowserCaller {
-  userId: string;
-  sessionId?: string;
-}
-
 interface RelayCaller {
   sub: string;
   authMethod: CallerAuthMethod;
-  sessionId?: string;
   actor?: string;
   keyId?: string;
   keyLabel?: string;
@@ -339,7 +276,6 @@ async function injectCallerAssertion(
     nbf: now - 5,
     exp: now + CALLER_ASSERTION_TTL_SECONDS,
     jti: crypto.randomUUID(),
-    ...(caller.sessionId ? { session_id: caller.sessionId } : {}),
     ...(caller.actor ? { actor: caller.actor } : {}),
     ...(caller.keyId ? { key_id: caller.keyId } : {}),
     ...(caller.keyLabel ? { key_label: caller.keyLabel } : {}),
@@ -350,71 +286,10 @@ async function injectCallerAssertion(
   );
 }
 
-/** A Set-Cookie that expires `name` on the current host. The attributes must
- *  mirror the set (Secure, Path=/, no Domain) or the browser keys the expiry to
- *  a different cookie and the live one survives. */
-function expireSessionCookie(name: string): string {
-  return `${name}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0`;
-}
-
-/** Expire BOTH login-wall cookies — what logout owes: leaving the legacy name
- *  behind would leave browserGate's legacy candidate still walking the user
- *  through the wall. The mint expires only the legacy name (it is writing the
- *  other), so that a single re-login during the transition retires the
- *  shadowable pre-prefix cookie instead of dragging it for its full 12h TTL. */
-function clearSessionCookies(): string[] {
-  return [SESSION_COOKIE, LEGACY_SESSION_COOKIE].map(expireSessionCookie);
-}
-
-/** Every value carried under `name` in the Cookie header, in header order.
- *  Minimal + allocation-light; cookie values here are base64url envelopes (no
- *  special chars), so a plain name=value split per pair is sufficient.
- *
- *  ALL matches, not the first: a Cookie header can legitimately repeat a name
- *  (distinct domain/path keys collapse into one header), and "first match wins"
- *  is precisely the behaviour an injected cookie games — RFC 6265 §5.4 puts the
- *  longer-path cookie first, and the attacker picks the path. */
-function readCookieValues(req: Request, name: string): string[] {
-  const raw = req.headers.get("cookie");
-  if (!raw) return [];
-  const out: string[] = [];
-  for (const part of raw.split(";")) {
-    const eq = part.indexOf("=");
-    if (eq < 0) continue;
-    if (part.slice(0, eq).trim() === name) out.push(part.slice(eq + 1).trim());
-  }
-  return out;
-}
-
-// Bound on how many session-cookie candidates browserGate will verify. Each
-// candidate that parses costs a signature check plus a gateBrowser round-trip,
-// and the header is caller-controlled, so the loop must not be unbounded. Two
-// is the honest maximum in the wild (prefixed + legacy); 4 leaves slack.
-const MAX_SESSION_COOKIE_CANDIDATES = 4;
-
-/** Session-cookie candidates for browserGate, BEST FIRST: every `__Host-`-named
- *  value ahead of every legacy-named one, regardless of Cookie header order.
- *
- *  Ranking (rather than a single first-match read) is what makes the transition
- *  safe. A sibling tenant cannot plant a `__Host-` cookie in a victim's jar at
- *  all, but it CAN still plant the legacy name with `Domain=finchmcp.com`; if
- *  header order decided the winner, that injected pair would shadow the
- *  victim's own legacy cookie during the changeover window. Ordering by name
- *  first, and treating the list as candidates to try in turn, means the
- *  attacker's pair can only ever be evaluated after the real one. */
-function readSessionCookies(req: Request): string[] {
-  return [
-    ...readCookieValues(req, SESSION_COOKIE),
-    ...readCookieValues(req, LEGACY_SESSION_COOKIE),
-  ].slice(0, MAX_SESSION_COOKIE_CANDIDATES);
-}
-
-/** Strip ONLY the login-wall cookies out of a Cookie header, preserving the
- *  hosted app's OWN cookies (e.g. app_sid). Parses the header into name=value
- *  pairs, drops the SESSION_COOKIE / LEGACY_SESSION_COOKIE pairs, and
- *  re-serializes the rest. Returns "" if nothing remains (caller then deletes
- *  the header). The login-wall cookie must never cross to the box — and that
- *  includes the legacy name for as long as browserGate still honors it — but a
+/** Strip ONLY the stale login-wall cookies out of a Cookie header, preserving
+ *  the hosted app's OWN cookies (e.g. app_sid). Parses the header into
+ *  name=value pairs, drops the STALE_SESSION_COOKIES pairs, and re-serializes
+ *  the rest. Returns "" if nothing remains (caller then deletes the header). A
  *  blanket "contains finch_" strip would delete the whole Cookie header and
  *  break every cookie-based hosted site. (#1) */
 function stripSessionCookie(cookieHeader: string): string {
@@ -422,175 +297,12 @@ function stripSessionCookie(cookieHeader: string): string {
   for (const part of cookieHeader.split(";")) {
     const eq = part.indexOf("=");
     const name = (eq < 0 ? part : part.slice(0, eq)).trim();
-    // drop only the login-wall cookie pairs
-    if (name === SESSION_COOKIE || name === LEGACY_SESSION_COOKIE) continue;
+    // drop only the stale login-wall cookie pairs
+    if (STALE_SESSION_COOKIES.has(name)) continue;
     const pair = part.trim();
     if (pair) kept.push(pair);
   }
   return kept.join("; ");
-}
-
-/** Validate a redirect target as a SAFE RELATIVE path (open-redirect guard).
- *  Accepts only a path that starts with a single "/" and is NOT a
- *  scheme-relative "//host" or a "/\host" (which browsers treat as a host). On
- *  anything else (absolute URL, empty, missing leading slash) returns "/". This
- *  is the SOLE gate on every `rd` we 302 to from the login-wall handlers. */
-export function safeRelPath(rd: string | null | undefined): string {
-  if (!rd || typeof rd !== "string") return "/";
-  // Must be path-absolute and not protocol-relative / backslash-host.
-  if (rd[0] !== "/" || rd[1] === "/" || rd[1] === "\\") return "/";
-  // Reject control chars / whitespace that could smuggle a header or confuse a
-  // parser; a legit path+query won't contain them.
-  if (/[\x00-\x1f\x7f]/.test(rd)) return "/";
-  return rd;
-}
-
-/** The login-wall decision: either a 302 to the wall (short-circuit the request)
- *  or a pass, optionally carrying `browserAuthed` — a valid session cookie that
- *  relayMcp must honor as an authorized caller (skipping the finch_ key gate, the
- *  same way a service-authed dashboard call does). */
-type GateDecision =
-  | { wall: Response }
-  | {
-      wall?: undefined;
-      browserAuthed: boolean;
-      browserCaller?: BrowserCaller;
-    };
-
-/** AUTH-BY-REQUEST-TYPE gate that runs RIGHT BEFORE relayMcp for both the
- *  pinned-box and load-balanced branches. It decides whether the login wall
- *  applies, per the contract's core rule:
- *    1. Bearer finch_ present                 → pass (MCP/key plane; relayMcp's
- *       checkKey gate is the real authority — the wall is BYPASSED).
- *    2. svc-authed (FINCH_SERVICE_SECRET + a valid assertion for THIS tenant)
- *                                              → pass (dashboard test-in-chat).
- *    3. service.auth === "public"            → pass (explicit open opt-out).
- *    4. otherwise (a browser, no finch_ bearer) → browserGate: a valid
- *       finch_session cookie passes as browserAuthed; else 302 to the login wall.
- *  Returns {wall} to short-circuit, or {browserAuthed} to let relayMcp proceed.
- *  We resolve the service's auth mode via the SAME checkKey op the relay uses
- *  (public:true short-circuits) so the two can never disagree. A browserAuthed
- *  pass authorizes the RELAY (it cleared the wall); relayMcp still strips the key
- *  and records the call, but does NOT re-run the per-key checkKey gate. */
-async function maybeBrowserGate(
-  req: Request,
-  env: Env,
-  tenant: string,
-  hostKey: string,
-  service: string,
-  originalPathAndQuery: string,
-): Promise<GateDecision> {
-  // 1. ANY bearer means a machine caller — relayMcp's own gates are the
-  //    authority (checkKey for finch_ keys, verifyClerkOAuthToken for OAuth
-  //    access tokens); never wall it. Walling non-finch_ bearers was the bug
-  //    that broke claude.ai connectors: the client completed the Clerk OAuth
-  //    flow, came back with a valid access token, and got 302'd to the browser
-  //    portal instead of reaching the OAuth verifier. No privilege is granted
-  //    here — an invalid bearer still 401/403s in relayMcp.
-  const auth = req.headers.get("authorization") || "";
-  if (/^Bearer\s+\S+$/.test(auth)) {
-    return { browserAuthed: false };
-  }
-
-  // 1b. Only wall BROWSER NAVIGATIONS. A bearer-less MCP/API client (POST, or
-  //     an Accept without text/html) must fall through to relayMcp's key gate,
-  //     whose 401 carries the WWW-Authenticate resource_metadata challenge —
-  //     that challenge is how OAuth-capable clients (claude.ai) discover the
-  //     flow at all. A 302-to-portal here reads as "couldn't connect" to them.
-  //     Browsers always send GET/HEAD with Accept: text/html on navigation.
-  const isBrowserNav =
-    (req.method === "GET" || req.method === "HEAD") &&
-    (req.headers.get("accept") || "").includes("text/html");
-  if (!isBrowserNav) {
-    return { browserAuthed: false };
-  }
-
-  // 2. First-party service caller acting for THIS tenant (test-in-chat) — bypass.
-  //    relayMcp re-derives svcAuthed itself, so we just don't wall it here.
-  if (
-    serviceOk(req, env) &&
-    (await verifyAssertion(
-      req.headers.get("x-finch-auth") || "",
-      env.FINCH_SERVICE_SECRET,
-    )) === tenant
-  ) {
-    return { browserAuthed: false };
-  }
-
-  // 3. Public service → no wall (the explicit opt-out). We ask checkKey with an
-  //    empty hash: a public service returns {public:true} regardless of key.
-  //    (A dev-fallback host with no usable host key also has none to bind a
-  //    cookie to; skip the wall there too rather than bounce to a dead slug. The
-  //    relay's own checkKey then enforces the key gate as before.) Gate this on
-  //    env.DEV: an empty host key only ever arises via the DEV DEFAULT_TENANT
-  //    fallback (resolveTenant fails closed in prod), so a prod build must never
-  //    take this wall-skip even if misconfigured — fall through to browserGate.
-  if (!hostKey) {
-    if (env.DEV === "1") return { browserAuthed: false };
-    // No host key in a non-dev build should be unreachable (resolveTenant 404s), but
-    // if it happens, fail CLOSED: treat as a private service needing the wall.
-    return browserGate(req, env, tenant, hostKey, service, originalPathAndQuery);
-  }
-  const probe = await tenantOp<{ public?: boolean }>(env, tenant, "checkKey", {
-    hash: "",
-    service,
-  });
-  if (probe?.public) return { browserAuthed: false };
-
-  // 4. A browser on a private service → require the session cookie.
-  return browserGate(req, env, tenant, hostKey, service, originalPathAndQuery);
-}
-
-/** browserGate — the login-wall decision for a relay request that is NOT a
- *  finch_ bearer call, NOT service-authed, and NOT a public service (the
- *  caller checks those first). For such a request (a plain browser hit on a
- *  PRIVATE service) we require a valid session cookie bound to THIS tenant+slug
- *  whose epoch matches the tenant's current sessionEpoch. A valid cookie passes
- *  as {browserAuthed:true} (relayMcp skips the key gate); a
- *  missing/invalid/stale cookie 302s to the Clerk-gated portal start page. The
- *  cookie is the ONLY thing checked here; the service-private check is upstream.
- *
- *  We walk CANDIDATES rather than one value (readSessionCookies, best-first) so
- *  that a shadowing pair under the legacy name cannot deny the wall to a user
- *  whose real cookie sits later in the header: a junk candidate only costs the
- *  next iteration. A definitive "not shared with you" verdict still short-
- *  circuits — that answer is about the USER, so a later candidate cannot
- *  improve it, and letting one try would turn the loop into an oracle. */
-async function browserGate(
-  req: Request,
-  env: Env,
-  tenant: string,
-  hostKey: string,
-  service: string,
-  originalPathAndQuery: string,
-): Promise<GateDecision> {
-  for (const cookie of readSessionCookies(req)) {
-    if (!cookie) continue;
-    const sess = await verifySession(cookie, env.SESSION_SECRET);
-    if (
-      sess &&
-      sess.kind === "session" &&
-      sess.tenant === tenant &&
-      sess.slug === hostKey &&
-      !!sess.userId
-    ) {
-      // Pre-scheme cookies carry neither identity field; re-mint them through the portal.
-      if (sess.admin !== undefined || sess.email) {
-        const gate = await tenantOp<{ allowed: boolean; reason?: string }>(env, tenant, "gateBrowser", { clerkUserId: sess.userId, email: sess.email, epoch: sess.epoch ?? 0, service });
-        if (gate.allowed) return { browserAuthed: true, browserCaller: { userId: sess.userId, ...(sess.jti ? { sessionId: sess.jti } : {}) } };
-        if (gate.reason !== "epoch") return { wall: new Response("You don't have access to this app. Ask an admin to share it with you.",{status:403,headers:{"content-type":"text/plain; charset=utf-8"}}) };
-      }
-    }
-  }
-  // No valid session → bounce to the Clerk-gated portal start page. WEB_URL is
-  // the dashboard origin; the portal page re-mints a portal grant for this host key
-  // and hands the browser back to /__finch/cb here. `rd` carries the original
-  // path+query so the user lands where they meant to after login.
-  const webBase = (env.WEB_URL || "https://finchmcp.com").replace(/\/+$/, "");
-  const target =
-    `${webBase}/portal/start?slug=${encodeURIComponent(hostKey)}` +
-    `&rd=${encodeURIComponent(safeRelPath(originalPathAndQuery))}`;
-  return { wall: Response.redirect(target, 302) };
 }
 
 // Default target for GET /releases/<asset>: the project's GitHub Releases
@@ -612,13 +324,13 @@ const RELEASE_ASSET_RE =
 // these, claude.ai falls back to requesting every scope the AS supports —
 // including public/private metadata the hub never reads — which both bloats
 // the consent screen and overgrants the issued token.
-// `email` is needed at the door: the relay enforces per-app user grants for
-// org members by matching the token's email against the tenant's ACL.
+// No `email`: the relay authorizes an OAuth caller by Clerk user id alone (it
+// must be the tenant owner), so nothing at the door reads an email any more.
 // `offline_access` stays despite the MCP auth spec's SHOULD NOT: the v1 SDK
 // (@modelcontextprotocol/sdk) sends the challenge scope to /authorize verbatim
 // and never adds it itself, so dropping it would leave those connectors with no
 // refresh token — a manual reconnect every time the access token expires.
-const MCP_SCOPES = ["openid", "email", "offline_access"];
+const MCP_SCOPES = ["openid", "offline_access"];
 
 /** Percent-decode a path segment, tolerating a malformed encoding (a raw "%"
  *  in a name would make decodeURIComponent throw). Falls back to the raw value
@@ -662,32 +374,20 @@ export function hostKeyFromHost(host: string): string {
   return h;
 }
 
-/** Back-compat alias for tests / older local imports; prefer hostKeyFromHost. */
-export const slugFromHost = hostKeyFromHost;
-
 /** Resolve the tenant id for an MCP/relay request from the host key.
  *  host key -> RouterDO.lookup -> tenant id. FAILS CLOSED: an unknown key returns
  *  a null tenant (the caller turns that into a 404). The DEFAULT_TENANT fallback
- *  is consulted ONLY in dev (env.DEV === "1") so prod never silently falls back.
- *  Returns the RESOLVED host key alongside the tenant: hostKey is "" when the
- *  dev fallback supplied the tenant (the inbound host never resolved), so the
- *  login wall / cookie binding only ever operate on a key RouterDO vouched for —
- *  never on a merely-parsed hostname. */
-async function resolveTenant(
-  host: string,
-  env: Env,
-): Promise<{ tenant: string | null; hostKey: string }> {
+ *  is consulted ONLY in dev (env.DEV === "1") so prod never silently falls back. */
+async function resolveTenant(host: string, env: Env): Promise<string | null> {
   const key = hostKeyFromHost(host);
   if (key) {
     const tenant = await routerLookup(env, key);
-    if (tenant) return { tenant, hostKey: key };
+    if (tenant) return tenant;
   }
   // No usable/registered host key (unregistered slug/custom host, apex, www, workers.dev,
   // localhost): fail closed in prod; dev-only DEFAULT_TENANT fallback otherwise.
-  if (env.DEV === "1" && env.DEFAULT_TENANT) {
-    return { tenant: env.DEFAULT_TENANT, hostKey: "" };
-  }
-  return { tenant: null, hostKey: "" };
+  if (env.DEV === "1" && env.DEFAULT_TENANT) return env.DEFAULT_TENANT;
+  return null;
 }
 
 /** Tenant DO stub for a tenant id. */
@@ -804,12 +504,6 @@ export default {
         status: 200,
         headers: { "content-type": "text/plain; charset=utf-8" },
       });
-    }
-
-    // ---- /chat — a tiny test chat that drives a service's MCP tools via a
-    //      Workers AI model (a "does my endpoint work" check). ----
-    if (path === "/chat" || path === "/chat/completions") {
-      return handleChat(req, env, url);
     }
 
     // ---- GET /install — the curl|sh agent installer (unauthenticated; the
@@ -943,30 +637,12 @@ export default {
 
     // ---- MCP / relay plane. Tenant id resolves from the host slug via the
     //      singleton RouterDO (slug→tenantId). FAIL CLOSED on an unknown slug. ----
-    const { tenant, hostKey } = await resolveTenant(host, env);
+    const tenant = await resolveTenant(host, env);
     if (!tenant) {
       return json(404, {
         error: "tenant could not be resolved from host",
         host,
       });
-    }
-
-    // ---- Login-wall hand-off endpoints. RESERVED paths, handled BEFORE the
-    //      service relay so a slug named "__finch" can never shadow them
-    //      (mirrors how _connect/releases are reserved). Both run on the slug
-    //      host (<slug>.finchmcp.com), where the tenant is already resolved. ----
-    if (path === "/__finch/cb" && req.method === "GET") {
-      return handleFinchCb(req, env, url, hostKey, tenant);
-    }
-    if (path === "/__finch/logout" && req.method === "GET") {
-      // Clear the session cookie (Max-Age=0) and 302 to a validated relative rd
-      // (default "/"). Host-scoped clear: same attributes as the set, no Domain.
-      // BOTH names — a logout that left the legacy cookie behind would leave the
-      // user still walked through the wall by browserGate's legacy candidate.
-      const rd = safeRelPath(url.searchParams.get("rd"));
-      const headers = new Headers({ location: rd });
-      for (const sc of clearSessionCookies()) headers.append("set-cookie", sc);
-      return new Response(null, { status: 302, headers });
     }
 
     const service = parts[0];
@@ -1045,38 +721,17 @@ export default {
       stripUntrustedCallerIdentity(untrustedHeaders);
       req = new Request(req, { headers: untrustedHeaders });
 
-      // THROTTLE FIRST — per-(tenant,IP), BEFORE any DO round-trip. The login wall
-      // below (maybeBrowserGate's checkKey probe + browserGate's sessionEpoch DO
-      // call) and the relay itself all hit Durable Objects; gating here makes a
-      // cheap DO-invocation DoS expensive. relayMcp does NOT re-check this limiter
+      // THROTTLE FIRST — per-(tenant,IP), BEFORE any DO round-trip. The box
+      // pin lookup, the route check and the relay itself all hit Durable
+      // Objects; gating here makes a cheap DO-invocation DoS expensive. There
+      // is no browser login wall: a keyless browser gets the same JSON 401 as
+      // any other keyless caller (relayMcp). relayMcp does NOT re-check this limiter
       // (it is only reachable through this gated path). Fails open in dev/test
       // (no binding). (security M5 / code-review #6)
       const ip = clientIp(req);
       if (!(await rateLimitOk(env.RELAY_LIMIT, `${tenant}:${ip}`))) {
         return json(429, { error: "rate limited" });
       }
-
-      // LOGIN WALL (auth-by-request-type). For a browser hit (no finch_ bearer,
-      // not svc-authed) on a PRIVATE service, bounce to the Clerk-gated portal
-      // unless a valid finch_session cookie is present. finch_ key calls, the
-      // dashboard's service-authed test-in-chat, and PUBLIC services all pass
-      // through untouched. Computed once here; covers BOTH the pinned-box and
-      // the load-balanced branch below. hostKey comes from resolveTenant above —
-      // it is the key RouterDO actually resolved ("" under the dev fallback), so
-      // the wall never binds a cookie to an unregistered hostname.
-      const originalPathAndQuery = path + (url.search || "");
-      const gate = await maybeBrowserGate(
-        req,
-        env,
-        tenant,
-        hostKey,
-        service,
-        originalPathAndQuery,
-      );
-      if (gate.wall) return gate.wall;
-      // A valid session cookie authorizes the relay as a web caller (cleared the
-      // wall) — relayMcp skips the per-key checkKey gate for it, like svcAuthed.
-      const browserCaller = gate.browserCaller;
 
       let pinned = "";
       if (second) {
@@ -1110,7 +765,7 @@ export default {
           { service, path: upstream ? `/${upstream}` : "/" },
         );
         if (!allowed.allowed) return json(404, { error: "route not exposed by service manifest" });
-        return relayMcp(req, env, ctx, tenant, service, pinned, path, upstream, browserCaller);
+        return relayMcp(req, env, ctx, tenant, service, pinned, path, upstream);
       }
 
       // Load-balanced across the service. Upstream = everything after
@@ -1145,7 +800,7 @@ export default {
         );
         return json(503, { error: "service offline", service });
       }
-      return relayMcp(req, env, ctx, tenant, service, pool, path, upstream, browserCaller);
+      return relayMcp(req, env, ctx, tenant, service, pool, path, upstream);
     }
 
     return json(404, { error: "not found", path });
@@ -1221,15 +876,14 @@ function relayBearerChallenge(req: Request): string {
   );
 }
 
-/** Extract a Bearer finch_ key, check it against the tenant's TenantDO, relay to
- *  the per-box BoxDO, and record the call. 401 if the key is absent or
- *  not allowed for this service. `boxOrPool` is a single box name (the
- *  specific-box route) or a shuffled candidate pool (the LB route) that we
- *  fail over on a DO "service offline" 503. `browserAuthed` is set when the
- *  caller already cleared the browser login wall with a valid finch_session
- *  cookie — that authorizes the relay (we skip the per-key checkKey gate, exactly
- *  like the service-authed dashboard path), label the caller "web", and still
- *  strip credentials + record the call. */
+/** Authenticate a relay caller, relay to the per-box BoxDO, and record the
+ *  call. Callers authenticate with a Bearer finch_ key (checked against the
+ *  tenant's TenantDO), a Clerk OAuth access token belonging to the tenant
+ *  OWNER, or the first-party service assertion POST /api/cli/call uses; a
+ *  public service needs none. 401 if no credential is presented on a
+ *  key-gated service, 403 if one is presented but not allowed. `boxOrPool` is
+ *  a single box name (the specific-box route) or a shuffled candidate pool
+ *  (the LB route) that we fail over on a DO "service offline" 503. */
 async function relayMcp(
   req: Request,
   env: Env,
@@ -1239,10 +893,9 @@ async function relayMcp(
   boxOrPool: string | string[],
   route: string,
   upstream: string,
-  browserCaller?: BrowserCaller,
 ): Promise<Response> {
   // NOTE: the per-(tenant,IP) RELAY_LIMIT is applied by the caller at the TOP of
-  // the `if (service)` block — BEFORE the login-wall DO round-trips — so it is
+  // the `if (service)` block — BEFORE any DO round-trip — so it is
   // NOT re-checked here (relayMcp is only reachable through that gated path; a
   // second check would double-count the limiter). (security M5 / code-review #6)
 
@@ -1254,36 +907,29 @@ async function relayMcp(
     return json(413, { error: "request body too large" });
   }
 
-  // TRUSTED INTERNAL RELAY: the dashboard's own "test in chat" panel relays via
-  // the web's service secret + a tenant assertion (no finch_ key). serviceOk +
-  // verifyAssertion proves a first-party caller acting for THIS resolved tenant,
-  // so we skip the per-key checkKey gate. Only the web holds FINCH_SERVICE_SECRET.
+  // TRUSTED INTERNAL RELAY: POST /api/cli/call (`finch call` / `finch tools`)
+  // relays through the SELF binding with the service secret + a tenant
+  // assertion (no finch_ key). serviceOk + verifyAssertion proves a first-party
+  // caller acting for THIS resolved tenant, so we skip the per-key checkKey
+  // gate. Only the hub itself and the web hold FINCH_SERVICE_SECRET.
   const svcAuthed =
     serviceOk(req, env) &&
     (await verifyAssertion(req.headers.get("x-finch-auth") || "", env.FINCH_SERVICE_SECRET)) ===
       tenant;
 
-  const browserAuthed = !!browserCaller;
-  let caller = svcAuthed ? "dashboard" : "web";
+  let caller = "dashboard";
   let edgeCaller: RelayCaller | null = svcAuthed
     ? { sub: "service:finch-dashboard", authMethod: "service" }
-    : browserCaller
-      ? {
-          sub: `user:${browserCaller.userId}`,
-          authMethod: "browser",
-          ...(browserCaller.sessionId
-            ? { sessionId: browserCaller.sessionId }
-            : {}),
-        }
-      : null;
+    : null;
   // OAUTH PLANE: a non-finch_ bearer with CLERK_ISSUER configured is tried as a
   // Clerk OAuth access token (claude.ai custom connectors — they can't send
-  // finch_ keys). A verified token whose identity IS this tenant (user or org)
-  // authorizes the relay like browserAuthed; a verified token for a DIFFERENT
-  // tenant is a hard 403. An unverifiable token falls through to the key gate,
-  // whose 401 carries the resource_metadata challenge pointing back at Clerk.
+  // finch_ keys). A verified token whose Clerk user OWNS this tenant
+  // authorizes the relay; any other verified identity is a hard 403 (Finch is
+  // single-user: there are no shared members or per-user app grants). An
+  // unverifiable token falls through to the key gate, whose 401 carries the
+  // resource_metadata challenge pointing back at Clerk.
   let oauthAuthed = false;
-  if (!svcAuthed && !browserAuthed && env.CLERK_ISSUER) {
+  if (!svcAuthed && env.CLERK_ISSUER) {
     const m = (req.headers.get("authorization") || "").match(
       /^Bearer\s+(?!finch_)(\S+)$/,
     );
@@ -1295,21 +941,25 @@ async function relayMcp(
       );
       const id = who?.sub || who?.user_id;
       if (who && id) {
-        const gate = await tenantOp<{allowed:boolean;reason?:string}>(env,tenant,"gateOauth",{clerkUserId:id,email:(who.email||"").trim().toLowerCase(),orgIdClaim:who.org_id,service});
+        const gate = await tenantOp<{ allowed: boolean }>(env, tenant, "gateOauth", {
+          clerkUserId: id,
+          service,
+          // Only consulted for a legacy Clerk-org tenant nobody has claimed.
+          orgIdClaim: who.org_id,
+          orgRole: who.org_role,
+        });
         if (!gate.allowed) {
-          if ((gate.reason === "no-email" || gate.reason === "needs-email") && !who.email) return json(403,{error:"token has no email claim — reconnect this connector so it can request the email scope"});
-          return json(403,{error:"your account is not granted access to this app"});
+          return json(403, { error: "token identity does not own this tenant" });
         }
-        oauthAuthed=true; caller=`oauth:${id}`; edgeCaller={sub:`user:${id}`,authMethod:"oauth"};
+        oauthAuthed = true;
+        caller = `oauth:${id}`;
+        edgeCaller = { sub: `user:${id}`, authMethod: "oauth" };
       } else if (who) {
         return json(403, { error: "token identity does not own this tenant" });
       }
     }
   }
-  // A browser that cleared the login wall (valid finch_session cookie) is an
-  // authorized web caller — like svcAuthed, it bypasses the per-key checkKey
-  // gate. The wall already proved the service is reachable by this session.
-  if (!svcAuthed && !browserAuthed && !oauthAuthed) {
+  if (!svcAuthed && !oauthAuthed) {
     // ALWAYS consult the TenantDO — even with NO bearer — because a PUBLIC
     // service (an open webpage) must be reachable without a key. We parse the
     // bearer when present (empty hash when absent) and let checkKey decide:
@@ -1382,9 +1032,9 @@ async function relayMcp(
   // secret downstream — never the caller key.)
   //
   // The scrub is BY NAME, not by value. The hub reads a finch_ key or OAuth
-  // token only from `Authorization: Bearer`, the login-wall session only from
-  // the finch_session cookie, and the dashboard's service secret + tenant
-  // assertion only from X-Finch-Service / X-Finch-Auth — so those are what go.
+  // token only from `Authorization: Bearer`, and the first-party service
+  // secret + tenant assertion only from X-Finch-Service / X-Finch-Auth — so
+  // those are what go (plus any stale login-wall cookie, below).
   // Every other header is forwarded byte-for-byte. This used to also delete ANY
   // header whose value merely contained "finch_", which dropped MCP
   // 2026-07-28's Mcp-Name / Mcp-Param-* mirrors for a tool or argument named
@@ -1411,8 +1061,8 @@ async function relayMcp(
       if (value.includes(presented)) relayHeaders.delete(name);
     }
   }
-  // Surgically remove ONLY the finch_session login-wall cookie from the Cookie
-  // header, leaving the hosted app's own cookies (e.g. app_sid) intact. (#1)
+  // Surgically remove ONLY a stale finch_session login-wall cookie from the
+  // Cookie header, leaving the hosted app's own cookies (e.g. app_sid) intact. (#1)
   const cookieHeader = relayHeaders.get("cookie");
   if (cookieHeader) {
     const remaining = stripSessionCookie(cookieHeader);
@@ -1526,111 +1176,6 @@ async function relayMcp(
   );
 
   return res;
-}
-
-/** GET /__finch/cb?g=<grant>&rd=<relpath> — the login-wall callback on the host
- *  host. The Clerk-authed portal page (web) mints a short single-use PORTAL grant
- *  and hands the browser here. We:
- *    1. verifyToken(g, TICKET_SECRET) and assert kind==="portal".
- *    2. Bind it to THIS host: grant.tenant === resolved tenant AND grant.slug
- *       carries the resolved host key. A grant for another tenant/host key is
- *       refused (the host is the security boundary — a grant minted for X can't
- *       set a cookie on Y). The signed field remains named `slug` for wire compat.
- *    3. Burn the jti (claimTicket) so a captured grant can't mint a second
- *       session — refuse on {ok:false} (replay).
- *    4. Mint a kind:"session" cookie (SESSION_SECRET) stamped with the tenant's
- *       CURRENT sessionEpoch, and 302 to the validated relative `rd`.
- *  Any failure → 302 back to the portal start (re-login) rather than a hard error,
- *  so a stale/expired grant just re-bounces through Clerk. */
-async function handleFinchCb(
-  req: Request,
-  env: Env,
-  url: URL,
-  // The RESOLVED host key from resolveTenant ("" under the dev fallback) — the
-  // grant/cookie binding below must only ever see a RouterDO-vouched key.
-  hostKey: string,
-  tenant: string,
-): Promise<Response> {
-  const rd = safeRelPath(url.searchParams.get("rd"));
-
-  // Re-bounce target if anything is wrong: back through the Clerk-gated portal.
-  const webBase = (env.WEB_URL || "https://finchmcp.com").replace(/\/+$/, "");
-  const reBounce = () =>
-    Response.redirect(
-      `${webBase}/portal/start?slug=${encodeURIComponent(hostKey)}&rd=${encodeURIComponent(rd)}`,
-      302,
-    );
-
-  const grantTok = url.searchParams.get("g") || "";
-  if (!grantTok || !hostKey) return reBounce();
-
-  const grant = await verifyToken(grantTok, env.TICKET_SECRET);
-  if (
-    !grant ||
-    grant.kind !== "portal" ||
-    grant.tenant !== tenant ||
-    grant.slug !== hostKey ||
-    !grant.userId
-  ) {
-    return reBounce();
-  }
-
-  // SINGLE-USE: burn the portal grant's jti before minting a session, so a
-  // captured grant can't be replayed into a second cookie. A grant WITHOUT a jti
-  // is refused outright (every portal grant the hub mints carries one).
-  if (!grant.jti) return reBounce();
-  const claim = await tenantOp<{ ok: boolean }>(env, tenant, "claimTicket", {
-    jti: grant.jti,
-    exp: grant.exp,
-  });
-  if (!claim.ok) return reBounce(); // replayed grant
-
-  // Stamp the tenant's CURRENT sessionEpoch into the cookie so a later
-  // "sign everyone out" (bumpSessionEpoch) invalidates it.
-  const { epoch } = await tenantOp<{ epoch: number }>(
-    env,
-    tenant,
-    "sessionEpoch",
-  );
-  const exp = Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS;
-  const session = await signSession(
-    {
-      kind: "session",
-      tenant,
-      slug: hostKey,
-      userId: grant.userId,
-      ...(grant.mid ? { mid: grant.mid } : {}),
-      // Carry the portal grant's identity fields into the cookie — browserGate
-      // enforces per-app user grants off them (admin bypass / email ACL match).
-      ...(grant.email ? { email: grant.email } : {}),
-      ...(grant.admin ? { admin: true } : {}),
-      epoch: epoch ?? 0,
-      jti: genJti(),
-      exp,
-    } as TicketPayload,
-    env.SESSION_SECRET,
-  );
-
-  // HOST-scoped cookie (NO Domain) so it can't be replayed against a sibling
-  // tenant's slug host — and named with the `__Host-` prefix, which is what
-  // stops a sibling from planting a same-named cookie of its own (see
-  // SESSION_COOKIE). HttpOnly + Secure + SameSite=Lax + Path=/; the prefix
-  // REQUIRES exactly Secure + Path=/ + no Domain, so those attributes are now
-  // load-bearing: drop any of them and the browser discards the cookie
-  // outright. Max-Age makes it a PERSISTENT cookie for the full session
-  // lifetime — without it the browser treats it as a session cookie that dies
-  // when the tab closes (the 12h TTL baked into the signed envelope would then
-  // be moot). (code-review #11)
-  //
-  // A second Set-Cookie expires the pre-prefix name in the same response: only
-  // the new name is ever WRITTEN, and re-login is what retires the old one.
-  const headers = new Headers({ location: rd });
-  headers.append(
-    "set-cookie",
-    `${SESSION_COOKIE}=${session}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=${SESSION_TTL_SECONDS}`,
-  );
-  headers.append("set-cookie", expireSessionCookie(LEGACY_SESSION_COOKIE));
-  return new Response(null, { status: 302, headers });
 }
 
 /** The `finch` agent installer served at GET /install. The enroll one-liner is

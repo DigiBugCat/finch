@@ -1,39 +1,70 @@
-import { describe,it,expect } from "vitest";
-import { env } from "cloudflare:test";
-async function op<T=any>(op:string,args:any={}){const stub=env.DIRECTORY.get(env.DIRECTORY.idFromName("global"));const res=await stub.fetch("https://directory.test/",{method:"POST",body:JSON.stringify({op,...args})});expect(res.ok).toBe(true);return res.json<T>();}
-describe("DirectoryDO discovery index",()=>{
-  it("round-trips idempotent memberships and invite pointers",async()=>{const tenantId=`ft_${Date.now()}`,clerkUserId=`user_${Date.now()}`,email=`A${Date.now()}@Example.com`;await op("upsertMembership",{clerkUserId,tenantId,memberId:"m_1",role:"member",state:"active"});await op("upsertMembership",{clerkUserId,tenantId,memberId:"m_1",role:"member",state:"active"});expect((await op<any>("listForUser",{clerkUserId})).memberships).toHaveLength(1);await op("addInvitePointer",{email,tenantId});await op("addInvitePointer",{email,tenantId});expect((await op<any>("invitesForEmails",{emails:[email.toLowerCase()]})).tenantIds).toEqual([tenantId]);await op("clearInvitePointer",{email,tenantId});expect((await op<any>("invitesForEmails",{emails:[email]})).tenantIds).toEqual([]);});
-  it("maps organizations and rebuilds a tenant snapshot",async()=>{const tenantId=`ft_re_${Date.now()}`,org=`org_${Date.now()}`,uid=`user_re_${Date.now()}`;await op("mapOrg",{clerkOrgId:org,tenantId});expect((await op<any>("orgLookup",{clerkOrgId:org})).tenantId).toBe(tenantId);await op("reindexTenant",{tenantId,members:[{id:"m_a",clerkUserId:uid,email:"x@example.com",role:"admin",state:"active"},{id:"m_b",clerkUserId:null,email:"invite@example.com",role:"member",state:"invited"}]});expect((await op<any>("listForUser",{clerkUserId:uid})).memberships[0].role).toBe("admin");expect((await op<any>("invitesForEmails",{emails:["invite@example.com"]})).tenantIds).toContain(tenantId);});
+import { describe, it, expect } from "vitest";
+import { env, runInDurableObject } from "cloudflare:test";
 
-  // reindexTenant is now prefix-scoped and only writes rows that actually
-  // reference the tenant (it used to list the whole keyspace and rewrite every
-  // u:/e: key unconditionally). Guard the correctness of that change-gating:
-  // stale references must still be dropped, and unrelated rows left intact.
-  it("drops stale references without disturbing unrelated rows",async()=>{
-    const stamp=Date.now();
-    const target=`ft_target_${stamp}`, other=`ft_other_${stamp}`;
-    const shared=`user_shared_${stamp}`, bystander=`user_bystander_${stamp}`;
-    const sharedEmail=`shared${stamp}@example.com`, bystanderEmail=`bystander${stamp}@example.com`;
+// DirectoryDO after the single-user cut: the hub consults it to find the
+// tenants a Clerk user owns, and writes only the owner row of a legacy org
+// tenant claimed at sign-in. Pre-cut rows are seeded straight into storage,
+// the way the retired write ops left them.
 
-    // `shared` belongs to BOTH tenants; `bystander` only to `other`.
-    await op("upsertMembership",{clerkUserId:shared,tenantId:target,memberId:"m_t",role:"member",state:"active"});
-    await op("upsertMembership",{clerkUserId:shared,tenantId:other,memberId:"m_o",role:"admin",state:"active"});
-    await op("upsertMembership",{clerkUserId:bystander,tenantId:other,memberId:"m_b",role:"member",state:"active"});
-    await op("addInvitePointer",{email:sharedEmail,tenantId:target});
-    await op("addInvitePointer",{email:sharedEmail,tenantId:other});
-    await op("addInvitePointer",{email:bystanderEmail,tenantId:other});
+const stub = () => env.DIRECTORY.get(env.DIRECTORY.idFromName("global"));
+const runInDO = runInDurableObject as unknown as (
+  target: DurableObjectStub,
+  callback: (instance: any) => unknown,
+) => Promise<any>;
 
-    // Reindex `target` with an empty roster: every reference to it must go.
-    await op("reindexTenant",{tenantId:target,members:[]});
+async function op(op: string, args: Record<string, unknown> = {}) {
+  const res = await stub().fetch("https://directory.test/", {
+    method: "POST",
+    body: JSON.stringify({ op, ...args }),
+  });
+  return { status: res.status, body: await res.json<any>() };
+}
 
-    const sharedRows=(await op<any>("listForUser",{clerkUserId:shared})).memberships;
-    expect(sharedRows.map((m:any)=>m.tenantId)).toEqual([other]);
-    expect(sharedRows[0].role).toBe("admin"); // untouched, not rewritten
+describe("DirectoryDO — owner index", () => {
+  it("lists a user's stored memberships, and nothing for an unknown user", async () => {
+    const clerkUserId = `user_dir_${Date.now()}`;
+    const rows = [{ tenantId: "ft_owned", memberId: "m_1", role: "owner", state: "active" }];
+    await runInDO(stub(), async (instance: any) => {
+      await instance.ctx.storage.put(`u:${clerkUserId}`, rows);
+    });
+    expect(await op("listForUser", { clerkUserId })).toEqual({ status: 200, body: { memberships: rows } });
+    expect(await op("listForUser", { clerkUserId: `${clerkUserId}_nobody` })).toEqual({
+      status: 200,
+      body: { memberships: [] },
+    });
+  });
 
-    const bystanderRows=(await op<any>("listForUser",{clerkUserId:bystander})).memberships;
-    expect(bystanderRows.map((m:any)=>m.tenantId)).toEqual([other]);
+  it("refuses every retired write op without touching stored rows", async () => {
+    const clerkUserId = `user_dir_w_${Date.now()}`;
+    const rows = [{ tenantId: "ft_keep", memberId: "m_1", role: "owner", state: "active" }];
+    await runInDO(stub(), async (instance: any) => {
+      await instance.ctx.storage.put(`u:${clerkUserId}`, rows);
+    });
+    for (const retired of [
+      "removeMembership",
+      "addInvitePointer",
+      "clearInvitePointer",
+      "invitesForEmails",
+      "mapOrg",
+      "orgLookup",
+      "reindexTenant",
+    ]) {
+      const out = await op(retired, { clerkUserId, tenantId: "ft_keep", members: [] });
+      expect(out.status, retired).toBe(400);
+    }
+    expect((await op("listForUser", { clerkUserId })).body.memberships).toEqual(rows);
+  });
 
-    expect((await op<any>("invitesForEmails",{emails:[sharedEmail]})).tenantIds).toEqual([other]);
-    expect((await op<any>("invitesForEmails",{emails:[bystanderEmail]})).tenantIds).toEqual([other]);
+  it("upserts one owner row (a legacy org claimed at sign-in) beside the existing rows", async () => {
+    const clerkUserId = `user_dir_u_${Date.now()}`;
+    const kept = { tenantId: "ft_keep", memberId: "m_1", role: "owner", state: "active" };
+    await runInDO(stub(), async (instance: any) => {
+      await instance.ctx.storage.put(`u:${clerkUserId}`, [kept]);
+    });
+    const row = { tenantId: "org_claimed", memberId: "m_2", role: "owner", state: "active" };
+    expect((await op("upsertMembership", { clerkUserId, ...row })).status).toBe(200);
+    expect((await op("upsertMembership", { clerkUserId, ...row })).status).toBe(200);
+    expect((await op("listForUser", { clerkUserId })).body.memberships).toEqual([kept, row]);
+    expect((await op("upsertMembership", { tenantId: "org_x" })).status).toBe(400);
   });
 });

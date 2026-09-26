@@ -112,10 +112,11 @@ describe("401 WWW-Authenticate challenge", () => {
     expect(chal).toContain(
       `/.well-known/oauth-protected-resource/${enroll.id}/mcp"`,
     );
-    // The scope hint is the client's priority-1 source — identity only, plus
+    // The scope hint is the client's priority-1 source — identity only (no
+    // email: the door authorizes the tenant owner by Clerk user id), plus
     // offline_access: v1 SDK clients send this string to /authorize verbatim,
     // so without it they never get a refresh token.
-    expect(chal).toContain(`scope="openid email offline_access"`);
+    expect(chal).toContain(`scope="openid offline_access"`);
     agent.close();
   });
 });
@@ -137,7 +138,7 @@ describe("RFC 9728 protected-resource metadata", () => {
     expect(doc.authorization_servers).toEqual([env.CLERK_ISSUER]);
     expect(doc.authorization_servers).not.toContain(`https://${HOST}`);
     expect(doc.bearer_methods_supported).toEqual(["header"]);
-    expect(doc.scopes_supported).toEqual(["openid", "email", "offline_access"]);
+    expect(doc.scopes_supported).toEqual(["openid", "offline_access"]);
   });
 
   it("strips a trailing slash so the pointer equals Clerk's issuer", async () => {

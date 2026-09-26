@@ -14,7 +14,7 @@ import { signAssertion } from "../src/auth";
 // MCP call through a fake agent and read back a streamed body) all work together.
 //
 // Tenancy: the relay plane resolves the tenant from the host slug. We use a
-// NON-slug test host (so slugFromHost() === "") and rely on the DEV=1 +
+// NON-slug test host (so hostKeyFromHost() === "") and rely on the DEV=1 +
 // DEFAULT_TENANT fallback in resolveTenant(); we enroll under that SAME tenant
 // (DEFAULT_TENANT) so the key, the service, and the relay all share one
 // TenantDO. Test fixtures: FINCH_SERVICE_SECRET / TICKET_SECRET / DEFAULT_TENANT
@@ -58,6 +58,31 @@ async function api(
       method,
       headers: { ...headers, host: HOST },
       body: body !== undefined ? JSON.stringify(body) : undefined,
+    }),
+  );
+}
+
+/** Set a service's access mode exactly as `finch auth <svc> <mode>` does:
+ *  POST /api/cli/auth with a CLI token for the tenant's current epoch. */
+async function cliAuth(service: string, mode: "key" | "public"): Promise<Response> {
+  const epochRes = await env.TENANT.get(env.TENANT.idFromName(TENANT)).fetch(
+    "https://tenant/op",
+    { method: "POST", body: JSON.stringify({ op: "cliEpoch" }) },
+  );
+  const { epoch } = (await epochRes.json()) as { epoch: number };
+  const token = await signAssertion(
+    { tenant: TENANT, exp: nowSec() + 300, kind: "cli", epoch },
+    SERVICE,
+  );
+  return call(
+    new Request(`${BASE}/api/cli/auth`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+        host: HOST,
+      },
+      body: JSON.stringify({ service, mode }),
     }),
   );
 }
@@ -350,12 +375,8 @@ describe("full-stack worker E2E — enroll → join → refresh → connect → 
     );
     expect(preFlip.status).toBe(401);
 
-    // Flip to PUBLIC via the BFF route.
-    const flip = await api(
-      "PUT",
-      `/api/services/${encodeURIComponent(service)}/auth`,
-      { mode: "public" },
-    );
+    // Flip to PUBLIC via the CLI route (`finch auth`).
+    const flip = await cliAuth(service, "public");
     expect(flip.status).toBe(200);
 
     // GET /<app>/index.html with NO Authorization header — a public webpage. The
@@ -389,11 +410,7 @@ describe("full-stack worker E2E — enroll → join → refresh → connect → 
     expect(await relayRes.text()).toBe("<h1>hi</h1>");
 
     // Flip back to KEY — the same no-key call is re-gated to 401.
-    const unflip = await api(
-      "PUT",
-      `/api/services/${encodeURIComponent(service)}/auth`,
-      { mode: "key" },
-    );
+    const unflip = await cliAuth(service, "key");
     expect(unflip.status).toBe(200);
     const reGated = await call(
       new Request(`${BASE}/${service}/index.html`, { headers: { host: HOST } }),
@@ -453,11 +470,7 @@ describe("full-stack worker E2E — enroll → join → refresh → connect → 
     );
 
     // Make it public — the worst case, where the relay needs no credential.
-    expect(
-      (await api("PUT", `/api/services/${encodeURIComponent(service)}/auth`, {
-        mode: "public",
-      })).status,
-    ).toBe(200);
+    expect((await cliAuth(service, "public")).status).toBe(200);
 
     // THE ATTACK: two segments, no connect token, no key, no session.
     const hijack = await call(

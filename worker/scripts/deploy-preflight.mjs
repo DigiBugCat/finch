@@ -84,26 +84,22 @@ const prodRoutes = Array.isArray(prod?.routes) ? prod.routes : [];
 if (!prodRoutes.some((r) => r?.pattern === canonicalRoute)) {
   fail(`[env.production].routes must include the canonical JWKS route ${canonicalRoute}.`);
 }
-const aviaryRoute = "finchmcp.com/api/aviary/*";
-if (!prodRoutes.some((r) => r?.pattern === aviaryRoute)) {
-  fail(`[env.production].routes must include the Aviary enrollment route ${aviaryRoute}.`);
-}
-
-// Every named environment must carry the enrollment DO binding and migration;
-// Wrangler does not inherit either from the top-level config.
-const aviaryBinding = (envCfg.durable_objects?.bindings ?? []).find(
-  (binding) => binding?.name === "AVIARY_ENROLLMENT",
-);
-if (aviaryBinding?.class_name !== "AviaryEnrollmentDO") {
-  fail(`[env.${env}] must bind AVIARY_ENROLLMENT to AviaryEnrollmentDO.`);
-}
+// The retired AviaryEnrollmentDO has no binding any more, but its migration
+// must stay: dropping it (or adding a deleted_classes step) would delete the
+// class's stored data. That is a deliberate, separate cleanup — never a side
+// effect of a routine deploy. Wrangler does not inherit migrations from the
+// top-level config, so every named environment is checked.
 const aviaryMigration = (envCfg.migrations ?? []).some(
   (migration) =>
+    migration?.tag === "v5" &&
     Array.isArray(migration?.new_sqlite_classes) &&
     migration.new_sqlite_classes.includes("AviaryEnrollmentDO"),
 );
 if (!aviaryMigration) {
-  fail(`[env.${env}] must include the AviaryEnrollmentDO SQLite migration.`);
+  fail(`[env.${env}] must keep migration v5 for the retired AviaryEnrollmentDO.`);
+}
+if ((envCfg.migrations ?? []).some((migration) => migration?.deleted_classes)) {
+  fail(`[env.${env}] carries a deleted_classes migration — deleting Durable Object data needs an explicit, reviewed change.`);
 }
 const directoryBinding = (envCfg.durable_objects?.bindings ?? []).find(
   (binding) => binding?.name === "DIRECTORY",
@@ -142,7 +138,6 @@ if (isProd) {
 const SECRET_KEYS = [
   "FINCH_SERVICE_SECRET",
   "TICKET_SECRET",
-  "SESSION_SECRET",
   "FINCH_ASSERTION_PRIVATE_JWKS",
 ];
 const devValues = new Set();

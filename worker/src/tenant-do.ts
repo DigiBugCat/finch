@@ -1,9 +1,14 @@
 /// <reference types="@cloudflare/workers-types" />
 //
-// TenantDO — one Durable Object per tenant (a Clerk org id, or a user id).
-// It owns the tenant's entire control-plane state: services, the boxes
-// that run them, finch_ keys, ACL rules, groups, settings, and the activity
-// log. The dashboard's GET /api/state returns exactly the projection this DO
+// TenantDO — one Durable Object per tenant (a user id, or the id of a
+// workspace/Clerk org claimed before the single-user cut). It owns the
+// tenant's entire control-plane state: services, the boxes that run them,
+// finch_ keys, ACL rules, groups, settings, and the activity log.
+//
+// Single-user tenancy: a tenant has ONE owner. Member rows, invitations,
+// access requests and user→service grants written by the retired team
+// features stay in storage untouched (nothing is deleted), but no op reads
+// them to authorize anyone except the owner. The dashboard's GET /api/state returns exactly the projection this DO
 // computes; the agent join flow, the relay (BoxDO), and the MCP router
 // all reach in here via internal RPC.
 //
@@ -41,7 +46,6 @@ import {
   type ServiceState,
   type TenantMember,
   type TenantMeta,
-  type FinchRole,
   normalizeEmail,
   isOnline,
   normalizeState,
@@ -55,12 +59,9 @@ import {
 // the service, but `boxes` flatten + overview are computed on read).
 
 interface StoredService extends Service {
-  // Present only for services created by the Aviary device flow. It makes an
-  // approval retry idempotent without treating an unrelated pre-existing
-  // service with the same app path as safe to overwrite.
-  aviaryManifestSha256?: string;
+  // Set on services created by the retired Aviary device flow. Their manifest
+  // route prefixes are still enforced at the edge (routeAllowed).
   aviaryManaged?: boolean;
-  aviaryApprovalNonce?: string;
 }
 
 interface StoredState {
@@ -69,9 +70,11 @@ interface StoredState {
   keys: Key[]; // full keys incl. hash — never leaves the DO as-is
   groups: Group[];
   acl: AclRule[];
+  // Rows from the retired access-sharing queue. Kept (and still reported in
+  // getState) so no data is dropped; nothing writes to it any more.
   accessRequests: AccessRequest[];
-  // StoredLogEvent, not LogEvent: rows carry the `svc` ACL subject that
-  // getState uses to narrow the log for a scoped viewer and then strips.
+  // StoredLogEvent, not LogEvent: rows carry the `svc` subject metadata that
+  // getState strips on the way out.
   logs: StoredLogEvent[];
   settings: Settings;
   // Spent join-ticket ids (M1): jti -> the ticket's exp (epoch SECONDS). A jti
@@ -81,11 +84,9 @@ interface StoredState {
   // Monotonic counter embedded in CLI tokens at mint. Bumped by "revoke all CLI
   // tokens"; a token whose epoch != this is rejected. Absent == 0 (legacy state).
   cliTokenEpoch?: number;
-  // Monotonic counter stamped into the browser login-wall session cookie at mint
-  // (/__finch/cb). Bumped by "bumpSessionEpoch" ("sign everyone out"); browserGate
-  // rejects a cookie whose epoch != this. Absent == 0 (legacy state). Mirrors
-  // cliTokenEpoch exactly.
-  sessionEpoch?: number;
+  // Set once the single-user cut has been applied to this tenant's CLI tokens
+  // (see retireSharedCliTokens). Born true on a tenant created after the cut.
+  cliSingleUserCut?: boolean;
   tenantMeta?: TenantMeta;
   members: TenantMember[];
 }
@@ -107,11 +108,6 @@ const SERVICE_ID_RE = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,61}[A-Za-z0-9])?$/;
 // BYO-hostname flow; that flow has its own authorization (vanity gate + CF DV
 // provisioning) which the settings path does not perform.
 const SUBDOMAIN_LABEL_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
-// Access-request queue cap: resolved rows are evicted oldest-first to stay
-// under it; a queue full of live (pending/invited) rows refuses new ones.
-const MAX_ACCESS_REQUESTS = 200;
-const MAX_MEMBERS = 200;
-
 // Box-name validation (M1): the box picks its own name, so clamp it to a
 // sane length + charset before it pollutes the registry / squats a slot.
 const MAX_BOX_NAME = 64;
@@ -214,9 +210,16 @@ export class TenantDO extends DurableObject<Env> {
   // p50/p95/err on recordCall. Lost on eviction — that only blurs the rolling
   // window briefly, the durable counters (calls, recentCalls) survive.
   private samples = new Map<string, { ms: number; ok: boolean }[]>();
+  // Whether this instance has run retireSharedCliTokens (it is persisted, so
+  // this only saves the storage read on later requests).
+  private cliCutChecked = false;
 
   async fetch(req: Request): Promise<Response> {
     if (req.method !== "POST") return bad(405, "POST only");
+    if (!this.cliCutChecked) {
+      await this.retireSharedCliTokens();
+      this.cliCutChecked = true;
+    }
     let msg: { op?: string; [k: string]: unknown };
     try {
       msg = await req.json();
@@ -230,50 +233,17 @@ export class TenantDO extends DurableObject<Env> {
     try {
       switch (op) {
         case "getState":
-          return ok(await this.getState(a.viewer));
-        case "memberContext": return ok(await this.memberContext(a.clerkUserId, a.email));
-        case "ensureOwner": return ok(await this.ensureOwner(a.clerkUserId, a.email));
-        case "inviteMember": return this.opResponse(await this.inviteMember(a.email,a.role,a.actor));
-        case "bindIdentity": return this.opResponse(await this.bindIdentity(a.clerkUserId,a.emails,a.source));
-        case "adapterOrgMember": return this.opResponse(await this.adapterOrgMember(a.clerkUserId,a.emails,a.primaryEmail));
-        case "approveAccess": return this.opResponse(await this.approveAccess(a.id,a.actor));
-        case "denyAccess": return this.opResponse(await this.denyAccess(a.id,a.actor));
-        case "revokeAccess": return this.opResponse(await this.revokeAccess(a.id,a.ruleId,a.actor));
-        case "setMemberRole": return this.opResponse(await this.setMemberRole(a.memberId,a.role,a.actor));
-        case "setMemberState": return this.opResponse(await this.setMemberState(a.memberId,a.state,a.revokeGrants,a.actor));
-        case "removeMember": return this.opResponse(await this.removeMember(a.memberId,a.revokeGrants,a.actor));
-        case "bootstrapMembers": return this.opResponse(await this.bootstrapMembers(a));
-        case "gateBrowser": return ok(await this.gateBrowser(a));
-        case "gateOauth": return ok(await this.gateOauth(a));
-        case "legacyClaimStatus": return ok(await this.legacyClaimStatus());
+          return ok(await this.getState());
+        case "memberContext":
+          return this.opResponse(await this.memberContext(a.clerkUserId, a.email));
+        case "gateOauth":
+          return ok(await this.gateOauth(a.clerkUserId, a.service, a.orgIdClaim, a.orgRole));
+        case "holdings":
+          return ok(await this.holdings());
+        case "claimLegacyOrg":
+          return this.opResponse(await this.claimLegacyOrg(a.clerkOrgId, a.clerkUserId, a.email));
         case "enroll":
           return ok(await this.enroll(a.name, a.group));
-        case "registerAviaryService": {
-          const r = await this.registerAviaryService(
-            a.manifest,
-            a.manifestSha256,
-            a.approvalNonce,
-          );
-          if (!r.ok) return bad(409, r.error || "aviary registration failed");
-          return ok(r);
-        }
-        case "releaseAviaryService":
-          return ok(
-            await this.releaseAviaryService(
-              a.appPath,
-              a.manifestSha256,
-              a.approvalNonce,
-            ),
-          );
-        case "commitAviaryCredentialEpoch":
-          return ok(
-            await this.commitAviaryCredentialEpoch(
-              a.appPath,
-              a.box,
-              a.approvalNonce,
-              a.credentialEpoch,
-            ),
-          );
         case "release":
           return ok(await this.release(a.id));
         case "approve":
@@ -282,16 +252,10 @@ export class TenantDO extends DurableObject<Env> {
           return ok(await this.cliEpoch());
         case "revokeCliTokens":
           return ok(await this.revokeCliTokens());
-        case "sessionEpoch":
-          return ok(await this.sessionEpoch());
-        case "bumpSessionEpoch":
-          return ok(await this.bumpSessionEpoch());
         case "decline":
           return ok(await this.decline(a.id));
         case "setTags":
           return ok(await this.setTags(a.id, a.tags));
-        case "setGroup":
-          return ok(await this.setGroup(a.id, a.group));
         case "setAuth":
           return ok(await this.setAuth(a.service ?? a.id, a.mode));
         case "mintKey": {
@@ -303,25 +267,6 @@ export class TenantDO extends DurableObject<Env> {
           return ok(
             await this.revokeBoxKey(a.service, a.box, a.key),
           );
-        case "addAcl":
-          return ok(await this.addAcl(a.src, a.dst));
-        case "removeAcl":
-          return ok(await this.removeAcl(a.id));
-        case "requestAccess":
-          return ok(
-            await this.requestAccess(a.email, a.service, a.requestedBy, a.requestedByUserId),
-          );
-        case "setAccessStatus": {
-          const r = await this.setAccessStatus(a.id, a.status, a.resolvedBy, a.resolvedByUserId);
-          if ("error" in r) return bad(r.status ?? 400, r.error!);
-          return ok(r);
-        }
-        case "listAccess":
-          return ok(await this.listAccess());
-        case "removeUserGrant":
-          return ok(await this.removeUserGrant(a.email, a.service));
-        case "checkUserAccess":
-          return ok(await this.checkUserAccess(a.user, a.service));
         case "updateSetting":
           return ok(await this.updateSetting(a.key, a.val));
         case "registerBox": {
@@ -406,8 +351,8 @@ export class TenantDO extends DurableObject<Env> {
           : {},
       cliTokenEpoch:
         typeof stored.cliTokenEpoch === "number" ? stored.cliTokenEpoch : 0,
-      sessionEpoch:
-        typeof stored.sessionEpoch === "number" ? stored.sessionEpoch : 0,
+      // Explicit, so fresh()'s `true` never leaks into pre-cut stored state.
+      cliSingleUserCut: stored.cliSingleUserCut === true,
       members: Array.isArray(stored.members) ? stored.members : [],
       tenantMeta: stored.tenantMeta && typeof stored.tenantMeta === "object" ? stored.tenantMeta : undefined,
     };
@@ -426,11 +371,10 @@ export class TenantDO extends DurableObject<Env> {
    *
    *  So the invariant is enforced here, on every load, rather than only on the
    *  transitions. This runs in memory before any caller sees the state, which
-   *  means the gates (gateBrowser, gateOauth, checkUserAccess) and the viewer
-   *  filter are all correct on the very first read after deploy — no migration
-   *  step, no write amplification, and it is idempotent, so re-running it costs
-   *  a scan and changes nothing. The corrected rule is persisted whenever any
-   *  op happens to save.
+   *  means the key gate (checkKey) is correct on the very first read after
+   *  deploy — no migration step, no write amplification, and it is idempotent,
+   *  so re-running it costs a scan and changes nothing. The corrected rule is
+   *  persisted whenever any op happens to save.
    *
    *  Leaves the rule ALONE when no active owner exists: pre-bootstrap tenants
    *  still carry the "you" placeholder, and pointing the lockout backstop at a
@@ -471,7 +415,7 @@ export class TenantDO extends DurableObject<Env> {
       logs: [],
       usedTickets: {},
       cliTokenEpoch: 0,
-      sessionEpoch: 0,
+      cliSingleUserCut: true, // no team era to retire
       members: [],
       settings: {
         org: id,
@@ -492,11 +436,8 @@ export class TenantDO extends DurableObject<Env> {
   }
 
   /** Append an audit row. `svc` is REQUIRED (see StoredLogEvent in types.ts):
-   *  every call site has to state which service the entry is about, because
-   *  that is what decides whether a scoped viewer may read it. It is a required
-   *  field rather than an optional one precisely so a new log site cannot
-   *  silently inherit a default — either default is wrong somewhere ("" leaks a
-   *  service-specific row, LOG_SVC_MANY hides a tenant-wide one). */
+   *  every call site states which service the entry is about ("" for a
+   *  tenant-wide row), so the log stays filterable by service. */
   private log(
     s: StoredState,
     ev: Omit<StoredLogEvent, "ago" | "ts" | "svc"> & { svc: string },
@@ -513,12 +454,7 @@ export class TenantDO extends DurableObject<Env> {
   /** Build the public TenantState: flatten boxes, derive service.state
    *  from boxes, recompute `outdated`, compute the overview, strip key
    *  hashes. Never persisted — always recomputed from the stored record. */
-  /** The tenant state the dashboard renders. `viewer` is an OPTIONAL member id:
-   *  when present, services/boxes/overview are narrowed to what that member may
-   *  actually reach (see viewerFilter). Every other caller — the CLI's
-   *  /api/cli/state, the internal host/member lookups — passes nothing and gets
-   *  the unnarrowed state exactly as before. */
-  private async getState(viewer?: unknown): Promise<TenantState> {
+  private async getState(): Promise<TenantState> {
     const s = await this.load();
     // First dashboard load for a fresh tenant: hand out a default hub domain
     // so people start with a working <slug>.finchmcp.com instead of a claim
@@ -585,22 +521,10 @@ export class TenantDO extends DurableObject<Env> {
       };
     });
 
-    // Narrow the COLLECTIONS for a scoped viewer before anything is derived
-    // from them. This has to happen inside the DO: the ACL lives here, and the
-    // predicate must be the SAME one the door enforces (viewerFilter delegates
-    // to evalIdentAccess, as gateBrowser does) — a second copy of the rule in
-    // the web layer would drift and start hiding services a member can in fact
-    // call. Everything downstream (the boxes lens, overview's fleet totals and
-    // SLO numbers) is computed from `visible`, so a member's dashboard cannot
-    // re-derive the hidden fleet from an aggregate.
-    const viewerId = typeof viewer === "string" ? viewer.trim() : "";
-    const filter = viewerId ? this.viewerFilter(s, viewerId) : null;
-    const visible = filter ? services.filter(filter) : services;
-
     // Flattened boxes lens, annotated with the service's group/tags/owner
     // (the dashboard's Boxes view consumes this exact shape).
     const boxes: Box[] = [];
-    for (const a of visible) {
+    for (const a of services) {
       for (const m of a.boxes) {
         boxes.push({
           ...m,
@@ -613,45 +537,18 @@ export class TenantDO extends DurableObject<Env> {
 
     const publicKeys: PublicKey[] = s.keys.map(({ hash, ...rest }) => rest);
 
-    // The AUDIT LOG carries the same data services[] does — a `request` row is
-    // `${service} ${route}` + status, a `device` row is service→box, `set-auth`
-    // is `${id} → ${mode}` — so narrowing the collections without narrowing the
-    // log would just move the leak. Same viewerFilter, same place, one rule.
-    //
-    // The subject is read from the STRUCTURED `svc` field, never from the prose
-    // (see StoredLogEvent). A scoped viewer keeps a row ONLY when `svc` is a
-    // service that survived `filter`. Everything else fails closed: a released
-    // service (no longer checkable), a legacy row written before `svc` existed,
-    // and — deliberately — the tenant-wide rows too.
-    //
-    // Denying tenant-wide rows is the part worth justifying. They are the
-    // roster and settings history: "invited member <email>", "bound identity
-    // m_x <email>", "changed member role owner → admin", "changed setting
-    // subdomain → …". The web layer already refuses to show a member any of
-    // that (its MEMBER_LOG_CATEGORIES keeps only `device` and `request`, both of
-    // which are always service-scoped), so denying them here costs a member
-    // nothing they can see today — and it moves the boundary off that category
-    // list, which is a display convention, onto the ACL, which is the rule. It
-    // also makes a viewer that fails closed entirely (an unknown or disabled
-    // member id: viewerFilter admits nothing) get an EMPTY log, matching the
-    // empty services/boxes it already gets.
-    //
-    // `svc` is stripped on the way out for EVERY caller, scoped or not: it is
-    // ACL metadata, and dropping it keeps an admin's `logs` byte-for-byte what
-    // it was before this field existed.
-    const visibleIds = filter ? new Set(visible.map((a) => a.id)) : null;
-    const logs: LogEvent[] = (s.logs ?? [])
-      .filter((ev) => !visibleIds || (!!ev.svc && visibleIds.has(ev.svc)))
-      .map(({ svc: _svc, ...ev }) => ({
-        ...ev,
-        ago: timeAgo(ev.ts, now),
-      }));
+    // `svc` (the row's service subject) is storage metadata; strip it so the
+    // wire shape of `logs` stays exactly LogEvent.
+    const logs: LogEvent[] = (s.logs ?? []).map(({ svc: _svc, ...ev }) => ({
+      ...ev,
+      ago: timeAgo(ev.ts, now),
+    }));
 
     return {
       host: s.host,
       tenant: s.tenantMeta,
       members: s.members,
-      services: visible,
+      services,
       boxes,
       keys: publicKeys,
       groups: s.groups,
@@ -659,51 +556,14 @@ export class TenantDO extends DurableObject<Env> {
       accessRequests: s.accessRequests,
       logs,
       settings: s.settings,
-      // Every other Overview field is derived from `visible`, so narrowing
-      // services[] narrows them too. `keysActive` is the exception: it counts
-      // the tenant's KEYS, which have no service dimension to narrow by — a
-      // key's reach is a KeyScope resolved through the ACL, not a service id.
-      //
-      // A scoped viewer therefore gets 0, not a filtered count. Zeroing rather
-      // than approximating is the honest option twice over: the alternative
-      // would fork the ACL walk into a second, key-shaped predicate (the exact
-      // duplication viewerFilter exists to avoid), and a member has no keys
-      // view to feed anyway — the web projection already empties keys[] for
-      // them. Leaving it unnarrowed handed a member the tenant-wide credential
-      // count through the one field services[] narrowing could not reach.
       overview: this.overview(
-        visible,
-        filter ? [] : s.keys,
+        services,
+        s.keys,
         now,
         !!s.settings.enforceExpiry,
       ),
       latestAgent: LATEST_AGENT,
-      // Echoed whenever a viewer was named — the web treats a MISSING echo as
-      // "this hub does not scope" and empties the collections itself.
-      ...(viewerId ? { viewerScoped: true } : {}),
     };
-  }
-
-  /** The service-visibility predicate for a dashboard `viewer` (a member id),
-   *  or null when the viewer is not scoped at all.
-   *
-   *  Semantics are lifted verbatim from the door gate (gateBrowser): an
-   *  owner/admin is never narrowed (gateBrowser returns allowed for any
-   *  role !== "member"), a `public` service has no door so hiding it would hide
-   *  something the member can already call unauthenticated, and everything else
-   *  is the ordinary default-deny ACL walk over the member's user/group
-   *  identities. A viewer id that resolves to no ACTIVE member fails CLOSED —
-   *  the caller asked to be scoped, so an unrecognized one sees nothing rather
-   *  than everything. */
-  private viewerFilter(
-    s: StoredState,
-    viewerId: string,
-  ): ((service: Service) => boolean) | null {
-    const m = s.members.find((x) => x.id === viewerId && x.state === "active");
-    if (!m) return () => false;
-    if (m.role !== "member") return null;
-    const ident = this.userIdentities(s, m.email);
-    return (a) => a.auth === "public" || this.evalIdentAccess(s, ident, a.id);
   }
 
   private overview(
@@ -907,6 +767,46 @@ export class TenantDO extends DurableObject<Env> {
     return { epoch: s.cliTokenEpoch ?? 0 };
   }
 
+  /** One-time, on the first request after the single-user cut deploys: if
+   *  anyone other than the principal owner could have held a CLI token for
+   *  this tenant, bump cliTokenEpoch so every outstanding one dies.
+   *
+   *  A CLI token names a tenant and an epoch, not a person, so restricting
+   *  memberContext to the owner does not touch a token a former co-owner or
+   *  admin minted before the cut; it would stay valid for up to 30 days with
+   *  full tenant powers. Who "could have": any member row other than the
+   *  principal owner that ever got past an invitation (the retired removal
+   *  disabled such rows rather than deleting them, and only deleted pending
+   *  invitations, which never had access), any team workspace, and any
+   *  Clerk-org tenant (every org admin could mint for it). A personal tenant
+   *  with only its owner is left alone, so its owner's login keeps working.
+   *
+   *  The flag makes it run once; a tenant with no stored state is skipped
+   *  without writing, and one created after the cut is born flagged. */
+  private async retireSharedCliTokens(): Promise<void> {
+    if (!(await this.ctx.storage.get("state"))) return;
+    const s = await this.load();
+    if (s.cliSingleUserCut) return;
+    const principal = this.principalOwner(s);
+    const shared =
+      s.members.some((m) => m !== principal && m.state !== "invited") ||
+      s.tenantMeta?.kind === "team" ||
+      this.tenantId().startsWith("org_");
+    if (shared) {
+      s.cliTokenEpoch = (s.cliTokenEpoch ?? 0) + 1;
+      this.log(s, {
+        cat: "key",
+        actor: "finch",
+        action: "revoked all CLI tokens (workspace is now single-user)",
+        target: "cli access",
+        ip: "",
+        svc: "",
+      });
+    }
+    s.cliSingleUserCut = true;
+    await this.save(s);
+  }
+
   private async revokeCliTokens(): Promise<{ ok: boolean; epoch: number }> {
     const s = await this.load();
     s.cliTokenEpoch = (s.cliTokenEpoch ?? 0) + 1;
@@ -915,45 +815,7 @@ export class TenantDO extends DurableObject<Env> {
     return { ok: true, epoch: s.cliTokenEpoch };
   }
 
-  // ---- session epoch (browser login-wall "sign everyone out") -------------
-  // Exact mirror of the cliTokenEpoch pair: /__finch/cb stamps the CURRENT
-  // sessionEpoch into the cookie at mint; browserGate rejects a cookie whose
-  // epoch != this. bumpSessionEpoch increments it, invalidating every live
-  // session cookie at once — without rotating the global SESSION_SECRET.
-
-  private async sessionEpoch(): Promise<{ epoch: number }> {
-    const s = await this.load();
-    return { epoch: s.sessionEpoch ?? 0 };
-  }
-
-  private async bumpSessionEpoch(): Promise<{ ok: boolean; epoch: number }> {
-    const s = await this.load();
-    s.sessionEpoch = (s.sessionEpoch ?? 0) + 1;
-    this.log(s, { cat: "access", actor: "you", action: "signed out all sessions", target: "web access", ip: "", svc: "" });
-    await this.save(s);
-    return { ok: true, epoch: s.sessionEpoch };
-  }
-
   // ---- mutations: services ---------------------------------------------
-
-  /** Move a service to a group (creating it if new; pruning a now-empty old
-   *  group). Empty string clears the group. */
-  private async setGroup(id: string, group: string): Promise<{ ok: boolean }> {
-    const s = await this.load();
-    const ap = this.findService(s, id);
-    if (!ap) return { ok: false };
-    const old = ap.group;
-    ap.group = group || "";
-    if (group && !s.groups.some((g) => g.name === group)) {
-      s.groups.push({ name: group, members: ["you"] });
-    }
-    if (old && old !== group && !s.services.some((a) => a.group === old)) {
-      s.groups = s.groups.filter((g) => g.name !== old);
-    }
-    this.log(s, { cat: "admin", actor: "you", action: "moved to group", target: `${id} → ${group || "—"}`, ip: "", svc: id });
-    await this.save(s);
-    return { ok: true };
-  }
 
   private async enroll(
     name: string,
@@ -993,233 +855,6 @@ export class TenantDO extends DurableObject<Env> {
     });
     await this.save(s);
     return { id };
-  }
-
-  /** Atomically claim an exact app_path and register its exact Aviary box.
-   *  Browser approval has already happened, so the new box starts offline
-   *  rather than entering the generic join flow's second approval gate.
-   *  Existing services are never renamed or widened. The only idempotent case
-   *  is the same durable manifest digest created by this flow. */
-  private async registerAviaryService(
-    raw: unknown,
-    manifestSha256: unknown,
-    approvalNonce: unknown,
-  ): Promise<{ ok: boolean; error?: string; id?: string; created?: boolean; credentialEpoch?: number }> {
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-      return { ok: false, error: "invalid_manifest" };
-    }
-    const manifest = raw as Record<string, unknown>;
-    const id = typeof manifest.app_path === "string" ? manifest.app_path : "";
-    const label = typeof manifest.service === "string" ? manifest.service : "";
-    const box = cleanBoxName(manifest.machine);
-    const digest = typeof manifestSha256 === "string" ? manifestSha256 : "";
-    const nonce = typeof approvalNonce === "string" ? approvalNonce : "";
-    const auth = manifest.edge_auth;
-    const routes = Array.isArray(manifest.routes)
-      ? manifest.routes.filter((v): v is string => typeof v === "string")
-      : [];
-    if (
-      !/^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,61}[A-Za-z0-9])?$/.test(id) ||
-      !/^[A-Za-z0-9 ._-]{1,100}$/.test(label) ||
-      !box ||
-      !/^[a-f0-9]{64}$/.test(digest) ||
-      !/^[a-f0-9]{32}$/.test(nonce) ||
-      (auth !== "key" && auth !== "public") ||
-      routes.length < 1 ||
-      routes.length > 16
-    ) {
-      return { ok: false, error: "invalid_manifest" };
-    }
-
-    const s = await this.load();
-    const existing = this.findService(s, id);
-    if (existing) {
-      const existingBox = existing.boxes.find((candidate) => candidate.name === box);
-      const sameRoutes =
-        existing.routes.length === routes.length &&
-        existing.routes.every((route, index) => route === routes[index]);
-      if (existing.aviaryManaged === true && existingBox && sameRoutes && existing.auth === auth) {
-        const stored = existingBox as Box & {
-          aviaryCredentialEpoch?: number;
-          aviaryPendingCredentialEpoch?: number;
-          aviaryPendingApprovalNonce?: string;
-        };
-        if (stored.aviaryPendingApprovalNonce === nonce) {
-          return {
-            ok: true,
-            id,
-            created: false,
-            credentialEpoch: stored.aviaryPendingCredentialEpoch,
-          };
-        }
-        if (stored.aviaryPendingApprovalNonce) {
-          return { ok: false, error: "credential_rotation_pending" };
-        }
-        const nextEpoch = (stored.aviaryCredentialEpoch ?? 0) + 1;
-        stored.aviaryPendingCredentialEpoch = nextEpoch;
-        stored.aviaryPendingApprovalNonce = nonce;
-        this.log(s, {
-          cat: "device",
-          actor: "aviary enrollment",
-          action: "approved credential rotation",
-          target: `${id}/${box} epoch ${nextEpoch}`,
-          ip: "",
-          svc: id,
-        });
-        await this.save(s);
-        return { ok: true, id, created: false, credentialEpoch: nextEpoch };
-      }
-      return { ok: false, error: "app_path_collision" };
-    }
-    if (s.services.length >= MAX_SERVICES_PER_TENANT) {
-      return { ok: false, error: "service_limit" };
-    }
-
-    const group = s.settings.defaultGroup || "";
-    const service = this.newService(id, label, group);
-    service.auth = auth;
-    service.routes = [...routes];
-    service.state = "offline";
-    service.blurb = "Approved Aviary service — waiting for the relay to connect.";
-    service.aviaryManaged = true;
-    service.aviaryManifestSha256 = digest;
-    service.aviaryApprovalNonce = nonce;
-    service.boxes.push({
-      name: box,
-      os: "unknown",
-      version: "",
-      state: "offline",
-      service: id,
-      serviceLabel: label,
-      keys: [],
-      address: "",
-      outdated: true,
-      lastSeen: "never",
-      lastSeenAt: 0,
-      relay: "—",
-      handshake: "never",
-      handshakeAt: 0,
-      connected: false,
-      aviaryCredentialEpoch: 0,
-      aviaryPendingCredentialEpoch: 1,
-      aviaryPendingApprovalNonce: nonce,
-    } as Box);
-    service.boxCount = 1;
-    service.box = box;
-    service.lastSeenAt = 0;
-    s.services.push(service);
-    if (group && !s.groups.some((candidate) => candidate.name === group)) {
-      s.groups.push({ name: group, members: ["you"] });
-    }
-    await this.ensureDefaultSlug(s);
-    this.log(s, {
-      cat: "device",
-      actor: "aviary enrollment",
-      action: "approved service enrollment",
-      target: `${id}/${box} ${digest.slice(-12)}`,
-      ip: "",
-      svc: id,
-    });
-    await this.save(s);
-    return { ok: true, id, created: true, credentialEpoch: 1 };
-  }
-
-  /** Compensating action for an Aviary approval that timed out after claiming
-   *  the tenant registry but before durably publishing its grant. It is scoped
-   *  by both app path and manifest digest, so it cannot delete a legacy service
-   *  or a later enrollment that reused the path. */
-  private async releaseAviaryService(
-    appPath: unknown,
-    manifestSha256: unknown,
-    approvalNonce: unknown,
-  ): Promise<{ ok: boolean }> {
-    if (
-      typeof appPath !== "string" ||
-      typeof manifestSha256 !== "string" ||
-      typeof approvalNonce !== "string"
-    ) {
-      return { ok: false };
-    }
-    const s = await this.load();
-    const service = this.findService(s, appPath);
-    if (
-      !service ||
-      service.aviaryManaged !== true
-    ) {
-      return { ok: false };
-    }
-    const pendingBox = service.boxes.find(
-      (candidate) =>
-        (candidate as any).aviaryPendingApprovalNonce === approvalNonce,
-    ) as (Box & {
-      aviaryPendingApprovalNonce?: string;
-      aviaryPendingCredentialEpoch?: number;
-    }) | undefined;
-    if (service.aviaryApprovalNonce !== approvalNonce) {
-      if (!pendingBox) return { ok: false };
-      delete pendingBox.aviaryPendingApprovalNonce;
-      delete pendingBox.aviaryPendingCredentialEpoch;
-      await this.save(s);
-      return { ok: true };
-    }
-    if (service.aviaryManifestSha256 !== manifestSha256) return { ok: false };
-    s.services = s.services.filter((candidate) => candidate !== service);
-    this.log(s, {
-      cat: "device",
-      actor: "aviary enrollment",
-      action: "rolled back incomplete enrollment",
-      target: `${appPath} ${manifestSha256.slice(-12)}`,
-      ip: "",
-      svc: service.id,
-    });
-    await this.save(s);
-    return { ok: true };
-  }
-
-  private async commitAviaryCredentialEpoch(
-    appPath: unknown,
-    box: unknown,
-    approvalNonce: unknown,
-    credentialEpoch: unknown,
-  ): Promise<{ ok: boolean }> {
-    if (
-      typeof appPath !== "string" ||
-      typeof box !== "string" ||
-      typeof approvalNonce !== "string" ||
-      typeof credentialEpoch !== "number"
-    ) {
-      return { ok: false };
-    }
-    const s = await this.load();
-    const service = this.findService(s, appPath);
-    const stored = service?.boxes.find((candidate) => candidate.name === box) as
-      | (Box & {
-          aviaryCredentialEpoch?: number;
-          aviaryPendingCredentialEpoch?: number;
-          aviaryPendingApprovalNonce?: string;
-        })
-      | undefined;
-    if (!service?.aviaryManaged || !stored) return { ok: false };
-    if (stored.aviaryCredentialEpoch === credentialEpoch) return { ok: true };
-    if (
-      stored.aviaryPendingApprovalNonce !== approvalNonce ||
-      stored.aviaryPendingCredentialEpoch !== credentialEpoch
-    ) {
-      return { ok: false };
-    }
-    stored.aviaryCredentialEpoch = credentialEpoch;
-    delete stored.aviaryPendingApprovalNonce;
-    delete stored.aviaryPendingCredentialEpoch;
-    this.log(s, {
-      cat: "device",
-      actor: "aviary enrollment",
-      action: "activated service credential",
-      target: `${appPath}/${box} epoch ${credentialEpoch}`,
-      ip: "",
-      svc: service.id,
-    });
-    await this.save(s);
-    return { ok: true };
   }
 
   private async release(id: string): Promise<{ ok: boolean }> {
@@ -1296,12 +931,6 @@ export class TenantDO extends DurableObject<Env> {
     const s = await this.load();
     const ap = this.findService(s, id);
     if (!ap) return { ok: false, error: "unknown service" };
-    if (ap.aviaryManaged && ap.auth !== "public" && mode === "public") {
-      return {
-        ok: false,
-        error: "aviary service requires a new public-access approval",
-      };
-    }
     ap.auth = mode;
     this.log(s, {
       cat: "device",
@@ -1354,7 +983,7 @@ export class TenantDO extends DurableObject<Env> {
     const normScope = this.normalizeScope(s, scope);
     if ("error" in normScope) return { error: normScope.error };
 
-    if (s.tenantMeta && (!owner || owner === "you")) owner = this.activeOwners(s)[0]?.email ?? owner;
+    if (s.tenantMeta && (!owner || owner === "you")) owner = this.principalOwner(s)?.email ?? owner;
     const plaintext = genFinchKey();
     const hash = await hashKey(plaintext);
     const now = Date.now();
@@ -1490,285 +1119,35 @@ export class TenantDO extends DurableObject<Env> {
     return { ok: touched };
   }
 
-  // ---- mutations: ACL -----------------------------------------------------
+  // ---- tenant owner ---------------------------------------------------------
 
-  private async addAcl(
-    src: AclEntity,
-    dst: AclEntity[],
-  ): Promise<{ id: string }> {
+  /** THE owner of a bootstrapped tenant. A pre-cut team could have several
+   *  active owners, and with the member-management ops gone none of them can
+   *  remove another, so exactly one is honoured: the active owner the locked
+   *  `r_owner` rule names (the lockout backstop, which normalizeOwnerGrant
+   *  keeps pointing at an active owner), else the earliest-created active
+   *  owner. The other owner rows stay in storage but authorize nothing. */
+  private principalOwner(s: StoredState): TenantMember | undefined {
+    const owners = s.members
+      .filter((m) => m.role === "owner" && m.state === "active")
+      .sort((x, y) => (x.createdAt ?? 0) - (y.createdAt ?? 0));
+    const rule = s.acl.find((r) => r.id === "r_owner" && r.locked);
+    const named = rule?.src.type === "user" ? normalizeEmail(rule.src.name ?? "") : "";
+    return owners.find((m) => named && normalizeEmail(m.email) === named) ?? owners[0];
+  }
+
+  /** Whether this tenant has an owner row yet (`migrated`); whether it holds a
+   *  fleet its owner would lose track of — services (and with them their
+   *  boxes) or finch_ keys (`holdsFleet`); and whether it holds anything at
+   *  all, a subdomain included (`hasState`, the pre-cut claimability test). A
+   *  subdomain alone is not a fleet: getState hands every tenant it reads a
+   *  default one. */
+  private async holdings(): Promise<{ migrated: boolean; holdsFleet: boolean; hasState: boolean }> {
     const s = await this.load();
-    const dsts = Array.isArray(dst) ? dst : [dst];
-    // IDEMPOTENT: an identical rule (same src, same dst set) is returned, not
-    // duplicated. The dedupe lives HERE — inside the DO's serialized op — so
-    // two racing writers (e.g. the approve route and the Clerk webhook both
-    // ensuring the same user→service grant) can never create twin rules that
-    // a later revoke would only half-delete.
-    const existing = s.acl.find(
-      (r) =>
-        r.action === "allow" &&
-        entEq(r.src, src) &&
-        r.dst.length === dsts.length &&
-        dsts.every((d) => r.dst.some((rd) => entEq(rd, d))),
-    );
-    if (existing) return { id: existing.id };
-    const rule: AclRule = {
-      id: "r_" + crypto.randomUUID().slice(0, 8),
-      src,
-      dst: dsts,
-      action: "allow",
-    };
-    s.acl.push(rule);
-    this.log(s, {
-      cat: "access",
-      actor: "you",
-      action: "granted",
-      target: `${aclLabel(src)} → ${rule.dst.map(aclLabel).join(", ")}`,
-      ip: "",
-      // dst is a LIST (and may name groups, not services) — plural subject.
-      svc: "",
-    });
-    await this.save(s);
-    return { id: rule.id };
+    const holdsFleet = s.services.length > 0 || s.keys.length > 0;
+    return { migrated: !!s.tenantMeta, holdsFleet, hasState: holdsFleet || !!s.settings.subdomain };
   }
 
-  private async removeAcl(id: string): Promise<{ ok: boolean }> {
-    const s = await this.load();
-    const rule = s.acl.find((r) => r.id === id);
-    if (!rule) return { ok: false };
-    if (rule.locked) return { ok: false };
-    s.acl = s.acl.filter((r) => r.id !== id);
-    this.log(s, {
-      cat: "access",
-      actor: "you",
-      action: "removed policy",
-      target: id,
-      ip: "",
-      // `id` is the rule id; the rule it removed may have named many services.
-      svc: "",
-    });
-    await this.save(s);
-    return { ok: true };
-  }
-
-  // ---- mutations: access sharing -------------------------------------------
-  // The app-level access-request queue. The DO owns ONLY the queue rows; it
-  // never calls Clerk and never decides membership — the web hub orchestrates
-  // approve/deny and reuses addAcl/removeAcl for the actual grant.
-
-  /** Create a pending access request. Idempotent: an existing pending/invited
-   *  row for the same email+service is returned as-is, never duplicated. */
-  private async requestAccess(
-    email: unknown,
-    service: unknown,
-    requestedBy: unknown,
-    requestedByUserId?: unknown,
-  ): Promise<{ ok: boolean; request?: AccessRequest; error?: string }> {
-    const em = typeof email === "string" ? email.trim().toLowerCase() : "";
-    const svc = typeof service === "string" ? service.trim() : "";
-    if (!em || !svc) return { ok: false, error: "email and service required" };
-    const by = typeof requestedBy === "string" && requestedBy ? requestedBy : "you";
-
-    const s = await this.load();
-    if (!this.findService(s, svc)) return { ok: false, error: "unknown service" };
-    const existing = s.accessRequests.find(
-      (r) =>
-        r.email === em &&
-        r.service === svc &&
-        (r.status === "pending" || r.status === "invited"),
-    );
-    if (existing) return { ok: true, request: existing };
-
-    // BOUNDED, like every other DO collection: evict the oldest RESOLVED
-    // (granted/denied) rows to make room; if the queue is all live rows,
-    // refuse rather than grow without bound (the full array ships in every
-    // getState snapshot).
-    if (s.accessRequests.length >= MAX_ACCESS_REQUESTS) {
-      const resolved = s.accessRequests
-        .filter((r) => r.status === "granted" || r.status === "denied")
-        .sort((x, y) => (x.resolvedAt ?? x.created) - (y.resolvedAt ?? y.created));
-      const evict = new Set(
-        resolved
-          .slice(0, s.accessRequests.length - MAX_ACCESS_REQUESTS + 1)
-          .map((r) => r.id),
-      );
-      s.accessRequests = s.accessRequests.filter((r) => !evict.has(r.id));
-      if (s.accessRequests.length >= MAX_ACCESS_REQUESTS) {
-        return { ok: false, error: "too many open access requests" };
-      }
-    }
-
-    const req: AccessRequest = {
-      id: "ar_" + crypto.randomUUID().slice(0, 8),
-      email: em,
-      service: svc,
-      requestedBy: by,
-      ...(typeof requestedByUserId === "string" ? { requestedByUserId } : {}),
-      status: "pending",
-      created: Date.now(),
-    };
-    s.accessRequests.push(req);
-    this.log(s, {
-      cat: "access",
-      actor: by,
-      action: "requested access",
-      target: `${em} → ${svc}`,
-      ip: "",
-      svc,
-    });
-    await this.save(s);
-    return { ok: true, request: req };
-  }
-
-  /** Transition an access request's status, stamping who/when resolved it.
-   *  Unknown id → error (the hub must never invent rows here). */
-  private async setAccessStatus(
-    id: unknown,
-    status: unknown,
-    resolvedBy: unknown,
-    resolvedByUserId?: unknown,
-  ): Promise<{ ok: boolean; request?: AccessRequest; error?: string; status?: number }> {
-    if (
-      status !== "pending" &&
-      status !== "invited" &&
-      status !== "granted" &&
-      status !== "denied"
-    ) {
-      return { ok: false, error: "invalid status" };
-    }
-    const s = await this.load();
-    const req = s.accessRequests.find((r) => r.id === id);
-    if (!req) return { ok: false, error: "unknown access request id" };
-    // This legacy low-level transition remains for compatibility, but terminal
-    // decisions must never be resurrected by a stale caller. Deny/revoke use
-    // the actor-checked atomic operations below.
-    if (req.status === "denied" && status !== "denied") {
-      return { ok: false, error: "access request is denied", status: 409 };
-    }
-    if (req.status === "granted" && status !== "granted") {
-      return { ok: false, error: "granted access must be revoked atomically", status: 409 };
-    }
-    if (
-      status === "denied" &&
-      this.evalIdentAccess(s, this.userIdentities(s, normalizeEmail(req.email)), req.service)
-    ) {
-      return { ok: false, error: "access is still granted; revoke it instead", status: 409 };
-    }
-    if (req.status === status) return { ok: true, request: req };
-    req.status = status;
-    req.resolvedBy =
-      typeof resolvedBy === "string" && resolvedBy ? resolvedBy : "you";
-    if (typeof resolvedByUserId === "string") req.resolvedByUserId = resolvedByUserId;
-    req.resolvedAt = Date.now();
-    this.log(s, {
-      cat: "access",
-      actor: req.resolvedBy,
-      action: `access ${status}`,
-      target: `${req.email} → ${req.service}`,
-      ip: "",
-      svc: req.service,
-    });
-    await this.save(s);
-    return { ok: true, request: req };
-  }
-
-  /** The access lens: every queue row plus the user→service ACL grants (the
-   *  rows the dashboard's Access view renders side by side). Locked rules
-   *  (the seeded owner rule) are excluded — they aren't shareable/revocable
-   *  grants, and surfacing them gave every app a phantom "you — granted" row
-   *  plus a Revoke button that could never succeed. */
-  private async listAccess(): Promise<{
-    requests: AccessRequest[];
-    grants: AclRule[];
-  }> {
-    const s = await this.load();
-    return {
-      requests: s.accessRequests,
-      grants: s.acl.filter((r) => r.src.type === "user" && !r.locked),
-    };
-  }
-
-  /** Surgically revoke ONE user→service grant: strip the {service} dst from
-   *  every matching unlocked user rule (deleting a rule whose dst set empties).
-   *  A multi-destination rule keeps its OTHER services — revoking svcA must
-   *  never silently drop svcB. Reports `stillAllowed` when the user remains
-   *  covered by a rule this op can't surgically narrow (dst `all`/tag/group,
-   *  or a locked rule) so the caller can refuse a false-ok revoke. */
-  private async removeUserGrant(
-    email: unknown,
-    service: unknown,
-  ): Promise<{ ok: boolean; removed: boolean; stillAllowed: boolean }> {
-    const em = typeof email === "string" ? email.trim().toLowerCase() : "";
-    const svc = typeof service === "string" ? service.trim() : "";
-    if (!em || !svc) return { ok: false, removed: false, stillAllowed: false };
-
-    const s = await this.load();
-    const removed = this.stripUserServiceGrantState(s, em, svc);
-    const stillAllowed = this.evalIdentAccess(s, this.userIdentities(s, em), svc);
-    if (removed) {
-      this.log(s, {
-        cat: "access",
-        actor: "you",
-        action: "revoked",
-        target: `user:${em} → ${svc}`,
-        ip: "",
-        svc,
-      });
-      await this.save(s);
-    }
-    return { ok: true, removed, stillAllowed };
-  }
-
-  /** Mutate an already-loaded state by removing every exact user→service
-   * destination. Keeping this pure state helper lets revokeAccess evaluate
-   * broader coverage before committing either the ACL or queue transition. */
-  private stripUserServiceGrantState(
-    s: StoredState,
-    email: string,
-    service: string,
-  ): boolean {
-    let removed = false;
-    const em = normalizeEmail(email);
-    const svc = service.toLowerCase();
-    s.acl = s.acl.filter((r) => {
-      if (r.locked || r.action !== "allow") return true;
-      if (r.src.type !== "user") return true;
-      if (normalizeEmail(r.src.name || "") !== em) return true;
-      const rest = r.dst.filter(
-        (d) => !(d.type === "service" && (d.name || "").toLowerCase() === svc),
-      );
-      if (rest.length === r.dst.length) return true; // no service dst here
-      removed = true;
-      r.dst = rest;
-      return rest.length > 0; // dst set emptied → drop the whole rule
-    });
-    return removed;
-  }
-
-  /** Door-side authorization for a HUMAN caller (browser login-wall session or
-   *  OAuth token) identified by email: allowed iff the service is public or a
-   *  user/group ACL rule grants it. Admins are authorized by the CALLER (the
-   *  session/web layer knows the Clerk role); this op only evaluates the ACL. */
-  private async checkUserAccess(
-    user: unknown,
-    service: unknown,
-  ): Promise<{ allowed: boolean; public?: boolean }> {
-    const em = typeof user === "string" ? user.trim().toLowerCase() : "";
-    const svc = typeof service === "string" ? service.trim() : "";
-    if (!svc) return { allowed: false };
-    const s = await this.load();
-    const ap = this.findService(s, svc);
-    if (ap && ap.auth === "public") return { allowed: true, public: true };
-    if (!em) return { allowed: false };
-    return { allowed: this.evalIdentAccess(s, this.userIdentities(s, em), svc) };
-  }
-
-
-  // ---- native membership --------------------------------------------------
-  private actorMember(s: StoredState, actor: any): TenantMember | undefined {
-    return s.members.find(m => m.id === actor?.memberId && m.clerkUserId === actor?.clerkUserId && m.state === "active");
-  }
-  private activeOwners(s: StoredState): TenantMember[] { return s.members.filter(m=>m.role==="owner"&&m.state==="active"); }
-  private bump(s: StoredState): void { if(s.tenantMeta) s.tenantMeta.membershipVersion++; }
   /** Replace the pre-membership placeholder principal ("you") with the real
    *  owner's email, once a tenant gains its first identity. */
   private rewriteYou(s: StoredState, email: string): void {
@@ -1781,653 +1160,147 @@ export class TenantDO extends DurableObject<Env> {
       g.members = [...new Set(g.members.map((x) => (x === "you" ? email : x)))];
     }
   }
-  /** Keep the locked `r_owner` rule (`user:<email> -> all`) pointed at someone
-   *  who is still an active OWNER.
-   *
-   *  That rule exists so an owner can never lock themselves out, and bootstrap
-   *  rewrites its `src` from the placeholder "you" to the bootstrapping owner's
-   *  email. Nothing then moved it again — so demoting that owner to `member`,
-   *  disabling them, or removing them left a LOCKED `-> all` grant sitting on
-   *  their address. gateBrowser, gateOauth and the dashboard's viewerFilter all
-   *  evaluate it, and stripGrants deliberately skips locked rules, so the
-   *  demotion changed the badge in the UI while the person kept every service
-   *  in the tenant. Keys owned by that email kept the same reach.
-   *
-   *  Every caller is already guarded by the last-active-owner check, so an
-   *  active owner other than `leaving` exists whenever this runs. If one
-   *  somehow does not, the rule is left ALONE rather than pointed at a
-   *  non-owner or blanked: an unreachable tenant is a worse failure than a
-   *  stale grant, and this is the lockout backstop. */
-  private reassignOwnerGrant(s: StoredState, leaving: TenantMember): void {
-    const rule = s.acl.find((r) => r.id === "r_owner" && r.locked);
-    if (!rule || rule.src.type !== "user") return;
-    if (normalizeEmail(rule.src.name ?? "") !== normalizeEmail(leaving.email)) return;
-    const heir = this.activeOwners(s).find((m) => m.id !== leaving.id);
-    if (!heir) return;
-    rule.src = { type: "user", name: normalizeEmail(heir.email) };
+
+  /** First sign-in to a user's PERSONAL tenant (id === their Clerk user id):
+   *  record them as its owner. Idempotent once bootstrapped. */
+  private async ensureOwner(clerkUserId: string, email: unknown): Promise<any> {
+    const em = typeof email === "string" ? normalizeEmail(email) : "";
+    const s = await this.load();
+    if (s.tenantMeta) return this.memberContext(clerkUserId);
+    if (!clerkUserId || !em || clerkUserId !== this.tenantId()) {
+      return { error: "personal workspace owner mismatch", status: 403 };
+    }
+    const now = Date.now();
+    const member: TenantMember = {
+      id: "m_" + crypto.randomUUID().slice(0, 8),
+      tenantId: this.tenantId(),
+      clerkUserId,
+      email: em,
+      role: "owner",
+      state: "active",
+      createdAt: now,
+      updatedAt: now,
+      boundAt: now,
+    };
+    s.tenantMeta = {
+      id: this.tenantId(),
+      kind: "personal",
+      displayName: this.tenantId(),
+      createdAt: now,
+      bootstrappedFrom: "legacy-personal",
+      membershipVersion: 1,
+    };
+    s.members = [member];
+    this.rewriteYou(s, em);
+    this.log(s, { cat: "access", actor: member.id, action: "bootstrapped workspace", target: em, ip: "", svc: "" });
+    await this.save(s);
+    return this.memberContext(clerkUserId);
   }
-  private async ensureOwner(clerkUserId: unknown, email: unknown): Promise<any> {
-    const uid=typeof clerkUserId==="string"?clerkUserId:"", em=typeof email==="string"?normalizeEmail(email):"";
-    const s=await this.load(); if(s.tenantMeta) return this.memberContext(uid);
-    if(!uid||!em||uid!==this.tenantId()) return {error:"personal workspace owner mismatch",status:403};
-    const now=Date.now(), member:TenantMember={id:"m_"+crypto.randomUUID().slice(0,8),tenantId:this.tenantId(),clerkUserId:uid,email:em,role:"owner",state:"active",createdAt:now,updatedAt:now,boundAt:now};
-    s.tenantMeta={id:this.tenantId(),kind:"personal",displayName:this.tenantId(),createdAt:now,bootstrappedFrom:"legacy-personal",membershipVersion:1}; s.members=[member]; this.rewriteYou(s,em);
-    this.log(s,{cat:"access",actor:member.id,action:"bootstrapped workspace",target:em,ip:"",svc:""}); await this.save(s); return {member,tenantMeta:s.tenantMeta};
+
+  /** A legacy Clerk-org tenant (id === the Clerk org id) that holds state from
+   *  before native tenancy and was never claimed: record the caller — an admin
+   *  of that org, as verified by the web against Clerk — as its single owner.
+   *  This replaces the retired claim/import UI with a hub-side step. The first
+   *  admin to sign in wins; a repeat by that owner is idempotent and anyone
+   *  else gets a 409. An empty or already-claimed tenant is never taken. */
+  private async claimLegacyOrg(clerkOrgId: unknown, clerkUserId: unknown, email: unknown): Promise<any> {
+    const orgId = typeof clerkOrgId === "string" ? clerkOrgId : "";
+    const uid = typeof clerkUserId === "string" ? clerkUserId : "";
+    const em = typeof email === "string" ? normalizeEmail(email) : "";
+    if (!orgId.startsWith("org_") || orgId !== this.tenantId() || !uid || !em) {
+      return { error: "legacy org claim mismatch", status: 400 };
+    }
+    const s = await this.load();
+    if (s.tenantMeta) {
+      if (s.tenantMeta.clerkOrgId === orgId && this.principalOwner(s)?.clerkUserId === uid) {
+        return { ...(await this.memberContext(uid)), already: true };
+      }
+      return { error: "tenant already claimed", status: 409 };
+    }
+    if (!(await this.holdings()).hasState) return { error: "nothing to claim", status: 409 };
+    const now = Date.now();
+    const member: TenantMember = {
+      id: "m_" + crypto.randomUUID().slice(0, 8),
+      tenantId: orgId,
+      clerkUserId: uid,
+      email: em,
+      role: "owner",
+      state: "active",
+      createdAt: now,
+      updatedAt: now,
+      boundAt: now,
+    };
+    s.tenantMeta = {
+      id: orgId,
+      kind: "team",
+      displayName: orgId,
+      createdAt: now,
+      clerkOrgId: orgId,
+      bootstrappedFrom: "legacy-org",
+      membershipVersion: 1,
+    };
+    s.members = [member];
+    this.rewriteYou(s, em);
+    this.log(s, { cat: "access", actor: member.id, action: "claimed legacy org workspace", target: em, ip: "", svc: "" });
+    await this.save(s);
+    return this.memberContext(uid);
   }
-  /** Resolve this identity's membership in this tenant. Read-only. */
+
+  /** Resolve a Clerk user against this tenant. Only the tenant's OWNER is a
+   *  member: any other identity — including a member, admin or invitee row
+   *  left over from the retired team features — gets `member: null`. The
+   *  user's own personal tenant reports `needsBootstrap` until an email
+   *  arrives to bootstrap its owner row. */
   private async memberContext(clerkUserId: unknown, email?: unknown): Promise<any> {
     const uid = typeof clerkUserId === "string" ? clerkUserId : "";
     const s = await this.load();
-    if (!s.tenantMeta && uid === this.tenantId()) {
+    if (!s.tenantMeta && uid && uid === this.tenantId()) {
       if (typeof email === "string" && email) return this.ensureOwner(uid, email);
       return { member: null, tenantMeta: null, needsBootstrap: true };
     }
-    const m = s.members.find((x) => x.clerkUserId === uid);
+    const owner = this.principalOwner(s);
+    const m = uid && owner?.clerkUserId === uid ? owner : undefined;
     return {
       member: m ? { id: m.id, role: m.role, state: m.state, email: m.email } : null,
       tenantMeta: s.tenantMeta ?? null,
     };
   }
 
-  private async inviteMember(email:unknown,role:unknown,actor:any):Promise<any>{
-    const em=typeof email==="string"?normalizeEmail(email):""; if(!em||!['admin','member'].includes(String(role))) return {error:"invalid email or role",status:400};
-    const s=await this.load(), am=this.actorMember(s,actor); if(!am||am.role==="member") return {error:"admin role required",status:403};
-    const old=s.members.find(m=>normalizeEmail(m.email)===em); if(old){if(old.state==="disabled") return {error:"member is disabled; re-enable instead",status:409}; return {ok:true,member:old};}
-    if(s.members.length>=MAX_MEMBERS)return {error:"member limit reached",status:409}; const now=Date.now(); const member:TenantMember={id:"m_"+crypto.randomUUID().slice(0,8),tenantId:this.tenantId(),clerkUserId:null,email:em,role:role as FinchRole,state:"invited",invitedBy:am.id,createdAt:now,updatedAt:now}; s.members.push(member);this.bump(s);this.log(s,{cat:"access",actor:am.id,action:"invited member",target:em,ip:"",svc:""});await this.save(s);return {ok:true,member};
-  }
-  /** Add a `user -> service` allow rule, unless an unlocked one already says
-   *  the same thing. Locked rules are ignored on purpose: they are the
-   *  bootstrap grants, not per-service ones. */
-  private addAclState(s: StoredState, email: string, service: string): void {
-    const src = { type: "user", name: normalizeEmail(email) } as AclEntity;
-    const dst = { type: "service", name: service } as AclEntity;
-    const exists = s.acl.some(
-      (r) => !r.locked && entEq(r.src, src) && r.dst.some((d) => entEq(d, dst)),
-    );
-    if (exists) return;
-    s.acl.push({
-      id: "r_" + crypto.randomUUID().slice(0, 8),
-      src,
-      dst: [dst],
-      action: "allow",
-    });
-  }
-
-  /** Attach a Clerk identity (`uid`) to this tenant's membership, given every
-   *  email VERIFIED on that identity (`list`).
+  /** The OAuth door: a Clerk-verified caller may reach a key-gated service
+   *  only as this tenant's owner — the principal owner of a bootstrapped
+   *  tenant, or the user whose personal tenant this is. A public service
+   *  needs no identity. There are no shared members or per-user grants.
    *
-   *  Folds any invitations addressed to those emails into a single member row
-   *  and settles the access requests they were waiting on. Mutates `s` and
-   *  reports whether the caller must persist it (`save`). */
-  private bindIdentityState(
-    s: StoredState,
-    uid: string,
-    list: string[],
-    source: unknown,
-  ): any {
-    const named = (m: TenantMember) => list.includes(normalizeEmail(m.email));
-
-    // A disabled member is never re-admitted by signing in again; an admin
-    // must re-enable them explicitly.
-    if (s.members.some((m) => m.state === "disabled" && (m.clerkUserId === uid || named(m)))) {
-      return { error: "member is disabled", status: 409, save: false };
-    }
-
-    // One of these emails is already bound to a DIFFERENT identity. Logged
-    // (hence save:true) because it is the signature of an account takeover
-    // attempt as much as of an ordinary mistake.
-    const conflict = s.members.find((m) => m.clerkUserId && m.clerkUserId !== uid && named(m));
-    if (conflict) {
-      this.log(s, {
-        cat: "access",
-        actor: uid,
-        action: "bind-conflict",
-        target: `${conflict.id} <${conflict.email}>`,
-        ip: "",
-        svc: "",
-      });
-      return { error: "email belongs to another identity", status: 409, save: true };
-    }
-
-    // Prefer the row already bound to this identity; otherwise adopt an
-    // invitation addressed to one of its emails.
-    const invitations = s.members.filter((m) => m.state === "invited" && named(m));
-    const member = s.members.find((m) => m.clerkUserId === uid) ?? invitations[0];
-
-    let changed = false;
-    const consumed: string[] = [];
-
-    if (member) {
-      // Any OTHER invitation addressed to this same person is a duplicate of
-      // the row we just settled on.
-      for (const dup of invitations) {
-        if (dup === member) continue;
-        s.members = s.members.filter((m) => m !== dup);
-        consumed.push(dup.email);
-        changed = true;
-      }
-
-      if (member.clerkUserId !== uid || member.state !== "active") {
-        member.clerkUserId = uid;
-        member.state = "active";
-        member.boundAt = Date.now();
-        member.updatedAt = Date.now();
-        consumed.push(member.email);
-        changed = true;
-      }
-
-      // Access requests parked on any of these emails can now be granted.
-      //
-      // Rows that are ALREADY `granted` are deliberately left alone. A legacy
-      // one carries no principal, and nothing here can recover which address
-      // its rule was installed under: the alias's duplicate member row was
-      // folded away at bind time, so the linkage is simply not in the state
-      // any more. A verified email does not establish it — an alias can be
-      // dropped from one identity and verified by another — and neither does
-      // "this member holds a matching rule", which proves they have *a* grant
-      // to the service, never *the* grant this request created. Every such
-      // inference is wrong under some interleaving, and a wrong principal is
-      // worse than none: it makes revocation strip a bystander and report
-      // success while the real grant survives. revokeAccess refuses those rows
-      // outright instead — see the ambiguity guard there.
-      for (const r of s.accessRequests) {
-        if (r.status !== "invited" || !list.includes(normalizeEmail(r.email))) continue;
-        this.addAclState(s, member.email, r.service);
-        // The request may name an ALIAS of this member — `list` is every
-        // verified email on the identity — while the grant necessarily goes to
-        // the canonical `member.email`, which is the principal gateBrowser
-        // evaluates. Record which of the two actually carries the rule, or
-        // revokeAccess later strips the alias, finds nothing, and reports
-        // success while the access survives. See AccessRequest.grantedTo.
-        r.grantedTo = normalizeEmail(member.email);
-        r.status = "granted";
-        r.resolvedBy = "identity-bind";
-        r.resolvedAt = Date.now();
-        changed = true;
-      }
-    }
-
-    if (changed) {
-      this.bump(s);
-      this.log(s, {
-        cat: "access",
-        actor: uid,
-        action: "bound identity",
-        target: member ? `${member.id} <${member.email}>` : String(source ?? "sync"),
-        ip: "",
-        svc: "",
-      });
-    }
-    return {
-      ok: true,
-      changed,
-      member,
-      consumedEmails: [...new Set(consumed)],
-      // Emails on the identity that matched no invitation — the caller uses
-      // these to clear stale invite state upstream.
-      staleInviteEmails: list.filter(
-        (e) => !invitations.some((m) => normalizeEmail(m.email) === e),
-      ),
-      save: changed,
-    };
-  }
-  private async bindIdentity(clerkUserId:unknown,emails:unknown,source:unknown):Promise<any>{
-    const uid=typeof clerkUserId==="string"?clerkUserId:"", list=Array.isArray(emails)?[...new Set(emails.filter((x):x is string=>typeof x==="string").map(normalizeEmail))]:[]; const s=await this.load();
-    const out=this.bindIdentityState(s,uid,list,source);if(out.save)await this.save(s);delete out.save;return out;
-  }
-  private async adapterOrgMember(clerkUserId:unknown,emails:unknown,primaryEmail:unknown):Promise<any>{
-    const uid=typeof clerkUserId==="string"?clerkUserId:"";
-    const list=Array.isArray(emails)?[...new Set(emails.filter((x):x is string=>typeof x==="string").map(normalizeEmail))]:[];
-    const preferred=typeof primaryEmail==="string"&&list.includes(normalizeEmail(primaryEmail))?normalizeEmail(primaryEmail):list[0];
-    if(!uid||!preferred)return {error:"verified identity required",status:400};
-    const s=await this.load();
-    if(!s.tenantMeta?.clerkOrgId)return {error:"organization adapter is not mapped",status:409};
-    if(s.members.some(m=>m.state==="disabled"&&(m.clerkUserId===uid||list.includes(normalizeEmail(m.email)))))return {ok:true,skipped:"disabled"};
-    let member=s.members.find(m=>m.clerkUserId===uid||list.includes(normalizeEmail(m.email)));
-    let created=false;if(!member){if(s.members.length>=MAX_MEMBERS)return {error:"member limit reached",status:409};const now=Date.now();member={id:"m_"+crypto.randomUUID().slice(0,8),tenantId:this.tenantId(),clerkUserId:null,email:preferred,role:"member",state:"invited",createdAt:now,updatedAt:now};s.members.push(member);created=true;}
-    const out=this.bindIdentityState(s,uid,list,"clerk-org-adapter");if(out.error){if(out.save)await this.save(s);delete out.save;return out;}if(created&&!out.changed){this.bump(s);this.log(s,{cat:"access",actor:uid,action:"added organization member",target:`${member.id} <${member.email}>`,ip:"",svc:""});out.changed=true;}if(created||out.save)await this.save(s);delete out.save;return out;
-  }
-  private async approveAccess(id: unknown, actor: any): Promise<any> {
+   *  One pre-bootstrap case keeps a legacy Clerk-org tenant reachable by its
+   *  owner before anyone has claimed it: a token scoped to THIS org (org_id
+   *  === the tenant id) carrying the org admin role — the same people who may
+   *  claim it. Once claimed, the tenant has an owner row and only that owner
+   *  passes. (Pre-cut, an org token was checked against per-user ACL grants
+   *  instead; those grants are retired.) */
+  private async gateOauth(
+    clerkUserId: unknown,
+    service: unknown,
+    orgIdClaim?: unknown,
+    orgRole?: unknown,
+  ): Promise<{ allowed: boolean; public?: boolean }> {
+    const uid = typeof clerkUserId === "string" ? clerkUserId : "";
     const s = await this.load();
-    const am = this.actorMember(s, actor);
-    if (!am || am.role === "member") return { error: "admin role required", status: 403 };
-    const r = s.accessRequests.find((x) => x.id === id);
-    if (!r) return { error: "unknown access request id", status: 404 };
-    const em = normalizeEmail(r.email);
-    if (r.status === "granted") return { ok: true, status: "granted", email: em };
-    // A deny is terminal for this request id. A later request creates a fresh
-    // row; allowing a stale approval to resurrect this one is the losing side
-    // of the deny/approve race.
-    if (r.status === "denied") {
-      return { error: "access request is denied", status: 409 };
+    if (this.findService(s, String(service || ""))?.auth === "public") {
+      return { allowed: true, public: true };
     }
-    if (s.members.some((x) => normalizeEmail(x.email) === em && x.state === "disabled")) {
-      return { error: "member is disabled; re-enable instead", status: 409 };
-    }
-    let m = s.members.find((x) => normalizeEmail(x.email) === em);
-    if (m?.state === "active") {
-      this.addAclState(s, m.email, r.service);
-      // `m` was found BY `em`, so these agree today; stamped anyway so every
-      // granted row carries the principal its rule was installed under and
-      // revokeAccess never has to infer it.
-      r.grantedTo = normalizeEmail(m.email);
-      r.status = "granted";
-    } else {
-      if (!m) {
-        if (s.members.length >= MAX_MEMBERS) {
-          return { error: "member limit reached", status: 409 };
-        }
-        const now = Date.now();
-        m = {
-          id: "m_" + crypto.randomUUID().slice(0, 8),
-          tenantId: this.tenantId(),
-          clerkUserId: null,
-          email: em,
-          role: "member",
-          state: "invited",
-          invitedBy: am.id,
-          createdAt: now,
-          updatedAt: now,
-        };
-        s.members.push(m);
-        this.bump(s);
-      }
-      r.status = "invited";
-    }
-    r.resolvedBy = actor?.label ?? am.email;
-    r.resolvedByUserId = am.clerkUserId ?? undefined;
-    r.resolvedAt = Date.now();
-    this.log(s, {
-      cat: "access",
-      actor: am.id,
-      action: `access ${r.status}`,
-      target: `${r.email} → ${r.service}`,
-      ip: "",
-      svc: r.service,
-    });
-    await this.save(s);
-    return {
-      ok: true,
-      status: r.status,
-      email: em,
-      member: m,
-      memberCreated: m?.createdAt === m?.updatedAt,
-    };
-  }
-
-  /** Deny one request as a single DO mutation. If approval or identity binding
-   * already won and installed an effective grant, the caller gets a conflict
-   * and neither the queue nor ACL is changed. */
-  private async denyAccess(id: unknown, actor: any): Promise<any> {
-    const s = await this.load();
-    const am = this.actorMember(s, actor);
-    if (!am || am.role === "member") return { error: "admin role required", status: 403 };
-    if (typeof id !== "string" || !id || id.length > 256) {
-      return { error: "valid access request id required", status: 400 };
-    }
-    const r = s.accessRequests.find((candidate) => candidate.id === id);
-    if (!r) return { error: "unknown access request id", status: 404 };
-    if (r.status === "denied") return { ok: true, status: "denied" };
-    const allowed = this.evalIdentAccess(
-      s,
-      this.userIdentities(s, normalizeEmail(r.email)),
-      r.service,
-    );
-    if (r.status === "granted" || allowed) {
-      return { error: "already granted — revoke it instead", status: 409 };
-    }
-    r.status = "denied";
-    r.resolvedBy = actor?.label ?? am.email;
-    r.resolvedByUserId = am.clerkUserId ?? undefined;
-    r.resolvedAt = Date.now();
-    this.log(s, {
-      cat: "access",
-      actor: am.id,
-      action: "access denied",
-      target: `${r.email} → ${r.service}`,
-      ip: "",
-      svc: r.service,
-    });
-    await this.save(s);
-    return { ok: true, status: "denied" };
-  }
-
-  /** Resolve an access-row or rule handle, remove its exact user→service
-   * grants, and close every matching request row in one load/save cycle. A
-   * broader rule makes the whole operation fail without committing a partial
-   * direct-rule removal. */
-  private async revokeAccess(id: unknown, ruleId: unknown, actor: any): Promise<any> {
-    const s = await this.load();
-    const am = this.actorMember(s, actor);
-    if (!am || am.role === "member") return { error: "admin role required", status: 403 };
-    const requestId = typeof id === "string" ? id.trim() : "";
-    const grantId = typeof ruleId === "string" ? ruleId.trim() : "";
-    if ((!requestId && !grantId) || (requestId && grantId)) {
-      return { error: "provide id or ruleId, not both", status: 400 };
-    }
-    if (requestId.length > 256 || grantId.length > 256) {
-      return { error: "valid id or ruleId required", status: 400 };
-    }
-
-    let email: string;
-    let service: string;
-    if (requestId) {
-      const r = s.accessRequests.find((candidate) => candidate.id === requestId);
-      if (!r) return { error: "unknown access request", status: 404 };
-      // Revoke the principal the rule was actually INSTALLED under, which is
-      // not always the one the request names: identity binding grants an
-      // alias's request to the member's canonical email. Stripping the alias
-      // instead removed nothing, and — because the "still granted by a broader
-      // rule" guard below also evaluates the same wrong email — it did not
-      // even trip that check. The caller saw {ok:true}, the row flipped to
-      // `denied`, and the member kept the service.
-      //
-      // EVERY LEGACY ROW IS REFUSED. `grantedTo` is stamped at grant time, so
-      // a row written by the current code always names its principal. A row
-      // from before that does not, and the linkage is NOT recoverable: the
-      // alias's member row was folded away at bind time.
-      //
-      // No discriminator is applied, because none of them are proof — that is
-      // the whole lesson of this fix. "The identity verified the alias" fails
-      // when an alias moves between identities. "This member holds a matching
-      // rule" fails when they hold an independent grant to the same service.
-      // Even "a member exists with this email" fails: the alias may have been
-      // invited as its OWN member after the grant went to someone else, which
-      // is indistinguishable from that member having been the grantee. Each
-      // shows a principal COULD be the one, never that it IS, and picking
-      // wrong makes revocation strip a bystander and report success while the
-      // real grant survives — the exact silent failure this change removes,
-      // relocated onto a new victim.
-      //
-      // So: refuse, loudly, with a working alternative. Revoking the rule by
-      // grant id (the `grantId` branch below) already exists and names its
-      // principal unambiguously. The affected population is bounded and
-      // shrinking — no new row can be ambiguous.
-      if (r.status === "granted" && r.grantedTo === undefined) {
-        return {
-          error:
-            "this grant predates per-request principal tracking, so the rule it created " +
-            "cannot be identified from the request alone — revoke it from the Rules tab " +
-            "instead, where the rule names its principal directly",
-          status: 409,
-        };
-      }
-      email = normalizeEmail(r.grantedTo || r.email);
-      service = r.service;
-    } else {
-      const rule = s.acl.find((candidate) => candidate.id === grantId);
-      if (!rule) return { error: "unknown grant", status: 404 };
-      const dst = Array.isArray(rule.dst) ? rule.dst : [rule.dst];
-      if (
-        rule.locked ||
-        rule.action !== "allow" ||
-        rule.src.type !== "user" ||
-        !rule.src.name ||
-        dst.length !== 1 ||
-        dst[0].type !== "service" ||
-        !dst[0].name
-      ) {
-        return {
-          error: "multi-service or broader grants must be edited atomically in the Rules tab",
-          status: 409,
-        };
-      }
-      email = normalizeEmail(rule.src.name);
-      service = dst[0].name;
-    }
-
-    const removed = this.stripUserServiceGrantState(s, email, service);
-    if (this.evalIdentAccess(s, this.userIdentities(s, email), service)) {
-      // `s` is only an in-memory loaded snapshot until save(); returning here
-      // rolls back the tentative direct-rule removal as well as queue changes.
-      return {
-        error: "access is still granted by a broader rule — edit it in the Rules tab",
-        status: 409,
-      };
-    }
-
-    let denied = 0;
-    const resolvedAt = Date.now();
-    for (const r of s.accessRequests) {
-      // Match on the GRANT principal, falling back to the request's own email.
-      // `email` above is now the canonical one for an alias-bound row, so
-      // comparing `r.email` alone would skip the very request being revoked
-      // and leave it sitting in `granted` after its rule was stripped.
-      const principal = normalizeEmail(r.grantedTo || r.email);
-      if (principal !== email || r.service !== service || r.status === "denied") {
-        continue;
-      }
-      r.status = "denied";
-      r.resolvedBy = actor?.label ?? am.email;
-      r.resolvedByUserId = am.clerkUserId ?? undefined;
-      r.resolvedAt = resolvedAt;
-      denied++;
-    }
-    if (removed || denied) {
-      this.log(s, {
-        cat: "access",
-        actor: am.id,
-        action: "revoked access",
-        target: `user:${email} → ${service}`,
-        ip: "",
-        svc: service,
-      });
-      await this.save(s);
-    }
-    return { ok: true, removed, denied };
-  }
-  /** Resolve the acting member and check they outrank this operation.
-   *  `ownerEdge` marks operations that require owner even when the TARGET is
-   *  not currently an owner (notably: promoting someone TO owner). */
-  private authority(
-    s: StoredState,
-    actor: any,
-    target?: TenantMember,
-    ownerEdge = false,
-  ): TenantMember | any {
-    const am = this.actorMember(s, actor);
-    if (!am || am.role === "member") {
-      return { error: "admin role required", status: 403 };
-    }
-    if ((ownerEdge || target?.role === "owner") && am.role !== "owner") {
-      return { error: "owner role required", status: 403 };
-    }
-    return am;
-  }
-  private async setMemberRole(
-    memberId: unknown,
-    role: unknown,
-    actor: any,
-  ): Promise<any> {
-    if (!["owner", "admin", "member"].includes(String(role))) {
-      return { error: "invalid role", status: 400 };
-    }
-    const s = await this.load();
-    const t = s.members.find((m) => m.id === memberId);
-    if (!t) return { error: "member not found", status: 404 };
-
-    // Touching an owner — as the subject OR as the destination role — is an
-    // owner-only edge.
-    const am = this.authority(s, actor, t, t.role === "owner" || role === "owner");
-    if (am.error) return am;
-    if (t.role === role) return { ok: true, member: t };
-
-    const steppingDown =
-      t.role === "owner" && role !== "owner" && this.activeOwners(s).length > 1;
-    // You may not edit your own role, with one exception: stepping down from
-    // owner while another active owner remains.
-    if (am.id === t.id && !steppingDown) {
-      return { error: "cannot change own role", status: 409 };
-    }
-    if (t.role === "owner" && role !== "owner" && this.activeOwners(s).length <= 1) {
-      return { error: "last active owner", status: 409 };
-    }
-
-    const prior = t.role;
-    t.role = role as FinchRole;
-    t.updatedAt = Date.now();
-    // Demotion out of `owner` must also move the locked r_owner grant off
-    // them, or the role change is cosmetic — see reassignOwnerGrant.
-    if (prior === "owner" && role !== "owner") this.reassignOwnerGrant(s, t);
-
-    this.bump(s);
-    this.log(s, {
-      cat: "access",
-      actor: am.id,
-      action: `changed member role ${prior} → ${t.role}`,
-      target: `${t.id} <${t.email}>`,
-      ip: "",
-      svc: "",
-    });
-    await this.save(s);
-    return { ok: true, member: t };
-  }
-  private stripGrants(s: StoredState, email: string): void {
-    const principal = normalizeEmail(email);
-    s.acl = s.acl.flatMap((rule) => {
-      if (rule.locked || rule.src.type !== "user" || normalizeEmail(rule.src.name ?? "") !== principal) return [rule];
-      // Membership removal revokes only service grants. Keep tag/group/all
-      // destinations and unrelated services intact.
-      const dst = rule.dst.filter((entry) => entry.type !== "service");
-      return dst.length ? [{ ...rule, dst }] : [];
-    });
-  }
-  private async setMemberState(
-    memberId: unknown,
-    state: unknown,
-    revoke: boolean,
-    actor: any,
-  ): Promise<any> {
-    if (state !== "active" && state !== "disabled") {
-      return { error: "invalid state", status: 400 };
-    }
-    const s = await this.load();
-    const t = s.members.find((m) => m.id === memberId);
-    if (!t) return { error: "member not found", status: 404 };
-    if (t.state === "invited") {
-      return { error: "invited member must be canceled", status: 409 };
-    }
-    const am = this.authority(s, actor, t);
-    if (am.error) return am;
-    if (t.state === state) return { ok: true, member: t };
-    if (am.id === t.id) return { error: "cannot change own membership", status: 409 };
-    if (
-      state === "disabled" &&
-      t.role === "owner" &&
-      t.state === "active" &&
-      this.activeOwners(s).length <= 1
-    ) {
-      return { error: "last active owner", status: 409 };
-    }
-
-    const prior = t.state;
-    t.state = state;
-    t.updatedAt = Date.now();
-    if (state === "disabled") t.disabledAt = Date.now();
-    else delete t.disabledAt;
-
-    // A disabled owner is no longer an ACTIVE owner, so the locked r_owner
-    // grant must not keep naming them; stripGrants skips locked rules by
-    // design and would leave it behind even when `revoke` is set. Runs after
-    // the state flip so activeOwners() cannot return them as their own heir.
-    if (state === "disabled" && t.role === "owner") this.reassignOwnerGrant(s, t);
-    if (revoke) this.stripGrants(s, t.email);
-
-    this.bump(s);
-    this.log(s, {
-      cat: "access",
-      actor: am.id,
-      action: `changed member state ${prior} → ${t.state}${revoke ? " and revoked grants" : ""}`,
-      target: `${t.id} <${t.email}>`,
-      ip: "",
-      svc: "",
-    });
-    await this.save(s);
-    return { ok: true, member: t };
-  }
-  private async removeMember(
-    memberId: unknown,
-    revoke: boolean,
-    actor: any,
-  ): Promise<any> {
-    const s = await this.load();
-    const t = s.members.find((m) => m.id === memberId);
-    if (!t) return { error: "member not found", status: 404 };
-    const am = this.authority(s, actor, t);
-    if (am.error) return am;
-    if (am.id === t.id) return { error: "cannot change own membership", status: 409 };
-    if (t.role === "owner" && t.state === "active" && this.activeOwners(s).length <= 1) {
-      return { error: "last active owner", status: 409 };
-    }
-
-    // An invitation is deleted outright; a member who ever signed in is
-    // disabled instead, so their id keeps resolving in the audit log.
-    let removed = "disabled";
-    if (t.state === "invited") {
-      s.members = s.members.filter((m) => m !== t);
-      removed = "canceled";
-    } else {
-      t.state = "disabled";
-      t.disabledAt = Date.now();
-      t.updatedAt = Date.now();
-    }
-
-    // Same reason as setMemberState: removal must not leave the locked owner
-    // grant sitting on the removed member's address.
-    if (t.role === "owner") this.reassignOwnerGrant(s, t);
-    if (revoke) this.stripGrants(s, t.email);
-
-    this.bump(s);
-    this.log(s, {
-      cat: "access",
-      actor: am.id,
-      action: `${removed === "canceled" ? "canceled invitation" : "disabled member"}${revoke ? " and revoked grants" : ""}`,
-      target: `${t.id} <${t.email}>`,
-      ip: "",
-      svc: "",
-    });
-    await this.save(s);
-    return { ok: true, removed, member: t };
-  }
-  private async bootstrapMembers(a: any): Promise<any> {
-    const s = await this.load();
+    if (!uid) return { allowed: false };
     if (s.tenantMeta) {
-      if (a.clerkOrgId && s.tenantMeta.clerkOrgId === a.clerkOrgId) return { ok: true, already: true, members: s.members };
-      return { error: "tenant already bootstrapped", status: 409 };
+      return { allowed: this.principalOwner(s)?.clerkUserId === uid };
     }
-    const input = Array.isArray(a.members) ? a.members : [];
-    if (!input.length) return { error: "at least one member required", status: 400 };
-    if (input.length > MAX_MEMBERS) return { error: "member limit reached", status: 409 };
-    const seenEmails = new Set<string>();
-    const seenUsers = new Set<string>();
-    for (const member of input) {
-      const email = typeof member?.email === "string" ? normalizeEmail(member.email) : "";
-      const userId = typeof member?.clerkUserId === "string" ? member.clerkUserId : null;
-      if (!email || !["owner", "admin", "member"].includes(member?.role) || !["active", "invited"].includes(member?.state)) return { error: "invalid member", status: 400 };
-      if (member.state === "active" && !userId) return { error: "active member requires identity", status: 400 };
-      if (seenEmails.has(email) || (userId && seenUsers.has(userId))) return { error: "duplicate member identity", status: 409 };
-      seenEmails.add(email);
-      if (userId) seenUsers.add(userId);
-    }
-    const now = Date.now();
-    const members: TenantMember[] = input.map((member: any) => ({
-      id: "m_" + crypto.randomUUID().slice(0, 8), tenantId: this.tenantId(),
-      clerkUserId: member.clerkUserId ?? null, email: normalizeEmail(member.email),
-      role: member.role, state: member.state, createdAt: now, updatedAt: now,
-      ...(member.state === "active" ? { boundAt: now } : {}),
-    }));
-    const owner = members.find((member) => member.role === "owner" && member.state === "active" && member.clerkUserId === a.claimantClerkUserId);
-    if (!owner) return { error: "claimant must be active owner", status: 403 };
-    s.tenantMeta = { id: this.tenantId(), kind: "team", displayName: String(a.displayName || this.tenantId()), createdAt: now, clerkOrgId: a.clerkOrgId, bootstrappedFrom: a.bootstrappedFrom, membershipVersion: 1 };
-    s.members = members;
-    this.rewriteYou(s, owner.email);
-    this.log(s,{cat:"access",actor:owner.id,action:"bootstrapped workspace",target:`${this.tenantId()} (${members.map(m=>`${m.id} <${m.email}>`).join(", ")})`,ip:"",svc:""});
-    await this.save(s);
-    return { ok: true, members, tenantMeta: s.tenantMeta };
+    if (uid === this.tenantId()) return { allowed: true };
+    return {
+      allowed:
+        typeof orgIdClaim === "string" &&
+        orgIdClaim.startsWith("org_") &&
+        orgIdClaim === this.tenantId() &&
+        (orgRole === "org:admin" || orgRole === "admin"),
+    };
   }
-  private async gateBrowser(a:any):Promise<any>{const s=await this.load();if((a.epoch??0)!==(s.sessionEpoch??0))return {allowed:false,reason:"epoch"};const svc=this.findService(s,String(a.service||""));if(svc?.auth==="public")return {allowed:true,public:true};if(s.tenantMeta){const m=s.members.find(x=>x.clerkUserId===a.clerkUserId&&x.state==="active");if(!m)return {allowed:false,reason:"membership"};if(m.role!=="member")return {allowed:true,role:m.role};return {allowed:this.evalIdentAccess(s,this.userIdentities(s,m.email),a.service),reason:"acl",role:m.role};}if(a.clerkUserId===this.tenantId())return {allowed:true};return a.email?{allowed:this.evalIdentAccess(s,this.userIdentities(s,normalizeEmail(a.email)),a.service),reason:"acl"}:{allowed:false,reason:"needs-email"};}
-  private async gateOauth(a:any):Promise<any>{const s=await this.load();const svc=this.findService(s,String(a.service||""));if(svc?.auth==="public")return {allowed:true,public:true};if(s.tenantMeta){const m=s.members.find(x=>x.clerkUserId===a.clerkUserId&&x.state==="active");if(!m)return {allowed:false,reason:"membership"};if(m.role!=="member")return {allowed:true,role:m.role};return {allowed:this.evalIdentAccess(s,this.userIdentities(s,m.email),a.service),reason:"acl",role:m.role};}if(a.clerkUserId===this.tenantId())return {allowed:true};if(a.orgIdClaim===this.tenantId())return a.email?{allowed:this.evalIdentAccess(s,this.userIdentities(s,normalizeEmail(a.email)),a.service),reason:"acl"}:{allowed:false,reason:"no-email"};return {allowed:false,reason:"membership"};}
-  private async legacyClaimStatus():Promise<any>{const s=await this.load();return {migrated:!!s.tenantMeta,hasState:s.services.length>0||s.keys.length>0||!!s.settings.subdomain};}
 
   // ---- mutations: settings ------------------------------------------------
 
@@ -2923,9 +1796,8 @@ export class TenantDO extends DurableObject<Env> {
     return this.evalIdentAccess(s, this.keyIdentities(s, key), service);
   }
 
-  /** Core ACL walk shared by the key gate (checkKey) and the human gate
-   *  (checkUserAccess): does any allow rule's src match `ident` AND its dst
-   *  match `service`? */
+  /** Core ACL walk for the key gate (checkKey): does any allow rule's src
+   *  match `ident` AND its dst match `service`? */
   private evalIdentAccess(
     s: StoredState,
     ident: { keys: Set<string>; users: Set<string>; groups: Set<string> },
@@ -2981,24 +1853,6 @@ export class TenantDO extends DurableObject<Env> {
     return { keys, users, groups };
   }
 
-  /** The ACL src identities a HUMAN caller presents: their email (as a user)
-   *  plus any groups that email belongs to. No key identities — this is the
-   *  browser/OAuth plane, where there is no finch_ key. */
-  private userIdentities(
-    s: StoredState,
-    email: string,
-  ): { keys: Set<string>; users: Set<string>; groups: Set<string> } {
-    const em = email.toLowerCase();
-    const users = new Set<string>([em]);
-    const groups = new Set<string>();
-    for (const g of s.groups || []) {
-      if ((g.members || []).some((m) => m.toLowerCase() === em)) {
-        groups.add((g.name || "").toLowerCase());
-      }
-    }
-    return { keys: new Set<string>(), users, groups };
-  }
-
   /** Does a rule's src entity match one of the key's identities? */
   private srcMatches(
     src: AclEntity,
@@ -3018,18 +1872,4 @@ export class TenantDO extends DurableObject<Env> {
         return false;
     }
   }
-}
-
-// ---- ACL entity equality (for addAcl's idempotence) ------------------------
-function entEq(a: AclEntity, b: AclEntity): boolean {
-  return (
-    a.type === b.type &&
-    (a.name || "").toLowerCase() === (b.name || "").toLowerCase()
-  );
-}
-
-// ---- ACL label helper (for log targets) -----------------------------------
-function aclLabel(e: AclEntity): string {
-  if (e.type === "all") return "all services";
-  return e.name ? `${e.type}:${e.name}` : e.type;
 }
