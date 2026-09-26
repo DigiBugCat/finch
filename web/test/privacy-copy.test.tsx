@@ -2,7 +2,6 @@ import { describe, expect, it } from 'vitest';
 import { render, screen } from '@testing-library/react';
 
 import Safety from '@/components/Safety';
-import { ChatPanel } from '@/components/dash/ChatPanel';
 import PrivacyAndDataHandling from '@/app/docs/privacy/page';
 
 describe('customer-facing privacy copy', () => {
@@ -14,24 +13,28 @@ describe('customer-facing privacy copy', () => {
     expect(screen.queryByText(/never sees/i)).toBeNull();
   });
 
-  it('discloses Workers AI processing before Test Chat is used', () => {
-    render(<ChatPanel service="calendar" online={true} />);
-
-    const disclosure = screen.getByRole('note');
-    expect(disclosure).toHaveTextContent('Cloudflare Workers AI processes this chat');
-    expect(disclosure).toHaveTextContent('chat messages');
-    expect(disclosure).toHaveTextContent('tool schemas');
-    expect(disclosure).toHaveTextContent('tool arguments');
-    expect(disclosure).toHaveTextContent('tool results');
-    expect(disclosure).toHaveTextContent("Don't use Test Chat with sensitive data");
-  });
-
   it('documents the complete transport and retention boundary', () => {
     render(<PrivacyAndDataHandling />);
 
     expect(screen.getByText(/Finch is not end-to-end encrypted/i)).toBeInTheDocument();
     expect(screen.getByText(/does not log or persist those bodies/i)).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: /Operational metadata we retain/i })).toBeInTheDocument();
-    expect(screen.getByRole('heading', { name: /Test Chat is a separate processing path/i })).toBeInTheDocument();
+    // Test Chat (the one path that sent payloads to a hosted model) is gone;
+    // the page must not keep describing it as available.
+    expect(screen.queryAllByText(/Test Chat/i)).toHaveLength(0);
+    expect(screen.queryAllByText(/Workers AI/i)).toHaveLength(0);
+  });
+
+  it('still discloses sharing records retained from before the CLI cut', () => {
+    render(<PrivacyAndDataHandling />);
+
+    // The hub keeps pre-cut member, ACL and access-request rows (with emails)
+    // even though nothing reads them for access any more.
+    const note = screen.getByText(/earlier sharing features/i);
+    expect(note).toHaveTextContent(/access-control rules/i);
+    expect(note).toHaveTextContent(/access requests/i);
+    expect(note).toHaveTextContent(/email addresses/i);
+    expect(note).toHaveTextContent(/no longer uses these records/i);
+    expect(note).toHaveTextContent(/ask for them to be deleted/i);
   });
 });

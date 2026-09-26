@@ -1,9 +1,9 @@
-# finch dashboard (`web/`)
+# finch web (`web/`)
 
-The finch control-plane UI: sign in (Clerk), watch your fleet, mint `finch_`
-keys, manage access, and test services. Next.js (App Router) deployed to
-**Cloudflare Workers via [OpenNext](https://opennext.js.org/cloudflare)** —
-**not** Vercel.
+The browser side of Finch, which is otherwise driven entirely from the `finch`
+CLI: the landing page, the docs, Clerk sign-in/sign-up, and the `finch login`
+approval page. Next.js (App Router) deployed to **Cloudflare Workers via
+[OpenNext](https://opennext.js.org/cloudflare)** — **not** Vercel.
 
 > **Node 22 required.** The OpenNext build silently breaks on Node 26 (see
 > [`.nvmrc`](.nvmrc) / `engines`). Run `nvm use` / `fnm use` before building.
@@ -12,42 +12,45 @@ keys, manage access, and test services. Next.js (App Router) deployed to
 
 | Surface | What |
 |---|---|
-| **Fleet** | Your services + boxes, grouped; live status, traffic, p50/p95. |
-| **Service detail** | The connect URL (Claude/Cursor/JSON snippets), traffic, boxes + key revocation, recent calls, and a **"test in chat"** panel — an LLM (Cloudflare Workers AI) calls the service's MCP tools so you can confirm it works without leaving the dashboard. |
-| **Keys** | Mint/revoke `finch_` bearer keys (a default-deny ACL governs which reach which service). |
-| **Settings** | **Hub domain** — claim a `<slug>.finchmcp.com` with a live availability check. **CLI access** — generate the token you paste into `finch login`. Organization (read-only identity), default group, key expiry. |
-| **Users / Access / Logs** | Clerk org members, ACL rules, the audit log. |
+| **Landing** (`/`) | The marketing page. |
+| **Docs** (`/docs/*`) | Quickstart, services and boxes, keys and auth, access control, domains, the CLI reference, privacy. Also `/llms.txt` for agents. |
+| **Sign-in / sign-up** | Clerk. Lands on `/docs` unless a `redirect_url` (such as a `/cli` link) says otherwise. |
+| **CLI approval** (`/cli`) | `finch login` prints a link + code; the signed-in owner confirms the code here and the hub mints the box's CLI token. |
 
 ```
- browser ──▶ Next.js dashboard ──▶ /app/api/finch/* (BFF route handlers)
-                                        │  Clerk auth() → requireAdmin
-                                        │  sign a short-lived {tenant} assertion
-                                        ▼
-                                   finch hub Worker  (verifies X-Finch-Service
-                                                      + the signed X-Finch-Auth)
+ browser ──▶ /cli ──▶ /api/finch/cli-describe, /api/finch/cli-approve (BFF route handlers)
+                          │  Clerk auth() → resolveTenant (the owner's tenant)
+                          │  sign a short-lived {tenant} assertion
+                          ▼
+                     finch hub Worker  (verifies X-Finch-Service
+                                        + the signed X-Finch-Auth)
 ```
 
 The BFF never exposes the hub directly: each route checks the Clerk session,
-then calls the hub with the shared `FINCH_SERVICE_SECRET` **and** an HMAC-signed
-tenant assertion (so a leaked secret alone can't act as an arbitrary tenant).
+resolves the caller to one tenant, confirms they are its active owner with
+`/api/member-context`, then calls the hub over the `FINCH_HUB` service binding with the shared
+`FINCH_SERVICE_SECRET` **and** an HMAC-signed tenant assertion (so a leaked
+secret alone can't act as an arbitrary tenant).
+
+Which tenant: the personal one (the Clerk user id) unless the hub's
+user-scoped `/api/user/sync` lists other tenants the user actively owns. Then
+the web probes each candidate's `/api/state` and picks the one holding services
+or keys; if none does it stays personal, and if more than one does it refuses
+(409) rather than strand the others, since there is no workspace switcher.
+The `/cli` page shows the chosen account before the user approves.
+
+Everything else a user does (services, keys, domains, revoking CLI tokens)
+is a `finch` CLI command talking to the hub's `/api/cli/*` directly, not
+this app.
 
 ## Privacy behavior
 
-The ordinary MCP relay and Dashboard **Test in chat** have different data
-paths. Ordinary calls travel over HTTPS from the client and WSS from the Finch
-hub to the outbound box agent. Cloudflare terminates those encrypted
-connections, so this is transport encryption, not end-to-end encryption. Finch
-processes the payload transiently to relay it, but its application storage and
-logs do not retain ordinary request or response bodies. Recent-call and traffic
-views use operational metadata only: timestamp, tenant/service/route, caller
-label, response status, duration, and aggregate counters.
-
-Using **Test in chat** additionally sends the visible chat history, the
-service's tool names/descriptions/input schemas, model-selected tool arguments,
-and returned tool results to Cloudflare Workers AI. This is required for the
-model to decide which tool to call and compose an answer; it is not covered by
-the ordinary relay's no-body-retention guarantee. The full data-handling
-boundary is documented in [`../docs/privacy.md`](../docs/privacy.md).
+Ordinary calls travel over HTTPS from the client and WSS from the Finch hub to
+the outbound box agent. Cloudflare terminates those encrypted connections, so
+this is transport encryption, not end-to-end encryption. Finch processes the
+payload transiently to relay it, but its application storage and logs do not
+retain ordinary request or response bodies. The full data-handling boundary is
+documented in [`../docs/privacy.md`](../docs/privacy.md).
 
 ## Setup
 
@@ -59,8 +62,8 @@ Fill `.dev.vars`:
 
 - `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` / `CLERK_SECRET_KEY` — from a Clerk dev instance.
 - `HUB_URL` — the finch hub (e.g. `http://localhost:8787` in dev).
-- `FINCH_SERVICE_SECRET` / `TICKET_SECRET` — **must match `worker/.dev.vars`**
-  (the dashboard signs assertions/tickets the hub verifies).
+- `FINCH_SERVICE_SECRET` — **must match `worker/.dev.vars`** (the web signs
+  assertions the hub verifies).
 
 ```bash
 npm install
@@ -74,7 +77,7 @@ npm run dev          # http://localhost:3000  (run the hub in worker/ first)
 | `npm run dev` | local dev server |
 | `npm run typecheck` | `tsc --noEmit` |
 | `npm run lint` | eslint |
-| `npm test` | vitest (BFF auth, the signAssertion↔hub contract, scope formatting, …) |
+| `npm test` | vitest (BFF auth, the signAssertion↔hub contract, the hub transport, …) |
 | `npm run build` | `next build` |
 | `npm run deploy` | OpenNext build + deploy to Cloudflare |
 
@@ -82,13 +85,14 @@ npm run dev          # http://localhost:3000  (run the hub in worker/ first)
 
 | Path | What |
 |---|---|
-| `app/api/finch/*` | BFF route handlers — Clerk-gated, sign + proxy to the hub |
-| `lib/hub.ts` | hub client: `resolveTenant`, `requireAdmin`, `adminProxy`, error shaping |
+| `app/cli`, `components/CliApprove.tsx` | the `finch login` approval page |
+| `app/api/finch/*` | BFF route handlers for it — Clerk-gated, sign + proxy to the hub |
+| `app/docs/*` | the docs |
+| `lib/hub.ts` | hub client: `resolveTenant`, `requireAdmin`, `hubFetchAs`, error shaping |
 | `lib/assertion.ts` | the Clerk-free HMAC signer (shared shape with `worker/src/auth.ts`) |
-| `components/dash/*` | the dashboard app (fleet, keys, access, users, settings, logs) |
 | `middleware.ts` | Clerk middleware + CSRF (`Sec-Fetch-Site`/`Origin`) checks |
 | `test/` | vitest unit/contract tests |
 
 > Heads-up: this repo pins a **non-standard Next.js** build (see
-> [`AGENTS.md`](AGENTS.md)) — check `node_modules/next/dist/docs/` before
-> changing framework-level code.
+> [`AGENTS.md`](AGENTS.md)) — check the installed package before changing
+> framework-level code.

@@ -83,7 +83,7 @@ finch run`}</Code>
             </tr>
             <tr>
               <td><code>invited</code></td>
-              <td>A ticket was minted in the dashboard but no box has joined yet. It flips out of <code>invited</code> on the first real join.</td>
+              <td>The service was enrolled but no box has joined yet. It flips out of <code>invited</code> on the first real join.</td>
             </tr>
           </tbody>
         </table>
@@ -98,55 +98,27 @@ finch run`}</Code>
 
       <h2>Keeping boxes up to date</h2>
       <p>
-        A box on an older agent shows an <code>⬆</code> badge next to its version. Two
-        ways to update it:
-      </p>
-      <p>
-        <b>From the dashboard.</b> Open the service and click <b>update now</b> on the
-        box. The hub pushes an update command down the box&apos;s existing connection: the
-        agent downloads the new binary from the hub, swaps it in place, and restarts
-        itself. No SSH, no second process, about a second of downtime. The box comes
-        back on the new version within a few seconds. An offline box can&apos;t receive
-        the push; the dashboard shows the command to run instead.
-      </p>
-      <p>
-        <b>On the box.</b> Run:
+        Run this on the box:
       </p>
       <Code>{`finch update`}</Code>
       <p>
-        Same swap, run locally. If a systemd service manages the agent it restarts
-        cleanly; otherwise the process replaces itself in place. Either way the update
-        is atomic: a failed download never touches the running binary.
+        The agent downloads the new binary from the hub and swaps it in place. If a
+        systemd service manages the agent it restarts cleanly; otherwise the process
+        replaces itself in place. Either way the update is atomic: a failed download
+        never touches the running binary.
       </p>
 
       <h2>Enrolling another box</h2>
       <p>
-        You do not need <code>finch login</code> on every machine. Mint a ticket in the
-        dashboard (Add box), then on the new box:
-      </p>
-      <Code>{`finch enroll printer --ticket &lt;ticket&gt;   <span class="c"># writes the credential, one time</span>
-finch run                                <span class="c"># resumes ticketless thereafter</span>`}</Code>
-      <p>
-        Tickets are one-shot credentials. They are saved to disk by{' '}
-        <code>enroll</code> and never appear in <code>finch.yml</code>.
+        You do not need the browser step on every machine. From a box that is already
+        logged in, you can set up another one with no human step at all.{' '}
+        <code>finch token</code> mints a fresh, revocable CLI token; the browser
+        approval is only ever needed for your first box.
       </p>
       <div className="docs-note">
-        <b>Keep tickets off argv.</b> A ticket passed as a flag lands in shell history
-        and process lists. Pipe it to stdin with <code>--ticket -</code>, or set{' '}
-        <code>FINCH_TICKET</code>:
-      </div>
-      <Code>{`echo &lt;ticket&gt; | ssh newbox "finch enroll printer --ticket -"`}</Code>
-
-      <h2>Provisioning a box from a logged-in box</h2>
-      <p>
-        From a box that is already logged in, you can set up another one with no human
-        step at all. <code>finch token</code> mints a fresh, revocable CLI token; the
-        browser step is only ever needed for your first box.
-      </p>
-      <div className="docs-note">
-        <b>Keep the CLI token off argv too.</b> It is a tenant-admin credential, so it
-        deserves at least the care a ticket gets: pipe it into <code>--token -</code>,
-        or set <code>FINCH_CLI_TOKEN</code>.
+        <b>Keep the CLI token off argv.</b> It is a tenant-admin credential, and a
+        token passed as a flag lands in shell history and process lists. Pipe it into{' '}
+        <code>--token -</code>, or set <code>FINCH_CLI_TOKEN</code>.
       </div>
       <Code>{`finch token | ssh user@newbox "finch login --token -"
 ssh user@newbox "finch add api --service http://127.0.0.1:9000 && finch run"`}</Code>

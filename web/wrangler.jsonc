@@ -18,8 +18,8 @@
   // and FINCH_HUB binds to the matching hub worker (finch-dev / finch-staging /
   // finch-prod): lib/hub.ts sends every web→hub call over that binding, not the
   // public wire. HUB_URL is still required — it is the URL (and so the host)
-  // the hub sees on those calls, and the origin shown in install one-liners.
-  // FINCH_SERVICE_SECRET + CLERK_SECRET_KEY + CLERK_WEBHOOK_SECRET are SECRETS — set via
+  // the hub sees on those calls.
+  // FINCH_SERVICE_SECRET + CLERK_SECRET_KEY are SECRETS — set via
   // `wrangler secret put … --env <env>`, never here.
   "env": {
     // ---- dev: workers.dev, local/dev hub ----
@@ -63,8 +63,8 @@
         "NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY": "pk_test_c3Ryb25nLXRlcnJpZXItOTUuY2xlcmsuYWNjb3VudHMuZGV2JA",
         "NEXT_PUBLIC_CLERK_SIGN_IN_URL": "/sign-in",
         "NEXT_PUBLIC_CLERK_SIGN_UP_URL": "/sign-up",
-        "NEXT_PUBLIC_CLERK_SIGN_IN_FALLBACK_REDIRECT_URL": "/dashboard",
-        "NEXT_PUBLIC_CLERK_SIGN_UP_FALLBACK_REDIRECT_URL": "/dashboard"
+        "NEXT_PUBLIC_CLERK_SIGN_IN_FALLBACK_REDIRECT_URL": "/docs",
+        "NEXT_PUBLIC_CLERK_SIGN_UP_FALLBACK_REDIRECT_URL": "/docs"
       }
     },
 
@@ -88,15 +88,15 @@
         // The ONLY origin whose Clerk session tokens middleware.ts accepts
         // (the `azp` claim must equal it). Must stay the exact app origin —
         // never a wildcard, or a tenant's <slug>.finchmcp.com token would be
-        // replayable against the dashboard. deploy-preflight enforces this.
+        // replayable against the /cli approval routes. deploy-preflight enforces this.
         "NEXT_PUBLIC_APP_ORIGIN": "https://finchmcp.com",
         // Production Clerk instance (clerk.finchmcp.com). Publishable key is
         // PUBLIC; the secret half (CLERK_SECRET_KEY) is a wrangler secret.
         "NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY": "pk_live_Y2xlcmsuZmluY2htY3AuY29tJA",
         "NEXT_PUBLIC_CLERK_SIGN_IN_URL": "/sign-in",
         "NEXT_PUBLIC_CLERK_SIGN_UP_URL": "/sign-up",
-        "NEXT_PUBLIC_CLERK_SIGN_IN_FALLBACK_REDIRECT_URL": "/dashboard",
-        "NEXT_PUBLIC_CLERK_SIGN_UP_FALLBACK_REDIRECT_URL": "/dashboard"
+        "NEXT_PUBLIC_CLERK_SIGN_IN_FALLBACK_REDIRECT_URL": "/docs",
+        "NEXT_PUBLIC_CLERK_SIGN_UP_FALLBACK_REDIRECT_URL": "/docs"
       },
       "routes": [
         { "pattern": "finchmcp.com/*", "zone_name": "finchmcp.com" }

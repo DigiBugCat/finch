@@ -4,7 +4,7 @@
 
 Finch is operated from a CLI. Every command is non-interactive and supports --json. If you are an AI agent driving Finch, install it and run `finch guide`: it prints a complete, self-contained operating manual.
 
-Core loop: `finch login` (one-time approval — prints a link + code, you open the link on ANY device incl. your phone, so a headless box needs no local browser; over SSH use `finch login --headless` to skip the local browser spawn and flush the link straight to your terminal) → `finch add <app_path> --service http://127.0.0.1:<port>` → `finch run` → paste the printed URL into any MCP client with a key from `finch keys mint`. Fully unattended provisioning (no human): mint a one-shot ticket via `finch token` or the dashboard's "Add box", then `finch run --ticket -`.
+Core loop: `finch login` (one-time approval — prints a link + code, you open the link on ANY device incl. your phone, so a headless box needs no local browser; over SSH use `finch login --headless` to skip the local browser spawn and flush the link straight to your terminal) → `finch add <app_path> --service http://127.0.0.1:<port>` → `finch run` → paste the printed URL into any MCP client with a key from `finch keys mint`. Fully unattended provisioning (no human): from a box that is already logged in, `finch token | ssh newbox "finch login --token -"`.
 
 ## Base case: hello world, end to end
 
@@ -42,10 +42,10 @@ finch keys mint my-claude --service hello            # finch_ key, shown once
 ## Docs
 
 - [Quickstart](https://finchmcp.com/docs): install, log in, add a service, run, connect a client
-- [AviaryMCP](https://finchmcp.com/docs/aviarymcp): public Python SDK release candidate on PyPI; one tool registry for MCP, REST, and OpenAPI with native Finch enrollment
+- [AviaryMCP](https://finchmcp.com/docs/aviarymcp): public Python SDK release candidate on PyPI; one tool registry for MCP, REST, and OpenAPI, published with `finch add` like any local service
 - [Services & boxes](https://finchmcp.com/docs/services): the service/box model, finch.yml, states, enrolling more boxes
 - [Keys & auth](https://finchmcp.com/docs/auth): finch_ keys, mint/list/revoke, the CLI admin token, how auth is checked at the edge
-- [Access control](https://finchmcp.com/docs/acls): default-deny rules, granting by user, group, key, or tag; per-agent scoping
+- [Access control](https://finchmcp.com/docs/acls): finch_ keys scoped per service, OAuth, public services; one key per agent
 - [Domains](https://finchmcp.com/docs/domains): the automatic <slug>.finchmcp.com hub domain and custom hostnames
 - [CLI reference](https://finchmcp.com/docs/cli): every command, grouped, with the finch.yml format
 
@@ -55,29 +55,27 @@ finch keys mint my-claude --service hello            # finch_ key, shown once
 
 ## Optional
 
-- [Dashboard](https://finchmcp.com/dashboard): services, boxes, keys, access rules, users, logs
 - [Pricing](https://finchmcp.com/#pricing): free during beta; Hobby stays free for individuals and small groups
 
 ## AviaryMCP release candidate
 
-AviaryMCP 0.1.0rc6 is public on PyPI (`python -m pip install 'aviary-mcp==0.1.0rc6'`) and is the preferred path for a new Python service. Read the [project-specific machine-readable guide](/aviarymcp-llms.txt) on this origin. It subclasses FastMCP and follows the normal FastMCP convention: create `mcp = AviaryMCP("My MCP Server")`, register tools with `@mcp.tool`, and call `mcp.run()`.
+AviaryMCP 0.1.0rc6 is public on PyPI (`python -m pip install 'aviary-mcp==0.1.0rc6'`). Read the [project-specific machine-readable guide](/aviarymcp-llms.txt) on this origin. It subclasses FastMCP and follows the normal FastMCP convention: create `mcp = AviaryMCP("My MCP Server")`, register tools with `@mcp.tool`, and call `mcp.run()`. Serve it on loopback and publish it like any other local service:
 
 ```python
-from aviary_mcp import AviaryMCP, Finch
+from aviary_mcp import AviaryMCP
 
-mcp = AviaryMCP(
-    "calculator",
-    finch=Finch.local(
-        path="calculator",
-        binary="/absolute/path/to/finch",
-    ),
-)
+mcp = AviaryMCP("calculator")
 
 @mcp.tool
 def add(a: int, b: int) -> int:
     return a + b
 
-mcp.run()
+mcp.run(transport="http", host="127.0.0.1", port=8000)
 ```
 
-AviaryMCP exposes the same registered tools at `/mcp`, `/api/v1/tools`, `/api/v1/tools/<tool>`, and `/api/v1/openapi.json`. Choose `Finch.local(...)` for an application-owned, zero-config Finch child or `Finch.agent(path=..., socket=/absolute/control.sock)` for an existing agent. Both modes register one exact route manifest and start browser device approval on first run. Do not duplicate an AviaryMCP-managed app path in `finch.yml`; keep YAML for existing or non-SDK services.
+```bash
+finch add calculator --service http://127.0.0.1:8000
+finch run
+```
+
+AviaryMCP exposes the same registered tools at `/mcp`, `/api/v1/tools`, `/api/v1/tools/<tool>`, and `/api/v1/openapi.json`, so through Finch they answer under `https://<slug>.finchmcp.com/calculator/`.

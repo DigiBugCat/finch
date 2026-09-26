@@ -15,7 +15,7 @@ export default function Footer() {
             <a href="#abilities">Abilities</a>
             <a href="#safety">Safety</a>
             <a href="#pricing">Pricing</a>
-            <Link href="/dashboard">Dashboard</Link>
+            <Link href="/docs/cli">CLI reference</Link>
           </div>
           <div className="foot-col">
             <h5>Resources</h5>

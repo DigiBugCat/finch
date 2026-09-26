@@ -1,6 +1,6 @@
 // POST /api/finch/cli-approve {userCode} — approve a `finch login` device code.
 // Admin-only; mints the CLI token on the hub and stamps it onto the pending code.
-// We also pass the approver's Clerk email so the box (and its tray app) can show
+// We also pass the approver's Clerk email so the box can show
 // WHO it's signed in as.
 import { clerkClient } from "@clerk/nextjs/server";
 import { errorResponse, HttpError, hubFetchAs, requireAdmin } from "@/lib/hub";

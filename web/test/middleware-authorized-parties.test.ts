@@ -6,8 +6,8 @@
 // arbitrary tenant HTML there, so an attacker owns a cookie-sharing sibling
 // origin: mint a session JWT there, exfiltrate it, replay it server-side with
 // `Sec-Fetch-Site: same-origin` (which the CSRF guard accepts by design) against
-// POST /api/finch/cli-token, and you hold a ~30-day tenant-admin credential for
-// the victim's workspace. The azp pin is the only thing that separates those two
+// POST /api/finch/cli-approve with your own `finch login` code, and your terminal
+// holds a ~30-day tenant-admin credential for the victim's account. The azp pin is the only thing that separates those two
 // origins, so it is asserted here rather than left to review.
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { NextRequest } from "next/server";
@@ -35,7 +35,7 @@ async function optionsFor(env: Record<string, string | undefined>) {
   await import("@/middleware");
   expect(typeof capturedOptions).toBe("function");
   return await (capturedOptions as (req: NextRequest) => Promise<unknown> | unknown)(
-    new Request("https://finchmcp.com/dashboard") as unknown as NextRequest,
+    new Request("https://finchmcp.com/cli") as unknown as NextRequest,
   ) as { authorizedParties?: string[] };
 }
 

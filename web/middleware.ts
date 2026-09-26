@@ -2,25 +2,9 @@ import { clerkMiddleware, createRouteMatcher } from "@clerk/nextjs/server";
 import { NextResponse } from "next/server";
 import { isSecurePublicRequest } from "@/lib/secure-transport";
 
-// Only the dashboard (and future app routes) require auth. The marketing
-// landing, sign-in, and sign-up are public — don't gate the front door.
-//
-// /portal(.*) is the appliance login-wall bounce: an unauthenticated browser
-// hitting a gated <slug>.finchmcp.com appliance is 302'd by the worker to
-// /portal/start. Protecting it here means Clerk forces sign-in BEFORE the
-// route handler runs, so resolveTenant() always sees a real session and we
-// can mint a portal grant bound to the signed-in user.
-const isProtectedRoute = createRouteMatcher([
-  "/dashboard(.*)",
-  "/cli(.*)",
-  "/portal(.*)",
-]);
-
-// Device enrollment links are opened directly from the Finch CLI. Clerk's
-// default protection response is an intentionally opaque 404, which makes a
-// valid approval link look broken when the browser has no session. Send the
-// user through sign-in explicitly and preserve the complete approval URL.
-const isAviaryRoute = createRouteMatcher(["/aviary(.*)"]);
+// Only the `finch login` approval page requires auth. The marketing landing,
+// docs, sign-in, and sign-up are public — don't gate the front door.
+const isProtectedRoute = createRouteMatcher(["/cli(.*)"]);
 
 // All cookie-authed bridge handlers live under /api/finch/*.
 const isFinchApiRoute = createRouteMatcher(["/api/finch(.*)"]);
@@ -62,8 +46,9 @@ function isSameOrigin(request: Request): boolean {
  * registrable domain and shares our Clerk cookies. A token minted on that
  * subdomain, exfiltrated, and replayed server-side with `Sec-Fetch-Site:
  * same-origin` (which satisfies isSameOrigin above, by design — see the CSRF
- * note) would mint a ~30-day tenant-admin credential at POST
- * /api/finch/cli-token for the victim's workspace. Checking `azp` is what stops
+ * note) would approve the attacker's own `finch login` code at POST
+ * /api/finch/cli-approve, handing their terminal a ~30-day tenant-admin CLI
+ * token for the victim's account. Checking `azp` is what stops
  * that: the attacker's token names <slug>.finchmcp.com, not the app origin.
  *
  * Environment resolution mirrors allowedRedirectOrigins() in app/layout.tsx:59 —
@@ -109,14 +94,7 @@ export default clerkMiddleware(async (auth, request) => {
     );
   }
 
-  if (isAviaryRoute(request)) {
-    const { userId } = await auth();
-    if (!userId) {
-      const signInUrl = new URL("/sign-in", request.url);
-      signInUrl.searchParams.set("redirect_url", request.url);
-      return NextResponse.redirect(signInUrl);
-    }
-  } else if (isProtectedRoute(request)) {
+  if (isProtectedRoute(request)) {
     await auth.protect();
   }
 },
