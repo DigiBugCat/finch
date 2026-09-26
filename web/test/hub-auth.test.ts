@@ -158,7 +158,19 @@ describe("outbound hub authentication boundary", () => {
     expect(headers.get("x-finch-service")).toBe("service-secret");
     expect(headers.get("content-type")).toBe("application/json");
     expect(await verifyAssertion(headers.get("x-finch-auth")!, "service-secret")).toBe("org_1");
-    expect(init.redirect).toBe("error");
+    expect(init.redirect).toBe("manual");
+  });
+
+  // workerd implements only "follow" and "manual"; `redirect: "error"` throws a
+  // TypeError at call time, which silently 502'd every bridge route in prod
+  // because this suite's fetch mock accepts any init value.
+  it("refuses a redirect the hub actually returns instead of following it", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(null, { status: 302, headers: { location: "https://elsewhere.test/" } }),
+    );
+
+    await expect(hubFetchAs("org_1", "/api/state")).rejects.toMatchObject({ status: 502 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("mints user-scoped assertions that cannot authorize tenant-scoped calls", async () => {
@@ -173,7 +185,7 @@ describe("outbound hub authentication boundary", () => {
     ) => Promise<string | null>;
     expect(await verifyAssertion(token, "service-secret")).toBeNull();
     expect(await verifyWithKind(token, "service-secret", "user")).toBe("user_1");
-    expect(init.redirect).toBe("error");
+    expect(init.redirect).toBe("manual");
   });
 
   it("rejects non-origin and cleartext remote hub configuration", async () => {
