@@ -1491,6 +1491,17 @@ async function relayMcp(
   for (const name of [...relayHeaders.keys()]) {
     if (name.startsWith("x-finch-")) relayHeaders.delete(name);
   }
+  // A client may also copy the credential it presented into some other header
+  // (X-Api-Key, a custom auth header). The hub never reads it there, but it must
+  // still not reach the box, so drop any remaining header that contains the
+  // exact bearer secret presented on THIS request. Matching the secret itself,
+  // not the "finch_" prefix, keeps Mcp-Name: finch_status and friends intact.
+  const presented = /^Bearer\s+(\S{16,})$/i.exec(req.headers.get("authorization") || "")?.[1];
+  if (presented) {
+    for (const [name, value] of [...relayHeaders.entries()]) {
+      if (value.includes(presented)) relayHeaders.delete(name);
+    }
+  }
   // Surgically remove ONLY the finch_session login-wall cookie from the Cookie
   // header, leaving the hosted app's own cookies (e.g. app_sid) intact. (#1)
   const cookieHeader = relayHeaders.get("cookie");

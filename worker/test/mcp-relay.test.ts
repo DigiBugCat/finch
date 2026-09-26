@@ -182,6 +182,36 @@ describe("relay header fidelity (MCP 2026-07-28)", () => {
     agent.close();
   });
 
+  it("drops any other header carrying a copy of the presented key, but keeps finch_-named MCP headers", async () => {
+    const { service, agent, key } = await liveService("copy");
+    const reqSeen = nextFrame(agent);
+    const resP = call(
+      new Request(`${BASE}/${service}/mcp`, {
+        method: "POST",
+        headers: {
+          host: HOST,
+          "content-type": "application/json",
+          authorization: `Bearer ${key}`,
+          "x-api-key": key,
+          "x-custom-auth": `Token ${key}`,
+          cookie: `app_sid=ok; leaked=${key}`,
+          "mcp-name": "finch_status",
+        },
+        body: "{}",
+      }),
+    );
+    const req = await reqSeen;
+    const h = req.headers as Record<string, string>;
+    expect(h["x-api-key"]).toBeUndefined();
+    expect(h["x-custom-auth"]).toBeUndefined();
+    expect(h.cookie).toBeUndefined();
+    expect(JSON.stringify(req)).not.toContain(key);
+    expect(h["mcp-name"]).toBe("finch_status");
+    agent.send(JSON.stringify({ id: req.id, type: "err", status: 502, message: "done" }));
+    await resP;
+    agent.close();
+  });
+
   it("strips a finch_ key in Authorization whatever the scheme casing", async () => {
     const { service, agent, key } = await liveService("case");
     const reqSeen = nextFrame(agent);
