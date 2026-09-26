@@ -115,6 +115,20 @@ describe("tenant route request and upstream boundaries", () => {
     }
   });
 
+  it("forwards the browser's IP for the hub's per-IP creation throttle", async () => {
+    // Over the FINCH_HUB service binding the hub sees no CF-Connecting-IP, so
+    // without this every dashboard user would share one throttle bucket.
+    mocks.userFetch.mockResolvedValue(Response.json({ tenantId: "ft_12345678" }));
+    await createTenant(post({ name: "Acme", idempotencyKey: "attempt-1234" }, { "cf-connecting-ip": "203.0.113.7" }));
+    let [, , init] = mocks.userFetch.mock.calls[0];
+    expect(new Headers(init.headers).get("x-finch-client-ip")).toBe("203.0.113.7");
+
+    mocks.userFetch.mockClear();
+    await createTenant(post({ name: "Acme", idempotencyKey: "attempt-1234" }));
+    [, , init] = mocks.userFetch.mock.calls[0];
+    expect(new Headers(init.headers).has("x-finch-client-ip")).toBe(false);
+  });
+
   it("rejects overlong or control-bearing workspace names without side effects", async () => {
     for (const name of ["a".repeat(65), "line\nbreak"]) {
       expect((await createTenant(post({ name }))).status).toBe(400);

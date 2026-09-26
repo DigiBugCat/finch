@@ -106,10 +106,12 @@ FINCH_CLI_TOKEN`}</Code>
       <h2>OAuth</h2>
       <p>
         MCP clients that speak OAuth can authenticate at the door without a raw
-        key. The hub publishes standard protected-resource discovery metadata,
-        so a client like Claude&apos;s custom connectors can run its own OAuth
-        flow and present the resulting token instead of a <code>finch_</code> key.
-        For everything else, mint a key.
+        key. The hub publishes standard protected-resource discovery metadata
+        that points at Finch&apos;s sign-in service as the authorization server,
+        so a client like Claude&apos;s custom connectors registers and signs in
+        there, then presents the resulting token instead of a <code>finch_</code>{' '}
+        key. The token only needs your identity and email. For everything else,
+        mint a key.
       </p>
 
       <div className="docs-foot">
