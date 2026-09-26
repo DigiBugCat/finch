@@ -237,10 +237,32 @@ export async function hubFetchAs(
 
   // Control endpoints must never redirect: custom auth headers can otherwise
   // cross a trust boundary depending on the runtime's redirect implementation.
-  return fetch(`${hubOrigin}${path}`, { ...init, headers, redirect: "error" });
+  return fetchHubNoRedirect(`${hubOrigin}${path}`, { ...init, headers });
 }
 
-export async function userFetch(clerkUserId:string,path:string,init:RequestInit={}):Promise<Response>{const hubUrl=await runtimeEnv("HUB_URL"),secret=await runtimeEnv("FINCH_SERVICE_SECRET");if(!hubUrl||!secret)throw new HttpError(500,"hub is not configured");const hubOrigin=normalizeHubUrl(hubUrl);validateHubRequestIdentity(clerkUserId,"Clerk user id");validateHubPath(path);const headers=new Headers(init.headers);headers.set("X-Finch-Service",secret);headers.set("X-Finch-Auth",await signAssertion(clerkUserId,secret,undefined,"user"));if(init.body!=null&&!headers.has("content-type"))headers.set("content-type","application/json");return fetch(`${hubOrigin}${path}`,{...init,headers,redirect:"error"});}
+/**
+ * Fetch the hub with redirect-following disabled.
+ *
+ * `redirect: "error"` is NOT implemented by workers.dev's runtime — workerd
+ * throws `TypeError: Invalid redirect value…` at call time, which took the
+ * whole bridge down in production. `redirect: "manual"` is the supported way
+ * to refuse to follow: the 3xx comes back as an ordinary response, headers
+ * intact and never replayed to the redirect target, and we reject it here.
+ * That preserves the guarantee the "error" mode was chosen for — our service
+ * secret and signed assertion never cross an origin the hub didn't answer on.
+ */
+async function fetchHubNoRedirect(
+  url: string,
+  init: RequestInit,
+): Promise<Response> {
+  const response = await fetch(url, { ...init, redirect: "manual" });
+  if (response.status >= 300 && response.status < 400) {
+    throw new HttpError(502, "hub returned a redirect");
+  }
+  return response;
+}
+
+export async function userFetch(clerkUserId:string,path:string,init:RequestInit={}):Promise<Response>{const hubUrl=await runtimeEnv("HUB_URL"),secret=await runtimeEnv("FINCH_SERVICE_SECRET");if(!hubUrl||!secret)throw new HttpError(500,"hub is not configured");const hubOrigin=normalizeHubUrl(hubUrl);validateHubRequestIdentity(clerkUserId,"Clerk user id");validateHubPath(path);const headers=new Headers(init.headers);headers.set("X-Finch-Service",secret);headers.set("X-Finch-Auth",await signAssertion(clerkUserId,secret,undefined,"user"));if(init.body!=null&&!headers.has("content-type"))headers.set("content-type","application/json");return fetchHubNoRedirect(`${hubOrigin}${path}`,{...init,headers});}
 
 // ---- access sharing helpers -----------------------------------------------
 // Thin typed wrappers over the hub's /api/access* + /api/acl surface, shared
