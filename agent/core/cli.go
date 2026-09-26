@@ -135,6 +135,8 @@ Usage:
   finch add <app_path> --service <url> Enroll a service and append it to finch.yml
                                           <app_path> becomes the URL: <slug>.finchmcp.com/<app_path>/
   finch run [--config finch.yml]       Serve every ingress rule (auto-approves when logged in)
+  finch enroll <app_path> --ticket -   Save a box credential from a one-shot join ticket on stdin
+                                          (one time; a logged-in box uses 'finch add' instead)
   finch approve <app_path>             Approve a service (clear the pending gate)
   finch auth <app_path> public|key     Make a service open to anyone, or require a finch_ key
   finch token [--json|--login]         Mint a fresh CLI token (provision a new box, no browser)
@@ -1121,8 +1123,80 @@ func cmdAdd(args []string) {
 	fmt.Printf("       wrote rule to %s — run `finch run` to serve it\n", *configPath)
 }
 
-// resolveTicket applies argv-free intake for a single-service `finch join`
-// enrollment ticket: "-" reads it from stdin and FINCH_TICKET from the env — so
+// cmdEnroll: finch enroll <app_path> --ticket <t> [--hub …] [--box …] [--credentials-dir …]
+//
+// The one-time, imperative enrollment step for a box that has a ticket but no
+// CLI login: it trades a one-shot join ticket (the `ticket` field of
+// POST /api/cli/enroll) for the long-lived box-side refresh credential and
+// writes it to <credentials-dir>/<service>.json, where `finch run` resumes it
+// ticketless. Tickets are a credential, so they live here / on disk, never in
+// finch.yml. A logged-in box uses `finch add`, which does this in one step.
+func cmdEnroll(args []string) {
+	fs := flag.NewFlagSet("enroll", flag.ExitOnError)
+	ticket := fs.String("ticket", "", "one-shot enrollment ticket (required; '-' reads it from stdin, or set FINCH_TICKET)")
+	hub := fs.String("hub", "https://finchmcp.com", "finch hub base URL")
+	// Default --box and --credentials-dir to finch.yml's, so the box registers
+	// under the manifest's name and the credential lands where `finch run` looks.
+	host, _ := os.Hostname()
+	defBox, defCredDir := addPaths("finch.yml", host)
+	box := fs.String("box", defBox, "this box's name")
+	credDir := fs.String("credentials-dir", defCredDir, "directory the saved credential is written to")
+
+	appPath := ""
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		appPath = args[0]
+		args = args[1:]
+	}
+	_ = fs.Parse(args)
+	if appPath == "" && fs.NArg() > 0 {
+		appPath = fs.Arg(0)
+	}
+	ticketVal := resolveTicket(*ticket)
+	if appPath == "" || ticketVal == "" {
+		fmt.Fprintln(os.Stderr, "usage: finch enroll <app_path> --ticket <t>")
+		fmt.Fprintln(os.Stderr, "  <app_path> is the service/URL segment; a logged-in box can use 'finch add' instead")
+		fmt.Fprintln(os.Stderr, "  keep the ticket off argv/history: 'echo <t> | finch enroll <app_path> --ticket -' or set FINCH_TICKET")
+		os.Exit(2)
+	}
+	if err := validateServiceID(appPath); err != nil {
+		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
+		os.Exit(2)
+	}
+	id, statePath, err := enrollWithTicket(*hub, *box, ticketVal, expandHome(*credDir))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "finch: enroll failed: %v\n", err)
+		os.Exit(1)
+	}
+	if id != appPath {
+		fmt.Printf("finch: note: %q was registered as %q (host-safe slug)\n", appPath, id)
+	}
+	fmt.Printf("finch: enrolled %q — credential saved to %s\n", id, statePath)
+	fmt.Printf("       add it to finch.yml and run `finch run`:\n")
+	fmt.Printf("         ingress:\n           - app_path: %s\n             service: http://127.0.0.1:8000\n", id)
+}
+
+// enrollWithTicket joins FIRST so the credential is named by the hub's
+// slugified service id: the relay resolves the service by THAT id, so
+// `finch enroll Printer` must land as printer.json, not the raw argument, or
+// `finch run` never finds it.
+func enrollWithTicket(hub, box, ticket, credDir string) (id, statePath string, err error) {
+	hub, err = validateHubTransportURL(hub)
+	if err != nil {
+		return "", "", err
+	}
+	jr, err := join(hub, ticket, box)
+	if err != nil {
+		return "", "", err
+	}
+	statePath = filepath.Join(credDir, jr.Service+".json")
+	if _, err := persistJoin(hub, jr, statePath); err != nil {
+		return "", "", err
+	}
+	return jr.Service, statePath, nil
+}
+
+// resolveTicket applies argv-free intake for a `finch enroll` or single-service
+// `finch join` enrollment ticket: "-" reads it from stdin and FINCH_TICKET from the env — so
 // a one-shot ticket (which mints the long-lived refresh token) need not land on
 // the remote process table / shell history. A literal value passes through
 // unchanged.
@@ -1146,8 +1220,8 @@ func resolveTicket(ticket string) string {
 }
 
 // defaultCredentialsDir mirrors loadConfig's default: ~/.finch (cwd-relative
-// .finch if there's no home dir), so `finch add` writes the credential where
-// `finch run` will look for it.
+// .finch if there's no home dir), so `finch add`/`finch enroll` write the
+// credential where `finch run` will look for it.
 func defaultCredentialsDir() string {
 	if home, err := os.UserHomeDir(); err == nil && home != "" {
 		return filepath.Join(home, ".finch")

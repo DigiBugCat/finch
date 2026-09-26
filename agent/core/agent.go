@@ -268,6 +268,9 @@ func Main() {
 		case "add":
 			cmdAdd(os.Args[2:])
 			return
+		case "enroll":
+			cmdEnroll(os.Args[2:])
+			return
 		case "approve":
 			cmdApprove(os.Args[2:])
 			return
@@ -439,7 +442,8 @@ func agentDefaultBox(hostName string) string {
 // enrollToState trades a one-shot ticket for a long-lived refresh credential via
 // /join and persists it (0600) to statePath, returning the join response too so
 // callers can read the hub-slugified service id. Shared by the single-service
-// `finch join` path and `finch add` (both write a fixed state file).
+// `finch join` path and `finch add` (both write a fixed state file); `finch
+// enroll` names its file after the assignment, so it uses join + persistJoin.
 func enrollToState(hub, box, ticket, statePath string) (*agentState, *joinResp, error) {
 	validatedHub, err := validateHubTransportURL(hub)
 	if err != nil {
@@ -450,15 +454,24 @@ func enrollToState(hub, box, ticket, statePath string) (*agentState, *joinResp, 
 	if err != nil {
 		return nil, nil, err
 	}
-	// Only /join returns the long-lived refresh token, so it must be present.
+	st, err := persistJoin(hub, jr, statePath)
+	if err != nil {
+		return nil, nil, err
+	}
+	return st, jr, nil
+}
+
+// persistJoin writes the credential a successful /join returned to statePath
+// (0600). Only /join returns the long-lived refresh token, so it must be present.
+func persistJoin(hub string, jr *joinResp, statePath string) (*agentState, error) {
 	if jr.RefreshToken == "" {
-		return nil, nil, fmt.Errorf("hub returned no refresh token")
+		return nil, fmt.Errorf("hub returned no refresh token")
 	}
 	st := &agentState{Hub: hub, Tenant: jr.Tenant, Service: jr.Service, Box: jr.Box, RefreshToken: jr.RefreshToken}
 	if err := saveState(statePath, st); err != nil {
-		return nil, nil, fmt.Errorf("persisting credential to %s: %w", statePath, err)
+		return nil, fmt.Errorf("persisting credential to %s: %w", statePath, err)
 	}
-	return st, jr, nil
+	return st, nil
 }
 
 // join claims a box slot with the ticket and returns the hub's assignment

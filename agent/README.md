@@ -17,6 +17,7 @@ by an AI agent: every command is non-interactive and supports `--json`, and
 | `finch login` | Log in to your tenant: prints a link + code to approve on any device (like `gh auth login`). |
 | `finch add <app_path> --service <url>` | Enroll a service and append an `ingress` rule to `finch.yml`. |
 | `finch run` | Serve every rule in `finch.yml` — dials out, auto-approves, holds the relay open. |
+| `finch enroll <app_path> --ticket -` | One time, on a box with no CLI login: trade a one-shot join ticket (stdin, or `FINCH_TICKET`) for a saved credential. A logged-in box uses `finch add`. |
 | `finch status` | Am I logged in (which tenant)? What does `finch.yml` serve? |
 | `finch fleet` (alias `ls`) | List this account's services + state. |
 | `finch test <service>` | List a service's MCP tools (does-it-work check). |
@@ -109,8 +110,8 @@ ingress:
 `finch run` looks for the manifest in the working directory, then
 `~/.finch/finch.yml`, then `~/.config/finch/finch.yml` (or pass `--config`).
 Enrollment is a separate one-time step that keeps secrets out of the manifest:
-`finch add` trades a one-shot ticket for a refresh credential under
-`credentials-dir/`. On later runs the agent resumes from that credential. If a
+`finch add` (or `finch enroll --ticket` on a box with no CLI login) trades a
+one-shot ticket for a refresh credential under `credentials-dir/`. On later runs the agent resumes from that credential. If a
 rule has no credential yet, or the hub rejects it (the service was removed or
 revoked), that rule waits — without calling the hub — until `finch add` writes
 a new one; its siblings keep serving.
