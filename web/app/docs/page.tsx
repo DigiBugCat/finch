@@ -138,7 +138,7 @@ finch call hello greet --args '{"name": "world"}'
         </Link>
         <Link className="docs-card" href="/docs/privacy">
           <h3>Privacy &amp; data handling</h3>
-          <p>Transport encryption, the relay non-retention guarantee, retained metadata, and Test Chat.</p>
+          <p>Transport encryption, the relay non-retention guarantee, and retained metadata.</p>
         </Link>
       </div>
     </>

@@ -2,30 +2,19 @@ import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const authMock = vi.fn();
 const getUserMock = vi.fn();
-const cookieGetMock = vi.fn();
-const cookieDeleteMock = vi.fn();
 const fetchMock = vi.fn();
 
 vi.mock("@clerk/nextjs/server", () => ({
   auth: () => authMock(),
   clerkClient: async () => ({ users: { getUser: getUserMock } }),
 }));
-vi.mock("next/headers", () => ({
-  cookies: async () => ({
-    get: cookieGetMock,
-    delete: cookieDeleteMock,
-    set: vi.fn(),
-  }),
-}));
 
 import { verifyAssertion } from "@worker-auth";
 import {
-  getHubUrl,
   hubFetchAs,
   HttpError,
   requireAdmin,
   resolveTenant,
-  userFetch,
 } from "@/lib/hub";
 
 const originalHubUrl = process.env.HUB_URL;
@@ -39,7 +28,10 @@ afterAll(() => {
   vi.unstubAllGlobals();
 });
 
-function memberResponse(overrides: Record<string, unknown> = {}) {
+function memberResponse(
+  overrides: Record<string, unknown> = {},
+  tenantMeta: unknown = undefined,
+) {
   return new Response(
     JSON.stringify({
       member: {
@@ -49,18 +41,24 @@ function memberResponse(overrides: Record<string, unknown> = {}) {
         state: "active",
         ...overrides,
       },
+      ...(tenantMeta === undefined ? {} : { tenantMeta }),
     }),
     { headers: { "content-type": "application/json" } },
   );
 }
 
-describe("native tenant authorization", () => {
+async function signedTenant(call: number): Promise<string | null> {
+  const [, init] = fetchMock.mock.calls[call] as [URL, RequestInit];
+  const token = new Headers(init.headers).get("x-finch-auth")!;
+  return verifyAssertion(token, "service-secret");
+}
+
+describe("single-user tenant resolution", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     process.env.HUB_URL = "https://hub.example.test";
     process.env.FINCH_SERVICE_SECRET = "service-secret";
     authMock.mockResolvedValue({ userId: "user_1" });
-    cookieGetMock.mockReturnValue(undefined);
     fetchMock.mockImplementation(async () => memberResponse());
     vi.stubGlobal("fetch", fetchMock);
   });
@@ -70,6 +68,17 @@ describe("native tenant authorization", () => {
 
     await expect(resolveTenant()).rejects.toMatchObject({ status: 401 });
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("asks the hub as the user's personal tenant and keeps the unchanged request shape", async () => {
+    await resolveTenant();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("https://hub.example.test/api/member-context");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(String(init.body))).toEqual({ clerkUserId: "user_1" });
+    expect(await signedTenant(0)).toBe("user_1");
   });
 
   it("resolves a valid active member without granting ordinary members admin access", async () => {
@@ -84,6 +93,94 @@ describe("native tenant authorization", () => {
       isAdmin: false,
     });
     await expect(requireAdmin()).rejects.toMatchObject({ status: 403 });
+  });
+
+  it("resolves the personal tenant the hub names for its owner", async () => {
+    fetchMock.mockImplementation(async () =>
+      memberResponse({ role: "owner" }, { id: "user_1", kind: "personal" }),
+    );
+
+    await expect(requireAdmin()).resolves.toMatchObject({
+      tenant: "user_1",
+      role: "owner",
+      isAdmin: true,
+    });
+  });
+
+  it("follows the hub to another tenant the user owns", async () => {
+    fetchMock.mockImplementation(async () =>
+      memberResponse({ role: "owner" }, { id: "org_legacy", kind: "team" }),
+    );
+
+    await expect(requireAdmin()).resolves.toMatchObject({
+      tenant: "org_legacy",
+      userId: "user_1",
+      role: "owner",
+    });
+  });
+
+  it("refuses another tenant when the hub does not report the user as its owner", async () => {
+    for (const role of ["admin", "member"]) {
+      fetchMock.mockImplementation(async () =>
+        memberResponse({ role }, { id: "ft_someone_else" }),
+      );
+      await expect(resolveTenant()).rejects.toMatchObject({ status: 403 });
+    }
+  });
+
+  it("fails closed on a malformed tenant id from the hub", async () => {
+    for (const tenantMeta of [{ id: "../../attacker" }, { id: 42 }, "user_1", []]) {
+      fetchMock.mockImplementation(async () => memberResponse({ role: "owner" }, tenantMeta));
+      await expect(resolveTenant()).rejects.toMatchObject({ status: 502 });
+    }
+  });
+
+  it("bootstraps a new personal tenant with the verified primary email", async () => {
+    fetchMock
+      .mockResolvedValueOnce(Response.json({ member: null, tenantMeta: null, needsBootstrap: true }))
+      .mockResolvedValueOnce(
+        memberResponse({ role: "owner", email: "owner@example.com" }, { id: "user_1" }),
+      );
+    getUserMock.mockResolvedValue({
+      primaryEmailAddressId: "em_2",
+      emailAddresses: [
+        { id: "em_1", emailAddress: "unverified@example.com", verification: { status: "unverified" } },
+        { id: "em_2", emailAddress: "owner@example.com", verification: { status: "verified" } },
+      ],
+    });
+
+    await expect(resolveTenant()).resolves.toMatchObject({ tenant: "user_1", role: "owner" });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const [, init] = fetchMock.mock.calls[1] as [string, RequestInit];
+    expect(JSON.parse(String(init.body))).toEqual({
+      clerkUserId: "user_1",
+      email: "owner@example.com",
+    });
+    expect(await signedTenant(1)).toBe("user_1");
+  });
+
+  it("refuses to bootstrap without a verified email", async () => {
+    fetchMock.mockResolvedValueOnce(
+      Response.json({ member: null, tenantMeta: null, needsBootstrap: true }),
+    );
+    getUserMock.mockResolvedValue({
+      primaryEmailAddressId: "em_1",
+      emailAddresses: [
+        { id: "em_1", emailAddress: "x@example.com", verification: { status: "unverified" } },
+      ],
+    });
+
+    await expect(resolveTenant()).rejects.toMatchObject({ status: 403 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("refuses a membership that is not active", async () => {
+    for (const state of ["invited", "disabled"]) {
+      fetchMock.mockImplementation(async () => memberResponse({ role: "owner", state }));
+      await expect(resolveTenant()).rejects.toMatchObject({ status: 403 });
+    }
+    fetchMock.mockResolvedValue(Response.json({ member: null, tenantMeta: { id: "user_1" } }));
+    await expect(resolveTenant()).rejects.toMatchObject({ status: 403 });
   });
 
   it("fails closed when an active hub member carries an unknown role", async () => {
@@ -113,22 +210,11 @@ describe("native tenant authorization", () => {
     });
   });
 
-  it("clears a selected tenant cookie when membership is no longer active", async () => {
-    cookieGetMock.mockReturnValue({ value: "org_selected" });
-    fetchMock.mockResolvedValue(memberResponse({ state: "disabled" }));
+  it("passes a hub rejection status through", async () => {
+    fetchMock.mockResolvedValue(Response.json({ error: "nope" }, { status: 401 }));
 
-    await expect(resolveTenant()).rejects.toMatchObject({ status: 403 });
-    expect(cookieDeleteMock).toHaveBeenCalledWith("finch_active_tenant");
-  });
-
-  it("ignores a malformed selected-tenant cookie and signs the personal tenant", async () => {
-    cookieGetMock.mockReturnValue({ value: "../../attacker" });
-
-    await resolveTenant();
-
-    const [, init] = fetchMock.mock.calls[0] as [URL, RequestInit];
-    const token = new Headers(init.headers).get("x-finch-auth")!;
-    expect(await verifyAssertion(token, "service-secret")).toBe("user_1");
+    await expect(resolveTenant()).rejects.toBeInstanceOf(HttpError);
+    await expect(resolveTenant()).rejects.toMatchObject({ status: 401 });
   });
 });
 
@@ -173,21 +259,6 @@ describe("outbound hub authentication boundary", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("mints user-scoped assertions that cannot authorize tenant-scoped calls", async () => {
-    await userFetch("user_1", "/api/user/sync");
-
-    const [, init] = fetchMock.mock.calls[0] as [URL, RequestInit];
-    const token = new Headers(init.headers).get("x-finch-auth")!;
-    const verifyWithKind = verifyAssertion as unknown as (
-      token: string,
-      secret: string,
-      expectedKind: string,
-    ) => Promise<string | null>;
-    expect(await verifyAssertion(token, "service-secret")).toBeNull();
-    expect(await verifyWithKind(token, "service-secret", "user")).toBe("user_1");
-    expect(init.redirect).toBe("manual");
-  });
-
   it("rejects non-origin and cleartext remote hub configuration", async () => {
     for (const hubUrl of [
       "http://hub.example.test",
@@ -198,7 +269,7 @@ describe("outbound hub authentication boundary", () => {
       "not a url",
     ]) {
       process.env.HUB_URL = hubUrl;
-      await expect(getHubUrl()).rejects.toBeInstanceOf(HttpError);
+      await expect(hubFetchAs("user_1", "/api/state")).rejects.toBeInstanceOf(HttpError);
     }
     expect(fetchMock).not.toHaveBeenCalled();
   });
@@ -206,7 +277,6 @@ describe("outbound hub authentication boundary", () => {
   it("allows only local cleartext development origins and canonicalizes them", async () => {
     process.env.HUB_URL = "http://127.0.0.1:8787/";
 
-    await expect(getHubUrl()).resolves.toBe("http://127.0.0.1:8787");
     await hubFetchAs("user_1", "/api/state");
     expect(String(fetchMock.mock.calls[0][0])).toBe("http://127.0.0.1:8787/api/state");
   });

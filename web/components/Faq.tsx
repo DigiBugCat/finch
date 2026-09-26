@@ -24,7 +24,7 @@ export default function Faq() {
     },
     {
       q: "Can Finch read or store my requests?",
-      a: "Finch is not end-to-end encrypted: its Cloudflare-hosted relay handles request and response plaintext in memory while forwarding it. Ordinary MCP request and response bodies aren't logged or stored. Finch retains operational metadata such as the timestamp, route, caller, status, and latency. Dashboard Test Chat is separate and sends chat and tool data to Cloudflare Workers AI.",
+      a: "Finch is not end-to-end encrypted: its Cloudflare-hosted relay handles request and response plaintext in memory while forwarding it. Ordinary MCP request and response bodies aren't logged or stored. Finch retains operational metadata such as the timestamp, route, caller, status, and latency.",
     },
     {
       q: "What can I actually expose through it?",

@@ -23,9 +23,8 @@ export default function CliApprove() {
   const [origin, setOrigin] = useState<Origin>(null);   // initiator context for the typed code
   const seq = useRef(0);
 
-  // The account the minted token will act as. Orgs are disabled during beta,
-  // so this is always the personal account.
-  const account = `${user?.primaryEmailAddress?.emailAddress || user?.username || 'your account'} (personal)`;
+  // The account the minted token will act as: the signed-in user's own.
+  const account = user?.primaryEmailAddress?.emailAddress || user?.username || 'your account';
 
   // When a full code is typed, look up WHERE it was started so the user can tell
   // it's their own box (not an attacker-initiated code they were sent).
@@ -109,7 +108,7 @@ export default function CliApprove() {
             <div className="cli-warn">
               ⚠️ Only approve a code <b>you</b> just started with <code className="mono">finch login</code> on a box you control.
               If someone sent you this code, do not approve it — it would give <i>their</i> terminal access to your account.
-              You can revoke all CLI tokens anytime in Settings → CLI access.
+              You can revoke every CLI token anytime with <code className="mono">finch revoke-tokens</code>.
             </div>
           </>
         )}

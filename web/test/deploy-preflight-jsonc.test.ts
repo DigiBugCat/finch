@@ -46,10 +46,9 @@ describe("deploy preflight JSONC parser", () => {
   });
 });
 
-// REGRESSION: the app shipped no frame protection at all — only HSTS. /cli and
-// /aviary/authorize are one-click consent screens seeded from ?code=, and
-// approving /cli mints a ~30-day TENANT-ADMIN token bound to the approver's
-// workspace. SameSite offered no protection because every tenant gets
+// REGRESSION: the app shipped no frame protection at all — only HSTS. /cli is
+// a one-click consent screen seeded from ?code=, and approving it mints a
+// ~30-day TENANT-ADMIN token bound to the approver's account. SameSite offered no protection because every tenant gets
 // <slug>.finchmcp.com and can serve arbitrary HTML there, so an attacker's
 // frame is SAME-SITE; the resulting POST is same-origin, so middleware's
 // Sec-Fetch-Site guard passes by design. Unauthenticated attacker + one victim

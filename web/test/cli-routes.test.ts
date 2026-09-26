@@ -12,8 +12,6 @@ setupTestEnv({ HUB_URL: "https://hub.example.com", FINCH_SERVICE_SECRET: "test-s
 
 import { POST as approve } from "@/app/api/finch/cli-approve/route";
 import { POST as describeCode } from "@/app/api/finch/cli-describe/route";
-import { POST as revoke } from "@/app/api/finch/cli-revoke/route";
-import { POST as mint } from "@/app/api/finch/cli-token/route";
 
 const userId = "user_cli_owner";
 
@@ -45,13 +43,6 @@ function memberContext(role: "owner" | "admin" | "member" = "owner"): Response {
   });
 }
 
-const FUTURE_EXPIRY = Math.floor(Date.now() / 1000) + 24 * 60 * 60;
-const validToken = {
-  token: "eyJ0ZW5hbnQiOiJ1c2VyX2NsaV9vd25lciJ9.signature_-",
-  hub: "https://hub.example.com",
-  expiresAt: FUTURE_EXPIRY,
-};
-
 beforeEach(() => {
   authMock.mockReset();
   getUserMock.mockReset();
@@ -69,8 +60,6 @@ describe("CLI route authorization boundary", () => {
   it.each([
     ["approve", () => approve(request("/api/finch/cli-approve", { userCode: "ABCD-EFGH" }))],
     ["describe", () => describeCode(request("/api/finch/cli-describe", { userCode: "ABCD-EFGH" }))],
-    ["revoke", () => revoke()],
-    ["mint", () => mint()],
   ])("rejects an unauthenticated %s request before any hub action", async (_name, call) => {
     authMock.mockResolvedValue({ userId: null });
     const fetchSpy = vi.spyOn(globalThis, "fetch");
@@ -84,8 +73,6 @@ describe("CLI route authorization boundary", () => {
   it.each([
     ["approve", () => approve(request("/api/finch/cli-approve", { userCode: "ABCD-EFGH" }))],
     ["describe", () => describeCode(request("/api/finch/cli-describe", { userCode: "ABCD-EFGH" }))],
-    ["revoke", () => revoke()],
-    ["mint", () => mint()],
   ])("rejects a non-admin %s request before its privileged action", async (_name, call) => {
     const fetchSpy = vi
       .spyOn(globalThis, "fetch")
@@ -349,103 +336,6 @@ describe("POST /api/finch/cli-approve", () => {
     expect(malformed.status).toBe(502);
     expect(rejected.status).toBe(409);
     expect(await rejected.json()).toEqual({ error: "code expired" });
-    expect(fetchSpy).toHaveBeenCalledTimes(4);
-  });
-});
-
-describe("POST /api/finch/cli-revoke", () => {
-  it("forwards one authorized epoch bump and validates its result", async () => {
-    const fetchSpy = vi
-      .spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(memberContext())
-      .mockResolvedValueOnce(Response.json({ ok: true, epoch: 3 }));
-
-    const response = await revoke();
-
-    expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ ok: true, epoch: 3 });
-    expect(fetchSpy).toHaveBeenCalledTimes(2);
-    const [url, init] = fetchSpy.mock.calls[1] as [string, RequestInit];
-    expect(url).toBe("https://hub.example.com/api/cli-revoke");
-    expect(init.method).toBe("POST");
-    expect(init.body).toBe("{}");
-  });
-
-  it.each([
-    ["non-JSON", new Response("bad gateway")],
-    ["false ok", Response.json({ ok: false, epoch: 1 })],
-    ["fractional epoch", Response.json({ ok: true, epoch: 1.5 })],
-  ])("returns 502 for %s success data", async (_name, actionResponse) => {
-    vi.spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(memberContext())
-      .mockResolvedValueOnce(actionResponse);
-
-    const response = await revoke();
-
-    expect(response.status).toBe(502);
-    expect(await response.json()).toEqual({ error: "invalid response from hub" });
-  });
-
-  it("maps a network failure to 502 without exposing its details", async () => {
-    vi.spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(memberContext())
-      .mockRejectedValueOnce(new Error("secret upstream detail"));
-
-    const response = await revoke();
-
-    expect(response.status).toBe(502);
-    expect(await response.json()).toEqual({ error: "hub unavailable" });
-  });
-});
-
-describe("POST /api/finch/cli-token", () => {
-  it("returns a validated token contract", async () => {
-    const fetchSpy = vi
-      .spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(memberContext())
-      .mockResolvedValueOnce(Response.json(validToken));
-
-    const response = await mint();
-
-    expect(response.status).toBe(200);
-    expect(await response.json()).toEqual(validToken);
-    expect(fetchSpy).toHaveBeenCalledTimes(2);
-  });
-
-  it.each([
-    ["non-JSON", new Response("bad gateway")],
-    ["a primitive", Response.json("token")],
-    ["a shell-shaped token", Response.json({ ...validToken, token: "good.bad; rm" })],
-    ["an expired token", Response.json({ ...validToken, expiresAt: 1 })],
-    ["a cleartext remote hub", Response.json({ ...validToken, hub: "http://evil.example.com" })],
-    ["a hub URL with a path", Response.json({ ...validToken, hub: "https://hub.example.com/evil" })],
-    ["a fractional expiry", Response.json({ ...validToken, expiresAt: 2.5 })],
-  ])("returns 502 for %s success data", async (_name, actionResponse) => {
-    vi.spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(memberContext())
-      .mockResolvedValueOnce(actionResponse);
-
-    const response = await mint();
-
-    expect(response.status).toBe(502);
-    expect(await response.json()).toEqual({ error: "invalid response from hub" });
-  });
-
-  it("preserves an authenticated upstream status and maps transport failure to 502", async () => {
-    const fetchSpy = vi
-      .spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(memberContext())
-      .mockResolvedValueOnce(Response.json({ error: "overloaded" }, { status: 503 }))
-      .mockResolvedValueOnce(memberContext())
-      .mockRejectedValueOnce(new TypeError("connection reset"));
-
-    const rejected = await mint();
-    const unavailable = await mint();
-
-    expect(rejected.status).toBe(503);
-    expect(await rejected.json()).toEqual({ error: "could not mint CLI token" });
-    expect(unavailable.status).toBe(502);
-    expect(await unavailable.json()).toEqual({ error: "invalid response from hub" });
     expect(fetchSpy).toHaveBeenCalledTimes(4);
   });
 });

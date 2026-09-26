@@ -2,8 +2,8 @@ import {ClerkProvider} from "@clerk/nextjs";
 import type { Metadata } from "next";
 import "./globals.css";
 
-// Clerk components themed to the Finch palette (globals.css / dashboard.css
-// tokens — warm dark bg, amber accent, Nunito). Values are duplicated here
+// Clerk components themed to the Finch palette (globals.css tokens — warm
+// dark bg, amber accent, Nunito). Values are duplicated here
 // because Clerk renders some surfaces (modals, portals) outside our CSS scope.
 const clerkAppearance = {
   variables: {
@@ -51,10 +51,9 @@ export const metadata: Metadata = {
  * Returning undefined elsewhere keeps Clerk's default, which includes the
  * current origin and so keeps local dev and the workers.dev previews working.
  *
- * Safe to narrow: middleware only ever sets redirect_url to request.url (always
- * this origin), and the portal login-wall hop to a tenant host does not use
- * Clerk's redirect machinery — app/portal/start/route.ts issues its own
- * Response.redirect after auth().
+ * Safe to narrow: nothing in this app sends a signed-in user to another origin
+ * — sign-in only ever returns to pages on this one (the /cli approval page, the
+ * docs).
  */
 function allowedRedirectOrigins(): string[] | undefined {
   const key = process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY ?? "";
