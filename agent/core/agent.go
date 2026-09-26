@@ -402,13 +402,35 @@ func Main() {
 	defer release()
 
 	// The ticket rides along so a same-hub-but-revoked credential can still
-	// recover from a fresh ticket.
+	// recover from a fresh ticket. A revoked credential is otherwise recovered
+	// with `finch add`, which writes finch.yml — superviseRelay then hands back
+	// errManifestChanged and this process switches to serving the manifest.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	superviseRelay(ctx, relayOptions{
+	err = superviseRelay(ctx, relayOptions{
 		Hub: *hub, Box: *box, Upstream: *upstream, CredentialPath: *statePath,
-		Ticket: *ticket, ForwardAll: *forwardAll,
+		Ticket: *ticket, ForwardAll: *forwardAll, WatchManifest: true,
 	})
+	if errors.Is(err, errManifestChanged) {
+		if err := serveFoundManifest(ctx, hostName); err != nil {
+			log.Fatalf("finch: %v", err)
+		}
+	}
+}
+
+// serveFoundManifest serves the finch.yml findManifest discovers — the handoff
+// from a single-service relay whose credential was replaced via `finch add`.
+func serveFoundManifest(ctx context.Context, hostName string) error {
+	path := findManifest()
+	if path == "" {
+		return fmt.Errorf("finch.yml disappeared before it could be served")
+	}
+	cfg, err := loadConfig(path, hostName)
+	if err != nil {
+		return err
+	}
+	log.Printf("finch: %s was written — switching this box to serve it", path)
+	return serveConfig(ctx, cfg)
 }
 
 func validateRelayCommandArg(arg string) error {

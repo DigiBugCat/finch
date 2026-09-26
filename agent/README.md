@@ -168,6 +168,10 @@ It resumes from `--state` (default `~/.finch/agent.json`). `--ticket` (or
 lines keep working after an update; a ticket only matters on first join. New
 boxes should use `finch add` + `finch run`.
 
+If the hub revokes a single-service credential, recover with `finch login` and
+`finch add <app_path> --service <url>`. The running process notices the new
+`finch.yml` and switches to serving it, with no restart.
+
 ## Flags (run / join)
 
 | Flag | Default | What |

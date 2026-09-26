@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -190,11 +191,12 @@ func TestWaitForNewCredential_WakesOnReplacementOnly(t *testing.T) {
 	if err := saveState(path, &agentState{Hub: hub, RefreshToken: "old"}); err != nil {
 		t.Fatal(err)
 	}
-	previous := savedCredentialFingerprint(path)
+	saved, _ := loadState(path)
+	previous := credentialFingerprint(saved)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	woke := make(chan error, 1)
-	go func() { woke <- waitForNewCredential(ctx, path, hub, previous) }()
+	go func() { woke <- waitForNewCredential(ctx, path, hub, previous, nil) }()
 	select {
 	case err := <-woke:
 		t.Fatalf("woke without a replacement credential: %v", err)
@@ -280,5 +282,145 @@ func TestServeConfig_RefusesWhileAnotherRunHoldsTheLock(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "already serves") {
 		t.Fatalf("second run=%v, want lock refusal", err)
+	}
+}
+
+// `finch add` can replace a credential while the relay is still using the old
+// one. The rejection of the OLD token must not make the supervisor treat the
+// NEW token (already on disk by then) as the rejected baseline and wait for yet
+// another replacement: it retries the new one straight away.
+func TestSuperviseRelay_RetriesCredentialReplacedDuringRun(t *testing.T) {
+	credentialPath := filepath.Join(t.TempDir(), "credentials", "media.json")
+	var mu sync.Mutex
+	seen := map[string]int{}
+	var hub *httptest.Server
+	hub = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct{ RefreshToken string }
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		seen[body.RefreshToken]++
+		mu.Unlock()
+		if body.RefreshToken == "old" {
+			// The operator's `finch add` lands while this request is in flight.
+			if err := saveState(credentialPath, &agentState{Hub: hub.URL, RefreshToken: "new"}); err != nil {
+				t.Error(err)
+			}
+		}
+		http.Error(w, "revoked", http.StatusForbidden)
+	}))
+	defer hub.Close()
+	if err := saveState(credentialPath, &agentState{Hub: hub.URL, RefreshToken: "old"}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- superviseRelay(ctx, relayOptions{
+			Hub: hub.URL, AppPath: "media", Upstream: "http://127.0.0.1:7342", CredentialPath: credentialPath,
+		})
+	}()
+	time.Sleep(500 * time.Millisecond)
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("superviseRelay: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if seen["old"] != 1 || seen["new"] != 1 {
+		t.Fatalf("refreshes old=%d new=%d, want exactly one each", seen["old"], seen["new"])
+	}
+}
+
+// A re-enrolled service joins as pending when the tenant requires approval, so
+// a logged-in `finch run` approves it again once its relay picks up the new
+// credential — not only once at startup.
+func TestServeConfig_AutoApprovesAfterReEnroll(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	var approvals atomic.Int32
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/cli/approve" {
+			var body struct{ ID string }
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			if body.ID == "media" && r.Header.Get("Authorization") == "Bearer cli-token" {
+				approvals.Add(1)
+			}
+			_, _ = w.Write([]byte(`{"ok":true}`))
+			return
+		}
+		http.Error(w, "revoked", http.StatusForbidden)
+	}))
+	defer hub.Close()
+	if err := saveCliCred(&cliCred{Hub: hub.URL, Token: "cli-token"}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config{
+		Hub: hub.URL, Box: "box1", CredentialsDir: t.TempDir(),
+		Ingress: []ingress{{AppPath: "media", Service: "http://127.0.0.1:7342"}},
+	}
+	if err := saveState(cfg.statePathFor("media"), &agentState{Hub: hub.URL, RefreshToken: "revoked"}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- serveConfig(ctx, cfg) }()
+
+	waitFor := func(want int32) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for approvals.Load() < want {
+			if time.Now().After(deadline) {
+				t.Fatalf("approvals=%d, want %d", approvals.Load(), want)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	waitFor(1) // startup
+	// `finch add media` re-enrolls while the relay waits on the revoked credential.
+	if err := saveState(cfg.statePathFor("media"), &agentState{Hub: hub.URL, RefreshToken: "re-enrolled"}); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(2)
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("serveConfig: %v", err)
+	}
+}
+
+// A revoked single-service (`finch join`) relay recovers through `finch add`,
+// which writes finch.yml and a credential under the manifest's credentials dir —
+// never the relay's --state file. The supervisor hands off once finch.yml
+// changes instead of polling --state forever.
+func TestSuperviseRelay_SingleServiceHandsOffWhenManifestWritten(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Chdir(t.TempDir())
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "revoked", http.StatusForbidden)
+	}))
+	defer hub.Close()
+	statePath := filepath.Join(home, ".finch", "agent.json")
+	if err := saveState(statePath, &agentState{Hub: hub.URL, RefreshToken: "revoked"}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- superviseRelay(ctx, relayOptions{
+			Hub: hub.URL, Upstream: "http://127.0.0.1:7342", CredentialPath: statePath, WatchManifest: true,
+		})
+	}()
+	select {
+	case err := <-done:
+		t.Fatalf("returned before finch.yml was written: %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	manifest := "hub: " + hub.URL + "\ningress:\n  - app_path: media\n    service: http://127.0.0.1:7342\n"
+	if err := os.WriteFile(filepath.Join(home, ".finch", "finch.yml"), []byte(manifest), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; !errors.Is(err, errManifestChanged) {
+		t.Fatalf("superviseRelay=%v, want errManifestChanged", err)
 	}
 }

@@ -7,6 +7,8 @@ package core
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -29,6 +31,8 @@ type relayOptions struct {
 	CredentialPath string // file the refresh credential is read from / written to
 	Ticket         string // single-service `finch join --ticket` re-enroll fallback; "" in config mode
 	ForwardAll     bool   // forward the whole host (default: confine to /mcp)
+	AutoApprove    bool   // config mode: self-approve AppPath again whenever a new credential is picked up
+	WatchManifest  bool   // single-service mode: hand off to finch.yml once `finch add` writes it
 }
 
 func (o relayOptions) hub() string {
@@ -70,6 +74,26 @@ func (o relayOptions) validate() (*url.URL, error) {
 // credential for this hub and no ticket to enroll with.
 var errNotEnrolled = errors.New("not enrolled on this box")
 
+// errManifestChanged is superviseRelay's result in single-service mode when
+// finch.yml was written while the relay waited for a new credential: the
+// recovery for a revoked `finch join` credential is `finch add`, which enrolls
+// into finch.yml, so the caller switches this process over to serving it.
+var errManifestChanged = errors.New("finch.yml changed")
+
+// credentialError is runRelay's terminal "this credential cannot serve" result
+// (errNotEnrolled or a hub auth rejection). It records the fingerprint of the
+// credential runRelay actually tried ("" when none was usable), so the
+// supervisor waits for a credential different from THAT one — not whatever is
+// on disk by the time the rejection surfaces, which `finch add` may already
+// have replaced with a good one.
+type credentialError struct {
+	attempted string
+	err       error
+}
+
+func (e *credentialError) Error() string { return e.err.Error() }
+func (e *credentialError) Unwrap() error { return e.err }
+
 // runConfig serves every ingress rule from a finch.yml — one relay per service,
 // concurrently, over a single process (the cloudflared model) — until SIGINT or
 // SIGTERM, which closes each relay cleanly.
@@ -93,18 +117,19 @@ func serveConfig(ctx context.Context, cfg *config) error {
 		return fmt.Errorf("another finch run already serves %s — refusing to start a second relay", cfg.CredentialsDir)
 	}
 	defer release()
-	autoApproveAsync(cfg)
 
 	var wg sync.WaitGroup
 	for _, ing := range cfg.Ingress {
 		o := relayOptions{
 			Hub: cfg.Hub, Box: cfg.Box, AppPath: ing.AppPath, Upstream: ing.Service,
 			CredentialPath: cfg.statePathFor(ing.AppPath), ForwardAll: ing.ForwardAll,
+			AutoApprove: true,
 		}
+		autoApproveAsync(o.hub(), o.AppPath)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			superviseRelay(ctx, o)
+			_ = superviseRelay(ctx, o)
 		}()
 	}
 	log.Printf("finch: serving %d ingress rule(s) from finch.yml as box %q", len(cfg.Ingress), cfg.Box)
@@ -112,58 +137,69 @@ func serveConfig(ctx context.Context, cfg *config) error {
 	return nil
 }
 
-// autoApproveAsync self-approves the services a logged-in box serves (best
-// effort, idempotent): the CLI-token holder is the tenant admin, so a service
-// that registered as pending goes live without a separate `finch approve`. Each
-// call is independent so one slow hub request never blocks a sibling or a relay.
-func autoApproveAsync(cfg *config) {
+// autoApproveAsync self-approves a service a logged-in box serves (best effort,
+// idempotent): the CLI-token holder is the tenant admin, so a service that
+// registered as pending goes live without a separate `finch approve`. It runs
+// at startup and again whenever a relay picks up a re-enrolled credential (the
+// re-join lands pending too). The CLI login is read per call, so a login made
+// after `finch run` started still counts, and the request runs in the
+// background so one slow hub call never blocks a sibling or a relay.
+func autoApproveAsync(hub, appPath string) {
 	cred := loadCliCredQuiet()
-	if cred == nil || strings.TrimRight(cred.Hub, "/") != cfg.hubBase() {
+	if cred == nil || strings.TrimRight(cred.Hub, "/") != hub {
 		return
 	}
-	for _, ing := range cfg.Ingress {
-		appPath := ing.AppPath
-		go func() {
-			if err := cliApprove(cred, appPath); err != nil {
-				log.Printf("finch[%s]: auto-approve skipped (%v) — run `finch approve %s` if it stays pending", appPath, err, appPath)
-			}
-		}()
-	}
+	go func() {
+		if err := cliApprove(cred, appPath); err != nil {
+			log.Printf("finch[%s]: auto-approve skipped (%v) — run `finch approve %s` if it stays pending", appPath, err, appPath)
+		}
+	}()
 }
 
-// hubBase normalizes the config's hub the way relayOptions.hub() does, so the
-// CLI-token hub comparison matches how relays actually dial out.
-func (c *config) hubBase() string {
-	if c.Hub == "" {
-		return "https://finchmcp.com"
-	}
-	return strings.TrimRight(c.Hub, "/")
-}
-
-// superviseRelay keeps one service's relay alive until ctx is cancelled.
-// runRelay reconnects on its own and hands control back only on a terminal
-// problem (or a panic, recovered here). A missing or hub-rejected credential is
-// stable operator work — re-enroll with `finch add` — so we wait for the
-// credential file to change rather than hammer the hub; anything else retries
-// with a capped backoff. One wedged service never takes its siblings down.
-func superviseRelay(ctx context.Context, o relayOptions) {
+// superviseRelay keeps one service's relay alive until ctx is cancelled
+// (returning nil). runRelay reconnects on its own and hands control back only
+// on a terminal problem (or a panic, recovered here). A missing or hub-rejected
+// credential is stable operator work — re-enroll with `finch add` — so we wait
+// for a replacement credential rather than hammer the hub; anything else
+// retries with a capped backoff. One wedged service never takes its siblings
+// down.
+//
+// With o.WatchManifest (single-service `finch join` mode) that wait also ends
+// when finch.yml changes, returning errManifestChanged: `finch add` writes its
+// credential under the manifest's credentials dir, never to this relay's
+// --state file, so the caller must switch to serving the manifest.
+func superviseRelay(ctx context.Context, o relayOptions) error {
 	lp := o.logPrefix()
 	backoff := 5 * time.Second
+	var manifestChanged func() bool
+	if o.WatchManifest {
+		baseline := manifestFingerprint()
+		manifestChanged = func() bool { return manifestFingerprint() != baseline }
+	}
 	for {
 		started := time.Now()
 		err := callRelay(ctx, o)
 		if ctx.Err() != nil {
-			return
+			return nil
 		}
-		if errors.Is(err, errNotEnrolled) || isHubAuthRejection(err) {
-			hint := o.AppPath
-			if hint == "" {
-				hint = "<app_path>"
+		var cerr *credentialError
+		if errors.As(err, &cerr) {
+			if o.WatchManifest {
+				log.Printf("%s: %v — run `finch login`, then `finch add <app_path> --service %s`; this process switches to serving finch.yml once it is written",
+					lp, err, o.Upstream)
+			} else {
+				log.Printf("%s: %v — run `finch add %s --service %s` to enroll; waiting for a new credential at %s",
+					lp, err, o.AppPath, o.Upstream, o.CredentialPath)
 			}
-			log.Printf("%s: %v — run `finch add %s --service %s` to enroll; waiting for a new credential at %s",
-				lp, err, hint, o.Upstream, o.CredentialPath)
-			if waitForNewCredential(ctx, o.CredentialPath, o.hub(), savedCredentialFingerprint(o.CredentialPath)) != nil {
-				return
+			if werr := waitForNewCredential(ctx, o.CredentialPath, o.hub(), cerr.attempted, manifestChanged); werr != nil {
+				if errors.Is(werr, errManifestChanged) {
+					return werr
+				}
+				return nil
+			}
+			if o.AutoApprove && o.AppPath != "" {
+				// The re-enrollment registered as pending; approve it like startup does.
+				autoApproveAsync(o.hub(), o.AppPath)
 			}
 			backoff = 5 * time.Second
 			continue
@@ -177,7 +213,7 @@ func superviseRelay(ctx context.Context, o relayOptions) {
 		log.Printf("%s: %v — restarting in %s", lp, err, backoff)
 		select {
 		case <-ctx.Done():
-			return
+			return nil
 		case <-time.After(backoff):
 		}
 		if backoff < time.Minute {
@@ -197,23 +233,27 @@ func callRelay(ctx context.Context, o relayOptions) (err error) {
 	return runRelay(ctx, o)
 }
 
-// savedCredentialFingerprint identifies the credential currently on disk ("" if
-// none), so waitForNewCredential can tell a replacement from the rejected one.
-func savedCredentialFingerprint(path string) string {
-	saved, err := loadState(path)
-	if err != nil || saved == nil {
+// credentialFingerprint identifies one saved credential ("" for none), so
+// waitForNewCredential can tell a replacement from the rejected one.
+func credentialFingerprint(st *agentState) string {
+	if st == nil {
 		return ""
 	}
-	return saved.Hub + "\x00" + saved.RefreshToken
+	return st.Hub + "\x00" + st.RefreshToken
 }
 
 // waitForNewCredential polls (locally — no hub traffic) until a usable
-// credential for hub, different from previous, is saved at path.
-func waitForNewCredential(ctx context.Context, path, hub, previous string) error {
+// credential for hub, different from previous, is saved at path. A non-nil
+// manifestChanged is polled too; once it reports true the wait ends with
+// errManifestChanged.
+func waitForNewCredential(ctx context.Context, path, hub, previous string, manifestChanged func() bool) error {
 	for {
 		if saved, err := loadState(path); err == nil && saved != nil && saved.RefreshToken != "" &&
-			saved.Hub == hub && savedCredentialFingerprint(path) != previous {
+			saved.Hub == hub && credentialFingerprint(saved) != previous {
 			return nil
+		}
+		if manifestChanged != nil && manifestChanged() {
+			return errManifestChanged
 		}
 		select {
 		case <-ctx.Done():
@@ -223,15 +263,31 @@ func waitForNewCredential(ctx context.Context, path, hub, previous string) error
 	}
 }
 
+// manifestFingerprint identifies the finch.yml findManifest would serve right
+// now: its path plus a hash of its contents ("" when there is none). `finch add`
+// always rewrites the manifest, so any change means there is a rule to serve.
+func manifestFingerprint() string {
+	p := findManifest()
+	if p == "" {
+		return ""
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return p
+	}
+	sum := sha256.Sum256(b)
+	return p + "\x00" + hex.EncodeToString(sum[:])
+}
+
 // runRelay resumes the service from its saved credential and holds the relay
 // open, reconnecting with backoff, until ctx is cancelled. If no usable
 // credential exists and o.Ticket is set, it enrolls first (the single-service
 // `finch join --ticket` fallback, which also recovers a box whose credential was
 // revoked server-side).
 //
-// Returns nil on ctx cancellation; otherwise a terminal error: errNotEnrolled,
-// a hub auth rejection (401/403 — the credential was revoked), or a setup
-// failure the supervisor retries.
+// Returns nil on ctx cancellation; otherwise a terminal error: a
+// *credentialError (errNotEnrolled, or a hub auth rejection — 401/403, the
+// credential was revoked), or a setup failure the supervisor retries.
 func runRelay(ctx context.Context, o relayOptions) error {
 	up, err := o.validate()
 	if err != nil {
@@ -243,7 +299,10 @@ func runRelay(ctx context.Context, o relayOptions) error {
 	var jr *joinResp
 	var resumeErr error
 	refreshToken := ""
+	attempted := "" // fingerprint of the credential this run relies on
+	rejected := func(err error) error { return &credentialError{attempted: attempted, err: err} }
 	if saved, _ := loadState(o.CredentialPath); saved != nil && saved.RefreshToken != "" && saved.Hub == hub {
+		attempted = credentialFingerprint(saved)
 		if r, rerr := refreshContext(ctx, hub, saved.RefreshToken); rerr == nil {
 			jr, refreshToken = r, saved.RefreshToken
 			log.Printf("%s: resumed from saved credential (%s)", lp, o.CredentialPath)
@@ -256,21 +315,22 @@ func runRelay(ctx context.Context, o relayOptions) error {
 		st, ejr, eerr := enrollToState(hub, o.box(), o.Ticket, o.CredentialPath)
 		if eerr != nil {
 			if isHubAuthRejection(resumeErr) {
-				return fmt.Errorf("saved credential rejected: %w (re-enroll from ticket failed: %v)", resumeErr, eerr)
+				return rejected(fmt.Errorf("saved credential rejected: %w (re-enroll from ticket failed: %v)", resumeErr, eerr))
 			}
 			return fmt.Errorf("enroll failed: %w", eerr)
 		}
 		jr, refreshToken = ejr, st.RefreshToken
+		attempted = credentialFingerprint(st)
 		log.Printf("%s: enrolled from ticket — credential saved to %s", lp, o.CredentialPath)
 	}
 	if jr == nil {
 		if resumeErr != nil {
 			if isHubAuthRejection(resumeErr) {
-				return fmt.Errorf("saved credential rejected: %w", resumeErr)
+				return rejected(fmt.Errorf("saved credential rejected: %w", resumeErr))
 			}
 			return fmt.Errorf("resume service: %w", resumeErr)
 		}
-		return errNotEnrolled
+		return rejected(errNotEnrolled)
 	}
 
 	name := o.AppPath
@@ -311,7 +371,7 @@ func runRelay(ctx context.Context, o relayOptions) error {
 			fresh, rerr := refreshContext(ctx, hub, refreshToken)
 			if rerr != nil {
 				if isHubAuthRejection(rerr) {
-					return fmt.Errorf("saved credential rejected: %w", rerr)
+					return rejected(fmt.Errorf("saved credential rejected: %w", rerr))
 				}
 				log.Printf("%s: connect-token refresh failed: %v (retrying in %s)", lp, rerr, backoff)
 				if !sleep() {
