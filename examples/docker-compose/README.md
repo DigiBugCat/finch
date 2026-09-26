@@ -9,15 +9,14 @@ agent's state. No ports are published to the host — the agent dials out.
 ```bash
 cd examples/docker-compose
 
-# 1. log in. Dashboard → Settings → CLI access → Generate → Copy hands you a
-#    ready-to-run `finch login` heredoc; the token is its middle line, which is
-#    what $CLI_TOKEN below wants (the agent runs in a container, so the block's
-#    own `finch login` cannot be pasted as-is).
-#    `-T` keeps stdin attached so the tenant-admin token arrives off-argv.
-docker compose run --rm -T finch login --hub https://finchmcp.com --token - <<<"$CLI_TOKEN"
+# 1. log in — prints a link + code to approve on any device, once.
+docker compose run --rm finch login --hub https://finchmcp.com --headless
+#    Or pipe a token from a machine that is already logged in; `-T` keeps
+#    stdin attached so the tenant-admin token arrives off-argv:
+#    finch token | docker compose run --rm -T finch login --hub https://finchmcp.com --token -
 
 # 2. enroll the demo server — note the URL is the compose service name
-docker compose run --rm finch add hello --service http://hello-mcp:8000 --name "Hello MCP"
+docker compose run --rm finch add hello --service http://hello-mcp:8000
 
 # 3. serve
 docker compose up -d
