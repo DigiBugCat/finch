@@ -1,9 +1,10 @@
 import { SignUp } from "@clerk/nextjs";
+import AuthShell from "@/components/fieldguide/AuthShell";
 
 export default function SignUpPage() {
   return (
-    <div style={{ display: "flex", minHeight: "100vh", alignItems: "center", justifyContent: "center" }}>
+    <AuthShell note="free, and the band is yours for life">
       <SignUp fallbackRedirectUrl="/docs" />
-    </div>
+    </AuthShell>
   );
 }

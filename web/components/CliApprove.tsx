@@ -6,8 +6,10 @@
 // session, a deliberate Approve click, and the displayed initiator IP/UA context
 // so the user can confirm it's their own box (the anti-phishing binding).
 import { useEffect, useRef, useState } from 'react';
+import Link from 'next/link';
 import { useSearchParams } from 'next/navigation';
 import { UserButton, useUser } from '@clerk/nextjs';
+import { BirdMark } from './fieldguide/Bird';
 
 type Account = { name: string; kind: 'personal' | 'team' };
 type Origin = { found: boolean; reqIp?: string; reqUa?: string; ageSeconds?: number; account?: Account; error?: string } | null;
@@ -76,53 +78,60 @@ export default function CliApprove() {
   }
 
   return (
-    <main className="cli-page">
-      <div className="cli-nav">
-        <a className="logo" href="/"><span className="logo-mark">🐦</span> Finch</a>
+    <div className="cli-page">
+      <header className="iw-wrap cli-nav">
+        <Link className="site-logo" href="/" aria-label="finch home">
+          <BirdMark />
+          <span className="site-logo-word">finch</span>
+        </Link>
         <UserButton />
-      </div>
-      <div className="cli-box">
-        <span className="eyebrow">🔑 Connect the finch CLI</span>
-        <h1>Authorize a box</h1>
-        {state === 'done' ? (
-          <>
-            <p className="cli-sub">Your terminal is now logged in to <b>{account}</b>. Close this tab and head back to it.</p>
-            <div className="cli-ok">✓ Box approved</div>
-          </>
-        ) : (
-          <>
-            <p className="cli-sub">Type the code your terminal printed after <code className="mono">finch login</code>, then approve.</p>
-            <input
-              className="cli-code"
-              value={code}
-              onChange={(e) => setCode(e.target.value.toUpperCase())}
-              placeholder="XXXX-XXXX"
-              spellCheck={false}
-              autoComplete="off"
-              autoFocus
-            />
-            {origin && (origin.found
-              ? <div className="cli-origin">
-                  <div className="cli-origin-h">This login was started from:</div>
-                  <div className="cli-origin-d mono">{origin.reqIp || 'unknown IP'} · {(origin.reqUa || 'unknown client').slice(0, 60)}</div>
-                  <div className="cli-origin-age dim">{origin.ageSeconds != null ? `${origin.ageSeconds}s ago` : ''} — approve only if that's the box where you ran <code className="mono">finch login</code>.</div>
-                </div>
-              : origin.error
-                ? <div className="cli-err">{origin.error}</div>
-                : <div className="cli-err">No active login for that code — check it or run <code className="mono">finch login</code> again.</div>)}
-            <div className="cli-grant">This grants a CLI token (~30 days) acting as <b>{account}</b>.</div>
-            <button type="button" className="btn btn-lg btn-amber" onClick={approve} disabled={state === 'busy' || !origin?.found}>
-              {state === 'busy' ? 'Approving…' : 'Approve box'}
-            </button>
-            {state === 'error' && <div className="cli-err">{msg}</div>}
-            <div className="cli-warn">
-              ⚠️ Only approve a code <b>you</b> just started with <code className="mono">finch login</code> on a box you control.
-              If someone sent you this code, do not approve it — it would give <i>their</i> terminal access to your account.
-              You can revoke every CLI token anytime with <code className="mono">finch revoke-tokens</code>.
-            </div>
-          </>
-        )}
-      </div>
-    </main>
+      </header>
+      <main className="cli-main">
+        <div className="cli-box">
+          <span className="iw-label iw-label-indigo">Connect the finch CLI</span>
+          <h1>Authorize a box</h1>
+          {state === 'done' ? (
+            <>
+              <p className="cli-sub">Your terminal is now logged in to <b>{account}</b>. Close this tab and head back to it.</p>
+              <div className="cli-ok" role="status">✓ Box approved</div>
+            </>
+          ) : (
+            <>
+              <p className="cli-sub">Type the code your terminal printed after <code>finch login</code>, then approve.</p>
+              <input
+                className="cli-code"
+                aria-label="Login code"
+                value={code}
+                onChange={(e) => setCode(e.target.value.toUpperCase())}
+                placeholder="XXXX-XXXX"
+                spellCheck={false}
+                autoComplete="off"
+                autoFocus
+              />
+              {origin && (origin.found
+                ? <div className="cli-origin">
+                    <span className="iw-label">This login was started from:</span>
+                    <div className="cli-origin-d">{origin.reqIp || 'unknown IP'} · {(origin.reqUa || 'unknown client').slice(0, 60)}</div>
+                    <div className="cli-origin-age">{origin.ageSeconds != null ? `${origin.ageSeconds}s ago` : ''} — approve only if that&apos;s the box where you ran <code>finch login</code>.</div>
+                  </div>
+                : origin.error
+                  ? <div className="cli-err" role="alert">{origin.error}</div>
+                  : <div className="cli-err" role="alert">No active login for that code — check it or run <code>finch login</code> again.</div>)}
+              <div className="cli-grant">This grants a CLI token (~30 days) acting as <b>{account}</b>.</div>
+              <button type="button" className="iw-btn iw-btn-primary" onClick={approve} disabled={state === 'busy' || !origin?.found}>
+                {state === 'busy' ? 'Approving…' : 'Approve box'}
+              </button>
+              {state === 'error' && <div className="cli-err" role="alert">{msg}</div>}
+              <div className="cli-warn">
+                <span className="iw-label">Before you approve</span>
+                Only approve a code <b>you</b> just started with <code>finch login</code> on a box you control.
+                If someone sent you this code, do not approve it — it would give <i>their</i> terminal access to your account.
+                You can revoke every CLI token anytime with <code>finch revoke-tokens</code>.
+              </div>
+            </>
+          )}
+        </div>
+      </main>
+    </div>
   );
 }

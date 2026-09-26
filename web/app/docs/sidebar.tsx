@@ -35,12 +35,19 @@ export default function DocsSidebar() {
     <nav className="docs-side" aria-label="Docs">
       {GROUPS.map((g) => (
         <div className="docs-group" key={g.h}>
-          <div className="docs-group-h">{g.h}</div>
-          {g.items.map(([href, label]) => (
-            <Link key={href} href={href} className={path === href ? 'on' : ''}>
-              {label}
-            </Link>
-          ))}
+          <div className="docs-group-h" id={`docs-group-${g.h.replace(/\W+/g, '-').toLowerCase()}`}>{g.h}</div>
+          <ul aria-labelledby={`docs-group-${g.h.replace(/\W+/g, '-').toLowerCase()}`}>
+            {g.items.map(([href, label]) => {
+              const on = path === href;
+              return (
+                <li key={href}>
+                  <Link href={href} className={on ? 'on' : undefined} aria-current={on ? 'page' : undefined}>
+                    {label}
+                  </Link>
+                </li>
+              );
+            })}
+          </ul>
         </div>
       ))}
     </nav>
