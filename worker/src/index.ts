@@ -167,12 +167,6 @@ export function secureTransport(req: Request, env: Env): boolean {
 // from summing past DO heap. Enforced here pre-stub AND in BoxDO.fetch.
 const MAX_RELAY_BODY_BYTES = 4 * 1024 * 1024; // 4 MiB
 
-// Max body accepted by the /register DCR proxy. That branch runs BEFORE tenant
-// resolution and before RELAY_LIMIT, so it is the cheapest unauthenticated path
-// into this Worker — the cap has to be tight. RFC 7591 client metadata is a
-// handful of fields (redirect_uris dominates); 64 KiB is generous.
-const MAX_DCR_BODY_BYTES = 64 * 1024; // 64 KiB
-
 // Browser login-wall session cookie lifetime (12h). The cookie is the long-lived
 // proof a browser already cleared the Clerk wall; the portal hand-off grant that
 // mints it is short (~60s, single-use). 12h balances "don't re-login constantly"
@@ -595,17 +589,18 @@ const RELEASE_ASSET_RE =
 
 // The OAuth scopes the MCP resource actually needs — identity only.
 // verifyClerkOAuthToken reads sub/user_id/org_id from Clerk's userinfo, so
-// `openid` covers verification; `offline_access` keeps connectors connected via
-// refresh tokens. Advertised in BOTH the 401 WWW-Authenticate scope hint and
-// the RFC 9728 scopes_supported (single const so the two can't drift). Without
-// these, claude.ai falls back to requesting every scope the AS supports —
-// including public/private metadata the hub never reads — which both bloats
-// the consent screen and overgrants the issued token. Deliberately NOT
-// filtered from the proxied AS metadata: that document must stay faithful to
-// what Clerk actually supports.
+// `openid` covers verification. Advertised in BOTH the 401 WWW-Authenticate
+// scope hint and the RFC 9728 scopes_supported (single const so the two can't
+// drift). Without these, claude.ai falls back to requesting every scope the AS
+// supports — including public/private metadata the hub never reads — which
+// both bloats the consent screen and overgrants the issued token.
 // `email` is needed at the door: the relay enforces per-app user grants for
 // org members by matching the token's email against the tenant's ACL.
-const MCP_SCOPES = ["openid", "email", "offline_access"];
+// NOT `offline_access`: the MCP auth spec says servers SHOULD NOT put it in the
+// challenge scope or scopes_supported — refresh tokens are the client's call.
+// Clerk still advertises it in its own AS metadata and registers it on every
+// DCR client, so a client that wants refresh can request it.
+const MCP_SCOPES = ["openid", "email"];
 
 /** Percent-decode a path segment, tolerating a malformed encoding (a raw "%"
  *  in a name would make decodeURIComponent throw). Falls back to the raw value
@@ -872,25 +867,23 @@ export default {
       const suffix = parts.slice(2).join("/");
       const body = JSON.stringify({
         resource: `https://${host}${suffix ? `/${suffix}` : ""}`,
-        // Advertise OURSELVES as the authorization server, NOT Clerk directly.
-        // A spec-compliant client (ChatGPT) follows this pointer to fetch AS
-        // metadata; if it points at Clerk, the client reads Clerk's own doc
-        // (registration_endpoint = clerk.finchmcp.com/oauth/register) and DCRs
-        // straight against Clerk, BYPASSING our /register scope-injection proxy.
-        // Clerk's DCR default omits `openid`, so the client is then rejected at
-        // /authorize with invalid_scope. Pointing here routes AS-metadata
-        // discovery through our proxy (below), which rewrites registration_endpoint
-        // to /register so every DCR carries MCP_SCOPES. authorize/token/jwks
-        // inside that doc still point at Clerk — we're only the nominal AS.
-        // (Claude read AS metadata from this resource origin regardless, so it
-        // already worked; this makes the pointer honest for everyone else.)
-        authorization_servers: [`https://${host}`],
+        // Point straight at Clerk, the real authorization server. The client
+        // fetches Clerk's own RFC 8414 metadata (registration_endpoint
+        // included) and records Clerk's `issuer` — the same value Clerk stamps
+        // on the authorization response as `iss` (RFC 9207). A finch-hosted AS
+        // document with any other issuer fails that check and current MCP SDKs
+        // abort the flow, so the hub serves no AS metadata and no /register
+        // proxy of its own. Clients that DCR without a `scope` get Clerk's
+        // instance default_scopes (must include openid + email — an instance
+        // setting, not something the hub can inject any more).
+        // Trailing slash stripped: the pointer must equal Clerk's `issuer`.
+        authorization_servers: [env.CLERK_ISSUER.replace(/\/+$/, "")],
         bearer_methods_supported: ["header"],
         // The scopes THIS resource actually needs — identity only. MCP clients
         // (claude.ai) request the scopes advertised here (or in the 401
         // challenge's scope hint) instead of everything the AS supports, so
-        // the consent screen stops asking for profile/email/metadata that the
-        // hub never reads (verifyClerkOAuthToken consumes only sub/org_id).
+        // the consent screen stops asking for profile/metadata that the hub
+        // never reads (verifyClerkOAuthToken consumes only sub/org_id/email).
         scopes_supported: MCP_SCOPES,
       });
       return new Response(body, {
@@ -899,124 +892,6 @@ export default {
           "content-type": "application/json",
           "access-control-allow-origin": "*",
         },
-      });
-    }
-
-    // ---- AS metadata on the RESOURCE origin. claude.ai fetches the OAuth
-    //      authorization-server metadata from the MCP server's OWN host,
-    //      ignoring the external authorization_servers pointer in the RFC 9728
-    //      doc (anthropics/claude-ai-mcp#82) — without this, that fetch fell
-    //      through to the relay and 503'd, surfacing as
-    //      "registration_endpoint_missing". Proxy Clerk's metadata here (both
-    //      well-known spellings), guaranteeing registration_endpoint is present
-    //      (Clerk omits it from openid-configuration even with DCR enabled).
-    //      The endpoints inside still point at Clerk — we only host the doc. ----
-    if (
-      req.method === "GET" &&
-      parts[0] === ".well-known" &&
-      (parts[1] === "oauth-authorization-server" ||
-        parts[1] === "openid-configuration") &&
-      env.CLERK_ISSUER
-    ) {
-      // Fail closed as a clean 502 on ANY upstream failure — a thrown fetch
-      // (Clerk unreachable) must not surface as an unhandled 500.
-      let meta: Record<string, unknown>;
-      try {
-        const up = await fetch(
-          `${env.CLERK_ISSUER}/.well-known/oauth-authorization-server`,
-        );
-        if (!up.ok) throw new Error(`upstream ${up.status}`);
-        meta = (await up.json()) as Record<string, unknown>;
-      } catch {
-        return json(502, { error: "authorization server metadata unavailable" });
-      }
-      // Advertise OUR OWN host as the registration endpoint (not Clerk's) so
-      // every DCR POST flows through the /register proxy below, where we inject
-      // the scopes Clerk needs. Some clients (poke.com) omit `scope` at DCR;
-      // Clerk then defaults to a scope set WITHOUT `openid`, so the client —
-      // being an OIDC client that needs an id_token — silently aborts before
-      // the consent screen. Routing DCR through us lets us force `openid`
-      // (MCP_SCOPES) in regardless of what the client sent. Claude already
-      // POSTs /register on this origin, so this only makes the advertised path
-      // match reality.
-      meta.registration_endpoint = `https://${host}/register`;
-      // Rewrite `issuer` to match the host this doc is served from. RFC 8414
-      // requires the returned `issuer` to byte-equal the AS identifier the
-      // client used to fetch metadata; since our RFC 9728 doc now names THIS
-      // host as the authorization server, a strict client (ChatGPT) rejects the
-      // doc if `issuer` still says clerk.finchmcp.com. Only the metadata
-      // identity moves — authorize/token/jwks below still point at Clerk, and
-      // token validation is UNAFFECTED: verifyClerkOAuthToken introspects the
-      // opaque token against env.CLERK_ISSUER /oauth/userinfo and never asserts
-      // the token's `iss`, so the minted-by-Clerk token still verifies.
-      meta.issuer = `https://${host}`;
-      return new Response(JSON.stringify(meta), {
-        status: 200,
-        headers: {
-          "content-type": "application/json",
-          "access-control-allow-origin": "*",
-          "cache-control": "public, max-age=300",
-        },
-      });
-    }
-
-    // ---- DCR proxy: our AS metadata points registration_endpoint here, so
-    //      every dynamic client registration POSTs to us first. We inject the
-    //      scopes this resource needs (MCP_SCOPES = openid offline_access) into
-    //      the body before forwarding to Clerk's /oauth/register. WHY: some
-    //      clients (poke.com) send no `scope` at DCR; Clerk then registers them
-    //      with a default set WITHOUT `openid`, and an OIDC client that needs an
-    //      id_token aborts before the consent screen ("Connection failed"). By
-    //      merging our required scopes in, the registered client always carries
-    //      `openid`, so the flow reaches consent. Harmless for clients that
-    //      already request openid (claude.ai) — it's a set-union, and a broader
-    //      grant only widens the consent prompt, which the user still approves.
-    //      (Also still catches the claude build that POSTs /register on the
-    //      resource origin — anthropics/claude-code#36743.) Reserves the bare
-    //      /register path ahead of the relay, like /.well-known. ----
-    if (
-      req.method === "POST" &&
-      parts.length === 1 &&
-      parts[0] === "register" &&
-      env.CLERK_ISSUER
-    ) {
-      // Read the client's DCR body ONCE as text, union our required scopes into
-      // `scope`, and forward. On any parse failure, forward the raw text
-      // unchanged — never break registration just because we couldn't augment
-      // it. (Reading text first avoids a half-consumed req.body on a throw.)
-      //
-      // SIZE CAP FIRST: this branch sits AHEAD of resolveTenant and the
-      // per-(tenant,IP) RELAY_LIMIT, so it is unauthenticated, untenanted and
-      // unthrottled — req.text() on a chunked body would let anyone stream
-      // ~100 MB into a 128 MB isolate and take co-resident requests down with
-      // it. readBoundedBody cancels the reader the moment the running total
-      // would cross the cap; a real DCR document is a few KB.
-      let rawBytes: Uint8Array | undefined;
-      try {
-        rawBytes = await readBoundedBody(req, MAX_DCR_BODY_BYTES);
-      } catch {
-        return json(400, { error: "invalid request body" });
-      }
-      if (rawBytes === undefined) {
-        return json(413, { error: "request body too large" });
-      }
-      const raw = new TextDecoder().decode(rawBytes);
-      let body = raw;
-      try {
-        const reg = JSON.parse(raw) as Record<string, unknown>;
-        const requested =
-          typeof reg.scope === "string" && reg.scope.length
-            ? reg.scope.split(/\s+/).filter(Boolean)
-            : [];
-        reg.scope = [...new Set([...requested, ...MCP_SCOPES])].join(" ");
-        body = JSON.stringify(reg);
-      } catch {
-        // non-JSON body — forward the original text as-is
-      }
-      return fetch(`${env.CLERK_ISSUER}/oauth/register`, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body,
       });
     }
 
