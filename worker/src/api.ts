@@ -47,31 +47,47 @@ async function directoryOp<T=any>(env: Env, op: string, args: Record<string, unk
 }
 function cloneResponse(res: Response): Promise<Response> { return res.text().then(text=>new Response(text,{status:res.status,headers:{"content-type":res.headers.get("content-type")??"application/json"}})); }
 
-/** The tenants a Clerk user OWNS, in directory order, each one re-verified
- *  against the TenantDO itself (the directory is an index, never the
- *  authority). The personal tenant (the user's own Clerk id) is excluded —
- *  it is the fallback, not a match. Legacy Clerk-org tenants that were claimed
- *  before the cut carry an owner row too, so they resolve here like any other
- *  owned tenant. The row's own role is not trusted either way: every listed
- *  tenant is asked, so a directory row that lags an ownership change can
- *  neither grant nor hide ownership. */
-async function ownedTenants(env: Env, clerkUserId: string): Promise<string[]> {
+/** The tenants a Clerk user OWNS — the directory's rows for them, plus any
+ *  `extra` candidates (the legacy Clerk-org tenants the web says they admin)
+ *  — each one re-verified against the TenantDO itself (the directory is an
+ *  index, never the authority). The personal tenant (the user's own Clerk id)
+ *  is excluded: it is the fallback, not a match. Legacy Clerk-org tenants
+ *  carry an owner row once claimed, so they resolve like any other owned
+ *  tenant. The row's own role is not trusted either way: every candidate is
+ *  asked, so a directory row that lags an ownership change can neither grant
+ *  nor hide ownership. An owned tenant the directory does not list yet (one
+ *  claimed just now) is indexed, so it keeps resolving if the web stops
+ *  naming it. */
+async function ownedTenants(env: Env, clerkUserId: string, extra: string[] = []): Promise<string[]> {
   const listed = await directoryOp<{ memberships?: { tenantId: string }[] }>(
     env,
     "listForUser",
     { clerkUserId },
   );
+  const indexed = (listed.memberships ?? []).map((row) => String(row.tenantId || ""));
   const out: string[] = [];
-  for (const row of listed.memberships ?? []) {
-    const tenantId = String(row.tenantId || "");
+  for (const tenantId of [...indexed, ...extra]) {
     if (!tenantId || tenantId === clerkUserId || out.includes(tenantId)) continue;
     const res = await tenantOpRaw(env, tenantId, "memberContext", { clerkUserId });
     if (!res.ok) continue;
     const ctx: any = await res.json();
-    if (ctx?.member?.role === "owner" && ctx.member.state === "active") out.push(tenantId);
+    if (ctx?.member?.role !== "owner" || ctx.member.state !== "active") continue;
+    out.push(tenantId);
+    if (!indexed.includes(tenantId)) {
+      await directoryOp(env, "upsertMembership", {
+        clerkUserId,
+        tenantId,
+        memberId: ctx.member.id,
+        role: "owner",
+        state: "active",
+      });
+    }
   }
   return out;
 }
+
+// Mirrors the web's cap on the admin org ids it reads from Clerk.
+const MAX_ADMIN_ORG_IDS = 1_000;
 
 // A CLI token is a long-lived tenant assertion, distinguished from a per-call
 // assertion by kind:"cli" + an epoch the tenant can bump to revoke. 30 days.
@@ -542,13 +558,23 @@ async function handleApiInner(
   const assertion = req.headers.get("X-Finch-Auth") || "";
 
   // POST /api/user/sync — the one USER-scoped route (the assertion names a Clerk
-  // user, kind:"user"). It resolves which tenant that user acts on and returns
-  // it in the same {tenants, claimable} shape the web has always read:
-  //   - the tenant they OWN, if any (a claimed team/org workspace), and
+  // user, kind:"user"). It resolves which tenants that user OWNS and returns
+  // them in the same {tenants, claimable} shape the web has always read:
+  //   - the tenants they own beyond their personal one (team workspaces and
+  //     Clerk-org tenants claimed before the cut), and
   //   - their personal tenant (their Clerk user id), bootstrapped from the
   //     verified primaryEmail when the web supplies one.
-  // `tenant` is the single tenant to act on (owned first, else personal).
-  // There are no invitations to bind and nothing left to claim.
+  // Legacy Clerk-org tenants: for each org the web says (from Clerk) the user
+  // administers — `adminOrgIds` — a tenant that holds state from before native
+  // tenancy and was never claimed is claimed for this user here, as its single
+  // owner (it needs the verified primaryEmail for the owner row; without one
+  // it is reported in `claimable` instead). This is the retired claim UI's
+  // replacement, so such a tenant never becomes unreachable.
+  // `tenant` is the one tenant to act on, by the same rule as the web's
+  // chooseTenant: the only one of personal + owned that holds a fleet
+  // (services or finch_ keys); the personal tenant when none does; and null
+  // when more than one does, so a caller is never switched away from a
+  // populated tenant silently.
   if (path === "/api/user/sync") {
     const clerkUserId = await verifyAssertion(assertion, env.FINCH_SERVICE_SECRET, "user");
     if (!clerkUserId) return json(401, { error: "invalid user assertion" });
@@ -557,15 +583,34 @@ async function handleApiInner(
     const emails = Array.isArray(body.emails)
       ? body.emails.map((x: any) => String(x).trim().toLowerCase())
       : [];
-    if (body.primaryEmail && !emails.includes(String(body.primaryEmail).trim().toLowerCase())) {
+    const primaryEmail = body.primaryEmail ? String(body.primaryEmail).trim().toLowerCase() : "";
+    if (primaryEmail && !emails.includes(primaryEmail)) {
       return json(400, { error: "primaryEmail must be verified" });
     }
-    if (body.primaryEmail) {
-      const r = await tenantOpRaw(env, clerkUserId, "memberContext", { clerkUserId, email: body.primaryEmail });
+    if (primaryEmail) {
+      const r = await tenantOpRaw(env, clerkUserId, "memberContext", { clerkUserId, email: primaryEmail });
       if (!r.ok) return cloneResponse(r);
     }
+    const rawOrgIds: unknown[] = Array.isArray(body.adminOrgIds) ? body.adminOrgIds : [];
+    if (rawOrgIds.length > MAX_ADMIN_ORG_IDS) return json(400, { error: "too many adminOrgIds" });
+    const adminOrgIds = [...new Set(
+      rawOrgIds.filter((x): x is string => typeof x === "string" && x.startsWith("org_") && x.length <= 128),
+    )];
+    const claimable: { clerkOrgId: string }[] = [];
+    for (const clerkOrgId of adminOrgIds) {
+      const held = await tenantOp<{ migrated: boolean; hasState: boolean }>(env, clerkOrgId, "holdings");
+      if (held.migrated || !held.hasState) continue; // claimed already, or nothing to claim
+      if (!primaryEmail) {
+        claimable.push({ clerkOrgId });
+        continue;
+      }
+      // A 409 here means another admin claimed it first; it then resolves for
+      // them, not for this user.
+      await tenantOpRaw(env, clerkOrgId, "claimLegacyOrg", { clerkOrgId, clerkUserId, email: primaryEmail });
+    }
+    const owned = await ownedTenants(env, clerkUserId, adminOrgIds);
     const tenants: Record<string, unknown>[] = [];
-    for (const tenantId of [...(await ownedTenants(env, clerkUserId)), clerkUserId]) {
+    for (const tenantId of [...owned, clerkUserId]) {
       const contextRes = await tenantOpRaw(env, tenantId, "memberContext", { clerkUserId });
       if (!contextRes.ok) continue;
       const context: any = await contextRes.json();
@@ -581,7 +626,17 @@ async function handleApiInner(
         state: personalPending ? "invited" : context.member.state,
       });
     }
-    return json(200, { tenant: tenants[0]?.tenantId ?? clerkUserId, tenants, claimable: [] });
+    // Almost everyone owns only their personal tenant: nothing to probe.
+    let chosen: string | null = clerkUserId;
+    if (owned.length > 0) {
+      const populated: string[] = [];
+      for (const tenantId of [clerkUserId, ...owned]) {
+        const held = await tenantOp<{ holdsFleet: boolean }>(env, tenantId, "holdings");
+        if (held.holdsFleet) populated.push(tenantId);
+      }
+      chosen = populated.length === 0 ? clerkUserId : populated.length === 1 ? populated[0] : null;
+    }
+    return json(200, { tenant: chosen, tenants, claimable });
   }
 
   const tenant = await verifyAssertion(assertion, env.FINCH_SERVICE_SECRET);

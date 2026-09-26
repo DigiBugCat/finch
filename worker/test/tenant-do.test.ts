@@ -762,6 +762,74 @@ describe("TenantDO — single-user owner gates", () => {
     expect(await gate(t)).toBe(false);
   });
 
+  it("honours ONE owner of a pre-cut multi-owner team: the one the owner rule names", async () => {
+    const t = freshTenant();
+    await op(t, "enroll", { name: "Scraper" });
+    await seedTeam(t, [
+      { clerkUserId: "u_first", email: "first@example.com", role: "owner", state: "active" },
+      { clerkUserId: "u_second", email: "second@example.com", role: "owner", state: "active" },
+    ]);
+    const gate = async (clerkUserId: string) =>
+      (await op<any>(t, "gateOauth", { clerkUserId, service: "scraper" })).allowed;
+    // seedTeam points r_owner at the first owner.
+    expect(await gate("u_first")).toBe(true);
+    expect(await gate("u_second")).toBe(false);
+    expect((await op<any>(t, "memberContext", { clerkUserId: "u_second" })).member).toBeNull();
+    // Re-point the owner rule and the principal follows it.
+    await seedState(t, (s) => {
+      s.acl.find((r: any) => r.id === "r_owner").src = { type: "user", name: "second@example.com" };
+    });
+    expect(await gate("u_first")).toBe(false);
+    expect(await gate("u_second")).toBe(true);
+    expect((await op<any>(t, "memberContext", { clerkUserId: "u_second" })).member).toMatchObject({
+      role: "owner",
+      email: "second@example.com",
+    });
+  });
+
+  it("gateOauth admits an org-admin token to its own UNCLAIMED legacy org tenant only", async () => {
+    const t = `org_${freshTenant()}`;
+    await op(t, "enroll", { name: "Scraper" });
+    const gate = async (args: Record<string, unknown>) =>
+      (await op<any>(t, "gateOauth", { clerkUserId: "u_admin", service: "scraper", ...args })).allowed;
+    expect(await gate({ orgIdClaim: t, orgRole: "org:admin" })).toBe(true);
+    expect(await gate({ orgIdClaim: t, orgRole: "admin" })).toBe(true);
+    expect(await gate({ orgIdClaim: t, orgRole: "org:member" })).toBe(false);
+    expect(await gate({ orgIdClaim: t })).toBe(false);
+    expect(await gate({ orgIdClaim: "org_other", orgRole: "org:admin" })).toBe(false);
+
+    // Once claimed, only the claimant passes; the org claim no longer does.
+    const claimed = await op<any>(t, "claimLegacyOrg", { clerkOrgId: t, clerkUserId: "u_admin", email: "A@example.com" });
+    expect(claimed.member).toMatchObject({ role: "owner", state: "active", email: "a@example.com" });
+    expect(await gate({})).toBe(true);
+    expect(
+      (await op<any>(t, "gateOauth", { clerkUserId: "u_admin2", service: "scraper", orgIdClaim: t, orgRole: "org:admin" }))
+        .allowed,
+    ).toBe(false);
+  });
+
+  it("claimLegacyOrg is idempotent for its owner and refuses everyone and everything else", async () => {
+    const t = `org_${freshTenant()}`;
+    const claim = async (args: Record<string, unknown>) => {
+      const stub = env.TENANT.get(env.TENANT.idFromName(t));
+      const res = await stub.fetch("https://tenant/op", {
+        method: "POST",
+        body: JSON.stringify({ op: "claimLegacyOrg", clerkOrgId: t, clerkUserId: "u_a", email: "a@example.com", ...args }),
+      });
+      return { status: res.status, body: (await res.json()) as any };
+    };
+    expect((await claim({})).status).toBe(409); // empty: nothing to claim
+    await op(t, "enroll", { name: "Scraper" });
+    expect((await claim({ clerkOrgId: "org_elsewhere" })).status).toBe(400);
+    expect((await claim({ email: "" })).status).toBe(400);
+    const first = await claim({});
+    expect(first.status).toBe(200);
+    const again = await claim({});
+    expect(again.status).toBe(200);
+    expect(again.body).toMatchObject({ already: true, member: { id: first.body.member.id } });
+    expect((await claim({ clerkUserId: "u_b", email: "b@example.com" })).status).toBe(409);
+  });
+
   it("gateOauth lets anyone reach a public service", async () => {
     const t = freshTenant();
     await op(t, "enroll", { name: "Status" });

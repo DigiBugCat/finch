@@ -326,19 +326,29 @@ token whose user OWNS the tenant, or the first-party service assertion used by
 browser without a key on a key-gated service gets a plain JSON 401; there is no
 login-wall redirect, portal grant, or session cookie.
 
-A signed-in Clerk user acts on the tenant they own if one exists, else on their
-personal tenant (their Clerk user id):
+A signed-in Clerk user acts on their personal tenant (their Clerk user id) or a
+tenant they own, whichever holds their fleet:
 
 - `POST /api/user/sync` (user-scoped assertion) returns
-  `{tenant, tenants, claimable: []}` — `tenant` is the owned tenant (first in
-  directory order) or the personal one. Owned tenants are found through
-  `DirectoryDO.listForUser` and each row is re-verified against the TenantDO,
-  so a stale directory row never grants anything.
+  `{tenant, tenants, claimable}`. `tenants` lists every tenant the user owns
+  plus the personal one; owned tenants are found through
+  `DirectoryDO.listForUser` (and the `adminOrgIds` the web sends), and each
+  candidate is re-verified against the TenantDO, so a stale directory row
+  never grants anything. `tenant` is the only one of them holding services or
+  `finch_` keys, the personal tenant when none does, and `null` when more than
+  one does — an empty workspace never displaces a personal tenant that holds
+  the user's boxes. The web's `chooseTenant` applies the same rule.
 - `POST /api/member-context` keeps its request/response shape; it returns the
   member only for the tenant's owner and `{member:null}` for anyone else. A
   personal tenant bootstraps its owner row from the first verified email.
-- The OAuth door (`TenantDO.gateOauth`) admits the active owner of a
-  bootstrapped tenant, or the Clerk user whose personal tenant it is.
+- A tenant has ONE owner. A pre-cut team with several active owners honours
+  only the one the locked `r_owner` rule names (else the earliest-created);
+  the other owner rows stay in storage but authorize nothing, since there is
+  no longer a way to remove a co-owner.
+- The OAuth door (`TenantDO.gateOauth`) admits that owner of a bootstrapped
+  tenant, or the Clerk user whose personal tenant it is. For a legacy Clerk-org
+  tenant nobody has claimed yet, it also admits a token scoped to that org
+  (`org_id` = the tenant id) with the org admin role.
 
 Data written by the retired team features — `tenantMeta`, member rows
 (admins, members, invitations), access requests, user→service ACL rules,
@@ -349,12 +359,18 @@ expiry, and the stored ACL rules exactly as before, so no key gains or loses
 access; rule-editing endpoints are gone, and keys minted by the CLI are owned
 by the tenant owner, whom the locked `r_owner` rule always admits. Legacy
 Clerk-org tenants that were claimed before the cut resolve for their owner like
-any other owned tenant; unclaimed ones keep their data but have no owner to
-resolve to until an explicit migration assigns one.
+any other owned tenant. An unclaimed one that holds state (services, keys or a
+subdomain) is claimed at sign-in, with no UI step: when `/api/user/sync`
+receives the org in `adminOrgIds` (the orgs Clerk says the user administers)
+along with a verified `primaryEmail`, the hub records that user as its single
+owner (`tenantMeta.kind = "team"`, `bootstrappedFrom = "legacy-org"`) and
+indexes it in the directory. The first admin to sign in becomes the owner;
+without an email the org is reported in `claimable` instead.
 
 Retired Durable Object: `AviaryEnrollmentDO` (migration `v5`) is a 410 stub
 kept only so the migrated class stays exported; its binding was removed and its
-stored enrollment/audit rows are untouched. Deleting that data requires an
+stored enrollment/audit rows are untouched. It has a no-op `alarm()` so an
+expiry alarm still armed at deploy time drains quietly instead of erroring. Deleting that data requires an
 explicit `deleted_classes` migration, which deploy preflight refuses until
 someone deliberately changes that guard. Boxes enrolled through the old device
 flow keep refreshing: `/refresh` still honors their per-box credential epoch,

@@ -227,7 +227,11 @@ export class TenantDO extends DurableObject<Env> {
         case "memberContext":
           return this.opResponse(await this.memberContext(a.clerkUserId, a.email));
         case "gateOauth":
-          return ok(await this.gateOauth(a.clerkUserId, a.service));
+          return ok(await this.gateOauth(a.clerkUserId, a.service, a.orgIdClaim, a.orgRole));
+        case "holdings":
+          return ok(await this.holdings());
+        case "claimLegacyOrg":
+          return this.opResponse(await this.claimLegacyOrg(a.clerkOrgId, a.clerkUserId, a.email));
         case "enroll":
           return ok(await this.enroll(a.name, a.group));
         case "release":
@@ -926,7 +930,7 @@ export class TenantDO extends DurableObject<Env> {
     const normScope = this.normalizeScope(s, scope);
     if ("error" in normScope) return { error: normScope.error };
 
-    if (s.tenantMeta && (!owner || owner === "you")) owner = this.activeOwners(s)[0]?.email ?? owner;
+    if (s.tenantMeta && (!owner || owner === "you")) owner = this.principalOwner(s)?.email ?? owner;
     const plaintext = genFinchKey();
     const hash = await hashKey(plaintext);
     const now = Date.now();
@@ -1064,8 +1068,31 @@ export class TenantDO extends DurableObject<Env> {
 
   // ---- tenant owner ---------------------------------------------------------
 
-  private activeOwners(s: StoredState): TenantMember[] {
-    return s.members.filter((m) => m.role === "owner" && m.state === "active");
+  /** THE owner of a bootstrapped tenant. A pre-cut team could have several
+   *  active owners, and with the member-management ops gone none of them can
+   *  remove another, so exactly one is honoured: the active owner the locked
+   *  `r_owner` rule names (the lockout backstop, which normalizeOwnerGrant
+   *  keeps pointing at an active owner), else the earliest-created active
+   *  owner. The other owner rows stay in storage but authorize nothing. */
+  private principalOwner(s: StoredState): TenantMember | undefined {
+    const owners = s.members
+      .filter((m) => m.role === "owner" && m.state === "active")
+      .sort((x, y) => (x.createdAt ?? 0) - (y.createdAt ?? 0));
+    const rule = s.acl.find((r) => r.id === "r_owner" && r.locked);
+    const named = rule?.src.type === "user" ? normalizeEmail(rule.src.name ?? "") : "";
+    return owners.find((m) => named && normalizeEmail(m.email) === named) ?? owners[0];
+  }
+
+  /** Whether this tenant has an owner row yet (`migrated`); whether it holds a
+   *  fleet its owner would lose track of — services (and with them their
+   *  boxes) or finch_ keys (`holdsFleet`); and whether it holds anything at
+   *  all, a subdomain included (`hasState`, the pre-cut claimability test). A
+   *  subdomain alone is not a fleet: getState hands every tenant it reads a
+   *  default one. */
+  private async holdings(): Promise<{ migrated: boolean; holdsFleet: boolean; hasState: boolean }> {
+    const s = await this.load();
+    const holdsFleet = s.services.length > 0 || s.keys.length > 0;
+    return { migrated: !!s.tenantMeta, holdsFleet, hasState: holdsFleet || !!s.settings.subdomain };
   }
 
   /** Replace the pre-membership placeholder principal ("you") with the real
@@ -1117,6 +1144,55 @@ export class TenantDO extends DurableObject<Env> {
     return this.memberContext(clerkUserId);
   }
 
+  /** A legacy Clerk-org tenant (id === the Clerk org id) that holds state from
+   *  before native tenancy and was never claimed: record the caller — an admin
+   *  of that org, as verified by the web against Clerk — as its single owner.
+   *  This replaces the retired claim/import UI with a hub-side step. The first
+   *  admin to sign in wins; a repeat by that owner is idempotent and anyone
+   *  else gets a 409. An empty or already-claimed tenant is never taken. */
+  private async claimLegacyOrg(clerkOrgId: unknown, clerkUserId: unknown, email: unknown): Promise<any> {
+    const orgId = typeof clerkOrgId === "string" ? clerkOrgId : "";
+    const uid = typeof clerkUserId === "string" ? clerkUserId : "";
+    const em = typeof email === "string" ? normalizeEmail(email) : "";
+    if (!orgId.startsWith("org_") || orgId !== this.tenantId() || !uid || !em) {
+      return { error: "legacy org claim mismatch", status: 400 };
+    }
+    const s = await this.load();
+    if (s.tenantMeta) {
+      if (s.tenantMeta.clerkOrgId === orgId && this.principalOwner(s)?.clerkUserId === uid) {
+        return { ...(await this.memberContext(uid)), already: true };
+      }
+      return { error: "tenant already claimed", status: 409 };
+    }
+    if (!(await this.holdings()).hasState) return { error: "nothing to claim", status: 409 };
+    const now = Date.now();
+    const member: TenantMember = {
+      id: "m_" + crypto.randomUUID().slice(0, 8),
+      tenantId: orgId,
+      clerkUserId: uid,
+      email: em,
+      role: "owner",
+      state: "active",
+      createdAt: now,
+      updatedAt: now,
+      boundAt: now,
+    };
+    s.tenantMeta = {
+      id: orgId,
+      kind: "team",
+      displayName: orgId,
+      createdAt: now,
+      clerkOrgId: orgId,
+      bootstrappedFrom: "legacy-org",
+      membershipVersion: 1,
+    };
+    s.members = [member];
+    this.rewriteYou(s, em);
+    this.log(s, { cat: "access", actor: member.id, action: "claimed legacy org workspace", target: em, ip: "", svc: "" });
+    await this.save(s);
+    return this.memberContext(uid);
+  }
+
   /** Resolve a Clerk user against this tenant. Only the tenant's OWNER is a
    *  member: any other identity — including a member, admin or invitee row
    *  left over from the retired team features — gets `member: null`. The
@@ -1129,7 +1205,8 @@ export class TenantDO extends DurableObject<Env> {
       if (typeof email === "string" && email) return this.ensureOwner(uid, email);
       return { member: null, tenantMeta: null, needsBootstrap: true };
     }
-    const m = uid ? s.members.find((x) => x.clerkUserId === uid && x.role === "owner") : undefined;
+    const owner = this.principalOwner(s);
+    const m = uid && owner?.clerkUserId === uid ? owner : undefined;
     return {
       member: m ? { id: m.id, role: m.role, state: m.state, email: m.email } : null,
       tenantMeta: s.tenantMeta ?? null,
@@ -1137,12 +1214,21 @@ export class TenantDO extends DurableObject<Env> {
   }
 
   /** The OAuth door: a Clerk-verified caller may reach a key-gated service
-   *  only as this tenant's owner — the active owner member of a bootstrapped
+   *  only as this tenant's owner — the principal owner of a bootstrapped
    *  tenant, or the user whose personal tenant this is. A public service
-   *  needs no identity. There are no shared members or per-user grants. */
+   *  needs no identity. There are no shared members or per-user grants.
+   *
+   *  One pre-bootstrap case keeps a legacy Clerk-org tenant reachable by its
+   *  owner before anyone has claimed it: a token scoped to THIS org (org_id
+   *  === the tenant id) carrying the org admin role — the same people who may
+   *  claim it. Once claimed, the tenant has an owner row and only that owner
+   *  passes. (Pre-cut, an org token was checked against per-user ACL grants
+   *  instead; those grants are retired.) */
   private async gateOauth(
     clerkUserId: unknown,
     service: unknown,
+    orgIdClaim?: unknown,
+    orgRole?: unknown,
   ): Promise<{ allowed: boolean; public?: boolean }> {
     const uid = typeof clerkUserId === "string" ? clerkUserId : "";
     const s = await this.load();
@@ -1151,11 +1237,16 @@ export class TenantDO extends DurableObject<Env> {
     }
     if (!uid) return { allowed: false };
     if (s.tenantMeta) {
-      return {
-        allowed: this.activeOwners(s).some((m) => m.clerkUserId === uid),
-      };
+      return { allowed: this.principalOwner(s)?.clerkUserId === uid };
     }
-    return { allowed: uid === this.tenantId() };
+    if (uid === this.tenantId()) return { allowed: true };
+    return {
+      allowed:
+        typeof orgIdClaim === "string" &&
+        orgIdClaim.startsWith("org_") &&
+        orgIdClaim === this.tenantId() &&
+        (orgRole === "org:admin" || orgRole === "admin"),
+    };
   }
 
   // ---- mutations: settings ------------------------------------------------

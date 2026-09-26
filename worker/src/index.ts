@@ -944,6 +944,9 @@ async function relayMcp(
         const gate = await tenantOp<{ allowed: boolean }>(env, tenant, "gateOauth", {
           clerkUserId: id,
           service,
+          // Only consulted for a legacy Clerk-org tenant nobody has claimed.
+          orgIdClaim: who.org_id,
+          orgRole: who.org_role,
         });
         if (!gate.allowed) {
           return json(403, { error: "token identity does not own this tenant" });

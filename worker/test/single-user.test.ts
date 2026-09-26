@@ -8,10 +8,12 @@ import {
 import worker from "../src/index";
 import { signAssertion } from "../src/auth";
 
-// SINGLE-USER TENANCY at the control API. A signed-in Clerk user acts on the
-// tenant they OWN if one exists (a workspace or Clerk-org tenant claimed before
-// the cut), else their personal tenant (their Clerk user id). Pre-cut rosters,
-// directory rows and invitations stay in storage, but only an owner resolves.
+// SINGLE-USER TENANCY at the control API. A signed-in Clerk user acts on
+// their personal tenant (their Clerk user id) or a tenant they OWN (a
+// workspace, or a Clerk-org tenant claimed before the cut or at sign-in) —
+// whichever one holds their fleet, never silently switching between two that
+// both do. Pre-cut rosters, directory rows and invitations stay in storage,
+// but only an owner resolves.
 
 const SERVICE = env.FINCH_SERVICE_SECRET;
 const HOST = "hub.test";
@@ -78,6 +80,99 @@ async function seedDirectory(clerkUserId: string, rows: { tenantId: string; role
   });
 }
 
+/** Give a tenant something its owner would lose track of: one service. */
+async function populate(tenantId: string) {
+  const stub = env.TENANT.get(env.TENANT.idFromName(tenantId));
+  const res = await stub.fetch("https://tenant/op", {
+    method: "POST",
+    body: JSON.stringify({ op: "enroll", name: "Scraper" }),
+  });
+  expect(res.ok).toBe(true);
+}
+
+async function tenantState(tenantId: string): Promise<any> {
+  return runInDO(env.TENANT.get(env.TENANT.idFromName(tenantId)), (instance: any) =>
+    instance.ctx.storage.get("state"),
+  );
+}
+
+async function directoryRows(clerkUserId: string): Promise<any[]> {
+  return (
+    (await runInDO(env.DIRECTORY.get(env.DIRECTORY.idFromName("global")), (instance: any) =>
+      instance.ctx.storage.get(`u:${clerkUserId}`),
+    )) ?? []
+  );
+}
+
+describe("/api/user/sync — legacy Clerk-org tenants stay reachable for their owner", () => {
+  it("claims an unmigrated org tenant that holds state for the org admin who signs in", async () => {
+    const user = `user_orgadmin_${Date.now()}_${seq++}`;
+    const org = `org_unclaimed_${Date.now()}_${seq++}`;
+    await populate(org);
+    const out = (await (await post("/api/user/sync", { tenant: user, kind: "user" }, {
+      emails: ["admin@example.com"],
+      primaryEmail: "admin@example.com",
+      adminOrgIds: [org],
+    })).json()) as any;
+    expect(out.tenant).toBe(org);
+    expect(out.claimable).toEqual([]);
+    expect(out.tenants.map((t: any) => t.tenantId)).toEqual([org, user]);
+    expect(out.tenants[0]).toMatchObject({ role: "owner", state: "active", kind: "team", email: "admin@example.com" });
+
+    // A single owner row, the org recorded, nothing else in the tenant touched.
+    const s = await tenantState(org);
+    expect(s.tenantMeta).toMatchObject({ kind: "team", clerkOrgId: org, bootstrappedFrom: "legacy-org" });
+    expect(s.members).toHaveLength(1);
+    expect(s.services.map((x: any) => x.id)).toEqual(["scraper"]);
+    expect(s.acl.find((r: any) => r.id === "r_owner").src).toEqual({ type: "user", name: "admin@example.com" });
+
+    // Indexed, so it keeps resolving even when the web stops naming the org.
+    expect((await directoryRows(user)).map((r: any) => r.tenantId)).toEqual([org]);
+    const later = (await (await post("/api/user/sync", { tenant: user, kind: "user" }, { emails: [] })).json()) as any;
+    expect(later.tenant).toBe(org);
+
+    // A second admin of the same org does not take it over.
+    const other = `user_orgadmin2_${Date.now()}_${seq++}`;
+    const second = (await (await post("/api/user/sync", { tenant: other, kind: "user" }, {
+      emails: ["two@example.com"],
+      primaryEmail: "two@example.com",
+      adminOrgIds: [org],
+    })).json()) as any;
+    expect(second.tenant).toBe(other);
+    expect(second.tenants.map((t: any) => t.tenantId)).toEqual([other]);
+    expect((await tenantState(org)).members).toHaveLength(1);
+  });
+
+  it("reports the org as claimable instead when no verified email is sent", async () => {
+    const user = `user_noemail_${Date.now()}_${seq++}`;
+    const org = `org_noemail_${Date.now()}_${seq++}`;
+    await populate(org);
+    const out = (await (await post("/api/user/sync", { tenant: user, kind: "user" }, {
+      emails: [],
+      adminOrgIds: [org],
+    })).json()) as any;
+    expect(out.claimable).toEqual([{ clerkOrgId: org }]);
+    expect(out.tenant).toBe(user);
+    expect((await tenantState(org)).tenantMeta).toBeUndefined();
+  });
+
+  it("never claims an empty org tenant or a non-org id", async () => {
+    const user = `user_emptyorg_${Date.now()}_${seq++}`;
+    const org = `org_empty_${Date.now()}_${seq++}`;
+    const notOrg = `ft_notorg_${Date.now()}_${seq++}`;
+    await populate(notOrg);
+    const out = (await (await post("/api/user/sync", { tenant: user, kind: "user" }, {
+      emails: ["e@example.com"],
+      primaryEmail: "e@example.com",
+      adminOrgIds: [org, notOrg, 42],
+    })).json()) as any;
+    expect(out.tenant).toBe(user);
+    expect(out.claimable).toEqual([]);
+    expect(out.tenants.map((t: any) => t.tenantId)).toEqual([user]);
+    expect((await tenantState(notOrg)).tenantMeta).toBeUndefined();
+  });
+});
+
 describe("/api/user/sync — resolves the tenant a user owns", () => {
   it("falls back to the personal tenant, bootstrapping it from the verified email", async () => {
     const user = `user_solo_${Date.now()}_${seq++}`;
@@ -103,7 +198,7 @@ describe("/api/user/sync — resolves the tenant a user owns", () => {
     ]);
   });
 
-  it("puts an OWNED legacy workspace first, ahead of the personal tenant", async () => {
+  it("lists every tenant the user OWNS — workspaces and claimed org tenants — not ones they merely joined", async () => {
     const user = `user_owner_${Date.now()}_${seq++}`;
     const owned = `ft_owned_${Date.now()}_${seq++}`;
     const org = `org_legacy_${Date.now()}_${seq++}`;
@@ -126,9 +221,48 @@ describe("/api/user/sync — resolves the tenant a user owns", () => {
     ]);
 
     const out = (await (await post("/api/user/sync", { tenant: user, kind: "user" }, { emails: [] })).json()) as any;
-    expect(out.tenant).toBe(owned);
     expect(out.tenants.map((t: any) => t.tenantId)).toEqual([owned, org, user]);
     expect(out.tenants[0]).toMatchObject({ role: "owner", state: "active", kind: "team", memberId: "m_0" });
+    // None of them holds anything: the personal tenant, as before the cut.
+    expect(out.tenant).toBe(user);
+  });
+
+  it("never switches a user away from a personal tenant that holds their fleet to an empty workspace", async () => {
+    const user = `user_fleet_${Date.now()}_${seq++}`;
+    const empty = `ft_empty_${Date.now()}_${seq++}`;
+    await populate(user);
+    await seedTeamTenant(empty, [{ clerkUserId: user, email: "f@example.com", role: "owner", state: "active" }]);
+    await seedDirectory(user, [{ tenantId: empty, role: "owner", state: "active" }]);
+    const out = (await (await post("/api/user/sync", { tenant: user, kind: "user" }, { emails: [] })).json()) as any;
+    expect(out.tenant).toBe(user);
+    expect(out.tenants.map((t: any) => t.tenantId)).toEqual([empty, user]);
+  });
+
+  it("picks the one owned workspace that holds state over an empty personal tenant", async () => {
+    const user = `user_team_${Date.now()}_${seq++}`;
+    const team = `ft_full_${Date.now()}_${seq++}`;
+    const idle = `ft_idle_${Date.now()}_${seq++}`;
+    await populate(team);
+    await seedTeamTenant(team, [{ clerkUserId: user, email: "t@example.com", role: "owner", state: "active" }]);
+    await seedTeamTenant(idle, [{ clerkUserId: user, email: "t@example.com", role: "owner", state: "active" }]);
+    await seedDirectory(user, [
+      { tenantId: idle, role: "owner", state: "active" },
+      { tenantId: team, role: "owner", state: "active" },
+    ]);
+    const out = (await (await post("/api/user/sync", { tenant: user, kind: "user" }, { emails: [] })).json()) as any;
+    expect(out.tenant).toBe(team);
+  });
+
+  it("refuses to pick (tenant: null) when more than one owned tenant holds state", async () => {
+    const user = `user_both_${Date.now()}_${seq++}`;
+    const team = `ft_both_${Date.now()}_${seq++}`;
+    await populate(user);
+    await populate(team);
+    await seedTeamTenant(team, [{ clerkUserId: user, email: "b@example.com", role: "owner", state: "active" }]);
+    await seedDirectory(user, [{ tenantId: team, role: "owner", state: "active" }]);
+    const out = (await (await post("/api/user/sync", { tenant: user, kind: "user" }, { emails: [] })).json()) as any;
+    expect(out.tenant).toBeNull();
+    expect(out.tenants.map((t: any) => t.tenantId)).toEqual([team, user]);
   });
 
   it("re-verifies directory rows against the tenant — a stale owner row does not resolve", async () => {
@@ -150,7 +284,7 @@ describe("/api/user/sync — resolves the tenant a user owns", () => {
     await seedTeamTenant(promoted, [{ clerkUserId: user, email: "p@example.com", role: "owner", state: "active" }]);
     await seedDirectory(user, [{ tenantId: promoted, role: "admin", state: "active" }]);
     const out = (await (await post("/api/user/sync", { tenant: user, kind: "user" }, { emails: [] })).json()) as any;
-    expect(out.tenant).toBe(promoted);
+    expect(out.tenants.map((t: any) => t.tenantId)).toEqual([promoted, user]);
   });
 });
 

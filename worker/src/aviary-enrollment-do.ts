@@ -25,4 +25,10 @@ export class AviaryEnrollmentDO extends DurableObject<Env> {
       { status: 410 },
     );
   }
+
+  // The retired class kept a 60s expiry alarm armed while any enrollment was in
+  // flight. An instance that still has one set at deploy time fires it here;
+  // without a handler the runtime would error and retry. Drain it quietly —
+  // not rescheduling ends the loop — and leave the stored rows untouched.
+  async alarm(): Promise<void> {}
 }

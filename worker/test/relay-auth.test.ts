@@ -57,14 +57,14 @@ let seq = 0;
 /** A fresh tenant + slug pair, registered slug→tenant in the RouterDO so the
  *  relay resolves <slug>.finchmcp.com to this tenant. Slugs must be a single DNS
  *  label [a-z0-9-]; we keep them short + unique per test. */
-async function freshTenantSlug(): Promise<{
+async function freshTenantSlug(prefix = "user_relay_"): Promise<{
   tenant: string;
   slug: string;
   host: string;
   base: string;
 }> {
   const n = `${Date.now().toString(36)}${seq++}`.toLowerCase();
-  const tenant = `user_relay_${n}`;
+  const tenant = `${prefix}${n}`;
   const slug = `relay${n}`;
   // Register the mapping via the singleton RouterDO (same op routerRegister uses).
   const stub = env.ROUTER.get(env.ROUTER.idFromName("global"));
@@ -91,15 +91,22 @@ async function call(req: Request): Promise<Response> {
       ...(env as any),
       ...assertionBindings,
       // Test-only service binding for Clerk userinfo. A token of the form
-      // oauth:<clerk user id> authenticates that user; the raw token is never
+      // oauth:<clerk user id>[;<org id>;<org role>] authenticates that user
+      // (org-scoped when the suffix is present); the raw token is never
       // forwarded to the agent or placed in the assertion.
       CLERK_USERINFO: {
         async fetch(_input: RequestInfo | URL, init?: RequestInit) {
           const auth = new Headers(init?.headers).get("authorization") || "";
           const token = auth.replace(/^Bearer\s+/, "");
-          return token.startsWith("oauth:")
-            ? Response.json({ sub: token.slice("oauth:".length) })
-            : Response.json({ error: "invalid token" }, { status: 401 });
+          if (!token.startsWith("oauth:")) {
+            return Response.json({ error: "invalid token" }, { status: 401 });
+          }
+          const [sub, orgId, orgRole] = token.slice("oauth:".length).split(";");
+          return Response.json({
+            sub,
+            ...(orgId ? { org_id: orgId } : {}),
+            ...(orgRole ? { org_role: orgRole } : {}),
+          });
         },
       },
     } as any,
@@ -231,8 +238,10 @@ async function waitForBox(
  *  closes it). The service is KEY-gated by default, and the tenant is a
  *  PERSONAL tenant whose owner (Clerk user id === tenant id) has signed in
  *  once, so its owner row exists. */
-async function standUpService() {
-  const ctx = await freshTenantSlug();
+async function standUpService(opts: { legacyOrg?: boolean } = {}) {
+  // A legacy Clerk-org tenant (id = the org id) that nobody has claimed:
+  // it has no owner row, so nobody signs in to bootstrap one.
+  const ctx = await freshTenantSlug(opts.legacyOrg ? "org_relay_" : "user_relay_");
   const { tenant, slug, host, base } = ctx;
 
   const enroll = (await (
@@ -280,13 +289,15 @@ async function standUpService() {
     box,
     (m) => m.connected && m.state !== "pending",
   );
-  const boot = (await (
-    await api(tenant, host, "POST", "/api/member-context", {
-      clerkUserId: tenant,
-      email: "owner@example.com",
-    })
-  ).json()) as any;
-  expect(boot.member).toMatchObject({ role: "owner", state: "active" });
+  if (!opts.legacyOrg) {
+    const boot = (await (
+      await api(tenant, host, "POST", "/api/member-context", {
+        clerkUserId: tenant,
+        email: "owner@example.com",
+      })
+    ).json()) as any;
+    expect(boot.member).toMatchObject({ role: "owner", state: "active" });
+  }
 
   return { ...ctx, service, box, agent };
 }
@@ -621,6 +632,31 @@ describe("relay auth — callers on a key-gated service", () => {
       error: "token identity does not own this tenant",
     });
     expect(relayed).toBe(false);
+    agent.close(1000, "done");
+  });
+
+  it("relays an org-admin OAuth token to its own unclaimed legacy org tenant, and no other org token", async () => {
+    const { host, base, tenant, service, agent } = await standUpService({ legacyOrg: true });
+    const mcp = (token: string) =>
+      call(
+        new Request(`${base}/${service}/mcp`, {
+          method: "POST",
+          headers: { host, "content-type": "application/json", authorization: `Bearer ${token}` },
+          body: '{"jsonrpc":"2.0","id":1,"method":"initialize"}',
+        }),
+      );
+    for (const denied of [
+      `oauth:user_orgmember;${tenant};org:member`,
+      "oauth:user_orgadmin;org_somewhere_else;org:admin",
+      "oauth:user_orgadmin",
+    ]) {
+      expect((await mcp(denied)).status, denied).toBe(403);
+    }
+    const reqSeen = nextFrame(agent);
+    const relayP = mcp(`oauth:user_orgadmin;${tenant};org:admin`);
+    const frame = await reqSeen;
+    reply200(agent, frame.id, "<ok/>");
+    expect((await relayP).status).toBe(200);
     agent.close(1000, "done");
   });
 
