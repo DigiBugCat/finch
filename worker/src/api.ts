@@ -52,9 +52,11 @@ function cloneResponse(res: Response): Promise<Response> { return res.text().the
  *  authority). The personal tenant (the user's own Clerk id) is excluded —
  *  it is the fallback, not a match. Legacy Clerk-org tenants that were claimed
  *  before the cut carry an owner row too, so they resolve here like any other
- *  owned tenant. */
+ *  owned tenant. The row's own role is not trusted either way: every listed
+ *  tenant is asked, so a directory row that lags an ownership change can
+ *  neither grant nor hide ownership. */
 async function ownedTenants(env: Env, clerkUserId: string): Promise<string[]> {
-  const listed = await directoryOp<{ memberships?: { tenantId: string; role: string; state: string }[] }>(
+  const listed = await directoryOp<{ memberships?: { tenantId: string }[] }>(
     env,
     "listForUser",
     { clerkUserId },
@@ -62,7 +64,7 @@ async function ownedTenants(env: Env, clerkUserId: string): Promise<string[]> {
   const out: string[] = [];
   for (const row of listed.memberships ?? []) {
     const tenantId = String(row.tenantId || "");
-    if (!tenantId || tenantId === clerkUserId || row.role !== "owner" || row.state !== "active") continue;
+    if (!tenantId || tenantId === clerkUserId || out.includes(tenantId)) continue;
     const res = await tenantOpRaw(env, tenantId, "memberContext", { clerkUserId });
     if (!res.ok) continue;
     const ctx: any = await res.json();

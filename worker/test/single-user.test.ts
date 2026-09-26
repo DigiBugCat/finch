@@ -143,6 +143,15 @@ describe("/api/user/sync — resolves the tenant a user owns", () => {
     expect(out.tenant).toBe(user);
     expect(out.tenants.map((t: any) => t.tenantId)).toEqual([user]);
   });
+
+  it("trusts the tenant, not the row — ownership a lagging row misses still resolves", async () => {
+    const user = `user_lag_${Date.now()}_${seq++}`;
+    const promoted = `ft_promoted_${Date.now()}_${seq++}`;
+    await seedTeamTenant(promoted, [{ clerkUserId: user, email: "p@example.com", role: "owner", state: "active" }]);
+    await seedDirectory(user, [{ tenantId: promoted, role: "admin", state: "active" }]);
+    const out = (await (await post("/api/user/sync", { tenant: user, kind: "user" }, { emails: [] })).json()) as any;
+    expect(out.tenant).toBe(promoted);
+  });
 });
 
 describe("/api/member-context — only the owner is a member", () => {
