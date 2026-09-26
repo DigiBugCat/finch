@@ -34,7 +34,11 @@
       { "name": "BOX", "class_name": "BoxDO" },
       { "name": "TENANT", "class_name": "TenantDO" },
       { "name": "ROUTER", "class_name": "RouterDO" },
-      { "name": "DIRECTORY", "class_name": "DirectoryDO" }
+      { "name": "DIRECTORY", "class_name": "DirectoryDO" },
+      // Test-only: the retired AviaryEnrollmentDO has no binding in
+      // ../wrangler.jsonc (nothing routes to it). This one lets the tests
+      // reach an instance to check that it scrubs its stored secrets.
+      { "name": "AVIARY_ENROLLMENT", "class_name": "AviaryEnrollmentDO" }
     ]
   },
   "migrations": [
