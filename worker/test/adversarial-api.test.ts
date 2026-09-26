@@ -475,4 +475,91 @@ describe("/api/tenant-create", () => {
     expect(listed.memberships[0].role).toBe("owner");
     expect(listed.memberships[0].state).toBe("active");
   });
+
+  // The web calls this over the FINCH_HUB service binding, which carries no
+  // CF-Connecting-IP — clientIp() is "unknown" for every dashboard user, so the
+  // per-IP bucket (10/min) would be shared globally. The web forwards the
+  // browser's IP in X-Finch-Client-IP; this path is service-authed, so it's
+  // trusted here (and only here).
+  it("keys the per-IP creation throttle on the IP the web forwards", async () => {
+    const keys: string[] = [];
+    const JOIN_LIMIT = { limit: async ({ key }: { key: string }) => (keys.push(key), { success: true }) };
+    const clerkUserId = `user_ip_${crypto.randomUUID()}`;
+    const headers = await userHeaders(clerkUserId);
+
+    const forwarded = await call(
+      "/api/tenant-create",
+      createBody("ip@example.test", crypto.randomUUID()),
+      { ...headers, "X-Finch-Client-IP": "2001:db8::7" },
+      { JOIN_LIMIT },
+    );
+    expect(forwarded.status).toBe(200);
+    expect(keys).toEqual([`tcreate:${clerkUserId}`, "tcreate:2001:db8::7"]);
+
+    // A value that isn't an IP literal can't choose an arbitrary bucket.
+    keys.length = 0;
+    await call(
+      "/api/tenant-create",
+      createBody("ip@example.test", crypto.randomUUID()),
+      { ...headers, "X-Finch-Client-IP": "victim:bucket" },
+      { JOIN_LIMIT },
+    );
+    expect(keys[1]).toBe("tcreate:unknown");
+  });
+});
+
+// The web reaches the hub over the FINCH_HUB service binding with the SAME URL
+// it would fetch publicly (`${HUB_URL}/api/...`). A binding request skips DNS,
+// zone routes and the edge: it has no Host header unless the caller sets one,
+// no CF-Connecting-IP and no request.cf. It must still route to the control API
+// exactly like the public request.
+describe("requests arriving over the FINCH_HUB service binding", () => {
+  function bindingRequest(path: string, headers: Record<string, string>, body = "{}") {
+    return new Request(`https://hub.finchmcp.com${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...headers },
+      body,
+    });
+  }
+
+  it("routes to /api and derives the hub's host from the URL", async () => {
+    const assertion = await signAssertion(
+      { tenant: env.DEFAULT_TENANT!, kind: "assertion", exp: now() + 60 },
+      env.FINCH_SERVICE_SECRET,
+    );
+    const req = bindingRequest("/api/cli-mint", {
+      "X-Finch-Service": env.FINCH_SERVICE_SECRET,
+      "X-Finch-Auth": assertion,
+    });
+    expect(req.headers.has("host")).toBe(false);
+    expect(req.headers.has("cf-connecting-ip")).toBe(false);
+
+    const res = await worker.fetch(req, env as any, createExecutionContext());
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as any;
+    // The origin the CLI is told to talk to is the one the web addressed.
+    expect(body.hub).toBe("https://hub.finchmcp.com");
+    expect(typeof body.token).toBe("string");
+  });
+
+  it("still requires the service secret — the binding confers no trust", async () => {
+    const res = await worker.fetch(
+      bindingRequest("/api/cli-mint", {}),
+      env as any,
+      createExecutionContext(),
+    );
+    expect(res.status).toBe(401);
+  });
+
+  it("ignores X-Finch-Client-IP on unauthenticated paths", async () => {
+    const keys: string[] = [];
+    const JOIN_LIMIT = { limit: async ({ key }: { key: string }) => (keys.push(key), { success: true }) };
+    await worker.fetch(
+      bindingRequest("/api/cli/device/start", { "X-Finch-Client-IP": "198.51.100.9" }),
+      { ...env, JOIN_LIMIT } as any,
+      createExecutionContext(),
+    );
+    expect(keys[0]).toBe("devstart:unknown");
+  });
 });
