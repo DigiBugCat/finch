@@ -10,11 +10,11 @@
 //
 // Enrollment trades a one-shot ticket (minted by `finch add` via the CLI token)
 // at /join. The hub tells us which service/box we are AND hands us a
-// short-lived per-box connect-token; we present that token on the relay dial (?ct=<token>) — it is
-// the sole proof that authenticates this box-side channel. We then hold the
-// relay WebSocket open, reconnect with backoff, and send WS-protocol pings for
-// NAT keepalive (the hub auto-pongs them without waking the Durable Object, so
-// they're free).
+// short-lived per-box connect-token; we present that token on the relay dial
+// (?ct=<token>) — it is the sole proof that authenticates this box-side channel.
+// We then hold the relay WebSocket open, reconnect with backoff, and send
+// WS-protocol pings for NAT keepalive (the hub auto-pongs them without waking
+// the Durable Object, so they're free).
 //
 // Reconnect model: the enrollment ticket is ONE-SHOT — the hub burns it on the
 // first /join and 409s any replay. So /join also hands us a long-lived (~30d)
