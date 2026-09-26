@@ -25,16 +25,20 @@ describe('customer-facing privacy copy', () => {
     expect(screen.queryAllByText(/Workers AI/i)).toHaveLength(0);
   });
 
-  it('still discloses sharing records retained from before the CLI cut', () => {
+  it('says legacy sharing records are deleted on migration, not kept', () => {
     render(<PrivacyAndDataHandling />);
 
-    // The hub keeps pre-cut member, ACL and access-request rows (with emails)
-    // even though nothing reads them for access any more.
+    // The hub's single-user migration purges pre-cut member, ACL and
+    // access-request rows (with their emails) and revokes other people's keys.
     const note = screen.getByText(/earlier sharing features/i);
+    expect(note).toHaveTextContent(/deleted on migration/i);
+    expect(note).toHaveTextContent(/team members and invitations/i);
     expect(note).toHaveTextContent(/access-control rules/i);
     expect(note).toHaveTextContent(/access requests/i);
     expect(note).toHaveTextContent(/email addresses/i);
-    expect(note).toHaveTextContent(/no longer uses these records/i);
-    expect(note).toHaveTextContent(/ask for them to be deleted/i);
+    expect(note).toHaveTextContent(/keys minted by anyone other than the\s+account owner are revoked/i);
+    // The retired wording that the records are still stored must be gone.
+    expect(screen.queryAllByText(/still stored/i)).toHaveLength(0);
+    expect(screen.queryAllByText(/ask for them to be deleted/i)).toHaveLength(0);
   });
 });

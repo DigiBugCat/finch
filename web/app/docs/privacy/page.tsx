@@ -55,12 +55,16 @@ export default function PrivacyAndDataHandling() {
         and response bodies are not part of call history, logs, or analytics.
       </p>
       <p>
-        If your account used Finch&apos;s earlier sharing features, the records they
-        created are still stored: team members and invitations, groups,
-        access-control rules, and access requests, including the email addresses in
-        them. Finch no longer uses these records to grant access to anything. The
-        account owner can ask for them to be deleted by writing to{' '}
-        <a href="mailto:hello@aviary.run">hello@aviary.run</a>.
+        Each Finch account belongs to one person. If your account used Finch&apos;s
+        earlier sharing features, the records they created are deleted on
+        migration: team members and invitations, groups, access-control rules,
+        access requests, and the activity-log entries about them, including the
+        email addresses in them. Access keys minted by anyone other than the
+        account owner are revoked, and CLI logins are signed out if anyone else
+        could have held one. A one-time migration removes all of this from an
+        account the first time Finch handles a request for it after the update.
+        The sign-in index that linked people to shared accounts and the records of
+        the retired device-enrollment flow are deleted outright.
       </p>
 
       <h2>What this means in practice</h2>
