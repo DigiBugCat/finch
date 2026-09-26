@@ -24,4 +24,17 @@ describe('customer-facing privacy copy', () => {
     expect(screen.queryAllByText(/Test Chat/i)).toHaveLength(0);
     expect(screen.queryAllByText(/Workers AI/i)).toHaveLength(0);
   });
+
+  it('still discloses sharing records retained from before the CLI cut', () => {
+    render(<PrivacyAndDataHandling />);
+
+    // The hub keeps pre-cut member, ACL and access-request rows (with emails)
+    // even though nothing reads them for access any more.
+    const note = screen.getByText(/earlier sharing features/i);
+    expect(note).toHaveTextContent(/access-control rules/i);
+    expect(note).toHaveTextContent(/access requests/i);
+    expect(note).toHaveTextContent(/email addresses/i);
+    expect(note).toHaveTextContent(/no longer uses these records/i);
+    expect(note).toHaveTextContent(/ask for them to be deleted/i);
+  });
 });

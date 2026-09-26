@@ -54,6 +54,14 @@ export default function PrivacyAndDataHandling() {
         the plaintext key is shown only when it is minted. Ordinary MCP request
         and response bodies are not part of call history, logs, or analytics.
       </p>
+      <p>
+        If your account used Finch&apos;s earlier sharing features, the records they
+        created are still stored: team members and invitations, groups,
+        access-control rules, and access requests, including the email addresses in
+        them. Finch no longer uses these records to grant access to anything. The
+        account owner can ask for them to be deleted by writing to{' '}
+        <a href="mailto:hello@aviary.run">hello@aviary.run</a>.
+      </p>
 
       <h2>What this means in practice</h2>
       <ul>
