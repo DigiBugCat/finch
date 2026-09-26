@@ -25,61 +25,6 @@ async function op<T = any>(
   return (await res.json()) as T;
 }
 
-const runInDO = runInDurableObject as unknown as (
-  target: DurableObjectStub,
-  callback: (instance: any) => unknown,
-) => Promise<any>;
-
-/** Rewrite a tenant's STORED record directly. The ops that used to write
- *  ACL rules and member rosters were removed with the team features, but
- *  tenants created before the cut still carry that data and every gate must
- *  keep honoring (or ignoring) it correctly — so tests seed it here. */
-async function seedState(t: string, mutate: (s: any) => void): Promise<void> {
-  await op(t, "getState"); // materialize the stored record first
-  await runInDO(env.TENANT.get(env.TENANT.idFromName(t)), async (instance: any) => {
-    const s: any = await instance.ctx.storage.get("state");
-    mutate(s);
-    await instance.ctx.storage.put("state", s);
-  });
-}
-
-/** Seed a pre-cut ACL allow rule (formerly written by the addAcl op). */
-function addRule(t: string, src: unknown, dst: unknown[]): Promise<void> {
-  return seedState(t, (s) => {
-    s.acl.push({ id: "r_" + crypto.randomUUID().slice(0, 8), src, dst, action: "allow" });
-  });
-}
-
-/** Seed a pre-cut TEAM tenant (formerly written by bootstrapMembers): tenant
- *  metadata plus a roster, with the locked owner rule pointed at the first
- *  owner the way bootstrap left it. */
-function seedTeam(
-  t: string,
-  members: { clerkUserId: string | null; email: string; role: string; state: string }[],
-): Promise<void> {
-  return seedState(t, (s) => {
-    const now = Date.now();
-    s.tenantMeta = {
-      id: t,
-      kind: "team",
-      displayName: "Fleet",
-      createdAt: now,
-      bootstrappedFrom: "fresh",
-      membershipVersion: 1,
-    };
-    s.members = members.map((m, i) => ({
-      id: `m_${i}`,
-      tenantId: t,
-      createdAt: now,
-      updatedAt: now,
-      ...m,
-    }));
-    const owner = members.find((m) => m.role === "owner" && m.state === "active");
-    const rule = s.acl.find((r: any) => r.id === "r_owner");
-    if (owner && rule) rule.src = { type: "user", name: owner.email };
-  });
-}
-
 describe("TenantDO.enroll — slug derivation + dedup", () => {
   it("derives a slug id from the name", async () => {
     const t = freshTenant();
@@ -113,11 +58,15 @@ describe("TenantDO.enroll — slug derivation + dedup", () => {
     expect(ap.group).toBe("default"); // default group
   });
 
-  it("honors an explicit group and creates the group", async () => {
+  it("records an explicit group on the service without keeping a group list", async () => {
     const t = freshTenant();
     await op(t, "enroll", { name: "Scraper", group: "Lab B" });
     const state = await op<any>(t, "getState");
-    expect(state.groups.some((g: any) => g.name === "Lab B")).toBe(true);
+    expect(state.services[0].group).toBe("Lab B");
+    // Groups were ACL sources; there are none any more, stored or reported.
+    expect(state).not.toHaveProperty("groups");
+    expect(state).not.toHaveProperty("acl");
+    expect(state).not.toHaveProperty("accessRequests");
   });
 });
 
@@ -205,9 +154,8 @@ describe("TenantDO.registerBox — box state", () => {
 });
 
 describe("TenantDO.checkKey — scope gate (structured)", () => {
-  // The owner rule (user:you -> all) is seeded fresh, and mintKey owner defaults
-  // to "you", so a default key passes the ACL gate — letting us isolate scope.
-  // Scope is now STRUCTURED: {all:true} | {services:[...]}; magic strings/CSV
+  // A key is allowed iff it exists, has not expired, and its scope covers the
+  // service. Scope is STRUCTURED: {all:true} | {services:[...]}; magic strings/CSV
   // are gone (security M2). mintKey validates every listed service id exists.
   async function mint(
     t: string,
@@ -289,145 +237,67 @@ describe("TenantDO.checkKey — scope gate (structured)", () => {
   });
 });
 
-describe("TenantDO.evalAccess — ACL matrix (default-deny)", () => {
-  // The key gate still evaluates the tenant's stored ACL rules exactly as
-  // before the single-user cut (no key gains or loses access). Rule-editing
-  // ops are gone, so these tests seed rules straight into storage (addRule).
-  // To isolate the ACL gate we always mint with scope "all services" (scope
-  // passes) and a non-owner owner so the seeded owner rule (user:you) does NOT
-  // auto-allow. Then we add specific allow rules and assert allow/deny.
-  const ALICE = "alice";
-
-  async function setup(t: string, opts?: { tags?: string[]; group?: string }) {
-    await op(t, "enroll", { name: "Scraper", group: opts?.group });
-    if (opts?.tags) await op(t, "setTags", { id: "scraper", tags: opts.tags });
-  }
-
-  async function mintNonOwner(t: string, label: string): Promise<string> {
-    const r = await op<{ plaintext: string }>(t, "mintKey", {
-      label,
-      scope: { all: true }, // structured: scope passes, isolate the ACL gate
-      owner: ALICE,
-    });
-    return r.plaintext;
-  }
-
-  async function allowed(
-    t: string,
-    keyPlain: string,
-    service = "scraper",
-  ): Promise<boolean> {
-    const r = await op<{ allowed: boolean; reason?: string }>(t, "checkKey", {
-      hash: await hashKey(keyPlain),
+describe("TenantDO.checkKey — no ACL layer", () => {
+  async function allowed(t: string, plaintext: string, service = "scraper") {
+    return op<{ allowed: boolean; reason?: string }>(t, "checkKey", {
+      hash: await hashKey(plaintext),
       service,
     });
-    return r.allowed;
   }
 
-  it("DENY by default: a non-owner key with no matching rule is blocked", async () => {
+  it("admits a scoped key on scope alone: tags, groups and stored rules play no part", async () => {
     const t = freshTenant();
-    await setup(t);
-    const key = await mintNonOwner(t, "k1");
-    expect(await allowed(t, key)).toBe(false);
+    await op(t, "enroll", { name: "Scraper", group: "lab" });
+    await op(t, "setTags", { id: "scraper", tags: ["prod"] });
+    const { plaintext } = await op<{ plaintext: string }>(t, "mintKey", {
+      label: "k",
+      scope: { services: ["scraper"] },
+    });
+    expect(await allowed(t, plaintext)).toMatchObject({ allowed: true });
   });
 
-  it("ALLOW via key rule: src key:<label> -> service", async () => {
+  it("denies a key for a service that does not exist, even with {all:true}", async () => {
     const t = freshTenant();
-    await setup(t);
-    const key = await mintNonOwner(t, "k-by-label");
-    await addRule(t, { type: "key", name: "k-by-label" }, [{ type: "service", name: "scraper" }]);
-    expect(await allowed(t, key)).toBe(true);
+    await op(t, "enroll", { name: "Scraper" });
+    const { plaintext } = await op<{ plaintext: string }>(t, "mintKey", { label: "wide", scope: { all: true } });
+    expect(await allowed(t, plaintext, "nope")).toEqual({
+      allowed: false,
+      keyLabel: "wide",
+      reason: "no-service",
+    });
   });
 
-  it("ALLOW via user rule: src user:<owner> -> service", async () => {
+  it("denies an empty hash rather than matching a key", async () => {
     const t = freshTenant();
-    await setup(t);
-    const key = await mintNonOwner(t, "k-user");
-    await addRule(t, { type: "user", name: ALICE }, [{ type: "service", name: "scraper" }]);
-    expect(await allowed(t, key)).toBe(true);
+    await op(t, "enroll", { name: "Scraper" });
+    await op(t, "mintKey", { label: "wide", scope: { all: true } });
+    const r = await op<any>(t, "checkKey", { hash: "", service: "scraper" });
+    expect(r).toMatchObject({ allowed: false, reason: "no-key" });
   });
 
-  it("ALLOW via group rule: key is a member of the src group -> service", async () => {
+  it("stops admitting a key the moment it is revoked", async () => {
     const t = freshTenant();
-    // enroll auto-creates the group "lab" with member ["you"]. keyIdentities
-    // adds a group to the key's identities when the key's LABEL is a member of
-    // that group — so a key LABELED "you" presents as a member of "lab" even
-    // though its owner ("alice") is not. That isolates the GROUP src path from
-    // the seeded user:you owner rule (which matches on owner, not label).
-    await setup(t, { group: "lab" });
-    const key = await mintNonOwner(t, "you"); // label "you", owner "alice"
-    await addRule(t, { type: "group", name: "lab" }, [{ type: "service", name: "scraper" }]);
-    expect(await allowed(t, key)).toBe(true);
-  });
-
-  it("DENY group rule: a key in no matching group is blocked", async () => {
-    const t = freshTenant();
-    await setup(t, { group: "lab" });
-    const key = await mintNonOwner(t, "k-not-in-group"); // not a member of "lab"
-    await addRule(t, { type: "group", name: "lab" }, [{ type: "service", name: "scraper" }]);
-    expect(await allowed(t, key)).toBe(false);
-  });
-
-  it("ALLOW via tag rule: src key -> tag matches an service tag", async () => {
-    const t = freshTenant();
-    await setup(t, { tags: ["prod", "scrapers"] });
-    const key = await mintNonOwner(t, "k-tag");
-    await addRule(t, { type: "key", name: "k-tag" }, [{ type: "tag", name: "prod" }]);
-    expect(await allowed(t, key)).toBe(true);
-  });
-
-  it("ALLOW via service-group rule: src key -> group matches", async () => {
-    const t = freshTenant();
-    await setup(t, { group: "homelab" });
-    const key = await mintNonOwner(t, "k-applgroup");
-    await addRule(t, { type: "key", name: "k-applgroup" }, [{ type: "group", name: "homelab" }]);
-    expect(await allowed(t, key)).toBe(true);
-  });
-
-  it("ALLOW via src:all -> any matching dst", async () => {
-    const t = freshTenant();
-    await setup(t, { tags: ["x"] });
-    const key = await mintNonOwner(t, "k-all-src");
-    await addRule(t, { type: "all" }, [{ type: "tag", name: "x" }]);
-    expect(await allowed(t, key)).toBe(true);
-  });
-
-  it("ALLOW via dst:all (owner-style blanket) for the seeded owner key", async () => {
-    const t = freshTenant();
-    await setup(t);
-    // The default 'you' owner: mint with default owner so it matches user:you.
-    const r = await op<{ plaintext: string }>(t, "mintKey", {
-      label: "owner-key",
+    await op(t, "enroll", { name: "Scraper" });
+    const minted = await op<{ plaintext: string; key: { id: string } }>(t, "mintKey", {
+      label: "short-lived",
       scope: { all: true },
     });
-    expect(await allowed(t, r.plaintext)).toBe(true);
+    expect((await allowed(t, minted.plaintext)).allowed).toBe(true);
+    expect(await op(t, "revokeBoxKey", { service: "", box: "", key: minted.key.id })).toEqual({ ok: true });
+    expect(await allowed(t, minted.plaintext)).toMatchObject({ allowed: false, reason: "no-key" });
   });
 
-  it("DENY when the allow rule targets a DIFFERENT service", async () => {
-    const t = freshTenant();
-    await setup(t);
-    await op(t, "enroll", { name: "Printer" });
-    const key = await mintNonOwner(t, "k-wrong-dst");
-    await addRule(t, { type: "key", name: "k-wrong-dst" }, [{ type: "service", name: "printer" }]); // not scraper
-    expect(await allowed(t, key, "scraper")).toBe(false);
-    expect(await allowed(t, key, "printer")).toBe(true);
-  });
-
-  it("DENY when the src does not match (rule for a different key label)", async () => {
-    const t = freshTenant();
-    await setup(t);
-    const key = await mintNonOwner(t, "k-real");
-    await addRule(t, { type: "key", name: "some-other-key" }, [{ type: "service", name: "scraper" }]);
-    expect(await allowed(t, key)).toBe(false);
-  });
-
-  it("DENY when the service does not exist (evalAccess returns false)", async () => {
-    const t = freshTenant();
-    await setup(t);
-    const key = await mintNonOwner(t, "k-ghost-dst");
-    await addRule(t, { type: "key", name: "k-ghost-dst" }, [{ type: "all" }]);
-    // service "nope" doesn't exist -> evalAccess findService fails -> deny.
-    expect(await allowed(t, key, "nope")).toBe(false);
+  it("labels every key with the tenant owner, whatever owner the caller names", async () => {
+    const t = `user_${freshTenant()}`;
+    await op(t, "enroll", { name: "Scraper" });
+    const before = await op<any>(t, "mintKey", { label: "pre", scope: { all: true }, owner: "mallory" });
+    expect(before.key.owner).toBe("you");
+    await op(t, "memberContext", { clerkUserId: t, email: "Me@Example.com" });
+    const after = await op<any>(t, "mintKey", { label: "post", scope: { all: true }, owner: "mallory" });
+    expect(after.key.owner).toBe("me@example.com");
+    // Bootstrap rewrote the placeholder on the earlier key too.
+    const owners = (await op<any>(t, "getState")).keys.map((k: any) => k.owner);
+    expect(owners).toEqual(["me@example.com", "me@example.com"]);
   });
 });
 
@@ -690,11 +560,10 @@ describe("TenantDO.approve — derives liveness from connected (#12)", () => {
   });
 });
 
-// Single-user tenancy: the tenant OWNER is the only human principal. These
-// gates run on tenants that may still carry a pre-cut team roster, invites or
-// access-request rows — none of which may authorize anyone.
+// Single-user tenancy: a tenant is one Clerk user. Its id is their Clerk user
+// id, and that user — as its owner — is the only human principal.
 describe("TenantDO — single-user owner gates", () => {
-  it("memberContext bootstraps a personal tenant's owner from an email", async () => {
+  it("memberContext bootstraps the tenant's own user as its owner from an email", async () => {
     const t = `user_${freshTenant()}`;
     expect(await op<any>(t, "memberContext", { clerkUserId: t })).toEqual({
       member: null,
@@ -704,130 +573,48 @@ describe("TenantDO — single-user owner gates", () => {
     const boot = await op<any>(t, "memberContext", { clerkUserId: t, email: "Me@Example.com" });
     expect(boot.member).toMatchObject({ role: "owner", state: "active", email: "me@example.com" });
     expect(boot.tenantMeta).toMatchObject({ kind: "personal", id: t });
-    // Idempotent, and the placeholder owner rule now names the owner.
-    const again = await op<any>(t, "memberContext", { clerkUserId: t, email: "me@example.com" });
+    // Idempotent: the same owner row, and still exactly one member.
+    const again = await op<any>(t, "memberContext", { clerkUserId: t, email: "other@example.com" });
     expect(again.member.id).toBe(boot.member.id);
-    const rule = (await op<any>(t, "getState")).acl.find((r: any) => r.id === "r_owner");
-    expect(rule.src.name).toBe("me@example.com");
+    expect(again.member.email).toBe("me@example.com");
+    expect((await op<any>(t, "getState")).members).toHaveLength(1);
   });
 
-  it("memberContext never bootstraps someone else's personal tenant", async () => {
+  it("memberContext never bootstraps or reports anyone else", async () => {
     const t = `user_${freshTenant()}`;
-    const out = await op<any>(t, "memberContext", { clerkUserId: "user_intruder", email: "x@example.com" });
-    expect(out.member).toBeNull();
-    expect((await op<any>(t, "getState")).tenant).toBeUndefined();
-  });
-
-  it("memberContext reports ONLY the owner of a legacy team tenant", async () => {
-    const t = freshTenant();
-    await seedTeam(t, [
-      { clerkUserId: "u_owner", email: "owner@example.com", role: "owner", state: "active" },
-      { clerkUserId: "u_admin", email: "admin@example.com", role: "admin", state: "active" },
-      { clerkUserId: "u_member", email: "member@example.com", role: "member", state: "active" },
-    ]);
-    const owner = await op<any>(t, "memberContext", { clerkUserId: "u_owner" });
-    expect(owner.member).toMatchObject({ role: "owner", state: "active", email: "owner@example.com" });
-    expect(owner.tenantMeta).toMatchObject({ kind: "team" });
-    for (const uid of ["u_admin", "u_member", "u_stranger"]) {
-      expect((await op<any>(t, "memberContext", { clerkUserId: uid })).member).toBeNull();
+    for (const clerkUserId of ["user_intruder", "", undefined, 42]) {
+      const out = await op<any>(t, "memberContext", { clerkUserId, email: "x@example.com" });
+      expect(out).toEqual({ member: null, tenantMeta: null });
     }
+    expect((await op<any>(t, "getState")).tenant).toBeUndefined();
+    await op(t, "memberContext", { clerkUserId: t, email: "me@example.com" });
+    // Once bootstrapped, another user still learns nothing about the tenant.
+    expect(await op<any>(t, "memberContext", { clerkUserId: "user_intruder" })).toEqual({
+      member: null,
+      tenantMeta: null,
+    });
   });
 
-  it("gateOauth admits the personal tenant's own user and nobody else", async () => {
+  it("gateOauth admits the tenant's own user and nobody else", async () => {
     const t = `user_${freshTenant()}`;
     await op(t, "enroll", { name: "Scraper" });
+    expect(await op<any>(t, "gateOauth", { clerkUserId: t, service: "scraper" })).toEqual({ allowed: true });
+    await op(t, "memberContext", { clerkUserId: t, email: "me@example.com" });
     expect(await op<any>(t, "gateOauth", { clerkUserId: t, service: "scraper" })).toEqual({ allowed: true });
     expect(await op<any>(t, "gateOauth", { clerkUserId: "user_other", service: "scraper" })).toEqual({ allowed: false });
     expect(await op<any>(t, "gateOauth", { service: "scraper" })).toEqual({ allowed: false });
   });
 
-  it("gateOauth admits a team tenant's active owner only — not admins, members or grants", async () => {
-    const t = freshTenant();
-    await op(t, "enroll", { name: "Scraper" });
-    await seedTeam(t, [
-      { clerkUserId: "u_owner", email: "owner@example.com", role: "owner", state: "active" },
-      { clerkUserId: "u_gone", email: "gone@example.com", role: "owner", state: "disabled" },
-      { clerkUserId: "u_admin", email: "admin@example.com", role: "admin", state: "active" },
-      { clerkUserId: "u_member", email: "member@example.com", role: "member", state: "active" },
-    ]);
-    // A pre-cut per-user grant for the member must not open the door.
-    await addRule(t, { type: "user", name: "member@example.com" }, [{ type: "service", name: "scraper" }]);
-    const gate = async (clerkUserId: string) =>
-      (await op<any>(t, "gateOauth", { clerkUserId, service: "scraper" })).allowed;
-    expect(await gate("u_owner")).toBe(true);
-    expect(await gate("u_gone")).toBe(false);
-    expect(await gate("u_admin")).toBe(false);
-    expect(await gate("u_member")).toBe(false);
-    // The tenant id itself is not an identity once the tenant has an owner row.
-    expect(await gate(t)).toBe(false);
-  });
-
-  it("honours ONE owner of a pre-cut multi-owner team: the one the owner rule names", async () => {
-    const t = freshTenant();
-    await op(t, "enroll", { name: "Scraper" });
-    await seedTeam(t, [
-      { clerkUserId: "u_first", email: "first@example.com", role: "owner", state: "active" },
-      { clerkUserId: "u_second", email: "second@example.com", role: "owner", state: "active" },
-    ]);
-    const gate = async (clerkUserId: string) =>
-      (await op<any>(t, "gateOauth", { clerkUserId, service: "scraper" })).allowed;
-    // seedTeam points r_owner at the first owner.
-    expect(await gate("u_first")).toBe(true);
-    expect(await gate("u_second")).toBe(false);
-    expect((await op<any>(t, "memberContext", { clerkUserId: "u_second" })).member).toBeNull();
-    // Re-point the owner rule and the principal follows it.
-    await seedState(t, (s) => {
-      s.acl.find((r: any) => r.id === "r_owner").src = { type: "user", name: "second@example.com" };
-    });
-    expect(await gate("u_first")).toBe(false);
-    expect(await gate("u_second")).toBe(true);
-    expect((await op<any>(t, "memberContext", { clerkUserId: "u_second" })).member).toMatchObject({
-      role: "owner",
-      email: "second@example.com",
-    });
-  });
-
-  it("gateOauth admits an org-admin token to its own UNCLAIMED legacy org tenant only", async () => {
+  it("gateOauth ignores organization claims entirely", async () => {
     const t = `org_${freshTenant()}`;
     await op(t, "enroll", { name: "Scraper" });
-    const gate = async (args: Record<string, unknown>) =>
-      (await op<any>(t, "gateOauth", { clerkUserId: "u_admin", service: "scraper", ...args })).allowed;
-    expect(await gate({ orgIdClaim: t, orgRole: "org:admin" })).toBe(true);
-    expect(await gate({ orgIdClaim: t, orgRole: "admin" })).toBe(true);
-    expect(await gate({ orgIdClaim: t, orgRole: "org:member" })).toBe(false);
-    expect(await gate({ orgIdClaim: t })).toBe(false);
-    expect(await gate({ orgIdClaim: "org_other", orgRole: "org:admin" })).toBe(false);
-
-    // Once claimed, only the claimant passes; the org claim no longer does.
-    const claimed = await op<any>(t, "claimLegacyOrg", { clerkOrgId: t, clerkUserId: "u_admin", email: "A@example.com" });
-    expect(claimed.member).toMatchObject({ role: "owner", state: "active", email: "a@example.com" });
-    expect(await gate({})).toBe(true);
-    expect(
-      (await op<any>(t, "gateOauth", { clerkUserId: "u_admin2", service: "scraper", orgIdClaim: t, orgRole: "org:admin" }))
-        .allowed,
-    ).toBe(false);
-  });
-
-  it("claimLegacyOrg is idempotent for its owner and refuses everyone and everything else", async () => {
-    const t = `org_${freshTenant()}`;
-    const claim = async (args: Record<string, unknown>) => {
-      const stub = env.TENANT.get(env.TENANT.idFromName(t));
-      const res = await stub.fetch("https://tenant/op", {
-        method: "POST",
-        body: JSON.stringify({ op: "claimLegacyOrg", clerkOrgId: t, clerkUserId: "u_a", email: "a@example.com", ...args }),
-      });
-      return { status: res.status, body: (await res.json()) as any };
-    };
-    expect((await claim({})).status).toBe(409); // empty: nothing to claim
-    await op(t, "enroll", { name: "Scraper" });
-    expect((await claim({ clerkOrgId: "org_elsewhere" })).status).toBe(400);
-    expect((await claim({ email: "" })).status).toBe(400);
-    const first = await claim({});
-    expect(first.status).toBe(200);
-    const again = await claim({});
-    expect(again.status).toBe(200);
-    expect(again.body).toMatchObject({ already: true, member: { id: first.body.member.id } });
-    expect((await claim({ clerkUserId: "u_b", email: "b@example.com" })).status).toBe(409);
+    const r = await op<any>(t, "gateOauth", {
+      clerkUserId: "user_admin",
+      service: "scraper",
+      orgIdClaim: t,
+      orgRole: "org:admin",
+    });
+    expect(r).toEqual({ allowed: false });
   });
 
   it("gateOauth lets anyone reach a public service", async () => {
@@ -840,31 +627,6 @@ describe("TenantDO — single-user owner gates", () => {
     });
   });
 
-  it("keeps pre-cut team data in storage and in the state snapshot", async () => {
-    const t = freshTenant();
-    await op(t, "enroll", { name: "Scraper" });
-    await seedTeam(t, [
-      { clerkUserId: "u_owner", email: "owner@example.com", role: "owner", state: "active" },
-      { clerkUserId: null, email: "invitee@example.com", role: "member", state: "invited" },
-    ]);
-    await seedState(t, (s) => {
-      s.accessRequests.push({
-        id: "ar_legacy",
-        email: "invitee@example.com",
-        service: "scraper",
-        requestedBy: "owner@example.com",
-        status: "invited",
-        created: Date.now(),
-      });
-    });
-    // Any mutation re-saves the whole record; nothing may be dropped.
-    await op(t, "setTags", { id: "scraper", tags: ["ops"] });
-    const state = await op<any>(t, "getState");
-    expect(state.members.map((m: any) => m.email)).toEqual(["owner@example.com", "invitee@example.com"]);
-    expect(state.accessRequests.map((r: any) => r.id)).toEqual(["ar_legacy"]);
-    expect(state.viewerScoped).toBeUndefined();
-  });
-
   it("strips the svc subject from every log row on the way out", async () => {
     const t = freshTenant();
     await op(t, "enroll", { name: "Scraper" });
@@ -874,13 +636,14 @@ describe("TenantDO — single-user owner gates", () => {
     for (const entry of logs) expect(entry).not.toHaveProperty("svc");
   });
 
-  it("no longer answers the retired team, sharing and login-wall ops", async () => {
+  it("no longer answers the retired team, sharing, org and Aviary ops", async () => {
     const t = freshTenant();
     for (const retired of [
       "inviteMember", "bindIdentity", "bootstrapMembers", "setMemberRole", "removeMember",
       "requestAccess", "approveAccess", "listAccess", "addAcl", "removeAcl", "removeUserGrant",
       "checkUserAccess", "gateBrowser", "sessionEpoch", "bumpSessionEpoch", "ensureOwner",
-      "setGroup", "registerAviaryService", "legacyClaimStatus",
+      "setGroup", "registerAviaryService", "legacyClaimStatus", "claimLegacyOrg", "holdings",
+      "routeAllowed", "boxCredentialEpoch",
     ]) {
       const res = await env.TENANT.get(env.TENANT.idFromName(t)).fetch("https://tenant/op", {
         method: "POST",
@@ -1000,52 +763,4 @@ describe("TenantDO.boxExists — /refresh revocation gate", () => {
     expect(state.settings.subdomain).toBe("demo-team");
     expect(state.host).toBe("demo-team.finchmcp.com");
   });
-});
-
-// REGRESSION (P1, Codex round 4): a locked owner rule stranded on someone who
-// is no longer an active owner (the demotion happened under older code) must
-// be repaired on load, or that person's keys keep reaching every service.
-describe("TenantDO — repairing state that predates the fix", () => {
-  const reachesWithKeyOwnedBy = async (t: string, owner: string) => {
-    const minted = await op<{ plaintext: string }>(t, "mintKey", {
-      label: `k-${owner}`,
-      scope: { all: true },
-      owner,
-    });
-    return (await op<any>(t, "checkKey", { hash: await hashKey(minted.plaintext), service: "scraper" })).allowed;
-  };
-
-  it("moves a locked owner grant already stranded on a non-owner", async () => {
-    const t = freshTenant();
-    await op(t, "enroll", { name: "Scraper" });
-    await seedTeam(t, [
-      { clerkUserId: "u_owner", email: "owner@example.com", role: "owner", state: "active" },
-      { clerkUserId: "u_second", email: "second@example.com", role: "owner", state: "active" },
-    ]);
-
-    // Exactly what a pre-upgrade DO holds: the demotion already happened under
-    // the old code, so the locked rule still names the demoted member and no
-    // future transition will ever revisit it.
-    await seedState(t, (s) => {
-      s.members.find((m: any) => m.email === "owner@example.com").role = "member";
-    });
-
-    // load() normalizes in memory, so the very first read after deploy is
-    // already correct -- no migration, and the key gate sees it immediately.
-    expect(await reachesWithKeyOwnedBy(t, "owner@example.com")).toBe(false);
-    expect(await reachesWithKeyOwnedBy(t, "second@example.com")).toBe(true);
-    const locked = (await op<any>(t, "getState")).acl.find((r: any) => r.id === "r_owner");
-    expect(locked.src.name).toBe("second@example.com");
-  });
-
-  it("leaves the locked grant alone when no active owner remains", async () => {
-    // The rule is the lockout backstop. With no heir, a stale grant beats an
-    // unreachable tenant -- and a pre-bootstrap tenant still carries the "you"
-    // placeholder, which must survive untouched.
-    const t = freshTenant();
-    await op(t, "enroll", { name: "Scraper" });
-    const fresh = (await op<any>(t, "getState")).acl.find((r: any) => r.id === "r_owner");
-    expect(fresh.src.name).toBe("you");
-  });
-
 });

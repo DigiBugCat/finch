@@ -2,8 +2,8 @@
 //
 // RouterDO — the single global slug→tenantId index for the relay plane.
 //
-// The control plane keys TenantDO/BoxDO by the REAL tenant id (a Clerk org
-// id, or a user id). But the public relay URL is a vanity subdomain
+// The control plane keys TenantDO/BoxDO by the REAL tenant id (the owner's
+// Clerk user id). But the public relay URL is a vanity subdomain
 // (<slug>.finchmcp.com) and the slug is NOT the tenant id. This DO is the one
 // authoritative map from a request's host slug to the tenant id it belongs to.
 //

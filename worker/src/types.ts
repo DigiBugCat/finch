@@ -4,21 +4,22 @@
 // mock ROOST_DATA so the UI renders unchanged).
 
 
-// Tenancy is single-user: only an "owner" member authorizes anything. The
-// "admin"/"member" roles, "invited"/"disabled" states and "team" tenants
-// survive only as stored rows written before the team features were removed.
-export type FinchRole = "owner" | "admin" | "member";
-export type MemberState = "invited" | "active" | "disabled";
+// Tenancy is single-user: a tenant IS one Clerk user — its id is that user's
+// Clerk user id, and its only member row is that user as owner. Rows written
+// by the retired team features (other members, invitations, groups, ACL rules,
+// access requests) are deleted by TenantDO's one-time single-user purge.
+export type FinchRole = "owner";
+export type MemberState = "active";
 export const normalizeEmail = (raw: string): string => raw.trim().toLowerCase();
 
 export interface TenantMember {
-  id: string; tenantId: string; clerkUserId: string | null; email: string;
-  role: FinchRole; state: MemberState; invitedBy?: string; createdAt: number;
-  updatedAt: number; boundAt?: number; disabledAt?: number;
+  id: string; tenantId: string; clerkUserId: string; email: string;
+  role: FinchRole; state: MemberState; createdAt: number;
+  updatedAt: number; boundAt?: number;
 }
 export interface TenantMeta {
-  id: string; kind: "personal" | "team"; displayName: string; createdAt: number;
-  clerkOrgId?: string; bootstrappedFrom: "fresh" | "legacy-personal" | "legacy-org";
+  id: string; kind: "personal"; displayName: string; createdAt: number;
+  bootstrappedFrom: "fresh" | "legacy-personal";
   membershipVersion: number;
 }
 
@@ -137,18 +138,6 @@ export interface Key {
   expiresAt?: number;
 }
 
-export interface AclEntity {
-  type: "user" | "group" | "key" | "tag" | "service" | "all";
-  name?: string;
-}
-export interface AclRule {
-  id: string;
-  src: AclEntity;
-  dst: AclEntity[];
-  action: "allow";
-  locked?: boolean;
-}
-
 export interface LogEvent {
   ago: string;
   ts: number; // epoch ms, for ordering/filtering
@@ -168,29 +157,6 @@ export interface LogEvent {
  *  exactly LogEvent. */
 export interface StoredLogEvent extends LogEvent {
   svc?: string;
-}
-
-/** A row from the retired app-level access-sharing queue. Nothing writes
- *  these any more; existing rows are kept in storage and still reported in
- *  TenantState.accessRequests so the wire shape is unchanged. */
-export interface AccessRequest {
-  id: string;
-  email: string; // lowercased
-  service: string; // service id
-  requestedBy: string;
-  status: "pending" | "invited" | "granted" | "denied";
-  created: number; // epoch ms
-  requestedByUserId?: string;
-  resolvedBy?: string;
-  resolvedByUserId?: string;
-  resolvedAt?: number; // epoch ms
-  grantedTo?: string;
-}
-
-export interface Group {
-  name: string;
-  members: string[];
-  extra?: number;
 }
 
 export interface Settings {
@@ -226,9 +192,6 @@ export interface TenantState {
   services: Service[];
   boxes: Box[]; // flattened across services (the Boxes lens)
   keys: PublicKey[]; // hash/last4 only — never plaintext over the wire
-  groups: Group[];
-  acl: AclRule[];
-  accessRequests: AccessRequest[];
   logs: LogEvent[];
   settings: Settings;
   overview: Overview;
