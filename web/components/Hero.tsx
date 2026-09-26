@@ -14,7 +14,7 @@ export default function Hero() {
               <Link className="btn btn-lg btn-amber" href="/sign-up">Get started →</Link>
             </Show>
             <Show when="signed-in">
-              <Link className="btn btn-lg btn-amber" href="/dashboard">Open dashboard →</Link>
+              <Link className="btn btn-lg btn-amber" href="/docs">Read the quickstart →</Link>
             </Show>
             <a className="btn btn-lg btn-ghost" href="#how">See how it works</a>
           </div>

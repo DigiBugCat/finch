@@ -32,7 +32,7 @@ export default function Nav() {
             <Link className="btn btn-md btn-amber" href="/sign-up">Get started</Link>
           </Show>
           <Show when="signed-in">
-            <Link className="nav-signin" href="/dashboard">Dashboard</Link>
+            <Link className="nav-signin" href="/docs">Quickstart</Link>
             <UserButton />
           </Show>
         </div>

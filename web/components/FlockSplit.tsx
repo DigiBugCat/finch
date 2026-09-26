@@ -13,7 +13,7 @@ export default function FlockSplit() {
             <div className="split-item"><span className="ck">✓</span><div><b>One-tap endpoints</b><span>Copy any MCP endpoint straight into your client. Masked by default, full when you copy.</span></div></div>
             <div className="split-item"><span className="ck">✓</span><div><b>Honest states</b><span>Online, offline, or invited. Finch tells you the truth about what's actually reachable.</span></div></div>
           </div>
-          <div style={{ marginTop: '30px' }}><Link className="btn btn-lg btn-ghost" href="/dashboard">Open the dashboard →</Link></div>
+          <div style={{ marginTop: '30px' }}><Link className="btn btn-lg btn-ghost" href="/docs/cli">See the CLI →</Link></div>
         </div>
         <div className="split-visual">
           <div className="pv-top">
