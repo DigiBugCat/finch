@@ -10,6 +10,7 @@ vi.mock("@clerk/nextjs/server", () => ({
 
 setupTestEnv({ HUB_URL: "https://hub.example.com", FINCH_SERVICE_SECRET: "test-service-secret" });
 
+import { verifyAssertion } from "@worker-auth";
 import { POST as approve } from "@/app/api/finch/cli-approve/route";
 import { POST as describeCode } from "@/app/api/finch/cli-describe/route";
 
@@ -29,6 +30,12 @@ function rawRequest(path: string, body: string, headers?: HeadersInit): Request 
     headers: { "content-type": "application/json", ...headers },
     body,
   });
+}
+
+/** The hub's answer to the owner lookup: nothing owned beyond the personal
+ *  tenant, so the routes act as the Clerk user id. */
+function ownerLookup(): Response {
+  return Response.json({ tenants: [], claimable: [] });
 }
 
 function memberContext(role: "owner" | "admin" | "member" = "owner"): Response {
@@ -76,18 +83,22 @@ describe("CLI route authorization boundary", () => {
   ])("rejects a non-admin %s request before its privileged action", async (_name, call) => {
     const fetchSpy = vi
       .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(ownerLookup())
       .mockResolvedValueOnce(memberContext("member"));
 
     const response = await call();
 
     expect(response.status).toBe(403);
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
   });
 
   it("fails closed when the hub returns malformed membership state", async () => {
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      Response.json({ member: { role: "owner", state: "active" } }),
-    );
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(ownerLookup())
+      .mockResolvedValueOnce(
+        Response.json({ member: { role: "owner", state: "active" } }),
+      );
 
     const response = await describeCode(
       request("/api/finch/cli-describe", { userCode: "ABCD-EFGH" }),
@@ -95,6 +106,26 @@ describe("CLI route authorization boundary", () => {
 
     expect(response.status).toBe(502);
     expect(await response.json()).toEqual({ error: "invalid response from hub" });
+    // Refused at membership, before any action call.
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("acts as the tenant the user owns, not their personal one", async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(Response.json({ tenant: "ft_owned_team" }))
+      .mockResolvedValueOnce(memberContext())
+      .mockResolvedValueOnce(Response.json({ found: false }));
+
+    const response = await describeCode(
+      request("/api/finch/cli-describe", { userCode: "ABCD-EFGH" }),
+    );
+
+    expect(response.status).toBe(200);
+    const [url, init] = fetchSpy.mock.calls[2] as [string, RequestInit];
+    expect(url).toBe("https://hub.example.com/api/cli-describe");
+    const assertion = new Headers(init.headers).get("x-finch-auth")!;
+    expect(await verifyAssertion(assertion, "test-service-secret")).toBe("ft_owned_team");
   });
 });
 
@@ -108,12 +139,13 @@ describe("CLI code request validation", () => {
   ])("rejects valid JSON whose top level is %s", async (_name, body) => {
     const fetchSpy = vi
       .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(ownerLookup())
       .mockResolvedValueOnce(memberContext());
 
     const response = await describeCode(request("/api/finch/cli-describe", body));
 
     expect(response.status).toBe(400);
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).toHaveBeenCalledTimes(2);
   });
 
   it.each([null, [], {}, 7, true])(
@@ -121,6 +153,7 @@ describe("CLI code request validation", () => {
     async (userCode) => {
       const fetchSpy = vi
         .spyOn(globalThis, "fetch")
+        .mockResolvedValueOnce(ownerLookup())
         .mockResolvedValueOnce(memberContext());
 
       const response = await approve(
@@ -128,7 +161,7 @@ describe("CLI code request validation", () => {
       );
 
       expect(response.status).toBe(400);
-      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
       expect(getUserMock).not.toHaveBeenCalled();
     },
   );
@@ -136,7 +169,9 @@ describe("CLI code request validation", () => {
   it("rejects malformed JSON and an over-limit body before the action call", async () => {
     const fetchSpy = vi
       .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(ownerLookup())
       .mockResolvedValueOnce(memberContext())
+      .mockResolvedValueOnce(ownerLookup())
       .mockResolvedValueOnce(memberContext());
 
     const malformed = await describeCode(
@@ -151,7 +186,7 @@ describe("CLI code request validation", () => {
 
     expect(malformed.status).toBe(400);
     expect(oversized.status).toBe(413);
-    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(fetchSpy).toHaveBeenCalledTimes(4);
   });
 
   it.each(["", "ABC", "ABCI-1234", "ABCD--EFGH", "A".repeat(33)])(
@@ -159,6 +194,7 @@ describe("CLI code request validation", () => {
     async (userCode) => {
       const fetchSpy = vi
         .spyOn(globalThis, "fetch")
+        .mockResolvedValueOnce(ownerLookup())
         .mockResolvedValueOnce(memberContext());
 
       const response = await describeCode(
@@ -166,7 +202,7 @@ describe("CLI code request validation", () => {
       );
 
       expect(response.status).toBe(400);
-      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
     },
   );
 });
@@ -175,6 +211,7 @@ describe("POST /api/finch/cli-describe", () => {
   it("normalizes a human-entered code, uses one auth snapshot, and strips unexpected fields", async () => {
     const fetchSpy = vi
       .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(ownerLookup())
       .mockResolvedValueOnce(memberContext())
       .mockResolvedValueOnce(
         Response.json({
@@ -193,8 +230,8 @@ describe("POST /api/finch/cli-describe", () => {
 
     expect(response.status).toBe(200);
     expect(authMock).toHaveBeenCalledTimes(1);
-    expect(fetchSpy).toHaveBeenCalledTimes(2);
-    const [url, init] = fetchSpy.mock.calls[1] as [string, RequestInit];
+    expect(fetchSpy).toHaveBeenCalledTimes(3);
+    const [url, init] = fetchSpy.mock.calls[2] as [string, RequestInit];
     expect(url).toBe("https://hub.example.com/api/cli-describe");
     expect(JSON.parse(init.body as string)).toEqual({ userCode: "ABCD-EFGH" });
     expect(await response.json()).toEqual({
@@ -212,6 +249,7 @@ describe("POST /api/finch/cli-describe", () => {
     ["a fractional age", Response.json({ found: true, ageSeconds: 1.5 })],
   ])("returns 502 for %s success data", async (_name, actionResponse) => {
     vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(ownerLookup())
       .mockResolvedValueOnce(memberContext())
       .mockResolvedValueOnce(actionResponse);
 
@@ -225,6 +263,7 @@ describe("POST /api/finch/cli-describe", () => {
 
   it("maps an action-plane network failure to an upstream 502", async () => {
     vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(ownerLookup())
       .mockResolvedValueOnce(memberContext())
       .mockRejectedValueOnce(new TypeError("connection reset"));
 
@@ -246,6 +285,7 @@ describe("POST /api/finch/cli-approve", () => {
     });
     const fetchSpy = vi
       .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(ownerLookup())
       .mockResolvedValueOnce(memberContext())
       .mockResolvedValueOnce(Response.json({ ok: true }));
 
@@ -258,8 +298,8 @@ describe("POST /api/finch/cli-approve", () => {
 
     expect(response.status).toBe(200);
     expect(authMock).toHaveBeenCalledTimes(1);
-    expect(fetchSpy).toHaveBeenCalledTimes(2);
-    const [url, init] = fetchSpy.mock.calls[1] as [string, RequestInit];
+    expect(fetchSpy).toHaveBeenCalledTimes(3);
+    const [url, init] = fetchSpy.mock.calls[2] as [string, RequestInit];
     expect(url).toBe("https://hub.example.com/api/device-approve");
     const forwarded = JSON.parse(init.body as string);
     expect(forwarded.userCode).toBe("ABCD-EFGH");
@@ -271,6 +311,7 @@ describe("POST /api/finch/cli-approve", () => {
     const clientEmail = `  ${"a".repeat(200)}  `;
     const fetchSpy = vi
       .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(ownerLookup())
       .mockResolvedValueOnce(memberContext())
       .mockResolvedValueOnce(Response.json({ ok: true }));
 
@@ -282,21 +323,24 @@ describe("POST /api/finch/cli-approve", () => {
     );
 
     expect(response.status).toBe(200);
-    const [, init] = fetchSpy.mock.calls[1] as [string, RequestInit];
+    const [, init] = fetchSpy.mock.calls[2] as [string, RequestInit];
     expect(JSON.parse(init.body as string).email).toBe("a".repeat(200));
   });
 
   it.each([`${"a".repeat(201)}`, "owner@example.com\nforged"])(
     "rejects an invalid client label without approving (%j)",
     async (email) => {
-      const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(memberContext());
+      const fetchSpy = vi
+        .spyOn(globalThis, "fetch")
+        .mockResolvedValueOnce(ownerLookup())
+        .mockResolvedValueOnce(memberContext());
 
       const response = await approve(
         request("/api/finch/cli-approve", { userCode: "ABCD-EFGH", email }),
       );
 
       expect(response.status).toBe(400);
-      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
       expect(getUserMock).not.toHaveBeenCalled();
     },
   );
@@ -306,6 +350,7 @@ describe("POST /api/finch/cli-approve", () => {
     async (email) => {
       const fetchSpy = vi
         .spyOn(globalThis, "fetch")
+        .mockResolvedValueOnce(ownerLookup())
         .mockResolvedValueOnce(memberContext());
 
       const response = await approve(
@@ -313,7 +358,7 @@ describe("POST /api/finch/cli-approve", () => {
       );
 
       expect(response.status).toBe(400);
-      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
       expect(getUserMock).not.toHaveBeenCalled();
     },
   );
@@ -321,8 +366,10 @@ describe("POST /api/finch/cli-approve", () => {
   it("rejects malformed success data while preserving a real hub rejection", async () => {
     const fetchSpy = vi
       .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(ownerLookup())
       .mockResolvedValueOnce(memberContext())
       .mockResolvedValueOnce(Response.json({ ok: "true" }))
+      .mockResolvedValueOnce(ownerLookup())
       .mockResolvedValueOnce(memberContext())
       .mockResolvedValueOnce(Response.json({ error: "code expired" }, { status: 409 }));
 
@@ -336,6 +383,6 @@ describe("POST /api/finch/cli-approve", () => {
     expect(malformed.status).toBe(502);
     expect(rejected.status).toBe(409);
     expect(await rejected.json()).toEqual({ error: "code expired" });
-    expect(fetchSpy).toHaveBeenCalledTimes(4);
+    expect(fetchSpy).toHaveBeenCalledTimes(6);
   });
 });

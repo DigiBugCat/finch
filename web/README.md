@@ -27,8 +27,9 @@ approval page. Next.js (App Router) deployed to **Cloudflare Workers via
 ```
 
 The BFF never exposes the hub directly: each route checks the Clerk session,
-resolves the caller to the tenant they own via the hub's `/api/member-context`,
-then calls the hub over the `FINCH_HUB` service binding with the shared
+resolves the caller to the tenant they own (the hub's user-scoped
+`/api/user/sync`, else their personal tenant), confirms they are its active
+owner with `/api/member-context`, then calls the hub over the `FINCH_HUB` service binding with the shared
 `FINCH_SERVICE_SECRET` **and** an HMAC-signed tenant assertion (so a leaked
 secret alone can't act as an arbitrary tenant).
 
