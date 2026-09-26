@@ -12,7 +12,7 @@ approval page. Next.js (App Router) deployed to **Cloudflare Workers via
 
 | Surface | What |
 |---|---|
-| **Landing** (`/`) | The marketing page. |
+| **Landing** (`/`) | "finch, a field guide": seven illustrated plates in the Indigo Wash design system (`components/fieldguide/`). SVG + CSS/SMIL animation, final frames under `prefers-reduced-motion`; fonts self-hosted via `next/font`. |
 | **Docs** (`/docs/*`) | Quickstart, services and boxes, keys and auth, access control, domains, the CLI reference, privacy. Also `/llms.txt` for agents. |
 | **Sign-in / sign-up** | Clerk. Lands on `/docs` unless a `redirect_url` (such as a `/cli` link) says otherwise. |
 | **CLI approval** (`/cli`) | `finch login` prints a link + code; the signed-in owner confirms the code here and the hub mints the box's CLI token. |
