@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -211,5 +212,73 @@ func TestServeConfig_RejectsEmptyManifest(t *testing.T) {
 	err := serveConfig(context.Background(), &config{Hub: "https://finch.example", CredentialsDir: t.TempDir()})
 	if err == nil || !strings.Contains(err.Error(), "no ingress rules") {
 		t.Fatalf("empty manifest=%v", err)
+	}
+}
+
+// Every ingress rule gets its own relay: each rule's credential reaches the hub,
+// and one rule's revoked credential does not stop its sibling from dialing.
+func TestServeConfig_StartsOneRelayPerRule(t *testing.T) {
+	t.Setenv("HOME", t.TempDir()) // no CLI login, so no auto-approve traffic
+	var mu sync.Mutex
+	seen := map[string]int{}
+	hub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct{ RefreshToken string }
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		seen[r.URL.Path+" "+body.RefreshToken]++
+		mu.Unlock()
+		http.Error(w, "revoked", http.StatusForbidden)
+	}))
+	defer hub.Close()
+
+	cfg := &config{
+		Hub: hub.URL, Box: "box1", CredentialsDir: t.TempDir(),
+		Ingress: []ingress{
+			{AppPath: "alpha", Service: "http://127.0.0.1:7342"},
+			{AppPath: "beta", Service: "http://127.0.0.1:7343"},
+		},
+	}
+	for _, ing := range cfg.Ingress {
+		if err := saveState(cfg.statePathFor(ing.AppPath), &agentState{Hub: hub.URL, RefreshToken: "rt-" + ing.AppPath}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- serveConfig(ctx, cfg) }()
+	time.Sleep(300 * time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("serveConfig: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("serveConfig did not return after cancel")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, want := range []string{"/refresh rt-alpha", "/refresh rt-beta"} {
+		if seen[want] != 1 {
+			t.Errorf("%s requests=%d, want exactly one (seen %v)", want, seen[want], seen)
+		}
+	}
+}
+
+// A second `finch run` against the same credentials dir would supersede the
+// first one's relays, so it must refuse before dialing anything.
+func TestServeConfig_RefusesWhileAnotherRunHoldsTheLock(t *testing.T) {
+	dir := t.TempDir()
+	release, ok := lockState(filepath.Join(dir, "finch-run"))
+	if !ok {
+		t.Fatal("could not take the finch-run lock")
+	}
+	defer release()
+	err := serveConfig(context.Background(), &config{
+		Hub: "https://finch.example", CredentialsDir: dir,
+		Ingress: []ingress{{AppPath: "alpha", Service: "http://127.0.0.1:7342"}},
+	})
+	if err == nil || !strings.Contains(err.Error(), "already serves") {
+		t.Fatalf("second run=%v, want lock refusal", err)
 	}
 }
