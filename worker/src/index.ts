@@ -143,6 +143,18 @@ export function clientIp(req: Request): string {
   );
 }
 
+/** The end-user IP a first-party caller (the web dashboard) forwards in
+ *  X-Finch-Client-IP, falling back to clientIp. Web→hub calls ride the
+ *  FINCH_HUB service binding, which carries no CF-Connecting-IP, so without
+ *  this every dashboard user shares one rate-limit bucket. ONLY call this after
+ *  serviceOk(): the header is caller-supplied and trusted solely because the
+ *  caller proved it holds FINCH_SERVICE_SECRET. */
+export function serviceClientIp(req: Request): string {
+  const forwarded = (req.headers.get("x-finch-client-ip") || "").trim();
+  if (forwarded.length <= 45 && /^[0-9A-Fa-f.:]+$/.test(forwarded)) return forwarded;
+  return clientIp(req);
+}
+
 /** Finch's public transport boundary. Cloudflare normally presents production
  * requests as HTTPS/WSS, but enforcing that assumption here prevents a route,
  * zone, or client misconfiguration from silently turning plain HTTP into an
