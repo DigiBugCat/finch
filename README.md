@@ -154,8 +154,8 @@ finch run            #  → https://<your-slug>.finchmcp.com/printer/mcp
 `finch add` writes a [`finch.yml`](agent/finch.example.yml) manifest; `finch
 run` serves every rule in it (add more services with more `finch add` calls —
 one process fronts them all). Then point any MCP client at the printed URL with
-a `finch_` key (mint one in the dashboard → **Keys**), or test it right in the
-dashboard with the service's **"test in chat"** panel.
+a `finch_` key (`finch keys mint <label> --service printer`), or check it from
+the terminal with `finch test printer` / `finch call printer <tool>`.
 
 A runnable end-to-end example lives in
 [`examples/hello-mcp/`](examples/hello-mcp/).
