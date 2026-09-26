@@ -121,15 +121,6 @@ auditable rather than invisible.
 
 ## Also outstanding
 
-**`/api/finch/state` service-inventory filtering** (from finding 2, partially
-fixed). A member no longer receives keys, ACL, access requests, settings, the
-roster, or box address/relay. They *still* see the service and box inventory for
-services no ACL grants them.
-
-Filtering that correctly needs `evalIdentAccess` / `userIdentities`, which live
-in the TenantDO — the web layer would have to reimplement identity expansion and
-risks wrongly hiding services a member can legitimately reach. The right shape is
-for `getState` to take the caller's role and member identity and project in the
-DO. That also requires `hubFetchAs` to transmit member identity, which it
-deliberately does not do today (it sends only a signed `{tenant}` assertion), so
-it is a real interface change rather than a patch.
+**`/api/finch/state` service-inventory filtering** — obsolete. Finch is now
+single-user (only the tenant owner is ever a member), so there is no member
+view to narrow; the hub's former viewer-scoped `getState` was removed.
