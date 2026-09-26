@@ -360,3 +360,92 @@ describe("retired hub surfaces", () => {
     expect(res.headers.get("content-type") || "").not.toContain("text/html");
   });
 });
+
+describe("CLI tokens minted before the single-user cut", () => {
+  /** Stored state as a pre-cut tenant left it: no cut flag, epoch 0. */
+  async function seedPreCut(
+    tenantId: string,
+    kind: "personal" | "team",
+    members: { clerkUserId: string | null; email: string; role: string; state: string }[],
+  ) {
+    const stub = env.TENANT.get(env.TENANT.idFromName(tenantId));
+    await runInDO(stub, async (instance: any) => {
+      const now = Date.now();
+      await instance.ctx.storage.put("state", {
+        host: "", services: [], keys: [], groups: [], accessRequests: [], logs: [],
+        cliTokenEpoch: 0,
+        tenantMeta: {
+          id: tenantId, kind, displayName: tenantId, createdAt: now,
+          bootstrappedFrom: "fresh", membershipVersion: 1,
+        },
+        members: members.map((m, i) => ({ id: `m_${i}`, tenantId, createdAt: now + i, updatedAt: now, ...m })),
+      });
+    });
+    return stub;
+  }
+
+  async function whoami(tenant: string, epoch: number): Promise<Response> {
+    const token = await signAssertion({ tenant, exp: nowSec() + 300, kind: "cli", epoch }, SERVICE);
+    return call(
+      new Request(`http://${HOST}/api/cli/whoami`, {
+        headers: { host: HOST, Authorization: `Bearer ${token}` },
+      }),
+    );
+  }
+
+  /** The epoch after a restart: a new instance re-reads the flag from storage. */
+  async function epochAfterRestart(stub: DurableObjectStub): Promise<number> {
+    await runInDO(stub, (instance: any) => {
+      instance.cliCutChecked = false;
+    });
+    const res = await stub.fetch("https://tenant/op", { method: "POST", body: JSON.stringify({ op: "cliEpoch" }) });
+    return (await res.json<{ epoch: number }>()).epoch;
+  }
+
+  it("revokes every outstanding token of a team tenant once, on first access", async () => {
+    const t = `ws_cli_team_${++seq}`;
+    const stub = await seedPreCut(t, "team", [
+      { clerkUserId: "user_cli_owner", email: "owner@x.test", role: "owner", state: "active" },
+      { clerkUserId: "user_cli_admin", email: "admin@x.test", role: "admin", state: "active" },
+    ]);
+    const stale = await whoami(t, 0);
+    expect(stale.status).toBe(401);
+    expect((await stale.json<any>()).error).toMatch(/revoked/);
+    // The owner's next `finch login` mints at the new epoch, which keeps working.
+    expect((await whoami(t, 1)).status).toBe(200);
+    expect((await whoami(t, 1)).status).toBe(200);
+    expect(await epochAfterRestart(stub)).toBe(1);
+    const s = await tenantState(t);
+    expect(s.cliSingleUserCut).toBe(true);
+    expect(s.logs.filter((l: any) => /single-user/.test(l.action))).toHaveLength(1);
+  });
+
+  it("also revokes when a personal tenant had another member who ever signed in", async () => {
+    const t = `user_cli_shared_${++seq}`;
+    const stub = await seedPreCut(t, "personal", [
+      { clerkUserId: t, email: "me@x.test", role: "owner", state: "active" },
+      { clerkUserId: "user_cli_former", email: "former@x.test", role: "member", state: "disabled" },
+    ]);
+    expect((await whoami(t, 0)).status).toBe(401);
+    expect(await epochAfterRestart(stub)).toBe(1);
+  });
+
+  it("leaves a personal tenant with only its owner alone, so the owner's login keeps working", async () => {
+    const t = `user_cli_solo_${++seq}`;
+    const stub = await seedPreCut(t, "personal", [
+      { clerkUserId: t, email: "me@x.test", role: "owner", state: "active" },
+      // A pending invitation never had access; it does not count.
+      { clerkUserId: null, email: "invitee@x.test", role: "member", state: "invited" },
+    ]);
+    expect((await whoami(t, 0)).status).toBe(200);
+    expect((await whoami(t, 0)).status).toBe(200);
+    expect(await epochAfterRestart(stub)).toBe(0);
+    expect((await tenantState(t)).cliSingleUserCut).toBe(true);
+  });
+
+  it("writes nothing for a tenant that has no stored state", async () => {
+    const t = `user_cli_none_${++seq}`;
+    expect((await whoami(t, 0)).status).toBe(200);
+    expect(await tenantState(t)).toBeUndefined();
+  });
+});

@@ -84,6 +84,9 @@ interface StoredState {
   // Monotonic counter embedded in CLI tokens at mint. Bumped by "revoke all CLI
   // tokens"; a token whose epoch != this is rejected. Absent == 0 (legacy state).
   cliTokenEpoch?: number;
+  // Set once the single-user cut has been applied to this tenant's CLI tokens
+  // (see retireSharedCliTokens). Born true on a tenant created after the cut.
+  cliSingleUserCut?: boolean;
   tenantMeta?: TenantMeta;
   members: TenantMember[];
 }
@@ -207,9 +210,16 @@ export class TenantDO extends DurableObject<Env> {
   // p50/p95/err on recordCall. Lost on eviction — that only blurs the rolling
   // window briefly, the durable counters (calls, recentCalls) survive.
   private samples = new Map<string, { ms: number; ok: boolean }[]>();
+  // Whether this instance has run retireSharedCliTokens (it is persisted, so
+  // this only saves the storage read on later requests).
+  private cliCutChecked = false;
 
   async fetch(req: Request): Promise<Response> {
     if (req.method !== "POST") return bad(405, "POST only");
+    if (!this.cliCutChecked) {
+      await this.retireSharedCliTokens();
+      this.cliCutChecked = true;
+    }
     let msg: { op?: string; [k: string]: unknown };
     try {
       msg = await req.json();
@@ -341,6 +351,8 @@ export class TenantDO extends DurableObject<Env> {
           : {},
       cliTokenEpoch:
         typeof stored.cliTokenEpoch === "number" ? stored.cliTokenEpoch : 0,
+      // Explicit, so fresh()'s `true` never leaks into pre-cut stored state.
+      cliSingleUserCut: stored.cliSingleUserCut === true,
       members: Array.isArray(stored.members) ? stored.members : [],
       tenantMeta: stored.tenantMeta && typeof stored.tenantMeta === "object" ? stored.tenantMeta : undefined,
     };
@@ -403,6 +415,7 @@ export class TenantDO extends DurableObject<Env> {
       logs: [],
       usedTickets: {},
       cliTokenEpoch: 0,
+      cliSingleUserCut: true, // no team era to retire
       members: [],
       settings: {
         org: id,
@@ -752,6 +765,46 @@ export class TenantDO extends DurableObject<Env> {
   private async cliEpoch(): Promise<{ epoch: number }> {
     const s = await this.load();
     return { epoch: s.cliTokenEpoch ?? 0 };
+  }
+
+  /** One-time, on the first request after the single-user cut deploys: if
+   *  anyone other than the principal owner could have held a CLI token for
+   *  this tenant, bump cliTokenEpoch so every outstanding one dies.
+   *
+   *  A CLI token names a tenant and an epoch, not a person, so restricting
+   *  memberContext to the owner does not touch a token a former co-owner or
+   *  admin minted before the cut; it would stay valid for up to 30 days with
+   *  full tenant powers. Who "could have": any member row other than the
+   *  principal owner that ever got past an invitation (the retired removal
+   *  disabled such rows rather than deleting them, and only deleted pending
+   *  invitations, which never had access), any team workspace, and any
+   *  Clerk-org tenant (every org admin could mint for it). A personal tenant
+   *  with only its owner is left alone, so its owner's login keeps working.
+   *
+   *  The flag makes it run once; a tenant with no stored state is skipped
+   *  without writing, and one created after the cut is born flagged. */
+  private async retireSharedCliTokens(): Promise<void> {
+    if (!(await this.ctx.storage.get("state"))) return;
+    const s = await this.load();
+    if (s.cliSingleUserCut) return;
+    const principal = this.principalOwner(s);
+    const shared =
+      s.members.some((m) => m !== principal && m.state !== "invited") ||
+      s.tenantMeta?.kind === "team" ||
+      this.tenantId().startsWith("org_");
+    if (shared) {
+      s.cliTokenEpoch = (s.cliTokenEpoch ?? 0) + 1;
+      this.log(s, {
+        cat: "key",
+        actor: "finch",
+        action: "revoked all CLI tokens (workspace is now single-user)",
+        target: "cli access",
+        ip: "",
+        svc: "",
+      });
+    }
+    s.cliSingleUserCut = true;
+    await this.save(s);
   }
 
   private async revokeCliTokens(): Promise<{ ok: boolean; epoch: number }> {

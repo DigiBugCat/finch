@@ -345,6 +345,14 @@ tenant they own, whichever holds their fleet:
   only the one the locked `r_owner` rule names (else the earliest-created);
   the other owner rows stay in storage but authorize nothing, since there is
   no longer a way to remove a co-owner.
+- CLI tokens name a tenant and its `cliTokenEpoch`, not a person, so on the
+  first request after the cut each TenantDO bumps its epoch once if anyone
+  besides that owner could have minted one: another member row that ever got
+  past an invitation, any team workspace, or any Clerk-org tenant. Every
+  outstanding CLI token there dies and the owner runs `finch login` again. A
+  personal tenant with only its owner is left alone. A `cliSingleUserCut` flag
+  in the stored state keeps it from repeating; tenants created later are born
+  with it set.
 - The OAuth door (`TenantDO.gateOauth`) admits that owner of a bootstrapped
   tenant, or the Clerk user whose personal tenant it is. For a legacy Clerk-org
   tenant nobody has claimed yet, it also admits a token scoped to that org
@@ -369,8 +377,10 @@ without an email the org is reported in `claimable` instead.
 
 Retired Durable Object: `AviaryEnrollmentDO` (migration `v5`) is a 410 stub
 kept only so the migrated class stays exported; its binding was removed and its
-stored enrollment/audit rows are untouched. It has a no-op `alarm()` so an
-expiry alarm still armed at deploy time drains quietly instead of erroring. Deleting that data requires an
+stored enrollment/audit rows are kept, minus their secrets: an expiry alarm
+still armed at deploy time (or any request) nulls `grant_json` (the issued
+refresh token) and `approval_nonce` in every row and disarms the alarm, since
+the retired cleanup that used to null them is gone. Deleting the rows requires an
 explicit `deleted_classes` migration, which deploy preflight refuses until
 someone deliberately changes that guard. Boxes enrolled through the old device
 flow keep refreshing: `/refresh` still honors their per-box credential epoch,
