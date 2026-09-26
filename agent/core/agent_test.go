@@ -2,6 +2,7 @@ package core
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
@@ -172,7 +173,7 @@ func TestRefresh_RejectsRedirectWithoutLeakingHubBody(t *testing.T) {
 		_, _ = w.Write([]byte("refresh-token-secret"))
 	}))
 	defer source.Close()
-	_, err := refresh(source.URL, "refresh-token-secret")
+	_, err := refreshContext(context.Background(), source.URL, "refresh-token-secret")
 	if err == nil || !strings.Contains(err.Error(), "HTTP 307") {
 		t.Fatalf("redirect error=%v", err)
 	}

@@ -526,14 +526,10 @@ func joinContext(ctx context.Context, hub, ticket, box string) (*joinResp, error
 	return &jr, nil
 }
 
-// refresh trades the long-lived per-box refresh token for a fresh
+// refreshContext trades the long-lived per-box refresh token for a fresh
 // connect-token, without re-using the one-shot enrollment ticket. The hub
 // rejects it (403) if the service or box was removed (`finch rm`), which is how
 // revocation propagates to the box within a connect-token TTL.
-func refresh(hub, refreshToken string) (*joinResp, error) {
-	return refreshContext(context.Background(), hub, refreshToken)
-}
-
 func refreshContext(ctx context.Context, hub, refreshToken string) (*joinResp, error) {
 	validatedHub, err := validateHubTransportURL(hub)
 	if err != nil {
