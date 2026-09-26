@@ -49,6 +49,25 @@ async function runtimeEnv(name: string): Promise<string | undefined> {
   return typeof pv === "string" && pv.length ? pv : undefined;
 }
 
+/** The subset of a Cloudflare service binding (Fetcher) the hub bridge uses. */
+interface HubBinding {
+  fetch(input: string, init?: RequestInit): Promise<Response>;
+}
+
+/** The FINCH_HUB service binding from the Cloudflare env, or undefined when
+ *  not running under the adapter or the env doesn't bind it. */
+async function hubBinding(): Promise<HubBinding | undefined> {
+  try {
+    const { getCloudflareContext } = await import("@opennextjs/cloudflare");
+    const env = getCloudflareContext().env as Record<string, unknown>;
+    const binding = env?.FINCH_HUB as Partial<HubBinding> | undefined;
+    if (binding && typeof binding.fetch === "function") return binding as HubBinding;
+  } catch {
+    // not running under the Cloudflare adapter — no binding
+  }
+  return undefined;
+}
+
 /** Public accessor for runtimeEnv — routes that need a non-hub secret (e.g.
  *  the Clerk webhook signing secret) read it through the same CF-or-process
  *  fallback the hub bridge uses. */
@@ -189,7 +208,8 @@ function validateHubPath(path: string): void {
 /**
  * Call the hub control API for the current tenant. Resolves the tenant from
  * the Clerk session, attaches the service secret + tenant headers, and fetches
- * `${HUB_URL}${path}`. Returns the raw Response (caller decides how to read it).
+ * `${HUB_URL}${path}` — over the FINCH_HUB service binding when deployed (see
+ * fetchHubNoRedirect). Returns the raw Response (caller decides how to read it).
  */
 export async function hubFetch(
   path: string,
@@ -250,12 +270,21 @@ export async function hubFetchAs(
  * intact and never replayed to the redirect target, and we reject it here.
  * That preserves the guarantee the "error" mode was chosen for — our service
  * secret and signed assertion never cross an origin the hub didn't answer on.
+ *
+ * Deployed, the request rides the FINCH_HUB service binding (wrangler.jsonc):
+ * it is handed straight to the hub Worker's fetch handler, never touching DNS,
+ * the zone's routes or the public internet. The URL is still `${HUB_URL}${path}`
+ * because the hub reads its own host from it (e.g. the `hub` origin cli-mint
+ * returns). Only without a binding (`next dev`, unit tests) does this fall back
+ * to a public fetch of the same URL.
  */
 async function fetchHubNoRedirect(
   url: string,
   init: RequestInit,
 ): Promise<Response> {
-  const response = await fetch(url, { ...init, redirect: "manual" });
+  const hub = await hubBinding();
+  const request: RequestInit = { ...init, redirect: "manual" };
+  const response = hub ? await hub.fetch(url, request) : await fetch(url, request);
   if (response.status >= 300 && response.status < 400) {
     throw new HttpError(502, "hub returned a redirect");
   }

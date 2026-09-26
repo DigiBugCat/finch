@@ -39,8 +39,14 @@ export async function POST(req: Request) {
     const identity = await syncIdentity(userId);
     const email = identity.primaryEmail ?? identity.emails[0];
     if (!email) throw new HttpError(403, "verify your email");
+    // The hub throttles creation per user AND per client IP, but over the
+    // FINCH_HUB service binding it sees no CF-Connecting-IP (and over the public
+    // wire only this Worker's egress IP), so pass the browser's IP explicitly.
+    // The hub trusts this header only on the service-authed path.
+    const clientIp = req.headers.get("cf-connecting-ip");
     const response = await userFetch(userId, "/api/tenant-create", {
       method: "POST",
+      headers: clientIp ? { "X-Finch-Client-IP": clientIp } : undefined,
       body: JSON.stringify({ name, email, emails: identity.emails, idempotencyKey }),
     });
     if (!response.ok) return forwardHubResponse(response);
