@@ -50,10 +50,32 @@ function memberResponse(overrides: Record<string, unknown> = {}) {
   );
 }
 
-// The hub is asked two things: /api/user/sync (which tenant this user owns)
-// and then /api/member-context (their membership there). Route by path.
+// The hub is asked /api/user/sync (which tenants this user owns), then, only
+// when they own more than their personal tenant, /api/state of each candidate
+// (does it hold services or keys?), and finally /api/member-context (their
+// membership in the chosen tenant). Route by path.
 let syncResponse: () => Response;
 let memberContext: () => Response;
+// What each tenant's /api/state holds; a tenant not listed is empty.
+let fleets: Record<string, { services?: unknown[]; keys?: unknown[] }>;
+let stateResponse: (tenant: string) => Response;
+
+function owns(...tenantIds: string[]): () => Response {
+  return () =>
+    Response.json({
+      tenants: [
+        { tenantId: "user_1", role: "owner", state: "active", name: "user_1", kind: "personal" },
+        ...tenantIds.map((tenantId) => ({
+          tenantId,
+          role: "owner",
+          state: "active",
+          name: `Team ${tenantId}`,
+          kind: "team",
+        })),
+      ],
+      claimable: [],
+    });
+}
 
 function callsTo(path: string): [string, RequestInit][] {
   return (fetchMock.mock.calls as [string, RequestInit][]).filter(([url]) =>
@@ -74,9 +96,14 @@ describe("single-user tenant resolution", () => {
     authMock.mockResolvedValue({ userId: "user_1" });
     syncResponse = () => Response.json({ tenants: [], claimable: [] });
     memberContext = () => memberResponse();
-    fetchMock.mockImplementation(async (url: string) =>
-      String(url).endsWith("/api/user/sync") ? syncResponse() : memberContext(),
-    );
+    fleets = {};
+    stateResponse = (tenant) =>
+      Response.json({ services: [], keys: [], ...fleets[tenant] });
+    fetchMock.mockImplementation(async (url: string, init: RequestInit) => {
+      if (String(url).endsWith("/api/user/sync")) return syncResponse();
+      if (String(url).endsWith("/api/state")) return stateResponse((await signedAs(init))!);
+      return memberContext();
+    });
     vi.stubGlobal("fetch", fetchMock);
   });
 
@@ -118,50 +145,118 @@ describe("single-user tenant resolution", () => {
     await expect(requireAdmin()).rejects.toMatchObject({ status: 403 });
   });
 
-  it("acts for the tenant a cut-over hub names", async () => {
-    syncResponse = () => Response.json({ tenant: "org_legacy", tenants: [], claimable: [] });
-    memberContext = () => memberResponse({ role: "owner" });
-
-    await expect(requireAdmin()).resolves.toMatchObject({
-      tenant: "org_legacy",
-      userId: "user_1",
-      role: "owner",
-      isAdmin: true,
-    });
-    const [[, member]] = callsTo("/api/member-context");
-    expect(await signedAs(member)).toBe("org_legacy");
-  });
-
-  it("picks the first actively owned tenant from an older hub's membership list", async () => {
+  it("stays on the personal tenant, without probing, when the user owns nothing else", async () => {
     syncResponse = () =>
       Response.json({
         tenants: [
-          { tenantId: "user_1", role: "owner", state: "active" },
+          { tenantId: "ft_team", role: "member", state: "active" },
           { tenantId: "ft_admin_only", role: "admin", state: "active" },
           { tenantId: "ft_disabled", role: "owner", state: "disabled" },
-          { tenantId: "ft_owned", role: "owner", state: "active" },
-          { tenantId: "ft_second", role: "owner", state: "active" },
+          { tenantId: "../../attacker", role: "owner", state: "active" },
         ],
         claimable: [],
       });
-    memberContext = () => memberResponse({ role: "owner" });
+    memberContext = () => memberResponse({ role: "owner", email: "owner@example.com" });
 
-    await expect(resolveTenant()).resolves.toMatchObject({ tenant: "ft_owned" });
+    await expect(resolveTenant()).resolves.toMatchObject({
+      tenant: "user_1",
+      role: "owner",
+      account: { name: "owner@example.com", kind: "personal" },
+    });
+    expect(callsTo("/api/state")).toHaveLength(0);
   });
 
-  it("falls back to the personal tenant when the user owns nothing else", async () => {
-    syncResponse = () =>
-      Response.json({
-        tenants: [{ tenantId: "ft_team", role: "member", state: "active" }],
-        claimable: [],
-      });
+  it("keeps the personal tenant that holds the fleet over an empty owned team", async () => {
+    // The user made an empty team during the beta, or co-owns someone's team.
+    syncResponse = owns("ft_empty_team");
+    fleets = { user_1: { services: [{ id: "printer" }] } };
     memberContext = () => memberResponse({ role: "owner" });
 
-    await expect(resolveTenant()).resolves.toMatchObject({ tenant: "user_1", role: "owner" });
+    await expect(resolveTenant()).resolves.toMatchObject({ tenant: "user_1" });
+    const probed = await Promise.all(callsTo("/api/state").map(([, init]) => signedAs(init)));
+    expect(probed).toEqual(["user_1", "ft_empty_team"]);
+    const [[, member]] = callsTo("/api/member-context");
+    expect(await signedAs(member)).toBe("user_1");
+  });
+
+  it("acts as an owned team that holds the fleet when the personal tenant is empty", async () => {
+    syncResponse = owns("ft_empty", "ft_fleet");
+    fleets = { ft_fleet: { services: [{ id: "printer" }] } };
+    memberContext = () => memberResponse({ role: "owner" });
+
+    await expect(requireAdmin()).resolves.toMatchObject({
+      tenant: "ft_fleet",
+      userId: "user_1",
+      role: "owner",
+      isAdmin: true,
+      account: { name: "Team ft_fleet", kind: "team" },
+    });
+    const [[, member]] = callsTo("/api/member-context");
+    expect(await signedAs(member)).toBe("ft_fleet");
+  });
+
+  it("counts finch_ keys as holding a fleet", async () => {
+    syncResponse = owns("ft_keys");
+    fleets = { ft_keys: { keys: [{ id: "k_1" }] } };
+    memberContext = () => memberResponse({ role: "owner" });
+
+    await expect(resolveTenant()).resolves.toMatchObject({ tenant: "ft_keys" });
+  });
+
+  it("stays on the personal tenant when no candidate holds anything", async () => {
+    syncResponse = owns("ft_a", "ft_b");
+    memberContext = () => memberResponse({ role: "owner" });
+
+    await expect(resolveTenant()).resolves.toMatchObject({ tenant: "user_1" });
+  });
+
+  it("refuses to choose between two tenants that both hold a fleet", async () => {
+    syncResponse = owns("ft_team");
+    fleets = {
+      user_1: { services: [{ id: "printer" }] },
+      ft_team: { services: [{ id: "scanner" }] },
+    };
+
+    await expect(resolveTenant()).rejects.toMatchObject({
+      status: 409,
+      message: expect.stringContaining('your personal account, "Team ft_team"'),
+    });
+    expect(callsTo("/api/member-context")).toHaveLength(0);
+  });
+
+  it("ignores a hub's own `tenant` pick and chooses from what the tenants hold", async () => {
+    // The shape a hub that has cut workspaces answers with: owned first.
+    syncResponse = () =>
+      Response.json({
+        tenant: "ft_empty",
+        tenants: [
+          { tenantId: "ft_empty", role: "owner", state: "active", name: "Empty", kind: "team" },
+          { tenantId: "user_1", role: "owner", state: "invited", name: "user_1", kind: "personal" },
+        ],
+        claimable: [],
+      });
+    fleets = { user_1: { services: [{ id: "printer" }] } };
+    memberContext = () => memberResponse({ role: "owner" });
+
+    await expect(resolveTenant()).resolves.toMatchObject({ tenant: "user_1" });
+  });
+
+  it("fails closed on a failed or malformed state probe", async () => {
+    syncResponse = owns("ft_team");
+    for (const [response, status] of [
+      [() => Response.json({ error: "down" }, { status: 503 }), 503],
+      [() => Response.json({ services: "none", keys: [] }), 502],
+      [() => new Response("<html>"), 502],
+    ] as const) {
+      stateResponse = response;
+      await expect(resolveTenant()).rejects.toMatchObject({ status });
+    }
+    expect(callsTo("/api/member-context")).toHaveLength(0);
   });
 
   it("refuses another tenant when member-context does not report the user as its owner", async () => {
-    syncResponse = () => Response.json({ tenant: "ft_someone_else" });
+    syncResponse = owns("ft_someone_else");
+    fleets = { ft_someone_else: { services: [{ id: "printer" }] } };
     for (const role of ["admin", "member"]) {
       memberContext = () => memberResponse({ role });
       await expect(resolveTenant()).rejects.toMatchObject({ status: 403 });
@@ -170,8 +265,7 @@ describe("single-user tenant resolution", () => {
 
   it("fails closed on a malformed owner lookup", async () => {
     for (const body of [
-      { tenant: "../../attacker" },
-      { tenant: 42 },
+      { tenant: "user_1" },
       { tenants: "user_1" },
       {},
       [],
@@ -228,7 +322,8 @@ describe("single-user tenant resolution", () => {
   });
 
   it("never bootstraps a tenant other than the personal one", async () => {
-    syncResponse = () => Response.json({ tenant: "ft_owned" });
+    syncResponse = owns("ft_owned");
+    fleets = { ft_owned: { services: [{ id: "printer" }] } };
     memberContext = () => Response.json({ member: null, tenantMeta: null, needsBootstrap: true });
 
     await expect(resolveTenant()).rejects.toMatchObject({ status: 403 });

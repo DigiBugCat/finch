@@ -27,11 +27,17 @@ approval page. Next.js (App Router) deployed to **Cloudflare Workers via
 ```
 
 The BFF never exposes the hub directly: each route checks the Clerk session,
-resolves the caller to the tenant they own (the hub's user-scoped
-`/api/user/sync`, else their personal tenant), confirms they are its active
-owner with `/api/member-context`, then calls the hub over the `FINCH_HUB` service binding with the shared
+resolves the caller to one tenant, confirms they are its active owner with
+`/api/member-context`, then calls the hub over the `FINCH_HUB` service binding with the shared
 `FINCH_SERVICE_SECRET` **and** an HMAC-signed tenant assertion (so a leaked
 secret alone can't act as an arbitrary tenant).
+
+Which tenant: the personal one (the Clerk user id) unless the hub's
+user-scoped `/api/user/sync` lists other tenants the user actively owns. Then
+the web probes each candidate's `/api/state` and picks the one holding services
+or keys; if none does it stays personal, and if more than one does it refuses
+(409) rather than strand the others, since there is no workspace switcher.
+The `/cli` page shows the chosen account before the user approves.
 
 Everything else a user does (services, keys, domains, revoking CLI tokens)
 is a `finch` CLI command talking to the hub's `/api/cli/*` directly, not

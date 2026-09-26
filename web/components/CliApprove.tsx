@@ -9,7 +9,8 @@ import { useEffect, useRef, useState } from 'react';
 import { useSearchParams } from 'next/navigation';
 import { UserButton, useUser } from '@clerk/nextjs';
 
-type Origin = { found: boolean; reqIp?: string; reqUa?: string; ageSeconds?: number } | null;
+type Account = { name: string; kind: 'personal' | 'team' };
+type Origin = { found: boolean; reqIp?: string; reqUa?: string; ageSeconds?: number; account?: Account; error?: string } | null;
 
 export default function CliApprove() {
   const { user } = useUser();
@@ -23,8 +24,13 @@ export default function CliApprove() {
   const [origin, setOrigin] = useState<Origin>(null);   // initiator context for the typed code
   const seq = useRef(0);
 
-  // The account the minted token will act as: the signed-in user's own.
-  const account = user?.primaryEmailAddress?.emailAddress || user?.username || 'your account';
+  // The account the minted token will act as, as the server resolved it: the
+  // user's personal account, or a team they own that holds their services.
+  // Until the code is looked up, fall back to the signed-in user's email.
+  const resolved = origin?.account;
+  const account = resolved
+    ? `${resolved.name} (${resolved.kind === 'team' ? 'team account' : 'personal account'})`
+    : user?.primaryEmailAddress?.emailAddress || user?.username || 'your account';
 
   // When a full code is typed, look up WHERE it was started so the user can tell
   // it's their own box (not an attacker-initiated code they were sent).
@@ -40,7 +46,9 @@ export default function CliApprove() {
           body: JSON.stringify({ userCode: c }),
         });
         const j = await r.json();
-        if (mine === seq.current) setOrigin(j);
+        // A refusal (e.g. no single account to log in to) is shown as-is
+        // rather than as "no active login".
+        if (mine === seq.current) setOrigin(r.ok ? j : { found: false, error: j.error || 'could not look up that code' });
       } catch { /* ignore */ }
     }, 300);
     return () => clearTimeout(t);
@@ -99,7 +107,9 @@ export default function CliApprove() {
                   <div className="cli-origin-d mono">{origin.reqIp || 'unknown IP'} · {(origin.reqUa || 'unknown client').slice(0, 60)}</div>
                   <div className="cli-origin-age dim">{origin.ageSeconds != null ? `${origin.ageSeconds}s ago` : ''} — approve only if that's the box where you ran <code className="mono">finch login</code>.</div>
                 </div>
-              : <div className="cli-err">No active login for that code — check it or run <code className="mono">finch login</code> again.</div>)}
+              : origin.error
+                ? <div className="cli-err">{origin.error}</div>
+                : <div className="cli-err">No active login for that code — check it or run <code className="mono">finch login</code> again.</div>)}
             <div className="cli-grant">This grants a CLI token (~30 days) acting as <b>{account}</b>.</div>
             <button type="button" className="btn btn-lg btn-amber" onClick={approve} disabled={state === 'busy' || !origin?.found}>
               {state === 'busy' ? 'Approving…' : 'Approve box'}

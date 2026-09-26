@@ -110,10 +110,20 @@ describe("CLI route authorization boundary", () => {
     expect(fetchSpy).toHaveBeenCalledTimes(2);
   });
 
-  it("acts as the tenant the user owns, not their personal one", async () => {
+  it("acts as, and names, an owned team that holds the fleet when the personal tenant is empty", async () => {
     const fetchSpy = vi
       .spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(Response.json({ tenant: "ft_owned_team" }))
+      .mockResolvedValueOnce(
+        Response.json({
+          tenants: [
+            { tenantId: "ft_owned_team", role: "owner", state: "active", name: "Acme", kind: "team" },
+          ],
+          claimable: [],
+        }),
+      )
+      // /api/state of the personal tenant, then of the team.
+      .mockResolvedValueOnce(Response.json({ services: [], keys: [] }))
+      .mockResolvedValueOnce(Response.json({ services: [{ id: "printer" }], keys: [] }))
       .mockResolvedValueOnce(memberContext())
       .mockResolvedValueOnce(Response.json({ found: false }));
 
@@ -122,10 +132,37 @@ describe("CLI route authorization boundary", () => {
     );
 
     expect(response.status).toBe(200);
-    const [url, init] = fetchSpy.mock.calls[2] as [string, RequestInit];
+    expect(await response.json()).toEqual({
+      found: false,
+      account: { name: "Acme", kind: "team" },
+    });
+    const [url, init] = fetchSpy.mock.calls[4] as [string, RequestInit];
     expect(url).toBe("https://hub.example.com/api/cli-describe");
     const assertion = new Headers(init.headers).get("x-finch-auth")!;
     expect(await verifyAssertion(assertion, "test-service-secret")).toBe("ft_owned_team");
+  });
+
+  it("surfaces a refusal to choose between two populated accounts before any action", async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(
+        Response.json({
+          tenants: [
+            { tenantId: "ft_owned_team", role: "owner", state: "active", name: "Acme", kind: "team" },
+          ],
+          claimable: [],
+        }),
+      )
+      .mockResolvedValueOnce(Response.json({ services: [{ id: "a" }], keys: [] }))
+      .mockResolvedValueOnce(Response.json({ services: [{ id: "b" }], keys: [] }));
+
+    const response = await approve(
+      request("/api/finch/cli-approve", { userCode: "ABCD-EFGH" }),
+    );
+
+    expect(response.status).toBe(409);
+    expect((await response.json()).error).toMatch(/more than one Finch account/);
+    expect(fetchSpy).toHaveBeenCalledTimes(3);
   });
 });
 
@@ -240,6 +277,7 @@ describe("POST /api/finch/cli-describe", () => {
       reqUa: "finch-cli/1",
       ageSeconds: 4,
       approved: false,
+      account: { name: "owner@example.com", kind: "personal" },
     });
   });
 
