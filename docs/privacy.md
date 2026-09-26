@@ -102,21 +102,41 @@ not part of the retained recent-call record.
 
 Finch also retains control-plane data that is not message content:
 
-- tenant identifiers and the tenant owner's Clerk user id and email (member,
-  invitation and access-request rows written by the retired team features are
-  kept as stored but no longer read to authorize anyone);
-- service, route, box, group, tag, hostname, manifest, and settings metadata;
-- access-control rules and key metadata, including the key hash, label, scope,
-  last four characters, creation time, and expiry (the plaintext `finch_` key
-  is returned only when minted);
+- tenant identifiers and the tenant owner's Clerk user id and email (a tenant
+  is one Clerk user; there are no other members);
+- service, box, group label, tag, hostname, and settings metadata;
+- key metadata, including the key hash, label, scope, last four characters,
+  creation time, and expiry (the plaintext `finch_` key is returned only when
+  minted);
 - authentication/enrollment state needed to operate and revoke box and CLI
   credentials; and
-- bounded administrative, device, access, and key audit events.
+- bounded administrative, device, and key audit events.
 
 This list is the allowed application-retention surface. Adding new retained
 relay metadata or any body capture requires an explicit documentation update,
 privacy review, and automated coverage proving the ordinary payload remains
 absent from storage and logs.
+
+### Legacy sharing records are deleted on migration
+
+Finch's retired team, sharing and device-enrollment features wrote records
+that named other people. The single-user migration deletes them:
+
+- Each tenant's stored state is purged once, on the first request the hub
+  serves for it after the migration deploys (`TenantDO.purgeLegacyTenancy`,
+  recorded by a versioned `singleUserPurge` flag): member rows other than the
+  owner, invitations, groups, access-control rules, access requests, the
+  retired login wall's session epoch, the Aviary manifest, route and
+  credential-epoch fields, the `access` audit-log rows, and any other audit
+  row that names a member other than the owner. Keys minted by anyone other than the owner
+  are revoked, and every CLI token is revoked if anyone besides the owner
+  could have held one. A tenant that no request touches keeps its legacy rows
+  until one does.
+- The global sign-in index (`DirectoryDO`) and the retired device-enrollment
+  records (`AviaryEnrollmentDO`) are deleted outright by Durable Object
+  migration `v7` when it deploys.
+
+Nothing from these records is retained afterwards.
 
 ## Approved language
 

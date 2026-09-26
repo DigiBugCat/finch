@@ -143,7 +143,10 @@ function teamEraState(tenant: string, extra: Record<string, unknown> = {}) {
     cliTokenEpoch: 2,
     usedTickets: {},
     logs: [
-      { cat: "access", actor: "m_0", action: "invited member", target: "friend@example.com", ip: "", svc: "", ts: 3, ago: "" },
+      { cat: "access", actor: "m_0", action: "invited member", target: "friend@example.com", ip: "", svc: "", ts: 7, ago: "" },
+      { cat: "key", actor: "Admin@Example.com", action: "minted key", target: "label-k_admin", ip: "", svc: "", ts: 6, ago: "" },
+      { cat: "admin", actor: "m_1", action: "changed setting", target: "keyExpiry → never", ip: "", svc: "", ts: 5, ago: "" },
+      { cat: "key", actor: "owner@example.com", action: "minted key", target: "label-k_owner", ip: "", svc: "", ts: 4, ago: "" },
       { cat: "device", actor: "scraper", action: "came online", target: "box-1", ip: "", svc: "scraper", ts: 2, ago: "" },
       { cat: "access", actor: "m_0", action: "granted access", target: "friend@example.com", ip: "", svc: "scraper", ts: 1, ago: "" },
     ],
@@ -200,9 +203,14 @@ describe("single-user purge — a tenant that had other members", () => {
     for (const field of ["aviaryCredentialEpoch", "aviaryPendingCredentialEpoch", "aviaryPendingApprovalNonce"]) {
       expect(s.services[0].boxes[0], field).not.toHaveProperty(field);
     }
-    // Sharing audit rows (they name the people shared with) are deleted; the
-    // rest of the log stays, plus one row recording the migration.
-    expect(s.logs.map((l: any) => l.cat)).toEqual(["key", "device"]);
+    // Sharing audit rows and every row naming a non-owner member (by email,
+    // case-insensitively, or member id) are deleted; the owner's and the
+    // fleet's rows stay, plus one row recording the migration.
+    expect(s.logs.map((l: any) => [l.cat, l.ts])).toEqual([
+      ["key", expect.any(Number)],
+      ["key", 4],
+      ["device", 2],
+    ]);
     expect(s.logs[0].action).toMatch(/revoked 2 key\(s\).*every CLI token/);
     expect(JSON.stringify(s)).not.toContain("friend@example.com");
     expect(JSON.stringify(s)).not.toContain("admin@example.com");

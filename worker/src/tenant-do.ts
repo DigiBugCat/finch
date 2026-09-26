@@ -738,7 +738,7 @@ export class TenantDO extends DurableObject<Env> {
    *      services and boxes (a formerly Aviary-managed service's route list is
    *      cleared with them);
    *    - deletes the audit rows of the retired sharing features (category
-   *      "access"), which name the people they shared with;
+   *      "access"), and every other row that names a non-owner member;
    *    - revokes every finch_ key the owner did not mint (see ownedByOwner);
    *    - bumps cliTokenEpoch once if anyone besides the owner could have held
    *      a CLI token for this tenant (another member row, or a team/org
@@ -822,9 +822,28 @@ export class TenantDO extends DurableObject<Env> {
       }
     }
 
+    // Audit rows: drop the sharing features' own rows, and any row that names
+    // someone other than the owner (by email, member id or Clerk user id) —
+    // e.g. "minted key" rows whose actor was an admin.
+    const otherNames = new Set<string>(); // matched anywhere in the text
+    const otherMemberIds = new Set<string>(); // short ids: matched exactly
+    for (const m of others) {
+      for (const v of [m.email, m.clerkUserId]) {
+        if (typeof v === "string" && v.trim()) otherNames.add(normalizeEmail(v));
+      }
+      if (typeof m.id === "string" && m.id) otherMemberIds.add(m.id);
+    }
+    const namesOther = (l: any): boolean =>
+      [l?.actor, l?.target].some((v) => {
+        if (typeof v !== "string") return false;
+        if (otherMemberIds.has(v)) return true;
+        const text = v.toLowerCase();
+        for (const name of otherNames) if (text.includes(name)) return true;
+        return false;
+      });
     for (const f of LEGACY_STATE_FIELDS) delete raw[f];
     const logs: any[] = Array.isArray(raw.logs) ? raw.logs : [];
-    raw.logs = logs.filter((l) => l?.cat !== "access");
+    raw.logs = logs.filter((l) => l?.cat !== "access" && !namesOther(l));
 
     const bump = shared || others.length > 0;
     if (bump) {
