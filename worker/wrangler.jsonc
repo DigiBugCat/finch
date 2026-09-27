@@ -19,13 +19,12 @@
   // migrations. The class definitions are identical, but DO ids are name-scoped
   // per Worker — so finch-dev and finch-prod get fully separate
   // BoxDO/TenantDO/RouterDO namespaces. A dev deploy can never read or
-  // mutate prod tenant registries, keys, or ACLs.
+  // mutate prod tenant registries or keys.
   "durable_objects": {
     "bindings": [
       { "name": "BOX", "class_name": "BoxDO" },
       { "name": "TENANT", "class_name": "TenantDO" },
-      { "name": "ROUTER", "class_name": "RouterDO" },
-      { "name": "DIRECTORY", "class_name": "DirectoryDO" }
+      { "name": "ROUTER", "class_name": "RouterDO" }
     ]
   },
   // Cloudflare Rate Limiting (unsafe.bindings) is defined PER-ENV below — wrangler
@@ -37,11 +36,11 @@
   // asset requests sharing the bucket). JOIN_LIMIT gates /join per-IP. The code
   // fails OPEN when the binding is absent (dev/test). (security M5)
   //
-  // Migrations are append-only history. AviaryEnrollmentDO (v5) is retired —
-  // its binding is gone and the class is a 410 stub — but the migration and
-  // the class export stay so its stored data is never deleted implicitly. Do
-  // NOT add a deleted_classes migration without an explicit decision to drop
-  // that data.
+  // Migrations are append-only history: never edit or drop an applied tag.
+  // v7 DELETES the retired AviaryEnrollmentDO (v5) and DirectoryDO (v6)
+  // classes and every object's stored data with them — the owner-approved
+  // single-user migration. deploy-preflight allows exactly that one
+  // deleted_classes step and refuses any other.
   "migrations": [
     {
       // SQLite-backed DOs — required for the free tier and the modern DO API.
@@ -66,7 +65,8 @@
       "tag": "v5",
       "new_sqlite_classes": ["AviaryEnrollmentDO"]
     },
-    { "tag": "v6", "new_sqlite_classes": ["DirectoryDO"] }
+    { "tag": "v6", "new_sqlite_classes": ["DirectoryDO"] },
+    { "tag": "v7", "deleted_classes": ["AviaryEnrollmentDO", "DirectoryDO"] }
   ],
 
   "env": {
@@ -97,8 +97,7 @@
         "bindings": [
           { "name": "BOX", "class_name": "BoxDO" },
           { "name": "TENANT", "class_name": "TenantDO" },
-          { "name": "ROUTER", "class_name": "RouterDO" },
-          { "name": "DIRECTORY", "class_name": "DirectoryDO" }
+          { "name": "ROUTER", "class_name": "RouterDO" }
         ]
       },
       // unsafe is NOT inherited into named envs — repeat it per env (see CLAUDE.md).
@@ -124,7 +123,8 @@
         { "tag": "v3", "new_sqlite_classes": ["RouterDO"] },
         { "tag": "v4", "renamed_classes": [{ "from": "ApplianceDO", "to": "BoxDO" }] },
         { "tag": "v5", "new_sqlite_classes": ["AviaryEnrollmentDO"] },
-        { "tag": "v6", "new_sqlite_classes": ["DirectoryDO"] }
+        { "tag": "v6", "new_sqlite_classes": ["DirectoryDO"] },
+        { "tag": "v7", "deleted_classes": ["AviaryEnrollmentDO", "DirectoryDO"] }
       ]
     },
 
@@ -175,8 +175,7 @@
         "bindings": [
           { "name": "BOX", "class_name": "BoxDO" },
           { "name": "TENANT", "class_name": "TenantDO" },
-          { "name": "ROUTER", "class_name": "RouterDO" },
-          { "name": "DIRECTORY", "class_name": "DirectoryDO" }
+          { "name": "ROUTER", "class_name": "RouterDO" }
         ]
       },
       "unsafe": {
@@ -201,7 +200,8 @@
         { "tag": "v3", "new_sqlite_classes": ["RouterDO"] },
         { "tag": "v4", "renamed_classes": [{ "from": "ApplianceDO", "to": "BoxDO" }] },
         { "tag": "v5", "new_sqlite_classes": ["AviaryEnrollmentDO"] },
-        { "tag": "v6", "new_sqlite_classes": ["DirectoryDO"] }
+        { "tag": "v6", "new_sqlite_classes": ["DirectoryDO"] },
+        { "tag": "v7", "deleted_classes": ["AviaryEnrollmentDO", "DirectoryDO"] }
       ]
     },
 
@@ -239,9 +239,6 @@
         { "pattern": "finchmcp.com/join*", "zone_name": "finchmcp.com" },
         { "pattern": "finchmcp.com/refresh*", "zone_name": "finchmcp.com" },
         { "pattern": "finchmcp.com/api/cli/*", "zone_name": "finchmcp.com" },
-        // Retired Aviary enrollment API: kept so old agents get the hub's
-        // plain 410 instead of the web's HTML 404.
-        { "pattern": "finchmcp.com/api/aviary/*", "zone_name": "finchmcp.com" },
         // Dedicated canonical caller-assertion issuer/JWKS origin. Keeping it
         // off the apex avoids competing with finch-web-prod's catch-all route.
         { "pattern": "jwks.finchmcp.com/.well-known/finch-jwks.json", "zone_name": "finchmcp.com" },
@@ -266,8 +263,7 @@
         "bindings": [
           { "name": "BOX", "class_name": "BoxDO" },
           { "name": "TENANT", "class_name": "TenantDO" },
-          { "name": "ROUTER", "class_name": "RouterDO" },
-          { "name": "DIRECTORY", "class_name": "DirectoryDO" }
+          { "name": "ROUTER", "class_name": "RouterDO" }
         ]
       },
       // unsafe is NOT inherited into named envs — repeat it per env (see CLAUDE.md).
@@ -293,7 +289,8 @@
         { "tag": "v3", "new_sqlite_classes": ["RouterDO"] },
         { "tag": "v4", "renamed_classes": [{ "from": "ApplianceDO", "to": "BoxDO" }] },
         { "tag": "v5", "new_sqlite_classes": ["AviaryEnrollmentDO"] },
-        { "tag": "v6", "new_sqlite_classes": ["DirectoryDO"] }
+        { "tag": "v6", "new_sqlite_classes": ["DirectoryDO"] },
+        { "tag": "v7", "deleted_classes": ["AviaryEnrollmentDO", "DirectoryDO"] }
       ]
     }
   }

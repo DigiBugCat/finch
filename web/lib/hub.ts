@@ -13,8 +13,11 @@
 //
 // This module centralizes (a) resolving the tenant from the Clerk session and
 // (b) calling the hub with the right headers. Route handlers stay thin. The
-// web's only hub-backed surface is the `finch login` approval page (/cli), and
-// its caller always acts as the owner of their own tenant.
+// web's only hub-backed surface is the `finch login` approval page (/cli).
+//
+// Tenancy is single-user: a signed-in Clerk user's tenant is exactly their
+// Clerk user id, and they are its owner. There is nothing to choose between
+// and no other tenant the web ever signs for.
 
 import "server-only";
 import { auth, clerkClient } from "@clerk/nextjs/server";
@@ -77,17 +80,12 @@ function validTenantId(value: unknown): value is string {
 }
 
 /** The signed-in user's Finch tenant context, revalidated against the hub on
- *  every request. */
+ *  every request. `tenant` is always the Clerk user id. */
 export interface ResolvedTenant {
   tenant: string;
   userId: string;
   memberId: string;
   email: string;
-  role: "owner" | "admin" | "member";
-  isAdmin: boolean;
-  /** The account a CLI token minted for this context acts as, for the
-   *  approval screen. */
-  account: { name: string; kind: "personal" | "team" };
 }
 
 async function readHubJson(res: Response): Promise<any> {
@@ -98,124 +96,19 @@ async function readHubJson(res: Response): Promise<any> {
   }
 }
 
-/** A tenant the signed-in user could act as: their personal tenant or one
- *  they actively own. */
-interface Candidate {
-  tenant: string;
-  name: string;
-  kind: "personal" | "team";
-}
-
-/** A hub-supplied display name if it is safe to show, else undefined. */
-function displayName(value: unknown): string | undefined {
-  if (typeof value !== "string") return undefined;
-  const name = value.trim();
-  if (!name || name.length > 200 || /[\u0000-\u001f\u007f]/.test(name)) return undefined;
-  return name;
-}
-
 /**
- * The tenants other than their personal one that `userId` actively OWNS, in
- * the order the hub lists them.
+ * Resolve the signed-in Clerk user to their tenant — their own Clerk user id —
+ * and confirm with the hub's /api/member-context that they are its owner.
  *
- * Asked of the hub's user-scoped /api/user/sync, the one place that knows
- * which tenants a user belongs to. Only its `tenants` list is read, never a
- * `tenant` pick: an older hub (full membership list) and a hub that has cut
- * workspaces both answer with the list, and the choice between the tenants is
- * made here from what they hold (see chooseTenant). Rows where the user is
- * not an active owner are dropped; co-owning a team counts as owning it.
- */
-async function ownedTenants(userId: string): Promise<Candidate[]> {
-  // No emails: this is a lookup, not an identity sync. An older hub binds
-  // pending invitations for the emails it is sent, and there are none to bind.
-  const res = await userFetch(userId, "/api/user/sync", {
-    method: "POST",
-    body: JSON.stringify({ emails: [] }),
-  });
-  if (!res.ok) throw new HttpError(res.status, "could not resolve your Finch account");
-  const data = await readHubJson(res);
-  if (!data || typeof data !== "object" || Array.isArray(data) || !Array.isArray(data.tenants)) {
-    throw new HttpError(502, "invalid response from hub");
-  }
-  const owned: Candidate[] = [];
-  for (const row of data.tenants) {
-    if (
-      !row || typeof row !== "object" ||
-      row.tenantId === userId || !validTenantId(row.tenantId) ||
-      row.role !== "owner" || row.state !== "active" ||
-      owned.some((c) => c.tenant === row.tenantId)
-    ) {
-      continue;
-    }
-    owned.push({ tenant: row.tenantId, name: displayName(row.name) ?? row.tenantId, kind: "team" });
-  }
-  return owned;
-}
-
-/** True when `tenant` holds something its owner would lose track of: a
- *  service (and with it its boxes) or a finch_ key. */
-async function holdsFleet(tenant: string): Promise<boolean> {
-  const res = await hubFetchAs(tenant, "/api/state", { method: "GET" });
-  if (!res.ok) throw new HttpError(res.status, "could not resolve your Finch account");
-  const state = await readHubJson(res);
-  if (
-    !state || typeof state !== "object" ||
-    !Array.isArray(state.services) || !Array.isArray(state.keys)
-  ) {
-    throw new HttpError(502, "invalid response from hub");
-  }
-  return state.services.length > 0 || state.keys.length > 0;
-}
-
-/**
- * The one tenant the signed-in user acts as. Workspace switching is gone, so
- * the choice must be deterministic and must never strand anyone's services
- * away from the CLI, which is now the only way to manage them:
- *
- * - Owns nothing beyond the personal tenant (almost everyone): the personal
- *   tenant, their Clerk user id, as before. Nothing is probed.
- * - Otherwise, whichever one of personal + owned holds services or keys. An
- *   empty team never displaces a personal tenant that holds the user's fleet,
- *   and a populated team wins over an empty personal tenant.
- * - None of them holds anything: the personal tenant, as before.
- * - More than one holds something: refuse rather than pick one silently.
- */
-async function chooseTenant(userId: string): Promise<Candidate> {
-  const personal: Candidate = { tenant: userId, name: userId, kind: "personal" };
-  const owned = await ownedTenants(userId);
-  if (owned.length === 0) return personal;
-  const populated: Candidate[] = [];
-  for (const candidate of [personal, ...owned]) {
-    if (await holdsFleet(candidate.tenant)) populated.push(candidate);
-  }
-  if (populated.length === 0) return personal;
-  if (populated.length === 1) return populated[0];
-  const names = populated
-    .map((c) => (c.kind === "personal" ? "your personal account" : `"${c.name}"`))
-    .join(", ");
-  throw new HttpError(
-    409,
-    `you own more than one Finch account with services or keys (${names}), ` +
-      "and Finch now has one account per sign-in, so it cannot choose which one to log in to",
-  );
-}
-
-/**
- * Resolve the signed-in Clerk user to one tenant (chooseTenant), then revalidate
- * their membership there with /api/member-context (request and response shape
- * unchanged). A tenant other than the personal one is accepted only for its
- * active owner, so a hub bug can never hand anyone else's tenant to this user.
- *
- * A personal tenant that has never been set up answers `needsBootstrap`; the
- * web then retries with the user's verified primary email, which makes the hub
- * create it with this user as its owner.
+ * A tenant that has never been set up answers `needsBootstrap`; the web then
+ * retries with the user's verified primary email, which makes the hub create
+ * the owner row for this user.
  */
 async function resolveTenantUncached(): Promise<ResolvedTenant> {
   const { userId } = await auth();
   if (!userId) throw new HttpError(401, "unauthenticated");
+  const tenant = userId;
 
-  const chosen = await chooseTenant(userId);
-  const tenant = chosen.tenant;
   let res = await hubFetchAs(tenant, "/api/member-context", {
     method: "POST",
     body: JSON.stringify({ clerkUserId: userId }),
@@ -224,7 +117,7 @@ async function resolveTenantUncached(): Promise<ResolvedTenant> {
   let data = await readHubJson(res);
   if (!data || typeof data !== "object") throw new HttpError(502, "invalid response from hub");
 
-  if (data.needsBootstrap === true && tenant === userId) {
+  if (data.needsBootstrap === true) {
     const clerk = await clerkClient();
     const user = await clerk.users.getUser(userId);
     const verified = user.emailAddresses.filter((e) => e.verification?.status === "verified");
@@ -241,36 +134,23 @@ async function resolveTenantUncached(): Promise<ResolvedTenant> {
   if (!data || typeof data !== "object" || !("member" in data)) {
     throw new HttpError(502, "invalid response from hub");
   }
-  if (data.member === null) throw new HttpError(403, "not an active member of this account");
+  if (data.member === null) throw new HttpError(403, "not the owner of this account");
   if (typeof data.member !== "object" || Array.isArray(data.member)) {
     throw new HttpError(502, "invalid response from hub");
   }
   const { id, email, role, state } = data.member;
+  // The hub reports exactly one kind of member: the active owner. Anything
+  // else is a hub that does not speak this contract, so fail closed.
   if (
     typeof id !== "string" || !id ||
     typeof email !== "string" || !email ||
-    (role !== "owner" && role !== "admin" && role !== "member") ||
-    (state !== "active" && state !== "invited" && state !== "disabled")
+    role !== "owner" || state !== "active"
   ) {
     throw new HttpError(502, "invalid response from hub");
   }
-  if (state !== "active") throw new HttpError(403, "not an active member of this account");
-  if (tenant !== userId && role !== "owner") {
-    throw new HttpError(403, "not the owner of this account");
-  }
-  // A personal tenant's display name is just the Clerk user id, so it is
-  // labelled with the member's email instead.
-  const account = { name: chosen.kind === "personal" ? email : chosen.name, kind: chosen.kind };
-  return { tenant, userId, memberId: id, email, role, isAdmin: role !== "member", account };
+  return { tenant, userId, memberId: id, email };
 }
 export const resolveTenant = process.env.NODE_ENV === "test" ? resolveTenantUncached : cache(resolveTenantUncached);
-
-/** The resolved tenant, refusing a member without admin rights. */
-export async function requireAdmin(): Promise<ResolvedTenant> {
-  const ctx = await resolveTenant();
-  if (!ctx.isAdmin) throw new HttpError(403, "admin role required");
-  return ctx;
-}
 
 
 /** Return a canonical origin, or throw unless `hubUrl` is https: or a
@@ -371,31 +251,6 @@ export async function hubFetchAs(
 
   // Control endpoints must never redirect: custom auth headers can otherwise
   // cross a trust boundary depending on the runtime's redirect implementation.
-  return fetchHubNoRedirect(`${hubOrigin}${path}`, { ...init, headers });
-}
-
-/**
- * Like hubFetchAs, but signs a USER-scoped assertion (kind "user") naming the
- * Clerk user rather than a tenant. The hub accepts it only on its user-scoped
- * routes (here, /api/user/sync) and never as a tenant credential.
- */
-export async function userFetch(
-  clerkUserId: string,
-  path: string,
-  init: RequestInit = {},
-): Promise<Response> {
-  const hubUrl = await runtimeEnv("HUB_URL");
-  const secret = await runtimeEnv("FINCH_SERVICE_SECRET");
-  if (!hubUrl || !secret) throw new HttpError(500, "hub is not configured");
-  const hubOrigin = normalizeHubUrl(hubUrl);
-  validateHubRequestIdentity(clerkUserId, "Clerk user id");
-  validateHubPath(path);
-  const headers = new Headers(init.headers);
-  headers.set("X-Finch-Service", secret);
-  headers.set("X-Finch-Auth", await signAssertion(clerkUserId, secret, undefined, "user"));
-  if (init.body != null && !headers.has("content-type")) {
-    headers.set("content-type", "application/json");
-  }
   return fetchHubNoRedirect(`${hubOrigin}${path}`, { ...init, headers });
 }
 

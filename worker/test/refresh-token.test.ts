@@ -80,6 +80,21 @@ describe("refresh-token verify — accept + kind separation", () => {
     expect(await acceptsConnect(await mint())).toBe(false);
   });
 
+  it("rejects a grant carrying a retired Aviary credential epoch", async () => {
+    // Only the retired Aviary device flow issued these. The purge deleted the
+    // stored per-box epochs they were checked against, so none may verify —
+    // otherwise a superseded credential would be accepted again.
+    for (const epoch of [0, 1, 7]) {
+      const withEpoch = await signToken(
+        { tenant: ROUTE.tenant, service: ROUTE.service, box: ROUTE.box, kind: "refresh", exp: nowSec() + 60, epoch } as TicketPayload,
+        SECRET,
+      );
+      expect(await verifyToken(withEpoch, SECRET), `epoch ${epoch}`).toBeNull();
+    }
+    // The same grant without the field still verifies.
+    expect(await acceptsRefresh(await mint())).toBe(true);
+  });
+
   it("rejects a refresh token signed with the wrong secret", async () => {
     const p = await verifyToken(await mint(), "wrong-secret");
     expect(p).toBeNull();

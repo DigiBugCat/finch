@@ -165,6 +165,40 @@ describe("RouterDO host-key validation", () => {
     expect((await router({ op: "listForTenant", tenant })).keys).toContain("mcp.acme.com");
     expect((await router({ op: "unregister", slug: "mcp.acme.com", tenant })).ok).toBe(true);
   });
+
+  it("transfers a host key only from its current owner, in one step", async () => {
+    const from = `tenant_from_${Date.now()}_${seq++}`;
+    const to = `tenant_to_${Date.now()}_${seq++}`;
+    const host = `moving-${seq++}.acme.com`;
+    expect((await router({ op: "register", slug: host, tenant: from })).ok).toBe(true);
+    // A third tenant cannot move it, and neither can anyone move an unowned key.
+    expect(await router({ op: "transfer", slug: host, from: "intruder", to })).toEqual({
+      ok: false,
+      reason: "not-owner",
+      owner: from,
+    });
+    expect((await router({ op: "transfer", slug: `nobody-${seq++}`, from, to })).reason).toBe("not-owner");
+    for (const bad of [
+      { slug: "evil.finchmcp.com", from, to },
+      { slug: host, from: "", to },
+      { slug: host, from, to: "" },
+      { slug: host, from: 7, to },
+    ]) {
+      expect((await router({ op: "transfer", ...bad })).reason, JSON.stringify(bad)).toBe("bad-input");
+    }
+    expect((await router({ op: "lookup", slug: host })).tenant).toBe(from);
+
+    expect(await router({ op: "transfer", slug: host.toUpperCase(), from, to })).toEqual({ ok: true });
+    expect((await router({ op: "lookup", slug: host })).tenant).toBe(to);
+    expect((await router({ op: "listForTenant", tenant: from })).keys).not.toContain(host);
+    // Idempotent once it is `to`'s; the old owner can no longer move it.
+    expect(await router({ op: "transfer", slug: host, from, to })).toEqual({ ok: true });
+    expect(await router({ op: "transfer", slug: host, from, to: "x" })).toEqual({
+      ok: false,
+      reason: "not-owner",
+      owner: to,
+    });
+  });
 });
 
 describe("custom hostname API", () => {

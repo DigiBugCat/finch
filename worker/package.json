@@ -16,7 +16,8 @@
     "privacy:check": "npm run privacy:test && node scripts/check-privacy-invariants.mjs",
     "validate:assertion-jwks": "node scripts/validate-assertion-jwks.mjs",
     "smoke:assertions": "node scripts/smoke-caller-assertions.mjs",
-    "test": "vitest run",
+    "scripts:test": "node --test scripts/*.test.mjs",
+    "test": "npm run scripts:test && vitest run",
     "test:watch": "vitest",
     "ci": "npm run privacy:check && npm run typecheck && wrangler deploy --dry-run --env production && vitest run"
   },

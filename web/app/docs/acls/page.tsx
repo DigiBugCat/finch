@@ -13,6 +13,11 @@ export default function Acls() {
         touches your box. Everything is managed from the CLI: you choose, per
         service, whether callers need a key, and you choose what each key can reach.
       </p>
+      <p>
+        A Finch account belongs to one person. There are no teams, groups,
+        shared members, or access-control rules to maintain: the scope of each
+        key is the whole policy.
+      </p>
 
       <h2>Three ways in</h2>
       <div className="docs-table-wrap">
@@ -23,11 +28,11 @@ export default function Acls() {
           <tbody>
             <tr>
               <td>A <code>finch_</code> key</td>
-              <td>The key is live (not revoked) and its scope covers the service. See <Link href="/docs/auth">Keys &amp; auth</Link>.</td>
+              <td>The key is live (not revoked) and its scope is <code>--all</code> or names the service. Nothing else is checked. See <Link href="/docs/auth">Keys &amp; auth</Link>.</td>
             </tr>
             <tr>
               <td>An OAuth token</td>
-              <td>An MCP client that speaks OAuth (such as Claude&apos;s custom connectors) signed in with your Finch account.</td>
+              <td>An MCP client that speaks OAuth (such as Claude&apos;s custom connectors) signed in as you, the account&apos;s owner. Anyone else&apos;s sign-in is refused.</td>
             </tr>
             <tr>
               <td>Nothing</td>
@@ -45,7 +50,8 @@ export default function Acls() {
 
       <h2>Key scope</h2>
       <p>
-        Every key is scoped when it is minted. <code>--service &lt;id&gt;</code>{' '}
+        Every key is scoped when it is minted, and that scope is the only thing
+        that decides what it reaches. <code>--service &lt;id&gt;</code>{' '}
         limits it to one service; <code>--all</code> lets it reach every service on
         the account. There is no unscoped default.
       </p>

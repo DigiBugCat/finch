@@ -32,12 +32,11 @@ resolves the caller to one tenant, confirms they are its active owner with
 `FINCH_SERVICE_SECRET` **and** an HMAC-signed tenant assertion (so a leaked
 secret alone can't act as an arbitrary tenant).
 
-Which tenant: the personal one (the Clerk user id) unless the hub's
-user-scoped `/api/user/sync` lists other tenants the user actively owns. Then
-the web probes each candidate's `/api/state` and picks the one holding services
-or keys; if none does it stays personal, and if more than one does it refuses
-(409) rather than strand the others, since there is no workspace switcher.
-The `/cli` page shows the chosen account before the user approves.
+Which tenant: always the signed-in user's own. The tenant id is their Clerk
+user id, and `resolveTenant` confirms they are its active owner with
+`POST /api/member-context`, which bootstraps the owner row from their verified
+primary email on first sign-in. There is no chooser, owned-tenant lookup or
+account label.
 
 Everything else a user does (services, keys, domains, revoking CLI tokens)
 is a `finch` CLI command talking to the hub's `/api/cli/*` directly, not
@@ -95,7 +94,7 @@ without that file would hand every agent a 404 on its first step.
 | `app/cli`, `components/CliApprove.tsx` | the `finch login` approval page |
 | `app/api/finch/*` | BFF route handlers for it — Clerk-gated, sign + proxy to the hub |
 | `app/docs/*` | the docs |
-| `lib/hub.ts` | hub client: `resolveTenant`, `requireAdmin`, `hubFetchAs`, error shaping |
+| `lib/hub.ts` | hub client: `resolveTenant` (tenant = Clerk userId, bootstrapped through `/api/member-context`), `hubFetchAs`, error shaping |
 | `lib/assertion.ts` | the Clerk-free HMAC signer (shared shape with `worker/src/auth.ts`) |
 | `middleware.ts` | Clerk middleware + CSRF (`Sec-Fetch-Site`/`Origin`) checks |
 | `test/` | vitest unit/contract tests |
