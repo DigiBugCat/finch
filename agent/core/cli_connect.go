@@ -9,12 +9,26 @@ package core
 //
 // The client is checked BEFORE a key is minted (a missing client must not
 // leave an orphan key behind), and a key whose wiring fails is revoked again.
-// When cursor/codex already had an entry for the service carrying a finch_ key
+// When the client already had an entry for the service carrying a finch_ key
 // that this command minted earlier (same label, same one-service scope, same
 // last four characters), that key is revoked once the new entry is written, so
-// re-running connect does not pile up live keys nothing references.
+// re-running connect rotates the key instead of piling up live keys nothing
+// references.
+//
+// Claude Code: the `claude` CLI (checked on 2.1.283) has no way to take a
+// header value except as an argument — `claude mcp add --header` and
+// `claude mcp add-json <name> <json>` both put it in claude's argv, where any
+// local process can read it (ps, /proc/<pid>/cmdline), and add-json does not
+// read '-', /dev/stdin or @file. So the key never goes to claude at all: finch
+// writes it to ~/.finch/connect/<name>.claude-code.json (0600, the hardened
+// credential writer) and registers the server with a headersHelper that cats
+// that file, which Claude Code runs each time it connects. claude's argv then
+// carries only the URL and the file's path. The same file serves every project
+// connected to that service on this machine, so a re-connect rotates the key
+// for all of them.
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -23,6 +37,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 )
 
 var connectClients = []string{"claude-code", "cursor", "codex", "json"}
@@ -44,8 +59,61 @@ type connectTarget struct {
 	cursor map[string]any // cursor: the parsed existing config
 	codex  string         // codex: the existing config text
 	// prevKey is the finch_ key the existing cursor/codex entry for the
-	// service carries, if any; it is replaced by this connect.
+	// service carries (for claude-code: the one written inline in the project's
+	// local entry), if any; it is replaced by this connect.
 	prevKey string
+	// claude-code: whether this project has a local entry for the service
+	// (it is removed and re-added), the headers file, and what it held before.
+	claudeLocal   bool
+	helperPath    string
+	helperBefore  []byte
+	helperPrevKey string
+}
+
+// claudeCommandTimeout bounds each `claude mcp` call (get health-checks the
+// server it describes).
+const claudeCommandTimeout = 2 * time.Minute
+
+// runClaude runs the claude CLI. Its argv must never carry a key.
+var runClaude = func(bin string, args ...string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), claudeCommandTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, bin, args...).CombinedOutput()
+	return string(out), err
+}
+
+// claudeHelperPath is the 0600 file Claude Code's headersHelper reads a
+// service's Authorization header from.
+func claudeHelperPath(name string) string {
+	return filepath.Join(finchHome(), "connect", name+".claude-code.json")
+}
+
+// shellQuote single-quotes s for the shell Claude Code runs headersHelper with.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+// claudeHelperCommand is the headersHelper: print the headers file, which is
+// already the JSON object of headers Claude Code expects.
+func claudeHelperCommand(path string) string { return "/bin/cat " + shellQuote(path) }
+
+var claudeLocalScope = regexp.MustCompile(`(?m)^\s*Scope:\s*Local config`)
+
+// claudeExistingEntry asks `claude mcp get` about the service's entry for this
+// project: whether it is a local one, and the finch_ key written inline in its
+// Authorization header, if any. No entry (or a get that fails) reads as none.
+func claudeExistingEntry(bin, name string) (local bool, inlineKey string) {
+	out, err := runClaude(bin, "mcp", "get", name)
+	if err != nil {
+		return false, ""
+	}
+	if !claudeLocalScope.MatchString(out) {
+		return false, ""
+	}
+	if m := bearerFinchKey.FindStringSubmatch(out); m != nil {
+		inlineKey = m[1]
+	}
+	return true, inlineKey
 }
 
 var bearerFinchKey = regexp.MustCompile(`Bearer\s+(finch_[A-Za-z0-9_-]+)`)
@@ -115,6 +183,16 @@ func preflightClient(client, name string) (*connectTarget, error) {
 			return nil, newCLIError(codeNotFound, jsonNext, "the 'claude' CLI (Claude Code) is not on PATH")
 		}
 		t.claude = bin
+		t.helperPath = claudeHelperPath(name)
+		before, err := readCredentialFile(t.helperPath, credentialStateLimit)
+		if err != nil {
+			return nil, newCLIError(codeInternal, "", "reading %s: %v", t.helperPath, err)
+		}
+		t.helperBefore = before
+		if m := bearerFinchKey.FindStringSubmatch(string(before)); m != nil {
+			t.helperPrevKey = m[1]
+		}
+		t.claudeLocal, t.prevKey = claudeExistingEntry(bin, name)
 	case "cursor":
 		dir := cursorConfigDir()
 		if st, err := os.Stat(dir); err != nil || !st.IsDir() {
@@ -150,7 +228,7 @@ func preflightClient(client, name string) (*connectTarget, error) {
 			return nil, newCLIError(codeInternal, "", "reading %s: %v", t.config, err)
 		}
 		if codexDefinesInline(t.codex, name) {
-			return nil, newCLIError(codeInternal, jsonNext, "%s already defines mcp_servers.%s inline; remove it first so finch can manage the entry", t.config, name)
+			return nil, newCLIError(codeInternal, jsonNext, "%s already defines mcp_servers.%s inline; remove it first so finch can manage the entry", t.config, codexServerKey(name))
 		}
 		t.prevKey = codexEntryKey(t.codex, name)
 	}
@@ -250,20 +328,9 @@ func runConnect(c *cli, args []string) error {
 		fmt.Fprintln(c.stdout, string(b))
 		return nil
 	case "claude-code":
-		args := []string{"mcp", "add", "--transport", "http", name, endpoint}
-		if key != "" {
-			args = append(args, "--header", "Authorization: Bearer "+key)
-		}
-		out, err := exec.Command(target.claude, args...).CombinedOutput()
-		if err != nil {
+		if err := connectClaudeCode(target, name, endpoint, key); err != nil {
 			revokeQuietly(cred, keyID)
-			msg := strings.TrimSpace(strings.ReplaceAll(string(out), key, "finch_…"))
-			if key == "" {
-				msg = strings.TrimSpace(string(out))
-			}
-			return newCLIError(codeUpstream, "claude mcp remove "+name+" && finch connect "+name+" --client claude-code",
-				"claude mcp add failed (%v): %s. If an entry named %s already exists, removing it leaves its key live: find it in 'finch keys list' (label %q) and revoke it with 'finch keys revoke <id>' once no other project uses it",
-				err, msg, name, label)
+			return err
 		}
 	case "cursor":
 		servers, _ := target.cursor["mcpServers"].(map[string]any)
@@ -290,11 +357,22 @@ func runConnect(c *cli, args []string) error {
 		configPath = target.config
 	}
 
-	// The cursor/codex entry now carries the new key (or none, for a public
-	// service), so the key it replaced is referenced nowhere: revoke it.
+	// The client's entry now carries the new key (or none, for a public
+	// service), so the key it replaced is referenced nowhere: revoke it. For
+	// claude-code that is the key inline in the project entry it removed, and
+	// the key the headers file held before this run overwrote it.
+	prevKeys := []string{target.prevKey}
+	if *client == "claude-code" && key != "" {
+		prevKeys = append(prevKeys, target.helperPrevKey)
+	}
 	revoked := []string{}
-	if configPath != "" {
-		for _, id := range replacedKeyIDs(st, name, label, keyID, target.prevKey) {
+	seen := map[string]bool{}
+	for _, prev := range prevKeys {
+		for _, id := range replacedKeyIDs(st, name, label, keyID, prev) {
+			if seen[id] {
+				continue
+			}
+			seen[id] = true
 			if _, err := cliRequest("POST", cred.Hub, "/api/cli/keys/revoke", cred.Token, map[string]string{"id": id}); err == nil {
 				revoked = append(revoked, id)
 			}
@@ -302,23 +380,68 @@ func runConnect(c *cli, args []string) error {
 	}
 
 	if c.json {
-		p := map[string]any{"client": *client, "name": name, "url": endpoint, "key_id": keyID}
-		if configPath != "" {
+		p := map[string]any{"client": *client, "name": name, "url": endpoint, "key_id": keyID, "revoked_key_ids": revoked}
+		switch {
+		case *client == "claude-code" && key != "":
+			p["headers_file"] = target.helperPath
+		case *client != "claude-code":
 			p["config"] = configPath
-			p["revoked_key_ids"] = revoked
 		}
 		return c.emit(p)
 	}
-	where := map[string]string{"claude-code": "Claude Code", "cursor": "Cursor (" + configPath + ")", "codex": "Codex (" + configPath + ")"}[*client]
+	where := map[string]string{"claude-code": "Claude Code (this directory's project)", "cursor": "Cursor (" + configPath + ")", "codex": "Codex (" + configPath + ")"}[*client]
 	c.printf("finch: connected %s to %s → %s\n", name, where, endpoint)
 	if keyID != "" {
 		c.printf("       using a new key %s (revoke with 'finch keys revoke %s'); the key was not printed\n", keyID, keyID)
 	}
+	if *client == "claude-code" && key != "" {
+		c.printf("       Claude Code reads it from %s through a headersHelper, which it runs only in a trusted workspace\n", target.helperPath)
+	}
 	if len(revoked) > 0 {
 		c.printf("       revoked the key the old entry used: %s\n", strings.Join(revoked, ", "))
 	}
-	if *client != "claude-code" {
-		c.printf("       restart the client (or reload its MCP servers) to pick it up\n")
+	c.printf("       restart the client (or reload its MCP servers) to pick it up\n")
+	return nil
+}
+
+// connectClaudeCode registers the service with Claude Code for the current
+// directory's project (claude's "local" scope) without the key ever reaching
+// claude's argv: the key goes to the 0600 headers file first, and the entry
+// runs a headersHelper that prints it. An existing local entry is replaced.
+// On failure the headers file is put back as it was; the caller revokes the
+// new key.
+func connectClaudeCode(t *connectTarget, name, endpoint, key string) error {
+	entry := map[string]any{"type": "http", "url": endpoint}
+	restore := func() {}
+	if key != "" {
+		headers, _ := json.Marshal(map[string]string{"Authorization": "Bearer " + key})
+		if err := writeCredentialFile(t.helperPath, append(headers, '\n')); err != nil {
+			return newCLIError(codeInternal, "", "writing %s: %v", t.helperPath, err)
+		}
+		restore = func() {
+			if t.helperBefore != nil {
+				_ = writeCredentialFile(t.helperPath, t.helperBefore)
+			} else {
+				_ = os.Remove(t.helperPath)
+			}
+		}
+		entry["headersHelper"] = claudeHelperCommand(t.helperPath)
+	}
+	next := "finch connect " + name + " --client claude-code"
+	if t.claudeLocal {
+		if out, err := runClaude(t.claude, "mcp", "remove", name, "-s", "local"); err != nil {
+			restore()
+			return newCLIError(codeUpstream, next, "claude mcp remove %s failed (%v): %s", name, err, strings.TrimSpace(out))
+		}
+	}
+	b, _ := json.Marshal(entry)
+	if out, err := runClaude(t.claude, "mcp", "add-json", name, string(b)); err != nil {
+		restore()
+		msg := fmt.Sprintf("claude mcp add-json failed (%v): %s", err, strings.TrimSpace(out))
+		if t.claudeLocal {
+			msg += "; this project's previous " + name + " entry was already removed, so run connect again"
+		}
+		return newCLIError(codeUpstream, next, "%s", msg)
 	}
 	return nil
 }
@@ -331,22 +454,48 @@ func revokeQuietly(cred *cliCred, keyID string) {
 
 var tomlHeaderLine = regexp.MustCompile(`^\s*\[`)
 
+var tomlBareKey = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+
+// codexServerKey is the service name as one TOML key segment. A service id may
+// contain '.', which a bare key would split into nested tables
+// ([mcp_servers.foo.bar] is server "foo", sub-table "bar"), so such a name is
+// quoted: [mcp_servers."foo.bar"]. Service ids never need escapes inside the
+// quotes (validAppPath allows only letters, digits, '-', '_' and '.').
+func codexServerKey(name string) string {
+	if tomlBareKey.MatchString(name) {
+		return name
+	}
+	return `"` + name + `"`
+}
+
+// codexKeyForms is a regexp alternation of the ways config.toml can spell the
+// service name as one key segment: quoted either way, or bare when the name is
+// a valid bare key. A dotted name has no bare form: bare, it is a key path.
+func codexKeyForms(name string) string {
+	q := regexp.QuoteMeta(name)
+	forms := `"` + q + `"|'` + q + `'`
+	if tomlBareKey.MatchString(name) {
+		forms = q + `|` + forms
+	}
+	return `(?:` + forms + `)`
+}
+
 // codexServerHeader matches `[mcp_servers.<name>]` and its sub-tables
 // (`[mcp_servers.<name>.env]`), bare or quoted, with an optional comment.
 func codexServerHeader(name string) *regexp.Regexp {
-	q := regexp.QuoteMeta(name)
-	return regexp.MustCompile(`^\s*\[\s*mcp_servers\s*\.\s*(?:` + q + `|"` + q + `"|'` + q + `')\s*(?:\.[^\]]*)?\]\s*(?:#.*)?$`)
+	return regexp.MustCompile(`^\s*\[\s*mcp_servers\s*\.\s*` + codexKeyForms(name) + `\s*(?:\.[^\]]*)?\]\s*(?:#.*)?$`)
 }
 
 // codexDefinesInline reports whether config.toml defines the server in a form
-// line surgery cannot safely replace: a key inside a [mcp_servers] table, or
-// an inline mcp_servers = { … } value.
+// line surgery cannot safely replace: a key (or dotted key) inside a
+// [mcp_servers] table, an inline mcp_servers = { … } value, or a root-level
+// dotted key mcp_servers.<name>.… = ….
 func codexDefinesInline(text, name string) bool {
-	q := regexp.QuoteMeta(name)
+	forms := codexKeyForms(name)
 	inTable := false
 	tableHeader := regexp.MustCompile(`^\s*\[\s*mcp_servers\s*\]\s*(?:#.*)?$`)
-	keyLine := regexp.MustCompile(`^\s*(?:` + q + `|"` + q + `"|'` + q + `')\s*=`)
-	rootInline := regexp.MustCompile(`^\s*mcp_servers\s*=`)
+	keyLine := regexp.MustCompile(`^\s*` + forms + `\s*[=.]`)
+	rootInline := regexp.MustCompile(`^\s*mcp_servers\s*(?:=|\.\s*` + forms + `\s*[=.])`)
 	atRoot := true
 	for _, line := range strings.Split(text, "\n") {
 		if tomlHeaderLine.MatchString(line) {
@@ -370,7 +519,8 @@ func tomlString(s string) (string, error) {
 	return `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(s) + `"`, nil
 }
 
-// mergeCodexConfig replaces (or adds) [mcp_servers.<name>] in Codex's
+// mergeCodexConfig replaces (or adds) [mcp_servers.<name>] (quoted when the
+// name has a '.') in Codex's
 // config.toml, leaving every other line — comments included — untouched.
 func mergeCodexConfig(text, name, endpoint, key string) (string, error) {
 	header := codexServerHeader(name)
@@ -389,7 +539,7 @@ func mergeCodexConfig(text, name, endpoint, key string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	block := "# Managed by 'finch connect " + name + " --client codex'.\n[mcp_servers." + name + "]\nurl = " + u + "\n"
+	block := "# Managed by 'finch connect " + name + " --client codex'.\n[mcp_servers." + codexServerKey(name) + "]\nurl = " + u + "\n"
 	if key != "" {
 		h, err := tomlString("Bearer " + key)
 		if err != nil {

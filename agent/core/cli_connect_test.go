@@ -3,6 +3,7 @@ package core
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -226,8 +227,7 @@ func TestConnectCursorWritesThroughSymlink(t *testing.T) {
 	}
 }
 
-// claude-code entries are per project and json snippets go who knows where,
-// so neither revokes anything.
+// json snippets go who knows where, so --client json never revokes anything.
 func TestConnectJSONRevokesNothing(t *testing.T) {
 	_, h := connectFixture(t)
 	for i := 0; i < 2; i++ {
@@ -237,6 +237,56 @@ func TestConnectJSONRevokesNothing(t *testing.T) {
 	}
 	if len(h.revoked) != 0 || len(h.keys) != 2 {
 		t.Fatalf("revoked=%v keys=%v", h.revoked, h.keys)
+	}
+}
+
+// A service id may contain '.', and a bare dotted TOML key is a key path:
+// [mcp_servers.foo.bar] is server "foo" with a sub-table "bar". The name must
+// be written, matched and replaced as one quoted key.
+func TestConnectCodexQuotesDottedNames(t *testing.T) {
+	home, h := connectFixture(t)
+	h.set(func(h *fakeHub) { h.services["foo.bar"] = "key" })
+	dir := filepath.Join(home, ".codex")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := filepath.Join(dir, "config.toml")
+	// Server "foo" with a sub-table "bar": not ours, and must survive.
+	existing := "[mcp_servers.foo]\ncommand = \"foo-server\"\n\n[mcp_servers.foo.bar]\nx = 1\n"
+	if err := os.WriteFile(cfg, []byte(existing), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for i := 1; i <= 2; i++ {
+		stdout, stderr, code := finch(t, "connect", "foo.bar", "--client", "codex", "--json")
+		if code != 0 {
+			t.Fatalf("run %d: exit=%d stderr=%q", i, code, stderr)
+		}
+		want := []any{}
+		if i == 2 {
+			want = []any{"k_1"}
+		}
+		if got := decodeJSONOut(t, stdout); !reflect.DeepEqual(got["revoked_key_ids"], want) {
+			t.Fatalf("run %d payload=%v", i, got)
+		}
+	}
+	got := mustRead(t, cfg)
+	wantBlock := "[mcp_servers.\"foo.bar\"]\nurl = \"" + h.url() + "/foo.bar/mcp\"\nhttp_headers = { \"Authorization\" = \"Bearer finch_secret2\" }\n"
+	if !strings.HasPrefix(got, existing) || strings.Count(got, `[mcp_servers."foo.bar"]`) != 1 || !strings.Contains(got, wantBlock) {
+		t.Fatalf("config.toml:\n%s", got)
+	}
+
+	// Recognised however it is quoted, and never in its bare (key path) form.
+	if out, _ := mergeCodexConfig("[mcp_servers.'foo.bar']\nurl = \"x\"\n", "foo.bar", "https://a/foo.bar/mcp", ""); strings.Contains(out, `url = "x"`) {
+		t.Fatalf("literal-quoted entry not replaced:\n%s", out)
+	}
+	if codexEntryKey("[mcp_servers.foo.bar]\nx = \"Bearer finch_abcd1234\"\n", "foo.bar") != "" {
+		t.Fatal("the bare key path [mcp_servers.foo.bar] is not the server foo.bar")
+	}
+	if !codexDefinesInline("[mcp_servers]\n\"foo.bar\" = { url = \"x\" }\n", "foo.bar") || codexDefinesInline("[mcp_servers]\nfoo.bar = 1\n", "foo.bar") {
+		t.Fatal("inline detection must use the quoted form of a dotted name")
+	}
+	if !codexDefinesInline("[mcp_servers]\nnotes.url = \"x\"\n", "notes") || !codexDefinesInline("mcp_servers.notes.url = \"x\"\n", "notes") {
+		t.Fatal("dotted-key definitions must be detected")
 	}
 }
 
@@ -256,63 +306,248 @@ func TestMergeCodexConfigQuotedHeaderAndInline(t *testing.T) {
 	}
 }
 
-// writeFakeClaude puts a strict fake `claude` on PATH: it accepts only the
-// exact `claude mcp add --transport http <name> <url> --header "Authorization:
-// Bearer finch_…"` shape and records its argv.
-func writeFakeClaude(t *testing.T, exitCode string) string {
+// fakeClaude is a strict fake `claude` on PATH. It keeps local-scope entries as
+// files in its state dir, answers `mcp get` in the real CLI's format (checked
+// against claude 2.1.283), accepts only `mcp get <name>`, `mcp remove <name>
+// -s local` and `mcp add-json <name> <json>`, fails any call whose argv
+// carries a finch_ key, and appends every argv to argv.log.
+type fakeClaude struct {
+	dir   string
+	state string
+	log   string
+}
+
+func writeFakeClaude(t *testing.T, addExit string) *fakeClaude {
 	t.Helper()
 	bin := t.TempDir()
-	log := filepath.Join(bin, "argv.log")
+	f := &fakeClaude{dir: bin, state: filepath.Join(bin, "state"), log: filepath.Join(bin, "argv.log")}
+	if err := os.MkdirAll(f.state, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	script := `#!/bin/sh
-if [ "$#" -ne 8 ] || [ "$1" != mcp ] || [ "$2" != add ] || [ "$3" != --transport ] || [ "$4" != http ] || [ "$7" != --header ]; then
-  echo "fake claude: unexpected argv: $*" >&2; exit 64
-fi
-case "$8" in "Authorization: Bearer finch_"*) ;; *) echo "fake claude: bad header" >&2; exit 64 ;; esac
-case "$6" in http://*/"$5"/mcp|https://*/"$5"/mcp) ;; *) echo "fake claude: bad url $6" >&2; exit 64 ;; esac
-for a in "$@"; do printf '%s\n' "$a"; done > "` + log + `"
-if [ "` + exitCode + `" != 0 ]; then echo "MCP server $5 already exists (header $8)" >&2; exit ` + exitCode + `; fi
-echo "Added HTTP MCP server $5"
+S="` + f.state + `"
+printf '%s\n' "$*" >> "` + f.log + `"
+case "$*" in *finch_*) echo "fake claude: a key reached argv" >&2; exit 65 ;; esac
+[ "$1" = mcp ] || { echo "fake claude: unexpected argv: $*" >&2; exit 64; }
+case "$2" in
+get)
+  [ "$#" -eq 3 ] || exit 64
+  if [ ! -f "$S/$3.json" ]; then echo "No MCP server named \"$3\". Run 'claude mcp add' to add one." >&2; exit 1; fi
+  echo "$3:"
+  echo "  Scope: $(cat "$S/$3.scope")"
+  echo "  Status: ✓ Connected"
+  echo "  Type: http"
+  echo "  URL: $(sed -n 's/.*"url":"\([^"]*\)".*/\1/p' "$S/$3.json")"
+  if [ -f "$S/$3.headers" ]; then echo "  Headers:"; echo "    $(cat "$S/$3.headers")"; fi
+  echo ""
+  echo "To remove this server, run: claude mcp remove $3 -s local"
+  ;;
+remove)
+  [ "$#" -eq 5 ] && [ "$4" = -s ] && [ "$5" = local ] || { echo "fake claude: bad remove: $*" >&2; exit 64; }
+  [ -f "$S/$3.json" ] || { echo "No MCP server found with name: $3" >&2; exit 1; }
+  rm -f "$S/$3.json" "$S/$3.scope" "$S/$3.headers"
+  echo "Removed MCP server $3 from local config"
+  ;;
+add-json)
+  [ "$#" -eq 4 ] || { echo "fake claude: bad add-json: $*" >&2; exit 64; }
+  if [ -f "$S/$3.json" ]; then echo "MCP server $3 already exists in local config" >&2; exit 1; fi
+  if [ "` + addExit + `" != 0 ]; then echo "Invalid configuration" >&2; exit ` + addExit + `; fi
+  printf '%s' "$4" > "$S/$3.json"
+  echo "Local config (private to you in this project)" > "$S/$3.scope"
+  echo "Added http MCP server $3 to local config"
+  ;;
+*) echo "fake claude: unexpected argv: $*" >&2; exit 64 ;;
+esac
 `
 	if err := os.WriteFile(filepath.Join(bin, "claude"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("PATH", bin)
-	return log
+	t.Setenv("PATH", bin+":/usr/bin:/bin")
+	return f
+}
+
+// seed plants an existing entry, as an older connect (or a human) left it.
+func (f *fakeClaude) seed(t *testing.T, name, scope, url, header string) {
+	t.Helper()
+	files := map[string]string{name + ".json": `{"type":"http","url":"` + url + `"}`, name + ".scope": scope + "\n"}
+	if header != "" {
+		files[name+".headers"] = header + "\n"
+	}
+	for n, body := range files {
+		if err := os.WriteFile(filepath.Join(f.state, n), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func (f *fakeClaude) entry(t *testing.T, name string) map[string]any {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(f.state, name+".json"))
+	if err != nil {
+		return nil
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("add-json got invalid JSON %q: %v", b, err)
+	}
+	return m
+}
+
+// runHelper runs a headersHelper the way Claude Code does (through the shell)
+// and decodes the headers it prints.
+func runHelper(t *testing.T, helper string) map[string]string {
+	t.Helper()
+	out, err := exec.Command("/bin/sh", "-c", helper).Output()
+	if err != nil {
+		t.Fatalf("headersHelper %q failed: %v", helper, err)
+	}
+	var h map[string]string
+	if err := json.Unmarshal(out, &h); err != nil {
+		t.Fatalf("headersHelper printed %q, not a JSON object of headers", out)
+	}
+	return h
 }
 
 func TestConnectClaudeCode(t *testing.T) {
-	_, h := connectFixture(t)
-	log := writeFakeClaude(t, "0")
+	home, h := connectFixture(t)
+	fc := writeFakeClaude(t, "0")
 	stdout, stderr, code := finch(t, "connect", "notes", "--client", "claude-code", "--json")
 	if code != 0 {
 		t.Fatalf("exit=%d stderr=%q", code, stderr)
 	}
-	if strings.Contains(stdout+stderr, "finch_secret") {
-		t.Fatal("connect printed the key")
+	if strings.Contains(stdout+stderr, "finch_secret") || strings.Contains(mustRead(t, fc.log), "finch_") {
+		t.Fatal("the key was printed or reached claude's argv")
 	}
-	argv := strings.Split(strings.TrimSpace(mustRead(t, log)), "\n")
-	want := []string{"mcp", "add", "--transport", "http", "notes", h.url() + "/notes/mcp", "--header", "Authorization: Bearer finch_secret1"}
-	if !reflect.DeepEqual(argv, want) {
-		t.Fatalf("claude argv=%q, want %q", argv, want)
-	}
-	if got := decodeJSONOut(t, stdout); got["client"] != "claude-code" || got["key_id"] != "k_1" {
+	helperFile := filepath.Join(home, ".finch", "connect", "notes.claude-code.json")
+	got := decodeJSONOut(t, stdout)
+	if got["client"] != "claude-code" || got["key_id"] != "k_1" || got["headers_file"] != helperFile || !reflect.DeepEqual(got["revoked_key_ids"], []any{}) {
 		t.Fatalf("payload=%v", got)
+	}
+	if m := fileMode(t, helperFile); m != 0o600 {
+		t.Fatalf("headers file mode=%04o, want 0600", m)
+	}
+	entry := fc.entry(t, "notes")
+	helper, _ := entry["headersHelper"].(string)
+	if entry["type"] != "http" || entry["url"] != h.url()+"/notes/mcp" || helper == "" || len(entry) != 3 {
+		t.Fatalf("claude entry=%v", entry)
+	}
+	if hdr := runHelper(t, helper); !reflect.DeepEqual(hdr, map[string]string{"Authorization": "Bearer finch_secret1"}) {
+		t.Fatalf("headersHelper printed %v", hdr)
+	}
+	calls := strings.Split(strings.TrimSpace(mustRead(t, fc.log)), "\n")
+	if len(calls) != 2 || calls[0] != "mcp get notes" || !strings.HasPrefix(calls[1], "mcp add-json notes {") {
+		t.Fatalf("claude calls=%q", calls)
+	}
+}
+
+// Re-connecting replaces this project's entry and revokes what it replaced:
+// the key the headers file held (shared by every project on this machine, so
+// they all move to the new key) and a key an older entry carried inline.
+func TestConnectClaudeCodeRotatesTheKey(t *testing.T) {
+	_, h := connectFixture(t)
+	h.set(func(h *fakeHub) { h.services["api"] = "key" })
+	fc := writeFakeClaude(t, "0")
+	host, _ := os.Hostname()
+	label := "claude-code on " + host
+
+	// k_1: an older connect's key, written inline into this project's entry.
+	if _, stderr, code := finch(t, "keys", "mint", label, "--service", "notes", "--json"); code != 0 {
+		t.Fatalf("keys mint: exit=%d stderr=%q", code, stderr)
+	}
+	fc.seed(t, "notes", "Local config (private to you in this project)", h.url()+"/notes/mcp", "Authorization: Bearer finch_secret1")
+	// k_2: api, same label, another service; must survive.
+	if _, stderr, code := finch(t, "connect", "api", "--client", "claude-code", "--json"); code != 0 {
+		t.Fatalf("connect api: exit=%d stderr=%q", code, stderr)
+	}
+
+	stdout, stderr, code := finch(t, "connect", "notes", "--client", "claude-code", "--json") // k_3
+	if code != 0 {
+		t.Fatalf("exit=%d stderr=%q", code, stderr)
+	}
+	if got := decodeJSONOut(t, stdout); got["key_id"] != "k_3" || !reflect.DeepEqual(got["revoked_key_ids"], []any{"k_1"}) {
+		t.Fatalf("payload=%v", got)
+	}
+	if hdr := runHelper(t, fc.entry(t, "notes")["headersHelper"].(string)); hdr["Authorization"] != "Bearer finch_secret3" {
+		t.Fatalf("helper after the first connect: %v", hdr)
+	}
+
+	stdout, stderr, code = finch(t, "connect", "notes", "--client", "claude-code", "--json") // k_4
+	if code != 0 {
+		t.Fatalf("reconnect: exit=%d stderr=%q", code, stderr)
+	}
+	if got := decodeJSONOut(t, stdout); got["key_id"] != "k_4" || !reflect.DeepEqual(got["revoked_key_ids"], []any{"k_3"}) {
+		t.Fatalf("reconnect payload=%v", got)
+	}
+	if hdr := runHelper(t, fc.entry(t, "notes")["headersHelper"].(string)); hdr["Authorization"] != "Bearer finch_secret4" {
+		t.Fatalf("helper after the reconnect: %v", hdr)
+	}
+	if !reflect.DeepEqual(h.revoked, []string{"k_1", "k_3"}) {
+		t.Fatalf("revoked=%v", h.revoked)
+	}
+	for _, live := range []string{"k_2", "k_4"} {
+		if _, ok := h.keys[live]; !ok {
+			t.Fatalf("%s was revoked; keys=%v", live, h.keys)
+		}
+	}
+	if strings.Contains(mustRead(t, fc.log), "finch_") {
+		t.Fatal("a key reached claude's argv")
+	}
+
+	// An entry in another scope is not this project's to replace: it is left
+	// alone, and so is its key.
+	fc2 := writeFakeClaude(t, "0")
+	h.set(func(h *fakeHub) { h.services["docs"] = "key" })
+	if _, _, code := finch(t, "keys", "mint", label, "--service", "docs", "--json"); code != 0 { // k_5
+		t.Fatal("keys mint failed")
+	}
+	fc2.seed(t, "docs", "User config (available in all your projects)", h.url()+"/docs/mcp", "Authorization: Bearer finch_secret5")
+	finch(t, "connect", "docs", "--client", "claude-code", "--json")
+	if _, ok := h.keys["k_5"]; !ok || strings.Contains(mustRead(t, fc2.log), "mcp remove") {
+		t.Fatalf("a user-scope entry was replaced or its key revoked: keys=%v log=%q", h.keys, mustRead(t, fc2.log))
 	}
 }
 
 func TestConnectClaudeCodeFailureRevokesKey(t *testing.T) {
-	_, h := connectFixture(t)
-	writeFakeClaude(t, "1")
+	home, h := connectFixture(t)
+	fc := writeFakeClaude(t, "1")
+	helperFile := filepath.Join(home, ".finch", "connect", "notes.claude-code.json")
 	_, stderr, code := finch(t, "connect", "notes", "--client", "claude-code", "--json")
 	env := decodeJSONError(t, stderr)
-	if code != 1 || env.Error.Code != "UPSTREAM" || !strings.HasPrefix(env.Error.Next, "claude mcp remove notes") {
+	if code != 1 || env.Error.Code != "UPSTREAM" || env.Error.Next != "finch connect notes --client claude-code" {
 		t.Fatalf("exit=%d env=%+v", code, env)
 	}
-	if strings.Contains(stderr, "finch_secret") {
-		t.Fatalf("the error leaked the key: %q", stderr)
+	if strings.Contains(stderr, "finch_secret") || strings.Contains(mustRead(t, fc.log), "finch_") {
+		t.Fatalf("the key leaked: %q", stderr)
 	}
 	if !reflect.DeepEqual(h.revoked, []string{"k_1"}) || len(h.keys) != 0 {
 		t.Fatalf("the orphan key was not revoked: revoked=%v keys=%v", h.revoked, h.keys)
+	}
+	if fileExists(helperFile) {
+		t.Fatal("a failed connect left a headers file with a revoked key")
+	}
+
+	// With an earlier headers file, a failure puts it back as it was.
+	prev := []byte(`{"Authorization":"Bearer finch_earlier"}` + "\n")
+	if err := writeCredentialFile(helperFile, prev); err != nil {
+		t.Fatal(err)
+	}
+	finch(t, "connect", "notes", "--client", "claude-code", "--json")
+	if mustRead(t, helperFile) != string(prev) {
+		t.Fatalf("headers file not restored: %q", mustRead(t, helperFile))
+	}
+}
+
+func TestShellQuoteSurvivesTheShell(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "it's a dir")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	f := filepath.Join(dir, "h.json")
+	if err := os.WriteFile(f, []byte(`{"Authorization":"Bearer x"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := runHelper(t, claudeHelperCommand(f)); got["Authorization"] != "Bearer x" {
+		t.Fatalf("helper=%v", got)
 	}
 }
 
