@@ -2,9 +2,11 @@ import { clerkMiddleware, createRouteMatcher } from "@clerk/nextjs/server";
 import { NextResponse } from "next/server";
 import { isSecurePublicRequest } from "@/lib/secure-transport";
 
-// Only the `finch login` approval page requires auth. The marketing landing,
-// docs, sign-in, and sign-up are public — don't gate the front door.
-const isProtectedRoute = createRouteMatcher(["/cli(.*)"]);
+// Only the `finch login` approval page and the signed-in fleet page require
+// auth. A signed-out visit is sent to sign-in and returned to the same page.
+// The marketing landing, docs, sign-in, and sign-up are public — don't gate
+// the front door.
+const isProtectedRoute = createRouteMatcher(["/cli(.*)", "/fleet(.*)"]);
 
 // All cookie-authed bridge handlers live under /api/finch/*.
 const isFinchApiRoute = createRouteMatcher(["/api/finch(.*)"]);

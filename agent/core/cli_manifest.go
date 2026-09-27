@@ -75,12 +75,18 @@ func validateManifestMutationTarget(configPath string) error {
 // only when absent. A missing file is created from the managed header + a minimal
 // struct marshal. No ticket is written — the credential is saved separately by enrollToState.
 func appendIngress(configPath, hub, appPath, service, box string) error {
-	manifestMutationMu.Lock()
-	defer manifestMutationMu.Unlock()
-	return appendIngressLocked(configPath, hub, appPath, service, box)
+	return appendIngressOpts(configPath, hub, appPath, service, box, nil)
 }
 
-func appendIngressLocked(configPath, hub, appPath, service, box string) error {
+// appendIngressOpts is appendIngress that also sets the rule's forward_all
+// when forwardAll is non-nil (nil leaves an existing rule's setting alone).
+func appendIngressOpts(configPath, hub, appPath, service, box string, forwardAll *bool) error {
+	manifestMutationMu.Lock()
+	defer manifestMutationMu.Unlock()
+	return appendIngressLocked(configPath, hub, appPath, service, box, forwardAll)
+}
+
+func appendIngressLocked(configPath, hub, appPath, service, box string, forwardAll *bool) error {
 	if err := validateManifestMutationTarget(configPath); err != nil {
 		return err
 	}
@@ -93,7 +99,7 @@ func appendIngressLocked(configPath, hub, appPath, service, box string) error {
 		if box == "" {
 			box, _ = os.Hostname()
 		}
-		c := config{Hub: hub, Box: box, Ingress: []ingress{{AppPath: appPath, Service: service}}}
+		c := config{Hub: hub, Box: box, Ingress: []ingress{{AppPath: appPath, Service: service, ForwardAll: forwardAll != nil && *forwardAll}}}
 		out, merr := yaml.Marshal(&c)
 		if merr != nil {
 			return merr
@@ -143,14 +149,82 @@ func appendIngressLocked(configPath, hub, appPath, service, box string) error {
 		}
 		if ap := yamlMapValue(item, "app_path"); ap != nil && ap.Value == appPath {
 			yamlMapSet(item, "service", yamlScalar(service))
+			setForwardAll(item, forwardAll)
 			return yamlWriteFile(configPath, &doc)
 		}
 	}
-	seq.Content = append(seq.Content, &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map", Content: []*yaml.Node{
+	item := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map", Content: []*yaml.Node{
 		yamlScalar("app_path"), yamlScalar(appPath),
 		yamlScalar("service"), yamlScalar(service),
-	}})
+	}}
+	setForwardAll(item, forwardAll)
+	seq.Content = append(seq.Content, item)
 	return yamlWriteFile(configPath, &doc)
+}
+
+// setForwardAll writes forward_all into one ingress rule: true adds it,
+// false removes it (false is the default), nil leaves the rule alone.
+func setForwardAll(item *yaml.Node, forwardAll *bool) {
+	switch {
+	case forwardAll == nil:
+	case *forwardAll:
+		yamlMapSet(item, "forward_all", &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!bool", Value: "true"})
+	default:
+		yamlMapDelete(item, "forward_all")
+	}
+}
+
+// yamlMapDelete removes key (and its value) from a mapping node.
+func yamlMapDelete(m *yaml.Node, key string) {
+	for i := 0; i+1 < len(m.Content); i += 2 {
+		if m.Content[i].Value == key {
+			m.Content = append(m.Content[:i], m.Content[i+2:]...)
+			return
+		}
+	}
+}
+
+// removeIngress drops the rule for appPath from finch.yml, keeping comments
+// and everything else. It reports whether a rule was removed; a missing file
+// removes nothing.
+func removeIngress(configPath, appPath string) (bool, error) {
+	manifestMutationMu.Lock()
+	defer manifestMutationMu.Unlock()
+	b, err := os.ReadFile(configPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if err := validateManifestMutationTarget(configPath); err != nil {
+		return false, err
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal(b, &doc); err != nil {
+		return false, fmt.Errorf("parsing %s: %w", configPath, err)
+	}
+	if doc.Kind != yaml.DocumentNode || len(doc.Content) == 0 {
+		return false, nil
+	}
+	seq := yamlMapValue(doc.Content[0], "ingress")
+	if seq == nil || seq.Kind != yaml.SequenceNode {
+		return false, nil
+	}
+	kept := seq.Content[:0:0]
+	removed := false
+	for _, item := range seq.Content {
+		if ap := yamlMapValue(item, "app_path"); item.Kind == yaml.MappingNode && ap != nil && ap.Value == appPath {
+			removed = true
+			continue
+		}
+		kept = append(kept, item)
+	}
+	if !removed {
+		return false, nil
+	}
+	seq.Content = kept
+	return true, yamlWriteFile(configPath, &doc)
 }
 
 // --- minimal yaml.Node helpers (comment-preserving finch.yml edits) ---

@@ -1,12 +1,14 @@
 > **AI agents: read https://finchmcp.com/agents.md first.** It is the step-by-step guide for publishing a local MCP server with finch on your human's behalf: install, a two-step login with one human approval, `finch add`, `finch service install`, `finch test`, and `finch connect`, plus the exit codes, the JSON error format, and the security rules. Follow it rather than the summary below.
 
-# Finch
+# finch
 
-> Finch turns a local HTTP or MCP service on your own machine into a secure public endpoint. The machine dials out to the Finch hub, so nothing listens and no ports open. Auth is checked at the edge before a request reaches your machine. Clients reach services at https://<slug>.finchmcp.com/<name>/ (MCP servers answer at /<name>/mcp) with an Authorization: Bearer finch_<key> header, or by signing in with OAuth. A service can also be made public (no key needed).
+> finch turns a local MCP server (or any local HTTP app) on your own machine into a stable public https endpoint. The machine dials out to finch, so nothing listens and no ports open. Auth is checked at the edge before a request reaches your machine. Clients reach an MCP server at https://<slug>.finchmcp.com/<name>/mcp, where <slug> is the account address finch assigns at sign-up, with an Authorization: Bearer finch_<key> header or by signing in with OAuth. A service can also be made public (no key needed).
 
-Finch is operated from a CLI on macOS and Linux. Every command accepts --json: success payloads carry "schema_version":1, and errors go to stderr as {"schema_version":1,"error":{"code","message","next"}}. Exit codes: 0 ok, 1 error, 2 usage, 10 waiting for approval, 11 expired, 12 not logged in. The installed binary prints the agent manual with `finch guide`.
+finch is operated from a CLI on macOS and Linux. Every command accepts --json: success payloads carry "schema_version":1 and use snake_case field names, and errors go to stderr as {"schema_version":1,"error":{"code","message","next"}}. Exit codes: 0 ok, 1 error, 2 usage, 10 waiting for approval, 11 expired, 12 not logged in. The installed binary prints the agent manual (the same text as agents.md) with `finch guide`, and `finch help <command>` shows one command's flags and an example.
 
-Agent flow: `finch status --json` (no "schema_version":1 in its output, or a "version" below 1.7.0, means an older finch: install 1.7.0 or later first) → `finch login --start --json` (show the human the link and code) → `finch login --poll --json` every `interval` seconds until exit 0 → `finch add <name> --service http://127.0.0.1:<port> --json` (prints the public URL) → `finch service install --json` (runs `finch run` as a launchd or systemd user service) → `finch test <name> --json` → `finch connect <name> --client claude-code|cursor|codex|json`. `finch connect` mints a finch_ key for that client and writes it into the client's config without printing it.
+By default finch forwards only /<name>/mcp. For a web app or a REST API, publish it with `finch add <name> --service <url> --forward-all`, and finch forwards every path under /<name>/.
+
+Agent flow: `finch status --json` (no "schema_version":1 in its output, or a "version" below 1.8.0, means an older finch: install 1.8.0 or later first) → `finch login --start --json` (show the human the link and code) → `finch login --poll --json` every `interval` seconds until exit 0 → `finch add <name> --service http://127.0.0.1:<port> --json` (prints the public URL) → `finch service install --json` (runs `finch run` as a launchd or systemd user service) → `finch test <name> --json` → `finch connect <name> --client claude-code|cursor|codex|json`. `finch connect` mints a finch_ key for that client and writes it into the client's config without printing it.
 
 The one paste for humans: "Read https://finchmcp.com/agents.md and use finch to publish my MCP server on http://127.0.0.1:8000 as notes. Show me the sign-in link when you get it. Run it as a background service, check it with finch test, then connect it to this agent."
 
@@ -30,17 +32,19 @@ EOF
 python server.py &                                   # serves MCP on http://127.0.0.1:8000
 
 curl -fsSL https://finchmcp.com/install | sh         # install finch (macOS/Linux, never prompts for sudo)
-finch login --start                                  # prints a link + code; approve on any device (phone ok)
-finch login --poll                                   # repeat until it reports approved (exit 0)
-finch add hello --service http://127.0.0.1:8000      # writes finch.yml (no secrets), prints the public URL
+finch login                                          # opens your browser; approve on any device (phone ok)
+finch add hello --service http://127.0.0.1:8000      # writes ~/.finch/finch.yml (no secrets), prints the public URL
 finch service install                                # keeps it running (launchd / systemd --user)
 
 finch test hello                                     # lists the greet tool; non-zero exit if it fails
 finch call hello greet --args '{"name": "world"}'    # -> Hello, world!
 finch connect hello --client claude-code             # wires it into Claude Code with a fresh finch_ key
+finch logs hello                                     # the recent calls: time, route, caller, status, duration
 ```
 
-Known limitation: `finch test` and `finch call` send one stateless JSON-RPC request through the hub. A Streamable-HTTP server that requires an MCP session or an SSE-capable client (FastMCP's default above, and the Python MCP SDK's) rejects that with HTTP 406 or 400 "Missing session ID". finch then exits 1 with UPSTREAM and a message saying the service is reachable; that does not mean the service is down, and MCP clients connected with `finch connect` still work through the public URL.
+An agent logs in with the two-step form instead (`finch login --start --json`, then `finch login --poll --json` until exit 0), as agents.md describes.
+
+Later: `finch add hello --service http://127.0.0.1:9000` again changes the local URL in place; `finch fleet` lists every service with its public URL; `finch rm hello` removes it from the account and this machine; `finch uninstall` removes finch's background service, logins, the keys and client entries `finch connect` made, and ~/.finch (it prints how to delete the binary).
 
 ## Docs
 
@@ -59,7 +63,7 @@ Known limitation: `finch test` and `finch call` send one stateless JSON-RPC requ
 
 ## Optional
 
-- [Pricing](https://finchmcp.com/#pricing): free during beta; Hobby stays free for individuals and small groups
+- [Pricing](https://finchmcp.com/#pricing): free for individuals; Enterprise (SLA, support, security review) by email
 
 ## AviaryMCP release candidate
 
@@ -82,4 +86,4 @@ finch add calculator --service http://127.0.0.1:8000
 finch service install
 ```
 
-AviaryMCP exposes the same registered tools at `/mcp`, `/api/v1/tools`, `/api/v1/tools/<tool>`, and `/api/v1/openapi.json`, so through Finch they answer under `https://<slug>.finchmcp.com/calculator/`.
+AviaryMCP exposes the same registered tools at `/mcp`, `/api/v1/tools`, `/api/v1/tools/<tool>`, and `/api/v1/openapi.json`. finch forwards only `/calculator/mcp` unless the service is added with `--forward-all` (`finch add calculator --service http://127.0.0.1:8000 --forward-all`); with it, all of them answer under `https://<slug>.finchmcp.com/calculator/`.

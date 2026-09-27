@@ -115,6 +115,15 @@ newtemp() {
     return 1
   }
 }
+# A directory where the binary goes would swallow it: mv moves the download
+# INTO it and the install looks successful while 'finch' still cannot run.
+refuse_dir_target() {
+  if [ -d "$BIN_DIR/finch" ]; then
+    echo "finch: $BIN_DIR/finch is a directory, so the binary cannot go there; move it away, or set FINCH_INSTALL_DIR" >&2
+    exit 1
+  fi
+}
+refuse_dir_target
 tmp="$(newtemp install)"
 sums="$(newtemp checksums)"
 echo "finch: downloading $url"
@@ -157,17 +166,27 @@ else
 fi
 
 chmod 755 "$tmp"
+refuse_dir_target
 mv -f "$tmp" "$BIN_DIR/finch"
-echo "finch: installed to $BIN_DIR/finch"
+# Say which version landed ("finch 1.8.0 (darwin/arm64)").
+installed="$("$BIN_DIR/finch" version 2>/dev/null | head -n 1 || true)"
+echo "finch: installed \${installed:-finch} to $BIN_DIR/finch"
 
 finch_cmd="finch"
 case ":\${PATH:-}:" in
   *":$BIN_DIR:"*) ;;
   *)
     finch_cmd="$BIN_DIR/finch"
+    rc="$HOME/.profile"
+    case "\${SHELL:-}" in
+      */zsh) rc="$HOME/.zshrc" ;;
+      */bash) rc="$HOME/.bashrc" ;;
+    esac
     echo ""
-    echo "finch: $BIN_DIR is not on your PATH. Add it with:"
+    echo "finch: $BIN_DIR is not on your PATH. Add it for this shell:"
     echo "  export PATH=\\"$BIN_DIR:\\$PATH\\""
+    echo "  and for every new one:"
+    echo "  echo 'export PATH=\\"$BIN_DIR:\\$PATH\\"' >> $rc"
     echo "  (or run $BIN_DIR/finch by its full path)"
     ;;
 esac
@@ -184,17 +203,17 @@ case "$found" in
       finch_cmd="$BIN_DIR/finch"
       echo ""
       echo "finch: warning: 'finch' on your PATH is $found, not the copy just installed."
-      echo "  That older finch shadows the new one. Run $BIN_DIR/finch by its full path,"
+      echo "  That other finch shadows the new one. Run $BIN_DIR/finch by its full path,"
       echo "  or remove $found (it may be root-owned from an earlier install)."
     fi
     ;;
 esac
 
 echo ""
-echo "  Next:  $finch_cmd login --start      # prints a sign-in link + code"
-echo "         $finch_cmd login --poll       # repeat until approved"
+echo "  Next:  $finch_cmd login                                  # opens your browser; approve and you are in"
 echo "         $finch_cmd add <name> --service http://127.0.0.1:8000"
-echo "         $finch_cmd service install    # keep it running"
+echo "         $finch_cmd service install                        # keep it running in the background"
+echo "         $finch_cmd connect <name> --client claude-code    # or cursor, codex"
 echo ""
 echo "  Driving finch with an AI agent? Point it at https://finchmcp.com/agents.md"
 echo "  (or run '$finch_cmd guide')."

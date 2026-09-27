@@ -180,24 +180,29 @@ func TestHubLatestVersion_RejectsOversizedOrMalformedResponse(t *testing.T) {
 }
 
 // performUpdate must no-op (updated=false, no download) when the hub reports
-// the current version at /api/version.
+// the current version: at /api/cli/version (1.8 hubs; the only version route
+// the finchmcp.com apex sends to the hub), or at /api/version (older hubs).
 func TestPerformUpdateNoopWhenCurrent(t *testing.T) {
-	downloads := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/api/version" {
-			_ = json.NewEncoder(w).Encode(map[string]string{"latest": agentVersion})
-			return
+	for _, route := range []string{"/api/cli/version", "/api/version"} {
+		downloads := 0
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.URL.Path == route:
+				_ = json.NewEncoder(w).Encode(map[string]string{"latest": agentVersion})
+			case strings.HasPrefix(r.URL.Path, "/releases/"):
+				downloads++
+				fmt.Fprint(w, "BIN")
+			default:
+				http.NotFound(w, r)
+			}
+		}))
+		_, updated, err := performUpdate(srv.URL, false)
+		srv.Close()
+		if err != nil {
+			t.Fatal(err)
 		}
-		downloads++
-		fmt.Fprint(w, "BIN")
-	}))
-	defer srv.Close()
-
-	_, updated, err := performUpdate(srv.URL, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if updated || downloads != 0 {
-		t.Fatalf("expected no-op (updated=%v downloads=%d)", updated, downloads)
+		if updated || downloads != 0 {
+			t.Fatalf("%s: expected no-op (updated=%v downloads=%d)", route, updated, downloads)
+		}
 	}
 }
