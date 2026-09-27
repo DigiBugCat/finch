@@ -351,7 +351,8 @@ func (h *fakeHub) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if _, ok := h.services[b.Service]; !ok {
-			writeJSON(w, 404, map[string]string{"error": "unknown service"})
+			// What the real relay answers for a service the tenant lacks.
+			writeJSON(w, 404, map[string]string{"error": "route not exposed by service manifest"})
 			return
 		}
 		h.callMethods = append(h.callMethods, b.Method)

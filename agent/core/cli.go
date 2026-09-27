@@ -285,8 +285,13 @@ func cliRequest(method, hub, path, token string, body any) (map[string]any, erro
 	if res.StatusCode != 200 {
 		msg := strings.TrimSpace(string(raw))
 		if out != nil {
-			if e, ok := out["error"].(string); ok {
+			switch e := out["error"].(type) {
+			case string:
 				msg = e
+			case map[string]any: // a relayed JSON-RPC error object
+				if m, ok := e["message"].(string); ok && m != "" {
+					msg = m
+				}
 			}
 		}
 		if msg == "" {
@@ -434,11 +439,7 @@ func mcpCall(cred *cliCred, service, method string, params any) (map[string]any,
 	}
 	out, err := cliRequest("POST", cred.Hub, "/api/cli/call", cred.Token, body)
 	if err != nil {
-		var he *hubError
-		if asHubError(err, &he) && he.Status >= 500 {
-			return nil, newCLIError(codeUpstream, "finch service status", "%s did not answer through the hub: %v (is 'finch run' serving it?)", service, he)
-		}
-		return nil, hubFailure(err, service, "finch fleet")
+		return nil, relayCallFailure(cred, service, method, err)
 	}
 	if out == nil {
 		return nil, newCLIError(codeUpstream, "", "%s returned a response that is not JSON-RPC", service)
@@ -457,6 +458,65 @@ func mcpCall(cred *cliCred, service, method string, params any) (map[string]any,
 		return nil, newCLIError(codeUpstream, "", "%s answered %s without a result", service, method)
 	}
 	return res, nil
+}
+
+// relayCallFailure classifies a failed /api/cli/call. The hub relays the
+// service's own HTTP status unchanged, so a 401 or 404 may come from the MCP
+// server behind finch rather than from the hub. Only a 401 the hub confirms
+// (whoami rejects the same login) means the login is gone, and only a service
+// missing from the account is NOT_FOUND; every other failure is UPSTREAM and
+// names the service.
+func relayCallFailure(cred *cliCred, service, method string, err error) error {
+	var he *hubError
+	if !asHubError(err, &he) || he.Status == 0 {
+		return hubFailure(err, service, "finch fleet")
+	}
+	switch {
+	case he.Status == 401:
+		if _, werr := cliRequest("GET", cred.Hub, "/api/cli/whoami", cred.Token, nil); werr != nil {
+			var we *hubError
+			if asHubError(werr, &we) && we.Status == 401 {
+				return hubFailure(werr, service, "")
+			}
+		}
+		return newCLIError(codeUpstream, "",
+			"%s rejected %s with HTTP 401 (%s): the MCP server behind finch asks for its own credentials. Your finch login is fine; the local server has to accept requests that finch relays",
+			service, method, he.Msg)
+	case he.Status == 404:
+		st, serr := cliRequest("GET", cred.Hub, "/api/cli/state", cred.Token, nil)
+		if serr != nil {
+			return hubFailure(serr, service, "finch fleet")
+		}
+		if !stateHasService(st, service) {
+			return newCLIError(codeNotFound, "finch fleet", "no service named %q in this account", service)
+		}
+		return newCLIError(codeUpstream, "",
+			"%s answered %s with HTTP 404 (%s): the local server has no MCP endpoint at /mcp under its --service URL",
+			service, method, he.Msg)
+	case he.Status >= 500:
+		return newCLIError(codeUpstream, "finch service status", "%s did not answer through the hub: %v (is 'finch run' serving it?)", service, he)
+	case he.Status == 406 || (he.Status == 400 && strings.Contains(strings.ToLower(he.Msg), "session")):
+		// The relay reached the server, which rejected finch's single
+		// stateless request: Streamable-HTTP servers that require an
+		// SSE-capable Accept header or an initialized session answer 406 or
+		// 400 "Missing session ID".
+		return newCLIError(codeUpstream, "finch connect "+service+" --client <client>",
+			"%s is reachable through finch, but it rejected finch's one-shot %s with HTTP %d (%s). finch test cannot check servers that require an MCP session or an SSE-capable client yet, so this does not mean the service is down; check it from an MCP client instead",
+			service, method, he.Status, he.Msg)
+	default:
+		return newCLIError(codeUpstream, "", "%s answered %s with HTTP %d: %s", service, method, he.Status, he.Msg)
+	}
+}
+
+// stateHasService reports whether a GET /api/cli/state answer lists service id.
+func stateHasService(st map[string]any, id string) bool {
+	services, _ := st["services"].([]any)
+	for _, s := range services {
+		if m, ok := s.(map[string]any); ok && m["id"] == id {
+			return true
+		}
+	}
+	return false
 }
 
 // runTest: finch test <name> — list the service's MCP tools through the hub (a

@@ -365,6 +365,64 @@ func TestTestCommandJSON(t *testing.T) {
 	}
 }
 
+// The hub relays the MCP server's own HTTP status, so a 401 or 404 from the
+// server behind finch must not read as "your login is gone" or "no such
+// service". Only a 401 the hub itself confirms is NOT_LOGGED_IN.
+func TestTestCommandClassifiesRelayedStatuses(t *testing.T) {
+	const sdk406 = `{"jsonrpc":"2.0","id":"server-error","error":{"code":-32600,"message":"Not Acceptable: Client must accept both application/json and text/event-stream"}}`
+	const sdk400 = `{"jsonrpc":"2.0","id":"server-error","error":{"code":-32600,"message":"Bad Request: Missing session ID"}}`
+	for _, tc := range []struct {
+		name        string
+		service     string // defaults to notes, which exists
+		token       string // defaults to the valid CLI token
+		status      int
+		body        string
+		wantExit    int
+		wantCode    string
+		wantNext    string
+		wantMessage string
+	}{
+		{name: "server's own 401", status: 401, body: `{"error":"bad bearer"}`, wantExit: 1, wantCode: "UPSTREAM", wantMessage: "finch login is fine"},
+		{name: "revoked finch login", token: "cli_revoked", status: 200, wantExit: 12, wantCode: "NOT_LOGGED_IN", wantNext: "finch login --start"},
+		{name: "server's own 404", status: 404, body: `{"detail":"Not Found"}`, wantExit: 1, wantCode: "UPSTREAM", wantMessage: "no MCP endpoint at /mcp"},
+		{name: "service not in the account", service: "ghost", wantExit: 1, wantCode: "NOT_FOUND", wantNext: "finch fleet", wantMessage: `no service named "ghost"`},
+		{name: "SDK 406 without SSE accept", status: 406, body: sdk406, wantExit: 1, wantCode: "UPSTREAM", wantNext: "finch connect notes --client <client>", wantMessage: "does not mean the service is down"},
+		{name: "SDK 400 missing session", status: 400, body: sdk400, wantExit: 1, wantCode: "UPSTREAM", wantNext: "finch connect notes --client <client>", wantMessage: "Missing session ID"},
+		{name: "server's own 403", status: 403, body: `{"error":"forbidden"}`, wantExit: 1, wantCode: "UPSTREAM", wantMessage: "HTTP 403: forbidden"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolate(t)
+			h := newFakeHub(t)
+			token := tc.token
+			if token == "" {
+				token = fakeCLIToken
+			}
+			if err := saveCliCred(&cliCred{Hub: h.url(), Token: token, Email: "owner@example.com", Tenant: "user_1"}); err != nil {
+				t.Fatal(err)
+			}
+			h.set(func(h *fakeHub) {
+				h.services["notes"] = "key"
+				h.call = func(string) (int, string, string) { return tc.status, "application/json", tc.body }
+			})
+			service := tc.service
+			if service == "" {
+				service = "notes"
+			}
+			stdout, stderr, code := finch(t, "test", service, "--json")
+			if code != tc.wantExit || stdout != "" {
+				t.Fatalf("exit=%d, want %d (stdout %q stderr %q)", code, tc.wantExit, stdout, stderr)
+			}
+			env := decodeJSONError(t, stderr)
+			if env.Error.Code != tc.wantCode || env.Error.Next != tc.wantNext || !strings.Contains(env.Error.Message, tc.wantMessage) {
+				t.Fatalf("envelope=%+v", env.Error)
+			}
+			if tc.wantCode == "UPSTREAM" && strings.Contains(env.Error.Message, "expired or revoked") {
+				t.Fatalf("an upstream failure blamed the finch login: %q", env.Error.Message)
+			}
+		})
+	}
+}
+
 func TestCallToolErrorExitsNonZero(t *testing.T) {
 	isolate(t)
 	h := newFakeHub(t)
