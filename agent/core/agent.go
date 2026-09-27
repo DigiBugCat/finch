@@ -1229,8 +1229,14 @@ func loadConfig(path, hostName string) (*config, error) {
 		} else {
 			c.CredentialsDir = ".finch"
 		}
+	} else if c.CredentialsDir = expandHome(c.CredentialsDir); !filepath.IsAbs(c.CredentialsDir) {
+		// A relative credentials-dir is relative to the manifest, not to the
+		// caller's cwd: `finch add --config dir/finch.yml` run from elsewhere
+		// and the service (which runs in the manifest's directory) must agree.
+		if abs, err := filepath.Abs(path); err == nil {
+			c.CredentialsDir = filepath.Join(filepath.Dir(abs), c.CredentialsDir)
+		}
 	}
-	c.CredentialsDir = expandHome(c.CredentialsDir)
 	seen := map[string]bool{}
 	for i, ing := range c.Ingress {
 		if ing.AppPath == "" || ing.Service == "" {

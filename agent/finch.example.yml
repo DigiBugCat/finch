@@ -14,7 +14,7 @@
 
 hub: https://finchmcp.com        # the finch hub (default; omit for prod)
 box: mac-mini                # this box's name (default: hostname)
-credentials-dir: ~/.finch        # where `finch add` writes per-app credentials
+credentials-dir: ~/.finch        # where `finch add` writes per-app credentials (a relative path is relative to this file)
 
 # Each rule forwards one local service:
 #   app_path    — the public URL segment AND the service you enrolled.

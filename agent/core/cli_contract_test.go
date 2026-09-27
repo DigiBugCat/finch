@@ -390,6 +390,45 @@ func TestPendingLoginBlocksTheSavedLogin(t *testing.T) {
 	}
 }
 
+// A relative credentials-dir belongs to the manifest: `finch add --config`
+// run from another directory must write the credential where the service
+// (which runs in the manifest's directory) and a later `finch run --config`
+// look for it.
+func TestRelativeCredentialsDirFollowsTheManifest(t *testing.T) {
+	home := isolate(t)
+	h := newFakeHub(t)
+	loginTo(t, h)
+	proj := filepath.Join(home, "proj")
+	if err := os.MkdirAll(proj, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cfg := filepath.Join(proj, "finch.yml")
+	if err := os.WriteFile(cfg, []byte("hub: "+h.url()+"\ncredentials-dir: creds\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	elsewhere := filepath.Join(home, "elsewhere")
+	if err := os.MkdirAll(elsewhere, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(elsewhere)
+	if _, stderr, code := finch(t, "add", "notes", "--service", "http://127.0.0.1:8000", "--config", cfg, "--json"); code != 0 {
+		t.Fatalf("exit=%d stderr=%q", code, stderr)
+	}
+	if !fileExists(filepath.Join(proj, "creds", "notes.json")) || fileExists(filepath.Join(elsewhere, "creds")) {
+		t.Fatal("the credential was not written under the manifest's credentials-dir")
+	}
+	for _, cwd := range []string{elsewhere, proj, home} {
+		t.Chdir(cwd)
+		c, err := loadConfig(cfg, "box")
+		if err != nil {
+			t.Fatalf("from %s: %v", cwd, err)
+		}
+		if c.CredentialsDir != filepath.Join(proj, "creds") {
+			t.Fatalf("from %s: credentials-dir=%q", cwd, c.CredentialsDir)
+		}
+	}
+}
+
 func TestAddPublicPrintsURL(t *testing.T) {
 	home := isolate(t)
 	h := newFakeHub(t)

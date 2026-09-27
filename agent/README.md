@@ -145,7 +145,7 @@ outbound link. The manifest holds **no secrets** — it's a pure wiring table of
 ```yaml
 hub: https://finchmcp.com        # default; omit for prod
 box: mac-mini                # this box's name (default: hostname)
-credentials-dir: ~/.finch        # where `finch add` writes per-app credentials
+credentials-dir: ~/.finch        # where `finch add` writes per-app credentials (relative = relative to finch.yml)
 
 # Each rule forwards one local service.
 #   app_path → the public URL segment: https://<your-slug>.finchmcp.com/<app_path>/
