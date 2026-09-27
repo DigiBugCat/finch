@@ -177,7 +177,7 @@ func TestServiceInstallLaunchd(t *testing.T) {
 }
 
 func TestLaunchdPlistEscapesPaths(t *testing.T) {
-	plist := string(launchdPlist("/Apps/a&b/finch", "/x/<y>/finch.yml", "/x/<y>", "/l/o\"g"))
+	plist := string(launchdPlist("/Apps/a&b/finch", "/x/<y>/finch.yml", "/x/<y>", "/l/o\"g", "/Users/a&b"))
 	if strings.Contains(plist, "a&b") || !strings.Contains(plist, "a&amp;b") || !strings.Contains(plist, "&lt;y&gt;") {
 		t.Fatalf("plist did not escape paths:\n%s", plist)
 	}
@@ -189,6 +189,20 @@ func TestLaunchdPlistEscapesPaths(t *testing.T) {
 		if out, err := exec.Command(path, "-lint", f).CombinedOutput(); err != nil {
 			t.Fatalf("plutil rejects an escaped plist: %s", out)
 		}
+	}
+}
+
+// The service must see the installing user's HOME: finch.yml's default
+// credentials-dir and the CLI login both derive from it, and launchd/systemd
+// may start 'finch run' with a different environment.
+func TestServiceUnitsPinHome(t *testing.T) {
+	plist := string(launchdPlist("/b/finch", "/h/.finch/finch.yml", "/h/.finch", "/h/.finch/finch.log", "/Users/o'n & co"))
+	if !strings.Contains(plist, "<key>HOME</key>\n\t\t<string>/Users/o&#39;n &amp; co</string>") {
+		t.Fatalf("plist does not pin HOME:\n%s", plist)
+	}
+	unit := string(systemdUnit("/b/finch", "/h/.finch/finch.yml", "/h/.finch", "/home/a b/100%"))
+	if !strings.Contains(unit, `Environment="HOME=/home/a b/100%%"`) {
+		t.Fatalf("unit does not pin HOME:\n%s", unit)
 	}
 }
 
@@ -482,7 +496,7 @@ func TestRestartManagedServicePicksTheInstalledUnit(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(systemdUnitPath()), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(systemdUnitPath(), systemdUnit("/opt/finch/bin/finch", "/x/finch.yml", "/x"), 0o644); err != nil {
+	if err := os.WriteFile(systemdUnitPath(), systemdUnit("/opt/finch/bin/finch", "/x/finch.yml", "/x", "/home/x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	calls = nil
