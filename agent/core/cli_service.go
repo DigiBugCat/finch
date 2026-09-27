@@ -355,9 +355,9 @@ func serviceInstall(c *cli, configPath string) error {
 	var unit []byte
 	switch serviceGOOS {
 	case "darwin":
-		unitPath, unit = launchdPlistPath(), launchdPlist(bin, manifest, workDir, serviceLogPath())
+		unitPath, unit = launchdPlistPath(), launchdPlist(bin, manifest, workDir, serviceLogPath(), homeDir())
 	default:
-		unitPath, unit = systemdUnitPath(), systemdUnit(bin, manifest, workDir)
+		unitPath, unit = systemdUnitPath(), systemdUnit(bin, manifest, workDir, homeDir())
 	}
 	if err := os.MkdirAll(filepath.Dir(unitPath), 0o755); err != nil {
 		return newCLIError(codeInternal, "", "creating %s: %v", filepath.Dir(unitPath), err)
@@ -588,7 +588,13 @@ func xmlText(s string) string {
 }
 
 // launchdPlist renders the LaunchAgent: start at login, restart on exit.
-func launchdPlist(bin, manifest, workDir, logPath string) []byte {
+//
+// HOME is pinned to the home of the user who ran 'finch service install'.
+// finch.yml's default credentials-dir and the CLI login that auto-approve reads
+// both come from $HOME, so without the pin a service manager starting 'finch
+// run' with a different environment looks for credentials somewhere other than
+// where 'finch add' wrote them.
+func launchdPlist(bin, manifest, workDir, logPath, home string) []byte {
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -616,6 +622,8 @@ func launchdPlist(bin, manifest, workDir, logPath string) []byte {
 	<string>Standard</string>
 	<key>EnvironmentVariables</key>
 	<dict>
+		<key>HOME</key>
+		<string>` + xmlText(home) + `</string>
 		<key>` + serviceLogEnv + `</key>
 		<string>` + xmlText(logPath) + `</string>
 	</dict>
@@ -636,8 +644,9 @@ func systemdQuote(s string) string {
 	return `"` + r.Replace(s) + `"`
 }
 
-// systemdUnit renders the user unit: start with the user manager, restart on exit.
-func systemdUnit(bin, manifest, workDir string) []byte {
+// systemdUnit renders the user unit: start with the user manager, restart on
+// exit. HOME is pinned for the same reason as in launchdPlist.
+func systemdUnit(bin, manifest, workDir, home string) []byte {
 	words := []string{}
 	for _, a := range []string{bin, "run", "--config", manifest} {
 		words = append(words, systemdQuote(a))
@@ -649,6 +658,7 @@ Description=finch: publish local services through the finch hub
 [Service]
 ExecStart=` + strings.Join(words, " ") + `
 WorkingDirectory=` + strings.ReplaceAll(workDir, "%", "%%") + `
+Environment=` + systemdQuote("HOME="+home) + `
 Restart=always
 RestartSec=5
 
