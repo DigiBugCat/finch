@@ -47,11 +47,13 @@ The same manual is hosted at https://finchmcp.com/agents.md.
 
 ## Before you start
   finch status --json
-  no "schema_version":1 -> an older finch answered. Reinstall:
+  no "schema_version":1, or "version" below 1.7.0
+                        -> an older finch answered. Install 1.7.0 or later:
                            curl -fsSL https://finchmcp.com/install | sh
                            If it warns that an older finch on PATH
                            shadows the new one, run the full path it prints.
   "loggedIn": true      -> skip step 1
+  "login_pending": true -> a started login awaits approval: poll (step 1)
   "service"             -> whether the background service is installed / running
   "ingress"             -> what this machine already publishes
 
@@ -63,6 +65,9 @@ The same manual is hosted at https://finchmcp.com/agents.md.
   -> exit 10 {"status":"pending"}    keep polling
      exit 11 {"status":"expired"}    run 'finch login --start' again
      exit 0  {"status":"approved"}   done: the credential is saved
+  Until the poll resolves, every other command answers APPROVAL_PENDING (exit
+  10), even over an older saved login. 'finch login --cancel' drops the
+  started login and goes back to the saved one.
   Never print, log, or paste tokens or keys.
 
 ## 2. Publish the service
@@ -74,9 +79,11 @@ The same manual is hosted at https://finchmcp.com/agents.md.
   finch service install --json    launchd on macOS, systemd --user on Linux
   finch service status --json     -> {"installed":true,"running":true,...}
   Run install again after every later 'finch add': the service reads finch.yml
-  only when it starts, and install restarts it. On Linux, "linger": false means
-  the human should run 'sudo loginctl enable-linger <user>' (never run sudo
-  yourself). ('finch run' serves in the foreground instead.)
+  only when it starts, and install restarts it. install exits 1 if 'finch run'
+  does not come up; the message says why (for example a 'finch run' already
+  serving in a terminal, which must be stopped). On Linux, "linger": false
+  means the human should run 'sudo loginctl enable-linger <user>' (never run
+  sudo yourself). ('finch run' serves in the foreground instead.)
 
 ## 4. Check it
   finch test notes --json         exit 0 = the MCP server answered tools/list
@@ -90,8 +97,9 @@ The same manual is hosted at https://finchmcp.com/agents.md.
 ## 5. Connect it to an MCP client
   finch connect notes --client claude-code     (or cursor | codex)
   Mints a finch_ key for that client and writes it into the client's config
-  without printing it. --client json prints an mcpServers snippet instead (the
-  only mode that shows the key).
+  without printing it. Running it again replaces the entry and revokes the key
+  it used. --client json prints an mcpServers snippet instead (the only mode
+  that shows the key).
 
 ## Exit codes
   0 ok | 1 error | 2 usage | 10 waiting for approval | 11 expired | 12 not logged in
@@ -127,6 +135,7 @@ Agent flow (every step takes --json; 'finch guide' explains it):
 Commands:
   login [--hub URL]                  Log in and wait for approval (link + code, any device)
   login --start | --poll             Two-step login: exit 10 pending, 11 expired, 0 approved
+  login --cancel                     Drop a started login; the saved login works again
   login --token -                    Log in with a token on stdin (or FINCH_CLI_TOKEN)
   add <name> --service <url>         Enroll a service and add it to finch.yml [--public]
   run [--config finch.yml]           Serve every finch.yml rule in the foreground
@@ -968,6 +977,14 @@ func runStatus(c *cli, args []string) error {
 	if credErr != nil {
 		return newCLIError(codeInternal, "", "reading %s: %v", cliCredPath(), credErr)
 	}
+	// A started login blocks the saved one (requireCred), so while it is
+	// pending the box reads as not logged in: the next step is --poll.
+	pending, _ := readPendingLogin()
+	loginPending := pending != nil && !pending.expired()
+	if loginPending {
+		hub = pending.Hub
+		cred = nil
+	}
 	if cred != nil && cred.Token != "" {
 		hub, tenant, account = cred.Hub, cred.Tenant, cred.Email
 		who, err := cliRequest("GET", cred.Hub, "/api/cli/whoami", cred.Token, nil)
@@ -985,8 +1002,6 @@ func runStatus(c *cli, args []string) error {
 			loggedIn, hubReachable = true, false
 		}
 	}
-	pending, _ := readPendingLogin()
-	loginPending := !loggedIn && pending != nil && !pending.expired()
 
 	ingress := []ingressStatus{}
 	cfgPath := ""

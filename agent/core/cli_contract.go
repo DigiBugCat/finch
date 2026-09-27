@@ -110,16 +110,6 @@ func (c *cli) printf(format string, a ...any) {
 	fmt.Fprintf(c.stdout, format, a...)
 }
 
-// live writes text a human must see while the command is still running (the
-// blocking login's link and code). With --json it goes to stderr.
-func (c *cli) live(format string, a ...any) {
-	w := c.stdout
-	if c.json {
-		w = c.stderr
-	}
-	fmt.Fprintf(w, format, a...)
-}
-
 // emit writes a --json success payload with schema_version stamped on it (as
 // the first field, so a human skimming the output sees it first).
 func (c *cli) emit(payload map[string]any) error {
@@ -331,19 +321,21 @@ func hubFailure(err error, what, notFoundNext string) error {
 }
 
 // requireCred loads the saved CLI login or explains how to get one. A login
-// started with `finch login --start` but not yet approved reports
-// APPROVAL_PENDING so an agent keeps polling instead of starting over.
+// started with `finch login --start` and not yet resolved reports
+// APPROVAL_PENDING, even over a saved login: the started login is about to
+// replace it (possibly with another account or hub), so an agent keeps polling
+// instead of acting on the old tenant. `finch login --cancel` lifts the block.
 func requireCred() (*cliCred, error) {
+	if p, _ := readPendingLogin(); p != nil && !p.expired() {
+		return nil, newCLIError(codeApprovalPending, "finch login --poll",
+			"login is waiting for approval — open %s and confirm code %s (or run 'finch login --cancel' to keep using the saved login)", p.VerificationURIComplete, p.UserCode)
+	}
 	cred, err := readCliCred()
 	if err != nil {
 		return nil, newCLIError(codeInternal, "", "reading %s: %v", cliCredPath(), err)
 	}
 	if cred != nil && cred.Token != "" {
 		return cred, nil
-	}
-	if p, _ := readPendingLogin(); p != nil && !p.expired() {
-		return nil, newCLIError(codeApprovalPending, "finch login --poll",
-			"login is waiting for approval — open %s and confirm code %s", p.VerificationURIComplete, p.UserCode)
 	}
 	return nil, newCLIError(codeNotLoggedIn, "finch login --start", "not logged in")
 }

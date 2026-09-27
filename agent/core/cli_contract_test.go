@@ -267,15 +267,12 @@ func TestBlockingLoginStillWaits(t *testing.T) {
 			h.set(func(h *fakeHub) { h.deviceState = "approved" })
 		}
 	}
-	stdout, stderr, code := finch(t, "login", "--hub", h.url(), "--headless", "--json")
-	if code != 0 {
+	stdout, stderr, code := finch(t, "login", "--hub", h.url(), "--headless")
+	if code != 0 || stderr != "" {
 		t.Fatalf("exit=%d stderr=%q", code, stderr)
 	}
-	if got := decodeJSONOut(t, stdout); got["status"] != "approved" {
-		t.Fatalf("payload=%v", got)
-	}
-	if !strings.Contains(stderr, "WXYZ-2345") || h.polls != 2 {
-		t.Fatalf("blocking login should show the code and poll until approved: polls=%d stderr=%q", h.polls, stderr)
+	if !strings.Contains(stdout, "WXYZ-2345") || !strings.Contains(stdout, "logged in as owner@example.com") || h.polls != 2 {
+		t.Fatalf("blocking login should show the code and poll until approved: polls=%d stdout=%q", h.polls, stdout)
 	}
 
 	// Expiry while blocking is exit 11 / EXPIRED.
@@ -283,12 +280,113 @@ func TestBlockingLoginStillWaits(t *testing.T) {
 	h = newFakeHub(t)
 	h.set(func(h *fakeHub) { h.deviceState = "expired" })
 	loginSleep = func(time.Duration) {}
-	_, stderr, code = finch(t, "login", "--hub", h.url(), "--headless", "--json")
-	// Blocking login shows the human the link on stderr; the envelope is the
-	// last line.
-	lines := strings.Split(strings.TrimRight(stderr, "\n"), "\n")
-	if code != 11 || decodeJSONError(t, lines[len(lines)-1]).Error.Code != "EXPIRED" {
+	_, stderr, code = finch(t, "login", "--hub", h.url(), "--headless")
+	if code != 11 || !strings.Contains(stderr, "expired") || !strings.Contains(stderr, "next: finch login") {
 		t.Fatalf("expired blocking login: exit=%d stderr=%q", code, stderr)
+	}
+}
+
+// The blocking login has to show a human its link while it waits, which
+// --json has no stream for (stderr carries only the one error envelope), so
+// with --json it refuses up front and points at the two-step form. Nothing is
+// started on the hub.
+func TestBlockingLoginRefusesJSON(t *testing.T) {
+	isolate(t)
+	h := newFakeHub(t)
+	stdout, stderr, code := finch(t, "login", "--hub", h.url(), "--headless", "--json")
+	env := decodeJSONError(t, stderr)
+	if code != 2 || stdout != "" || env.Error.Code != "USAGE" || env.Error.Next != "finch login --start --json" {
+		t.Fatalf("exit=%d stdout=%q env=%+v", code, stdout, env)
+	}
+	if h.polls != 0 || fileExists(pendingLoginPath()) {
+		t.Fatal("a refused blocking login must not start anything")
+	}
+}
+
+// A started login blocks the saved one: an agent switching account or hub with
+// --start must not keep acting on the old tenant until the new login resolves.
+// --cancel lifts the block, and so does the poll resolving it.
+func TestPendingLoginBlocksTheSavedLogin(t *testing.T) {
+	isolate(t)
+	h := newFakeHub(t)
+	loginTo(t, h)
+	h.set(func(h *fakeHub) { h.services["notes"] = "key" })
+	if _, stderr, code := finch(t, "fleet", "--json"); code != 0 {
+		t.Fatalf("fleet with a saved login: exit=%d stderr=%q", code, stderr)
+	}
+
+	if _, stderr, code := finch(t, "login", "--start", "--hub", h.url(), "--json"); code != 0 {
+		t.Fatalf("login --start: exit=%d stderr=%q", code, stderr)
+	}
+	for _, args := range [][]string{
+		{"fleet", "--json"},
+		{"add", "api", "--service", "http://127.0.0.1:9000", "--json"},
+		{"connect", "notes", "--client", "json", "--json"},
+		{"keys", "--json"},
+	} {
+		stdout, stderr, code := finch(t, args...)
+		env := decodeJSONError(t, stderr)
+		if code != 10 || stdout != "" || env.Error.Code != "APPROVAL_PENDING" || env.Error.Next != "finch login --poll" || !strings.Contains(env.Error.Message, "finch login --cancel") {
+			t.Fatalf("%v while a login is pending: exit=%d stdout=%q env=%+v", args, code, stdout, env)
+		}
+	}
+	if h.nextKey != 0 || len(h.services) != 1 {
+		t.Fatal("a command acted on the old tenant while a login was pending")
+	}
+	// status reports the pending login, not the blocked saved one.
+	stdout, _, code := finch(t, "status", "--json")
+	if got := decodeJSONOut(t, stdout); code != 0 || got["loggedIn"] != false || got["login_pending"] != true || got["hub"] != h.url() || got["account"] != nil {
+		t.Fatalf("status while pending: exit=%d payload=%v", code, got)
+	}
+	if stdout, _, _ := finch(t, "status"); !strings.Contains(stdout, "login waiting for approval") {
+		t.Fatalf("plain status while pending: %q", stdout)
+	}
+
+	// --cancel drops the started login and the saved one works again.
+	stdout, stderr, code := finch(t, "login", "--cancel", "--json")
+	if code != 0 || decodeJSONOut(t, stdout)["cancelled"] != true {
+		t.Fatalf("login --cancel: exit=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if fileExists(pendingLoginPath()) {
+		t.Fatal("--cancel left the pending login")
+	}
+	if _, stderr, code := finch(t, "fleet", "--json"); code != 0 {
+		t.Fatalf("fleet after --cancel: exit=%d stderr=%q", code, stderr)
+	}
+	stdout, _, code = finch(t, "login", "--cancel", "--json")
+	if code != 0 || decodeJSONOut(t, stdout)["cancelled"] != false {
+		t.Fatalf("second --cancel: exit=%d stdout=%q", code, stdout)
+	}
+	if stdout, _, code := finch(t, "login", "--cancel"); code != 0 || !strings.Contains(stdout, "no login was pending") {
+		t.Fatalf("plain --cancel: exit=%d stdout=%q", code, stdout)
+	}
+
+	// An expired start no longer blocks anything.
+	if _, _, code := finch(t, "login", "--start", "--hub", h.url(), "--json"); code != 0 {
+		t.Fatal("login --start failed")
+	}
+	loginNow = func() time.Time { return time.Now().Add(11 * time.Minute) }
+	if _, stderr, code := finch(t, "fleet", "--json"); code != 0 {
+		t.Fatalf("fleet after the started login expired: exit=%d stderr=%q", code, stderr)
+	}
+	loginNow = time.Now
+
+	// A login that completes another way (here --token) supersedes the start.
+	if _, _, code := finch(t, "login", "--start", "--hub", h.url(), "--json"); code != 0 {
+		t.Fatal("login --start failed")
+	}
+	t.Setenv("FINCH_CLI_TOKEN", fakeCLIToken)
+	if _, stderr, code := finch(t, "login", "--hub", h.url(), "--json"); code != 0 {
+		t.Fatalf("login --token: exit=%d stderr=%q", code, stderr)
+	}
+	if fileExists(pendingLoginPath()) {
+		t.Fatal("a completed login left the started one blocking")
+	}
+
+	for _, args := range [][]string{{"login", "--cancel", "--poll"}, {"login", "--cancel", "--start"}, {"login", "--cancel", "--token", "-"}} {
+		if _, stderr, code := finch(t, append(args, "--json")...); code != 2 || decodeJSONError(t, stderr).Error.Code != "USAGE" {
+			t.Fatalf("%v: exit=%d stderr=%q", args, code, stderr)
+		}
 	}
 }
 

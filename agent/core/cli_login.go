@@ -5,6 +5,13 @@ package core
 //	finch login            blocking — print the link + code, poll until approved
 //	finch login --start    agent step 1 — save the pending code, print, exit 0
 //	finch login --poll     agent step 2 — one poll: exit 0 approved, 10 pending, 11 expired
+//	finch login --cancel   drop a started login and go back to the saved one
+//
+// While a started login is pending, the saved login (if any) is blocked: every
+// command that needs it reports APPROVAL_PENDING. A --start is how an agent
+// switches account or hub, so running control commands against the old
+// account in the meantime would act on the wrong tenant. --poll resolving it
+// (approved or expired) or --cancel lifts the block.
 //
 // The two-step form exists because an agent's tool call cannot usefully block
 // for minutes while a human finds their phone: it shows the human the link,
@@ -133,6 +140,7 @@ func completeLogin(hub, token, email string) (account string, err error) {
 	if err := saveCliCred(cred); err != nil {
 		return "", newCLIError(codeInternal, "", "could not save the login to %s: %v", cliCredPath(), err)
 	}
+	clearPendingLogin() // this login supersedes any started one
 	if who, werr := cliRequest("GET", hub, "/api/cli/whoami", token, nil); werr == nil {
 		if t, _ := who["tenant"].(string); t != "" {
 			cred.Tenant = t
@@ -145,7 +153,7 @@ func completeLogin(hub, token, email string) (account string, err error) {
 	return cred.Tenant, nil
 }
 
-// runLogin: finch login [--hub URL] [--start | --poll | --token -] [--headless] [--json]
+// runLogin: finch login [--hub URL] [--start | --poll | --cancel | --token -] [--headless] [--json]
 func runLogin(c *cli, args []string) error {
 	fs := newFlagSet("login")
 	hubFlag := fs.String("hub", agentDefaultHub(), "finch hub base URL")
@@ -153,6 +161,7 @@ func runLogin(c *cli, args []string) error {
 	headless := fs.Bool("headless", false, "blocking login without opening a local browser (the link works on any device)")
 	start := fs.Bool("start", false, "start a login, save it to ~/.finch/login-pending.json, print the link + code, and exit")
 	poll := fs.Bool("poll", false, "poll the login saved by --start once: exit 0 approved, 10 pending, 11 expired")
+	cancel := fs.Bool("cancel", false, "drop the login started by --start (the saved login, if any, works again)")
 	fs.Bool("json", false, "JSON output")
 	pos, err := c.parseArgs(fs, args)
 	if err != nil {
@@ -164,18 +173,27 @@ func runLogin(c *cli, args []string) error {
 			hubSet = true
 		}
 	})
-	if *start && *poll {
-		return usageError("login: --start and --poll are separate steps; pass one")
+	steps := 0
+	for _, on := range []bool{*start, *poll, *cancel} {
+		if on {
+			steps++
+		}
 	}
-	if (*start || *poll) && (*tokenFlag != "" || len(pos) > 0) {
-		return usageError("login: --token cannot be combined with --start or --poll")
+	if steps > 1 {
+		return usageError("login: --start, --poll and --cancel are separate steps; pass one")
+	}
+	if steps == 1 && (*tokenFlag != "" || len(pos) > 0) {
+		return usageError("login: --token cannot be combined with --start, --poll or --cancel")
 	}
 	if len(pos) > 1 {
-		return usageError("usage: finch login [--start | --poll | --token -]")
+		return usageError("usage: finch login [--start | --poll | --cancel | --token -]")
 	}
 
 	if *poll {
 		return loginPoll(c, *hubFlag, hubSet)
+	}
+	if *cancel {
+		return loginCancel(c)
 	}
 	hub, err := validateHubTransportURL(*hubFlag)
 	if err != nil {
@@ -207,7 +225,14 @@ func runLogin(c *cli, args []string) error {
 		if err := saveCliCred(&cliCred{Hub: hub, Token: token, Tenant: tenant}); err != nil {
 			return newCLIError(codeInternal, "", "could not save the login to %s: %v", cliCredPath(), err)
 		}
+		clearPendingLogin() // this login supersedes any started one
 		return reportLoggedIn(c, hub, tenant)
+	}
+	if c.json {
+		// The blocking login has to show a human the link while it waits, and
+		// --json leaves no stream for that: stdout is the payload, stderr the
+		// one error envelope. The two-step form is the JSON form.
+		return newCLIError(codeUsage, "finch login --start --json", "login: the blocking login has no --json form; run 'finch login --start --json', then 'finch login --poll --json' until it exits 0")
 	}
 	return loginBlocking(c, hub, *headless)
 }
@@ -292,6 +317,24 @@ func loginPoll(c *cli, hubFlag string, hubSet bool) error {
 	}
 }
 
+// loginCancel drops a started login. It is idempotent: with nothing pending it
+// reports cancelled=false and still exits 0.
+func loginCancel(c *cli) error {
+	existed := fileExists(pendingLoginPath())
+	if err := os.Remove(pendingLoginPath()); err != nil && !os.IsNotExist(err) {
+		return newCLIError(codeInternal, "", "removing %s: %v", pendingLoginPath(), err)
+	}
+	if c.json {
+		return c.emit(map[string]any{"cancelled": existed})
+	}
+	if existed {
+		c.printf("finch: cancelled the pending login\n")
+	} else {
+		c.printf("finch: no login was pending\n")
+	}
+	return nil
+}
+
 // loginBlocking is plain `finch login`: print the link + code, open a browser
 // unless headless, and poll until approved or expired.
 func loginBlocking(c *cli, hub string, headless bool) error {
@@ -299,38 +342,38 @@ func loginBlocking(c *cli, hub string, headless bool) error {
 	if err != nil {
 		return err
 	}
-	c.live("\n  To finish login, open this page on any device (your phone or laptop\n  is fine — you do NOT need a browser on this machine):\n\n      %s\n\n  and confirm this code:  %s\n\n", p.VerificationURIComplete, p.UserCode)
+	c.printf("\n  To finish login, open this page on any device (your phone or laptop\n  is fine — you do NOT need a browser on this machine):\n\n      %s\n\n  and confirm this code:  %s\n\n", p.VerificationURIComplete, p.UserCode)
 	if !headless {
 		openURL(p.VerificationURIComplete)
 	}
-	c.live("  Waiting for approval")
+	c.printf("  Waiting for approval")
 	for !p.expired() {
 		loginSleep(time.Duration(p.Interval) * time.Second)
 		status, token, email, err := pollDeviceLogin(p)
 		if err != nil {
 			var ce *cliError
 			if asCLIError(err, &ce) && ce.Code == codeUpstream {
-				c.live(".") // transient: keep waiting
+				c.printf(".") // transient: keep waiting
 				continue
 			}
 			return err
 		}
 		switch status {
 		case "approved":
-			c.live("  ✓\n")
+			c.printf("  ✓\n")
 			account, err := completeLogin(hub, token, email)
 			if err != nil {
 				return err
 			}
 			return reportLoggedIn(c, hub, account)
 		case "expired":
-			c.live("\n")
+			c.printf("\n")
 			return newCLIError(codeExpired, "finch login", "the login code expired before it was approved")
 		default:
-			c.live(".")
+			c.printf(".")
 		}
 	}
-	c.live("\n")
+	c.printf("\n")
 	return newCLIError(codeExpired, "finch login", "timed out waiting for approval")
 }
 
