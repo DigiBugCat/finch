@@ -134,6 +134,8 @@ type fakeHub struct {
 	services    map[string]string // id -> auth mode
 	host        string
 	keys        map[string]string // id -> label
+	keyScope    map[string]string // id -> the one service it is scoped to
+	keyLast4    map[string]string // id -> last four characters of the plaintext
 	nextKey     int
 	revoked     []string
 	authCalls   []string // "id=mode"
@@ -151,6 +153,8 @@ func newFakeHub(t *testing.T) *fakeHub {
 		deviceState: "pending",
 		services:    map[string]string{},
 		keys:        map[string]string{},
+		keyScope:    map[string]string{},
+		keyLast4:    map[string]string{},
 	}
 	h.call = func(method string) (int, string, string) {
 		return 200, "application/json", `{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"echo","description":"Echo it"}]}}`
@@ -298,7 +302,11 @@ func (h *fakeHub) serve(w http.ResponseWriter, r *http.Request) {
 		}
 		keys := []map[string]any{}
 		for id, label := range h.keys {
-			keys = append(keys, map[string]any{"id": id, "label": label})
+			// The real state's PublicKey: never the plaintext, only last4.
+			keys = append(keys, map[string]any{
+				"id": id, "label": label, "last4": h.keyLast4[id],
+				"scope": map[string]any{"services": []string{h.keyScope[id]}},
+			})
 		}
 		writeJSON(w, 200, map[string]any{"host": h.host, "services": services, "keys": keys})
 	case "POST /api/cli/keys":
@@ -322,7 +330,10 @@ func (h *fakeHub) serve(w http.ResponseWriter, r *http.Request) {
 		h.nextKey++
 		id := fmt.Sprintf("k_%d", h.nextKey)
 		h.keys[id] = b.Label
-		writeJSON(w, 200, map[string]any{"key": fmt.Sprintf("finch_secret%d", h.nextKey), "id": id, "label": b.Label, "last4": "0000"})
+		h.keyScope[id] = b.Scope.Services[0]
+		plain := fmt.Sprintf("finch_secret%d", h.nextKey)
+		h.keyLast4[id] = plain[len(plain)-4:]
+		writeJSON(w, 200, map[string]any{"key": plain, "id": id, "label": b.Label, "last4": plain[len(plain)-4:]})
 	case "POST /api/cli/keys/revoke":
 		var b struct {
 			ID string `json:"id"`

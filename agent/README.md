@@ -19,7 +19,7 @@ prompts. `finch guide` prints the agent manual (the same flow as
 | `finch login` | The same login in one blocking step (like `gh auth login`); `--headless` skips opening a browser. |
 | `finch add <name> --service <url> [--public]` | Enroll a service, append an `ingress` rule to `finch.yml`, print its public URL. `--public` makes it open (no key). |
 | `finch service install\|uninstall\|status` | Run `finch run` as a login service: launchd LaunchAgent `~/Library/LaunchAgents/com.finchmcp.finch.plist` (macOS) or systemd user unit `finch.service` (Linux). Idempotent. |
-| `finch connect <name> --client claude-code\|cursor\|codex\|json` | Mint a `finch_` key for one client and write it into that client's config without printing it (`json` prints an `mcpServers` snippet — the only mode that shows the key). |
+| `finch connect <name> --client claude-code\|cursor\|codex\|json` | Mint a `finch_` key for one client and write it into that client's config without printing it (`json` prints an `mcpServers` snippet — the only mode that shows the key). Re-running it for `cursor` or `codex` revokes the key the replaced entry used. |
 | `finch test <name>` | List a service's MCP tools through the hub; non-zero exit when the call fails. |
 | `finch call <name> <tool> [--args '{…}']` | Invoke one tool through the hub; a tool error exits 1. |
 | `finch run` | Serve every rule in `finch.yml` in the foreground — dials out, auto-approves, holds the relay open. |

@@ -173,7 +173,8 @@ and writes it into the client's configuration without printing it:
 | `json` | Prints an `mcpServers` JSON snippet, key included. Use it only for a client finch cannot configure, and write it straight into that client's config file. |
 
 Pick the client you are running in. The JSON output has a `key_id`, never the
-key. The client usually has to reload its MCP servers (or restart) before the
+key. Running it again for `cursor` or `codex` is safe: it replaces the entry
+and revokes the key the old entry used (`revoked_key_ids`). The client usually has to reload its MCP servers (or restart) before the
 new server appears. Tell your human that.
 
 ## Errors

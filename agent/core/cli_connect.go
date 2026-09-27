@@ -9,6 +9,10 @@ package core
 //
 // The client is checked BEFORE a key is minted (a missing client must not
 // leave an orphan key behind), and a key whose wiring fails is revoked again.
+// When cursor/codex already had an entry for the service carrying a finch_ key
+// that this command minted earlier (same label, same one-service scope, same
+// last four characters), that key is revoked once the new entry is written, so
+// re-running connect does not pile up live keys nothing references.
 
 import (
 	"encoding/json"
@@ -39,6 +43,66 @@ type connectTarget struct {
 	config string         // cursor/codex: the config file to merge into
 	cursor map[string]any // cursor: the parsed existing config
 	codex  string         // codex: the existing config text
+	// prevKey is the finch_ key the existing cursor/codex entry for the
+	// service carries, if any; it is replaced by this connect.
+	prevKey string
+}
+
+var bearerFinchKey = regexp.MustCompile(`Bearer\s+(finch_[A-Za-z0-9_-]+)`)
+
+// cursorEntryKey returns the finch_ key in mcpServers.<name>.headers.Authorization.
+func cursorEntryKey(doc map[string]any, name string) string {
+	servers, _ := doc["mcpServers"].(map[string]any)
+	entry, _ := servers[name].(map[string]any)
+	headers, _ := entry["headers"].(map[string]any)
+	auth, _ := headers["Authorization"].(string)
+	if m := bearerFinchKey.FindStringSubmatch(auth); m != nil {
+		return m[1]
+	}
+	return ""
+}
+
+// codexEntryKey returns the finch_ key in the [mcp_servers.<name>] table.
+func codexEntryKey(text, name string) string {
+	header := codexServerHeader(name)
+	in := false
+	for _, line := range strings.Split(text, "\n") {
+		if tomlHeaderLine.MatchString(line) {
+			in = header.MatchString(line)
+			continue
+		}
+		if in {
+			if m := bearerFinchKey.FindStringSubmatch(line); m != nil {
+				return m[1]
+			}
+		}
+	}
+	return ""
+}
+
+// replacedKeyIDs finds the account key behind prevKey: minted by connect for
+// the same client and host (label), scoped to exactly this service, with the
+// same last four characters. The key minted by this run is never a match.
+func replacedKeyIDs(st map[string]any, name, label, newID, prevKey string) []string {
+	if len(prevKey) < len("finch_")+4 {
+		return nil
+	}
+	last4 := prevKey[len(prevKey)-4:]
+	var ids []string
+	keys, _ := st["keys"].([]any)
+	for _, k := range keys {
+		m, _ := k.(map[string]any)
+		id, _ := m["id"].(string)
+		if id == "" || id == newID || m["label"] != label || m["last4"] != last4 {
+			continue
+		}
+		scope, _ := m["scope"].(map[string]any)
+		services, _ := scope["services"].([]any)
+		if len(services) == 1 && services[0] == name {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 func preflightClient(client, name string) (*connectTarget, error) {
@@ -73,6 +137,7 @@ func preflightClient(client, name string) (*connectTarget, error) {
 			}
 		}
 		t.cursor = doc
+		t.prevKey = cursorEntryKey(doc, name)
 	case "codex":
 		dir := codexConfigDir()
 		if st, err := os.Stat(dir); err != nil || !st.IsDir() {
@@ -87,6 +152,7 @@ func preflightClient(client, name string) (*connectTarget, error) {
 		if codexDefinesInline(t.codex, name) {
 			return nil, newCLIError(codeInternal, jsonNext, "%s already defines mcp_servers.%s inline; remove it first so finch can manage the entry", t.config, name)
 		}
+		t.prevKey = codexEntryKey(t.codex, name)
 	}
 	return t, nil
 }
@@ -152,12 +218,11 @@ func runConnect(c *cli, args []string) error {
 	// A public service needs no key; everything else gets its own, so revoking
 	// one client never cuts off another.
 	key, keyID := "", ""
+	label := *client
+	if hostName, _ := os.Hostname(); hostName != "" {
+		label += " on " + hostName
+	}
 	if !public {
-		hostName, _ := os.Hostname()
-		label := *client
-		if hostName != "" {
-			label += " on " + hostName
-		}
 		out, err := mintClientKey(cred, label, map[string][]string{"services": {name}})
 		if err != nil {
 			return err
@@ -197,7 +262,8 @@ func runConnect(c *cli, args []string) error {
 				msg = strings.TrimSpace(string(out))
 			}
 			return newCLIError(codeUpstream, "claude mcp remove "+name+" && finch connect "+name+" --client claude-code",
-				"claude mcp add failed (%v): %s", err, msg)
+				"claude mcp add failed (%v): %s. If an entry named %s already exists, removing it leaves its key live: find it in 'finch keys list' (label %q) and revoke it with 'finch keys revoke <id>' once no other project uses it",
+				err, msg, name, label)
 		}
 	case "cursor":
 		servers, _ := target.cursor["mcpServers"].(map[string]any)
@@ -224,10 +290,22 @@ func runConnect(c *cli, args []string) error {
 		configPath = target.config
 	}
 
+	// The cursor/codex entry now carries the new key (or none, for a public
+	// service), so the key it replaced is referenced nowhere: revoke it.
+	revoked := []string{}
+	if configPath != "" {
+		for _, id := range replacedKeyIDs(st, name, label, keyID, target.prevKey) {
+			if _, err := cliRequest("POST", cred.Hub, "/api/cli/keys/revoke", cred.Token, map[string]string{"id": id}); err == nil {
+				revoked = append(revoked, id)
+			}
+		}
+	}
+
 	if c.json {
 		p := map[string]any{"client": *client, "name": name, "url": endpoint, "key_id": keyID}
 		if configPath != "" {
 			p["config"] = configPath
+			p["revoked_key_ids"] = revoked
 		}
 		return c.emit(p)
 	}
@@ -235,6 +313,9 @@ func runConnect(c *cli, args []string) error {
 	c.printf("finch: connected %s to %s → %s\n", name, where, endpoint)
 	if keyID != "" {
 		c.printf("       using a new key %s (revoke with 'finch keys revoke %s'); the key was not printed\n", keyID, keyID)
+	}
+	if len(revoked) > 0 {
+		c.printf("       revoked the key the old entry used: %s\n", strings.Join(revoked, ", "))
 	}
 	if *client != "claude-code" {
 		c.printf("       restart the client (or reload its MCP servers) to pick it up\n")

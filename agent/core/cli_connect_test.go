@@ -137,6 +137,62 @@ model = "gpt-5-mini"
 	}
 }
 
+// Re-running connect for cursor/codex overwrites the entry, so the key the old
+// entry carried must be revoked — but only that key: not the new one, not a
+// key for another service with the same client label, and not a key the old
+// entry did not carry.
+func TestConnectRevokesTheKeyItReplaces(t *testing.T) {
+	for _, client := range []string{"cursor", "codex"} {
+		t.Run(client, func(t *testing.T) {
+			home, h := connectFixture(t)
+			h.set(func(h *fakeHub) { h.services["api"] = "key" })
+			if err := os.MkdirAll(filepath.Join(home, "."+client), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			// k_1: notes, k_2: api (same label, other service).
+			for _, svc := range []string{"notes", "api"} {
+				if _, stderr, code := finch(t, "connect", svc, "--client", client, "--json"); code != 0 {
+					t.Fatalf("connect %s: exit=%d stderr=%q", svc, code, stderr)
+				}
+			}
+			// A manually minted key for notes with a different label (k_3).
+			if _, stderr, code := finch(t, "keys", "mint", "laptop", "--service", "notes", "--json"); code != 0 {
+				t.Fatalf("keys mint: exit=%d stderr=%q", code, stderr)
+			}
+			stdout, stderr, code := finch(t, "connect", "notes", "--client", client, "--json")
+			if code != 0 {
+				t.Fatalf("reconnect: exit=%d stderr=%q", code, stderr)
+			}
+			got := decodeJSONOut(t, stdout)
+			if got["key_id"] != "k_4" || !reflect.DeepEqual(got["revoked_key_ids"], []any{"k_1"}) {
+				t.Fatalf("payload=%v", got)
+			}
+			if !reflect.DeepEqual(h.revoked, []string{"k_1"}) {
+				t.Fatalf("revoked=%v, want only the replaced notes key", h.revoked)
+			}
+			for _, live := range []string{"k_2", "k_3", "k_4"} {
+				if _, ok := h.keys[live]; !ok {
+					t.Fatalf("%s was revoked; keys=%v", live, h.keys)
+				}
+			}
+		})
+	}
+}
+
+// claude-code entries are per project and json snippets go who knows where,
+// so neither revokes anything.
+func TestConnectJSONRevokesNothing(t *testing.T) {
+	_, h := connectFixture(t)
+	for i := 0; i < 2; i++ {
+		if _, stderr, code := finch(t, "connect", "notes", "--client", "json", "--json"); code != 0 {
+			t.Fatalf("exit=%d stderr=%q", code, stderr)
+		}
+	}
+	if len(h.revoked) != 0 || len(h.keys) != 2 {
+		t.Fatalf("revoked=%v keys=%v", h.revoked, h.keys)
+	}
+}
+
 func TestMergeCodexConfigQuotedHeaderAndInline(t *testing.T) {
 	out, err := mergeCodexConfig("[mcp_servers.\"notes\"] # old\nurl = \"x\"\n", "notes", "https://a/notes/mcp", "")
 	if err != nil || strings.Contains(out, `url = "x"`) || strings.Contains(out, "http_headers") {

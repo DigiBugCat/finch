@@ -118,7 +118,11 @@ ssh user@newbox "finch add api --service http://127.0.0.1:9000 && finch service 
         Each connect creates its own key, labelled with the client and machine, so
         you can revoke one client with <code>finch keys revoke &lt;id&gt;</code> without
         touching the others. The client is checked before a key is minted, and a key
-        whose setup fails is revoked again. A public service gets no key.
+        whose setup fails is revoked again. A public service gets no key. Running
+        connect again for Cursor or Codex replaces the entry and revokes the key the
+        old entry used (listed as <code>revoked_key_ids</code> in <code>--json</code>).
+        Claude Code keeps entries per project, so for it you remove the old entry
+        with <code>claude mcp remove</code> and revoke its key yourself.
       </p>
 
       <h2>Inspect</h2>
