@@ -128,10 +128,14 @@ that named other people. The single-user migration deletes them:
   owner, invitations, groups, access-control rules, access requests, the
   retired login wall's session epoch, the Aviary manifest, route and
   credential-epoch fields, the `access` audit-log rows, and any other audit
-  row that names a member other than the owner. Keys minted by anyone other than the owner
-  are revoked, and every CLI token is revoked if anyone besides the owner
-  could have held one. A tenant that no request touches keeps its legacy rows
-  until one does.
+  row that names a member other than the owner. If anyone besides the owner
+  could have signed in to the tenant, every access key, every box and every
+  CLI login is revoked, because none of them records which person created
+  it; the owner re-adds their own. Otherwise only keys labelled for someone
+  else are revoked. A team tenant's hostnames move to its one former owner
+  when it had exactly one. A tenant that no request touches keeps its legacy
+  rows until one does; after the migration there is no index that lists
+  such tenants.
 - The global sign-in index (`DirectoryDO`) and the retired device-enrollment
   records (`AviaryEnrollmentDO`) are deleted outright by Durable Object
   migration `v7` when it deploys.

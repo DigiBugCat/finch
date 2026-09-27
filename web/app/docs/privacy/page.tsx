@@ -59,9 +59,11 @@ export default function PrivacyAndDataHandling() {
         earlier sharing features, the records they created are deleted on
         migration: team members and invitations, groups, access-control rules,
         access requests, and the activity-log entries about them, including the
-        email addresses in them. Access keys minted by anyone other than the
-        account owner are revoked, and CLI logins are signed out if anyone else
-        could have held one. A one-time migration removes all of this from an
+        email addresses in them. If anyone besides the account owner could sign
+        in to the account, every access key, connected box and CLI login is
+        revoked, because none of them records which person created it; you re-add
+        your own with the finch CLI. Otherwise only access keys labelled for
+        someone else are revoked. A one-time migration removes all of this from an
         account the first time Finch handles a request for it after the update.
         The sign-in index that linked people to shared accounts and the records of
         the retired device-enrollment flow are deleted outright.

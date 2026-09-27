@@ -36,7 +36,13 @@ describe('customer-facing privacy copy', () => {
     expect(note).toHaveTextContent(/access-control rules/i);
     expect(note).toHaveTextContent(/access requests/i);
     expect(note).toHaveTextContent(/email addresses/i);
-    expect(note).toHaveTextContent(/keys minted by anyone other than the\s+account owner are revoked/i);
+    // Nothing records who minted a key or enrolled a box, so the page must not
+    // promise that only other people's keys go when others could sign in.
+    expect(note).toHaveTextContent(
+      /if anyone besides the account owner could sign\s+in to the account, every access key, connected box and CLI login is\s+revoked/i,
+    );
+    expect(note).toHaveTextContent(/only access keys labelled for\s+someone else are revoked/i);
+    expect(note).not.toHaveTextContent(/keys minted by anyone other than/i);
     // The retired wording that the records are still stored must be gone.
     expect(screen.queryAllByText(/still stored/i)).toHaveLength(0);
     expect(screen.queryAllByText(/ask for them to be deleted/i)).toHaveLength(0);
