@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { callTime, callerLabel, cmd, olderThan, timeAgo, toFleetView } from '@/components/fleet/model';
+import { callTime, callerLabel, cmd, groupOldMachines, olderThan, timeAgo, toFleetView } from '@/components/fleet/model';
 import { NOW, SECRETS, emptyState, stateWithServices } from './fleet-fixtures';
 
 describe('toFleetView: mapping the hub state for /fleet', () => {
@@ -160,7 +160,7 @@ describe('fleet helpers', () => {
   it('words callers as a person reads them', () => {
     expect(callerLabel('claude-code')).toBe('key: claude-code');
     expect(callerLabel('oauth:user_2mXf8Q')).toBe('you, signed in (OAuth)');
-    expect(callerLabel('anonymous')).toBe('no key (public)');
+    expect(callerLabel('anonymous')).toBe('turned away (machine offline)');
     expect(callerLabel('public')).toBe('no key (public)');
     expect(callerLabel('finch-cli')).toBe('finch test or call');
     expect(callerLabel('dashboard')).toBe('finch test or call');
@@ -199,5 +199,20 @@ describe('fleet helpers', () => {
     expect(cmd.connect('notes')).toBe('finch connect notes --client claude-code');
     expect(cmd.mint('notes')).toBe('finch keys mint my-client --service notes');
     expect(cmd.rm("it's mine; rm -rf ~")).toBe("finch rm 'it'\\''s mine; rm -rf ~'");
+  });
+});
+
+describe('groupOldMachines', () => {
+  it('lists each outdated machine once, with its versions and services', () => {
+    const groups = groupOldMachines([
+      { machine: 'pelican', service: 'raven', version: '1.6.0' },
+      { machine: 'pelican', service: 'kestrel', version: '1.6.0' },
+      { machine: 'Duck.local', service: 'safari', version: '1.6.0' },
+      { machine: 'Duck.local', service: 'phone', version: '1.7.1' },
+    ]);
+    expect(groups).toEqual([
+      { machine: 'pelican', versions: ['1.6.0'], services: ['raven', 'kestrel'] },
+      { machine: 'Duck.local', versions: ['1.6.0', '1.7.1'], services: ['safari', 'phone'] },
+    ]);
   });
 });
