@@ -40,11 +40,23 @@ finch service install
 finch test printer`}</Code>
       <p>
         <code>finch add</code> records the service in <code>finch.yml</code> and
-        prints its public URL (the <code>url</code> field with <code>--json</code>).
-        The name becomes part of the URL: letters and digits, with <code>-</code>,{' '}
-        <code>_</code> or <code>.</code> between them, up to 63 characters. Case
-        matters in the URL, so lowercase names are easiest to share. <code>finch.yml</code> holds no secrets; each service&apos;s
-        credential is saved separately under <code>~/.finch/</code>.
+        prints its public URL (the <code>url</code> field with <code>--json</code>).{' '}
+        <code>finch.yml</code> holds no secrets; each service&apos;s credential is
+        saved separately under <code>~/.finch/</code>.
+      </p>
+      <p id="names">
+        The name becomes part of the URL, and finch normalizes it first: it
+        lowercases it and turns each run of anything that isn&apos;t a letter or digit
+        into one <code>-</code>. <code>finch add My_API.v1 …</code> publishes{' '}
+        <code>my-api-v1</code> (at <code>…/my-api-v1/mcp</code>) and prints a note
+        saying so; use that name in every later command. A name you type can be up to
+        63 characters of letters, digits, <code>-</code>, <code>_</code> and{' '}
+        <code>.</code> (the last three only between letters or digits), so names like{' '}
+        <code>notes</code> or <code>team-wiki</code> are kept exactly as typed. If your
+        account already has a service by that name that no machine publishes, the new
+        one is published as <code>printer-2</code>, and <code>finch add</code> says so;
+        if another machine publishes it, <code>finch add</code> stops and asks for
+        another name.
       </p>
       <p>
         By default callers need a <code>finch_</code> key or an OAuth sign-in. Add{' '}
@@ -54,13 +66,17 @@ finch test printer`}</Code>
 
       <h3>Changing a service&apos;s port</h3>
       <p>
-        Run <code>finch add</code> again with the same name and the new URL. finch
-        updates that service&apos;s entry in <code>finch.yml</code>; the public URL
-        stays the same. Then restart the background service so it picks up the
-        change:
+        On the machine that publishes it, run <code>finch add</code> again with the
+        same name and the new URL. finch updates that service&apos;s entry in{' '}
+        <code>finch.yml</code> instead of adding a second service, and the public URL
+        stays the same. If the background service is running, <code>finch add</code>{' '}
+        restarts it so the change takes effect; if not, the next{' '}
+        <code>finch service install</code> (or <code>finch run</code>) picks it up.
       </p>
       <Code>{`finch add printer --service http://127.0.0.1:9000
-finch service install`}</Code>
+<span class="o">finch: updated "printer" → http://127.0.0.1:9000 (was http://127.0.0.1:8000)</span>
+<span class="o">       public URL: https://sunny-wren-42.finchmcp.com/printer/mcp</span>
+<span class="o">       restarted the background service to apply it</span>`}</Code>
 
       <h2 id="web-apps">Web apps and REST APIs</h2>
       <p>
@@ -148,8 +164,9 @@ finch service install`}</Code>
       <p>
         This removes the service from your account, deletes its entry from{' '}
         <code>finch.yml</code> and deletes its credential on this machine. Its public
-        URL stops answering. If finch runs in the background,{' '}
-        <code>finch service install</code> restarts it without the removed service.
+        URL stops answering. If finch runs in the background, <code>finch rm</code>{' '}
+        restarts it without the removed service; if that was the machine&apos;s last
+        service, it says to run <code>finch service uninstall</code> instead.
         Keys scoped to that service stay on your account until you revoke them, and
         would work again if you re-add the same name; list and revoke them with{' '}
         <code>finch keys list</code> and <code>finch keys revoke</code>.

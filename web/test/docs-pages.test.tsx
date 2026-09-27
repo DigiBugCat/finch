@@ -248,6 +248,36 @@ describe('docs describe the CLI shipping in this release', () => {
     expect(cli).toMatch(/never deletes the finch binary itself; it prints the command/);
   });
 
+  it('describes the name the hub publishes: lowercased, other runs become one dash', () => {
+    const services = prose(Services);
+    // tenant-do slugify: toLowerCase, /[^a-z0-9]+/g → "-". Case does not survive.
+    expect(services).not.toMatch(/Case\s+matters/);
+    expect(services).toMatch(/lowercases it and turns each run of anything that isn.t a letter or digit\s+into one -/);
+    expect(services).toMatch(/finch add My_API\.v1 … publishes\s+my-api-v1/);
+    expect(prose(Cli)).toMatch(/My_API\.v1 is published as my-api-v1/);
+  });
+
+  it('says add and rm restart a running background service themselves', () => {
+    const services = prose(Services);
+    expect(services).toMatch(/If the background service is running, finch add\s+restarts it/);
+    expect(services).toMatch(/finch rm\s+restarts it without the removed service/);
+    const Page = Services.default;
+    const { container, unmount } = render(<Page />);
+    const blocks = [...container.querySelectorAll('pre')].map((p) => p.textContent!).join('\n');
+    unmount();
+    // agent/core/cli.go updateService prints exactly this.
+    expect(blocks).toContain('finch: updated "printer" → http://127.0.0.1:9000 (was http://127.0.0.1:8000)');
+    expect(blocks).toContain('restarted the background service to apply it');
+  });
+
+  it('only promises the handshake wording for the refusals that produce it', () => {
+    const cli = prose(Cli);
+    // relayCallFailure: only a 406, or a 400 mentioning the session, gets it.
+    expect(cli).toMatch(/with HTTP 406, or a 400 that mentions the session, it starts with .the server rejected the MCP handshake./);
+    expect(cli).toMatch(/answered tools\/list with HTTP <status>/);
+    expect(cli).toMatch(/answered tools\/list with an MCP error/);
+  });
+
   it('marks the AviaryMCP REST and OpenAPI paths as needing --forward-all', () => {
     const Page = AviaryMCP.default;
     const { container } = render(<Page />);

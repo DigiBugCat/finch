@@ -47,7 +47,7 @@ finch connect notes --client claude-code        <span class="c"># add it to your
             </tr>
             <tr>
               <td><code>finch add &lt;name&gt; --service &lt;url&gt;</code></td>
-              <td>Publish the local app at <code>&lt;url&gt;</code> as <code>&lt;name&gt;</code>: add it to your account and to <code>finch.yml</code>, and print its public URL (JSON field <code>url</code>). The name becomes the URL segment: <code>&lt;account address&gt;.finchmcp.com/&lt;name&gt;/</code>. Running it again for a name this machine already serves updates that service&apos;s local URL instead of adding a second service.</td>
+              <td>Publish the local app at <code>&lt;url&gt;</code> as <code>&lt;name&gt;</code>: add it to your account and to <code>finch.yml</code>, and print its public URL (JSON field <code>url</code>). The name becomes the URL segment, <code>&lt;account address&gt;.finchmcp.com/&lt;name&gt;/</code>, lowercased and with each run of other characters turned into <code>-</code> (<code>My_API.v1</code> is published as <code>my-api-v1</code>; see <Link href="/docs/services#names">names</Link>). Running it again for a name this machine already serves updates that service&apos;s local URL instead of adding a second service, and restarts the background service if it is running.</td>
             </tr>
             <tr>
               <td><code>&nbsp;&nbsp;--public</code></td>
@@ -152,7 +152,7 @@ finch connect notes --client claude-code        <span class="c"># add it to your
           <tbody>
             <tr>
               <td><code>finch status</code></td>
-              <td>This machine at a glance: whether you are logged in (<code>logged_in</code>; <code>loggedIn</code> is kept for older scripts) or a login is waiting for approval (<code>login_pending</code>), which services its <code>finch.yml</code> serves and their public URLs, and whether the background service is installed and running. It always exits <code>0</code>; read the fields.</td>
+              <td>This machine at a glance: whether you are logged in (<code>logged_in</code>; <code>loggedIn</code> is kept for older scripts) or a login is waiting for approval (<code>login_pending</code>), which services its <code>finch.yml</code> serves and their public URLs (<code>url</code>, when logged in and finch answers), and whether the background service is installed and running. It always exits <code>0</code>; read the fields.</td>
             </tr>
             <tr>
               <td><code>finch fleet</code></td>
@@ -183,7 +183,7 @@ finch connect notes --client claude-code        <span class="c"># add it to your
           <tbody>
             <tr>
               <td><code>finch test &lt;name&gt;</code></td>
-              <td>Open an MCP session with the service through finch and list its tools. Exits non-zero when that fails; if your server refuses the session, the message starts with &ldquo;the server rejected the MCP handshake&rdquo; and quotes its answer.</td>
+              <td>Open an MCP session with the service through finch and list its tools. Exits non-zero when that fails, and the message says which part failed. If your server refuses the session with HTTP 406, or a 400 that mentions the session, it starts with &ldquo;the server rejected the MCP handshake&rdquo; and quotes the answer. Other refusals name the status or the error, as &ldquo;&lt;name&gt; answered tools/list with HTTP &lt;status&gt;&rdquo; or &ldquo;&lt;name&gt; answered tools/list with an MCP error&rdquo; followed by the answer, even when it was the opening handshake your server refused. A 401 says your MCP server asks for its own credentials, and a 5xx reads &ldquo;&lt;name&gt; did not answer through finch&rdquo;.</td>
             </tr>
             <tr>
               <td><code>finch call &lt;name&gt; &lt;tool&gt; [--args &apos;{'{...}'}&apos;]</code></td>
@@ -270,7 +270,7 @@ finch call notes search --args '{"q":"finch"}'`}</Code>
       </p>
       <ul>
         <li>stops and removes the background service;</li>
-        <li>revokes the keys this machine made with <code>finch connect</code>, and removes the client entries finch added to Claude Code, Cursor and Codex;</li>
+        <li>revokes the keys this machine made with <code>finch connect</code>, and removes the client entries finch added to Claude Code, Cursor and Codex. A machine set up before finch 1.8 kept no record of its keys, so there it revokes none and lists the keys that carry this machine&apos;s name for you to check; logged out or offline, it revokes none and says so;</li>
         <li>deletes this machine&apos;s login, service credentials and <code>finch.yml</code> from <code>~/.finch/</code>.</li>
       </ul>
       <p>
