@@ -1,0 +1,9 @@
+{
+  "args": [
+    "fleet",
+    "--json"
+  ],
+  "exit": 0,
+  "stdout": "{\"schema_version\":1,\"services\":[{\"auth\":\"key\",\"boxCount\":1,\"boxes\":[{\"connected\":true,\"handshake\":\"2m ago\",\"lastSeen\":\"just now\",\"name\":\"laptop\",\"os\":\"darwin\",\"outdated\":false,\"service\":\"notes\",\"serviceLabel\":\"notes\",\"state\":\"online\",\"version\":\"1.7.1\"}],\"id\":\"notes\",\"label\":\"notes\",\"lastSeen\":\"just now\",\"outdated\":false,\"state\":\"online\",\"version\":\"1.7.1\"},{\"auth\":\"public\",\"boxCount\":1,\"boxes\":[{\"connected\":false,\"handshake\":\"3h ago\",\"lastSeen\":\"3h ago\",\"name\":\"laptop\",\"os\":\"darwin\",\"outdated\":false,\"service\":\"kanban\",\"serviceLabel\":\"kanban\",\"state\":\"offline\",\"version\":\"1.7.1\"}],\"id\":\"kanban\",\"label\":\"kanban\",\"lastSeen\":\"3h ago\",\"outdated\":false,\"state\":\"offline\",\"version\":\"1.7.1\"}]}\n",
+  "stderr": ""
+}

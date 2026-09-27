@@ -1,0 +1,9 @@
+{
+  "args": [
+    "fleet",
+    "--json"
+  ],
+  "exit": 1,
+  "stdout": "",
+  "stderr": "{\"schema_version\":1,\"error\":{\"code\":\"UPSTREAM\",\"message\":\"fleet: could not reach the finch hub: dial tcp: lookup finchmcp.com: no such host\"}}\n"
+}

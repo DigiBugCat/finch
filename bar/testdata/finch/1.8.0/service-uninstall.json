@@ -1,0 +1,10 @@
+{
+  "args": [
+    "service",
+    "uninstall",
+    "--json"
+  ],
+  "exit": 0,
+  "stdout": "{\"schema_version\":1,\"installed\":false,\"manager\":\"launchd\",\"running\":false,\"unit\":\"/Users/you/Library/LaunchAgents/com.finchmcp.finch.plist\",\"removed\":true}\n",
+  "stderr": ""
+}

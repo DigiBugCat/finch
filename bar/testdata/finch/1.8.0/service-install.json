@@ -1,0 +1,10 @@
+{
+  "args": [
+    "service",
+    "install",
+    "--json"
+  ],
+  "exit": 0,
+  "stdout": "{\"schema_version\":1,\"installed\":true,\"manager\":\"launchd\",\"running\":true,\"unit\":\"/Users/you/Library/LaunchAgents/com.finchmcp.finch.plist\",\"relays\":{\"notes\":{\"state\":\"connected\",\"since\":1790000000},\"kanban\":{\"state\":\"connected\",\"since\":1790000000}},\"config\":\"/Users/you/.finch/finch.yml\",\"binary\":\"/Users/you/.local/bin/finch\",\"log\":\"/Users/you/.finch/finch.log\"}\n",
+  "stderr": ""
+}

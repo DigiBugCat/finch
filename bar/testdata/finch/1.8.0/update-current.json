@@ -1,0 +1,9 @@
+{
+  "args": [
+    "update",
+    "--json"
+  ],
+  "exit": 0,
+  "stdout": "{\"schema_version\":1,\"updated\":false,\"version\":\"1.8.0\"}\n",
+  "stderr": ""
+}

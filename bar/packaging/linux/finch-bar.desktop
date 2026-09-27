@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=finch-bar
+GenericName=finch menu bar
+Comment=See and control finch from your panel
+Exec=finch-bar
+Icon=finch-bar
+Terminal=false
+Categories=Network;Utility;
+Keywords=finch;mcp;tunnel;
+StartupNotify=false

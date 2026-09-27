@@ -1,0 +1,10 @@
+{
+  "args": [
+    "login",
+    "--poll",
+    "--json"
+  ],
+  "exit": 10,
+  "stdout": "{\"schema_version\":1,\"status\":\"pending\"}\n",
+  "stderr": ""
+}

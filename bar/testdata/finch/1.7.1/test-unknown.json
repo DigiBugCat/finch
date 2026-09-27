@@ -1,0 +1,10 @@
+{
+  "args": [
+    "test",
+    "nope",
+    "--json"
+  ],
+  "exit": 1,
+  "stdout": "",
+  "stderr": "{\"schema_version\":1,\"error\":{\"code\":\"NOT_FOUND\",\"message\":\"no service named \\\"nope\\\" in this account\",\"next\":\"finch fleet\"}}\n"
+}

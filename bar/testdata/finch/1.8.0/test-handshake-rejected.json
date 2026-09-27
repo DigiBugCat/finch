@@ -1,0 +1,10 @@
+{
+  "args": [
+    "test",
+    "notes",
+    "--json"
+  ],
+  "exit": 1,
+  "stdout": "",
+  "stderr": "{\"schema_version\":1,\"error\":{\"code\":\"UPSTREAM\",\"message\":\"notes: the server rejected the MCP handshake: HTTP 400 (Bad Request: Missing session ID)\"}}\n"
+}

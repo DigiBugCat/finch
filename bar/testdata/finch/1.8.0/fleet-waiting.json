@@ -1,0 +1,9 @@
+{
+  "args": [
+    "fleet",
+    "--json"
+  ],
+  "exit": 0,
+  "stdout": "{\"schema_version\":1,\"services\":[{\"id\":\"notes\",\"label\":\"notes\",\"state\":\"online\",\"auth\":\"key\",\"url\":\"https://wren.finchmcp.com/notes/mcp\",\"version\":\"1.8.0\",\"outdated\":false,\"lastSeen\":\"just now\",\"boxCount\":1},{\"id\":\"kanban\",\"label\":\"kanban\",\"state\":\"pending\",\"auth\":\"public\",\"url\":\"https://wren.finchmcp.com/kanban/\",\"version\":\"1.8.0\",\"outdated\":false,\"lastSeen\":\"just now\",\"boxCount\":1}]}\n",
+  "stderr": ""
+}

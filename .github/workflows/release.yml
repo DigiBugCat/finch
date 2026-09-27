@@ -59,3 +59,115 @@ jobs:
           for f in /tmp/release-assets/*; do
             npx wrangler@4.100.0 r2 object put "finch-releases/$(basename "$f")" --file "$f" --remote
           done
+
+  # ---- finch-bar: the optional menu bar companion (bar/) -------------------
+  # These jobs start after the agent release above is published, so nothing
+  # here can hold up or fail the agent release. Each adds its assets (and a
+  # .sha256 next to each) to the same GitHub Release and mirrors them to R2.
+
+  bar-macos:
+    # A universal (arm64 + amd64) finch-bar.app, signed with a Developer ID
+    # and notarized when the signing secrets are set; otherwise an ad-hoc
+    # signed ...-unsigned.zip and a loud warning (see bar/scripts/sign-macos.sh).
+    needs: goreleaser
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: bar
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.4"
+          cache-dependency-path: bar/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Test finch-bar
+        run: go test -race ./...
+      - name: Build finch-bar.app
+        run: scripts/build-macos.sh "${GITHUB_REF_NAME#v}" "$RUNNER_TEMP/bar"
+      - name: Sign and notarize
+        id: sign
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+        run: scripts/sign-macos.sh "$RUNNER_TEMP/bar"
+      - name: Upload to the release and mirror to R2
+        env:
+          ASSET: ${{ steps.sign.outputs.asset }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        working-directory: ${{ runner.temp }}/bar
+        run: |
+          set -eu
+          test -n "$ASSET" && test -f "$ASSET"
+          shasum -a 256 "$ASSET" > "$ASSET.sha256"
+          gh release upload "$GITHUB_REF_NAME" "$ASSET" "$ASSET.sha256" --clobber --repo "$GITHUB_REPOSITORY"
+          for f in "$ASSET" "$ASSET.sha256"; do
+            npx wrangler@4.100.0 r2 object put "finch-releases/$f" --file "$f" --remote
+          done
+
+  bar-linux:
+    # finch-bar-linux-<arch>.tar.gz: the binary, icons and a .desktop entry.
+    # fyne.io/systray talks to the panel over D-Bus (StatusNotifierItem) in
+    # pure Go, so the build needs no cgo and no GTK/AppIndicator packages,
+    # and the binary runs on any glibc or musl distribution. Each arch builds
+    # on its own runner so the smoke test runs the real binary.
+    needs: goreleaser
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        working-directory: bar
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.4"
+          cache-dependency-path: bar/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Test finch-bar
+        run: go test -race ./...
+      - name: Package finch-bar
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: scripts/package-linux.sh "${GITHUB_REF_NAME#v}" "$ARCH" "$RUNNER_TEMP/bar"
+      - name: Smoke-test the packaged binary
+        env:
+          ARCH: ${{ matrix.arch }}
+        working-directory: ${{ runner.temp }}/bar
+        run: |
+          set -eu
+          tar -xzf "finch-bar-linux-$ARCH.tar.gz"
+          "finch-bar-linux-$ARCH/finch-bar" --version | grep -F "finch-bar ${GITHUB_REF_NAME#v} (linux/$ARCH)"
+          # No finch on PATH here: the menu offers to install it.
+          env PATH=/usr/bin:/bin HOME="$RUNNER_TEMP/empty-home" "finch-bar-linux-$ARCH/finch-bar" --print | grep -F "finch isn't installed"
+          rm -rf "finch-bar-linux-$ARCH"
+      - name: Upload to the release and mirror to R2
+        env:
+          ASSET: finch-bar-linux-${{ matrix.arch }}.tar.gz
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        working-directory: ${{ runner.temp }}/bar
+        run: |
+          set -eu
+          sha256sum "$ASSET" > "$ASSET.sha256"
+          gh release upload "$GITHUB_REF_NAME" "$ASSET" "$ASSET.sha256" --clobber --repo "$GITHUB_REPOSITORY"
+          for f in "$ASSET" "$ASSET.sha256"; do
+            npx wrangler@4.100.0 r2 object put "finch-releases/$f" --file "$f" --remote
+          done

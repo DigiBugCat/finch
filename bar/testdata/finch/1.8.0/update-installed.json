@@ -1,0 +1,9 @@
+{
+  "args": [
+    "update",
+    "--json"
+  ],
+  "exit": 0,
+  "stdout": "{\"schema_version\":1,\"updated\":true,\"binary\":\"/Users/you/.local/bin/finch\",\"restart\":\"service\"}\n",
+  "stderr": ""
+}

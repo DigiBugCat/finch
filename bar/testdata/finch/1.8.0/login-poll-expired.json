@@ -1,0 +1,10 @@
+{
+  "args": [
+    "login",
+    "--poll",
+    "--json"
+  ],
+  "exit": 11,
+  "stdout": "{\"schema_version\":1,\"status\":\"expired\"}\n",
+  "stderr": ""
+}

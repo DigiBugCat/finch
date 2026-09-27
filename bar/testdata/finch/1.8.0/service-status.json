@@ -1,0 +1,10 @@
+{
+  "args": [
+    "service",
+    "status",
+    "--json"
+  ],
+  "exit": 0,
+  "stdout": "{\"schema_version\":1,\"installed\":true,\"manager\":\"launchd\",\"running\":true,\"unit\":\"/Users/you/Library/LaunchAgents/com.finchmcp.finch.plist\"}\n",
+  "stderr": ""
+}

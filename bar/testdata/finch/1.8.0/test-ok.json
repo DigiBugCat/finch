@@ -1,0 +1,10 @@
+{
+  "args": [
+    "test",
+    "notes",
+    "--json"
+  ],
+  "exit": 0,
+  "stdout": "{\"schema_version\":1,\"service\":\"notes\",\"ok\":true,\"tools\":[{\"name\":\"search\",\"description\":\"Search notes\"},{\"name\":\"add_note\",\"description\":\"Add a note\"}]}\n",
+  "stderr": ""
+}

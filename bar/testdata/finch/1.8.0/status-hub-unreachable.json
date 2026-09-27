@@ -1,0 +1,9 @@
+{
+  "args": [
+    "status",
+    "--json"
+  ],
+  "exit": 0,
+  "stdout": "{\"schema_version\":1,\"logged_in\":true,\"loggedIn\":true,\"login_pending\":false,\"ingress\":[{\"app_path\":\"notes\",\"service\":\"http://127.0.0.1:8000\",\"url\":\"https://wren.finchmcp.com/notes/mcp\"},{\"app_path\":\"kanban\",\"service\":\"http://127.0.0.1:3000\",\"url\":\"https://wren.finchmcp.com/kanban/\"}],\"service\":{\"installed\":true,\"manager\":\"launchd\",\"running\":true,\"unit\":\"/Users/you/Library/LaunchAgents/com.finchmcp.finch.plist\"},\"version\":\"1.8.0\",\"account\":\"you@example.com\",\"hub\":\"https://finchmcp.com\",\"hub_reachable\":false,\"config\":\"/Users/you/.finch/finch.yml\"}\n",
+  "stderr": ""
+}
