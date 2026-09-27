@@ -275,7 +275,7 @@ func serviceMCPURL(hub, serviceBase, host, name string) string {
 
 func runConnect(c *cli, args []string) error {
 	fs := newFlagSet("connect")
-	client := fs.String("client", "", "claude-code | cursor | codex | json")
+	client := fs.String("client", "", "the MCP `client`: claude-code, cursor, codex, or json (prints a snippet)")
 	fs.Bool("json", false, "JSON output (the key is included only with --client json)")
 	pos, err := c.parseArgs(fs, args)
 	if err != nil {
@@ -327,10 +327,7 @@ func runConnect(c *cli, args []string) error {
 	// A public service needs no key; everything else gets its own, so revoking
 	// one client never cuts off another.
 	key, keyID := "", ""
-	label := *client
-	if hostName, _ := os.Hostname(); hostName != "" {
-		label += " on " + hostName
-	}
+	label := connectLabel(*client)
 	if !public {
 		out, err := mintClientKey(cred, label, map[string][]string{"services": {name}})
 		if err != nil {
@@ -350,6 +347,9 @@ func runConnect(c *cli, args []string) error {
 		snippet := map[string]any{"type": "http", "url": endpoint}
 		if key != "" {
 			snippet["headers"] = server["headers"]
+		}
+		if keyID != "" {
+			recordConnection(connection{Client: "json", Name: name, URL: endpoint, KeyID: keyID})
 		}
 		servers := map[string]any{"mcpServers": map[string]any{name: snippet}}
 		if c.json {
@@ -387,6 +387,13 @@ func runConnect(c *cli, args []string) error {
 		}
 		configPath = target.config
 	}
+
+	// Remember the entry, so 'finch uninstall' can take it out again.
+	conn := connection{Client: *client, Name: name, URL: endpoint, KeyID: keyID, Config: configPath}
+	if *client == "claude-code" {
+		conn.Dir, _ = os.Getwd()
+	}
+	recordConnection(conn)
 
 	// The client's entry now carries the new key (or none, for a public
 	// service), so the key it replaced is referenced nowhere: revoke it. For
@@ -542,10 +549,14 @@ func codexKeyForms(name string) string {
 	return `(?:` + forms + `)`
 }
 
+// codexServersKey matches the mcp_servers key itself, bare or quoted
+// (["mcp_servers"] and ['mcp_servers'] are the same TOML key).
+const codexServersKey = `(?:mcp_servers|"mcp_servers"|'mcp_servers')`
+
 // codexServerHeader matches `[mcp_servers.<name>]` and its sub-tables
 // (`[mcp_servers.<name>.env]`), bare or quoted, with an optional comment.
 func codexServerHeader(name string) *regexp.Regexp {
-	return regexp.MustCompile(`^\s*\[\s*mcp_servers\s*\.\s*` + codexKeyForms(name) + `\s*(?:\.[^\]]*)?\]\s*(?:#.*)?$`)
+	return regexp.MustCompile(`^\s*\[\s*` + codexServersKey + `\s*\.\s*` + codexKeyForms(name) + `\s*(?:\.[^\]]*)?\]\s*(?:#.*)?$`)
 }
 
 // codexDefinesInline reports whether config.toml defines the server in a form
@@ -555,9 +566,9 @@ func codexServerHeader(name string) *regexp.Regexp {
 func codexDefinesInline(text, name string) bool {
 	forms := codexKeyForms(name)
 	inTable := false
-	tableHeader := regexp.MustCompile(`^\s*\[\s*mcp_servers\s*\]\s*(?:#.*)?$`)
+	tableHeader := regexp.MustCompile(`^\s*\[\s*` + codexServersKey + `\s*\]\s*(?:#.*)?$`)
 	keyLine := regexp.MustCompile(`^\s*` + forms + `\s*[=.]`)
-	rootInline := regexp.MustCompile(`^\s*mcp_servers\s*(?:=|\.\s*` + forms + `\s*[=.])`)
+	rootInline := regexp.MustCompile(`^\s*` + codexServersKey + `\s*(?:=|\.\s*` + forms + `\s*[=.])`)
 	atRoot := true
 	for _, line := range strings.Split(text, "\n") {
 		if tomlHeaderLine.MatchString(line) {

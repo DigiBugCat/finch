@@ -1,40 +1,44 @@
 # finch agent (`agent/`)
 
-The box-side CLI and daemon, for macOS and Linux. It runs on any always-on box
-(Mac mini, Raspberry Pi, old laptop), **dials out** to the finch hub over a
-single WebSocket, and relays each request the hub sends down to your local
-service(s). finch is a protocol-agnostic tunnel — the service can be an MCP
-server, a website, or any HTTP/WebSocket app. Nothing listens on the box; no
-ports are opened.
+The CLI and daemon that run on your machine, for macOS and Linux. It runs on
+any always-on machine (Mac mini, Raspberry Pi, old laptop), **dials out** to
+the finch hub over a single WebSocket, and relays each request the hub sends
+down to your local service(s). The service can be an MCP server, a website, or
+any HTTP/WebSocket app. Nothing listens on the machine; no ports are opened.
 
-A single Go binary with a few subcommands. It is built to be driven end to end
-by an AI agent: every command takes `--json`, uses fixed exit codes, and never
-prompts. `finch guide` prints the agent manual (the same flow as
-[finchmcp.com/agents.md](../web/public/agents.md)).
+A single Go binary with a few subcommands. Bare `finch` prints the help;
+`finch help <command>` (or `finch <command> -h`) prints one command's flags and
+an example. It is built to be driven end to end by an AI agent too: every
+command takes `--json`, uses fixed exit codes, and never prompts. `finch guide`
+prints the agent manual, which is [finchmcp.com/agents.md](../web/public/agents.md)
+byte for byte (`core/agents.md` is the embedded copy; a test keeps the two
+equal, so edit `web/public/agents.md` and copy it over).
 
 | Command | What it does |
 |---|---|
-| `finch login --start` | Start a login and return at once: prints the sign-in link + code and saves the pending login to `~/.finch/login-pending.json` (0600). |
+| `finch login` | Sign in: prints a link and a code, opens your browser, and waits for approval (like `gh auth login`); `--headless` skips opening a browser. |
+| `finch login --start` | The agent form: start a login and return at once. Prints the sign-in link + code and saves the pending login to `~/.finch/login-pending.json` (0600). |
 | `finch login --poll` | Poll that login once: exit 0 approved (credential saved), 10 pending, 11 expired. Until it resolves, other commands report `APPROVAL_PENDING`, even over an older saved login. |
 | `finch login --cancel` | Drop a started login; the saved login works again. |
-| `finch login` | The same login in one blocking step (like `gh auth login`); `--headless` skips opening a browser. |
-| `finch add <name> --service <url> [--public]` | Enroll a service, append an `ingress` rule to `finch.yml`, print its public URL. `--public` makes it open (no key). |
+| `finch add <name> --service <url> [--public] [--forward-all]` | Publish a service: enroll it, add it to `finch.yml`, print its public URL. `--public` makes it open (no key); `--forward-all` forwards every path (a web app or REST API) instead of only `/<name>/mcp`. Run again for a service this machine publishes, it updates the local URL in place. |
 | `finch service install\|uninstall\|status` | Run `finch run` as a login service: launchd LaunchAgent `~/Library/LaunchAgents/com.finchmcp.finch.plist` (macOS) or systemd user unit `finch.service` (Linux). Idempotent. `install` exits 1 when `finch run` never comes up or a service's relay has not connected within ~20s (it reads the serve's own report in `<credentials-dir>/finch-run.status`); `uninstall` exits 1 and keeps the unit when finch cannot be stopped. |
 | `finch connect <name> --client claude-code\|cursor\|codex\|json` | Mint a `finch_` key for one client and write it into that client's config without printing it (`json` prints an `mcpServers` snippet — the only mode that shows the key). Re-running it revokes the key the replaced entry used. For `claude-code` the key lives in `~/.finch/connect/<name>.claude-code.json` (0600) and Claude Code reads it through a `headersHelper`, so it never reaches `claude`'s argv. |
 | `finch test <name>` | List a service's MCP tools through the hub; non-zero exit when the call fails. |
 | `finch call <name> <tool> [--args '{…}']` | Invoke one tool through the hub; a tool error exits 1. |
 | `finch run` | Serve every rule in `finch.yml` in the foreground — dials out, auto-approves, holds the relay open. |
-| `finch status` | Logged in? Login pending? What does `finch.yml` serve? Is the service installed and running? Always exits 0. |
-| `finch fleet` (alias `ls`) | List this account's services + state. |
+| `finch status` | Logged in? Login pending? What does `finch.yml` serve, and at which public URLs? Is the service installed and running? Always exits 0. |
+| `finch fleet` (alias `ls`) | List this account's services, their state and public URLs. |
+| `finch logs <name> [--limit N]` | The most recent calls the hub recorded for a service: time, route, caller, status, duration. |
 | `finch keys [list \| mint <label> --service <name> \| revoke <id>]` | Manage the client `finch_` keys callers present (grant + revoke access). |
 | `finch auth <name> public\|key` | Serve a service with no auth, or require a `finch_` key (the default). |
-| `finch rm <name>` | Remove a service. |
+| `finch rm <name>` | Remove a service from the account, its `finch.yml` entry and its saved credential; restarts a running background service. |
 | `finch domain [ls \| add <hostname> \| rm <hostname>]` | Manage custom hostnames. |
 | `finch token` | Mint a fresh CLI token — set up another machine with no browser. |
 | `finch enroll <name> --ticket -` | One time, on a box with no CLI login: trade a one-shot join ticket (stdin, or `FINCH_TICKET`) for a saved credential. |
 | `finch approve <name>` | Approve a service (clear the pending gate). Usually automatic. |
-| `finch update` | Self-update this binary and restart the serve cleanly (through launchd/systemd when `finch service` manages it). |
-| `finch revoke-tokens` | De-authorize every CLI login (including this box). |
+| `finch update [--force]` | Self-update this binary and restart the serve cleanly (through launchd/systemd when `finch service` manages it). Says so and exits 0 without downloading when already current; a failed version check is an error, and `--force` reinstalls anyway. |
+| `finch uninstall` | Remove what finch set up on this machine: the background service, the keys `finch connect` created here (revoked), the client entries it wrote, and `~/.finch`. Prints how to delete the binary; never deletes it. |
+| `finch revoke-tokens` | De-authorize every CLI login (including this machine). |
 | `finch version [--json]` | Print this binary's version and platform. |
 | `finch guide` / `finch help` | The agent manual / the command overview. |
 
@@ -68,7 +72,7 @@ exit 10, `"expired"` with exit 11). The contract lives in
 SDKs and deployment checks:
 
 ```json
-{"schema_version":1,"product":"finch","version":"1.7.0","os":"linux","arch":"amd64"}
+{"schema_version":1,"product":"finch","version":"1.8.0","os":"linux","arch":"amd64"}
 ```
 
 `version` is the stamped Finch release version without a leading `v`; `os` and
@@ -83,9 +87,8 @@ change meaning.
 #    FINCH_INSTALL_DIR overrides (a dir other users can write is refused).
 curl -fsSL https://finchmcp.com/install | sh
 
-# 2. log in — two steps for an agent (a human can run plain `finch login`)
-finch login --start          # prints https://finchmcp.com/cli?code=WXYZ-2345 ; approve it on any device
-finch login --poll           # repeat every few seconds until it exits 0
+# 2. log in: opens your browser and waits (an agent uses --start, then --poll)
+finch login
 
 # 3. publish a local service (running on :8000) as "notes"; prints the public URL
 finch add notes --service http://127.0.0.1:8000
@@ -204,12 +207,12 @@ upgrade by rebuilding/pulling the image, not `finch update`.
 - **`finch add`** uses that token to enroll services.
 - **`finch run`** holds the relay open and **auto-approves** the services it
   serves when you're logged in (the CLI-token holder is the tenant admin). If
-  you're not logged in, approve with `finch approve <app_path>` from a box that is.
+  you're not logged in, approve with `finch approve <name>` from a machine that is.
 - Per-service **refresh credentials** live under `credentials-dir/` and survive
   restarts/reboots — "authenticate once", like ngrok's authtoken.
 - Callers reach a service with a `finch_` key (`finch keys mint`), through
   OAuth (MCP clients such as claude.ai custom connectors sign in to finch), or
-  with no auth at all after `finch auth <app_path> public`.
+  with no auth at all after `finch auth <name> public`.
 
 ## Single-service mode (existing installs)
 
@@ -226,7 +229,7 @@ lines keep working after an update; a ticket only matters on first join. New
 boxes should use `finch add` + `finch run`.
 
 If the hub revokes a single-service credential, recover with `finch login` and
-`finch add <app_path> --service <url>`. The running process notices the new
+`finch add <name> --service <url>`. The running process notices the new
 `finch.yml` and switches to serving it, with no restart.
 
 ## Flags (run / join)

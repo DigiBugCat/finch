@@ -58,7 +58,7 @@ import (
 // `-ldflags "-X github.com/digibugcat/finch/agent/core.agentVersion=<v>"`; the
 // literal here is the source of truth that CI (scripts/check-versions.mjs)
 // asserts matches the worker's LATEST_AGENT and the web's copy. Keep them in sync.
-var agentVersion = "1.7.1"
+var agentVersion = "1.8.0"
 
 // connectSkew is how long before a connect-token's exp we treat it as already
 // expired and force a fresh /join, so we never dial with a token that lapses
@@ -273,6 +273,34 @@ type joinResp struct {
 	Error        string `json:"error"`
 }
 
+// relayFlags are the flags of `finch run` and the legacy `finch join`.
+type relayFlags struct {
+	fs                                                *flag.FlagSet
+	hub, ticket, box, upstream, statePath, configPath *string
+	forwardAll                                        *bool
+}
+
+func newRelayFlags(name string) *relayFlags {
+	hostName, _ := os.Hostname()
+	fs := flag.NewFlagSet(name, flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	r := &relayFlags{fs: fs}
+	r.configPath = fs.String("config", "", "the `finch.yml` to serve (default: ./finch.yml, then ~/.finch/finch.yml, then ~/.config/finch/finch.yml)")
+	fs.Bool("json", false, "report a startup failure as the JSON error envelope")
+	// Single-service mode, kept for machines set up with the original
+	// `finch join` one-liner (a hub-pushed update re-execs with that argv).
+	r.hub = fs.String("hub", agentDefaultHub(), "finch hub base `url`")
+	r.ticket = fs.String("ticket", "", "one-time enrollment `ticket`, first run only ('-' reads it from stdin, or set FINCH_TICKET)")
+	r.box = fs.String("box", agentDefaultBox(hostName), "this machine's `name`")
+	r.upstream = fs.String("upstream", "http://127.0.0.1:8000", "the local service's base `url`")
+	r.statePath = fs.String("state", defaultStatePath(), "the `file` that keeps this machine's credential between runs")
+	r.forwardAll = fs.Bool("forward-all", false, "forward every path, not just /mcp (for a web app or any non-MCP HTTP app)")
+	return r
+}
+
+// relayFlagSet is the flag set `finch run -h` / `finch join -h` describe.
+func relayFlagSet(name string) *flag.FlagSet { return newRelayFlags(name).fs }
+
 func Main() {
 	// Setup and control subcommands (login, add, service, connect, …) run and
 	// exit through the agent-facing CLI contract (cli_contract.go); only
@@ -284,52 +312,58 @@ func Main() {
 	rotateServiceLogAtStart()
 
 	hostName, _ := os.Hostname()
-	defaultHub := agentDefaultHub()
-	defaultBox := agentDefaultBox(hostName)
-	hub := flag.String("hub", defaultHub, "finch hub base URL (http[s]://…)")
-	ticket := flag.String("ticket", "", "one-shot enrollment ticket (single-service mode, first run only; '-' reads it from stdin, or set FINCH_TICKET; later runs resume from --state)")
-	box := flag.String("box", defaultBox, "this box's name")
-	upstream := flag.String("upstream", "http://127.0.0.1:8000", "single-service mode: local service base URL")
-	statePath := flag.String("state", defaultStatePath(), "single-service mode: file that persists the per-box refresh credential so a restart needs no new ticket")
-	configPath := flag.String("config", "", "path to a finch.yml manifest; serves every ingress rule (one local service per app_path) over one process")
-	forwardAll := flag.Bool("forward-all", false, "forward the WHOLE loopback host (every path), not just /mcp — for a website or any non-MCP HTTP app (single-service mode)")
-
 	// The install one-liners are `finch join …` (single service) and `finch run`
-	// (read finch.yml). flag.Parse stops at the first non-flag arg, so strip a
-	// leading subcommand — both `finch join …`/`finch run` and bare `finch …` work.
-	if len(os.Args) > 1 && (os.Args[1] == "join" || os.Args[1] == "run") {
-		os.Args = append(os.Args[:1], os.Args[2:]...)
+	// (read finch.yml). Both, and bare `finch --flag …`, land here.
+	args := os.Args[1:]
+	name := "run"
+	if len(args) > 0 && (args[0] == "join" || args[0] == "run") {
+		name, args = args[0], args[1:]
 	}
-	flag.Parse()
-	if err := validateRelayPositionals(flag.Args()); err != nil {
-		log.Fatalf("finch: %v", err)
+	rf := newRelayFlags(name)
+	c := &cli{stdout: os.Stdout, stderr: os.Stderr, stdin: os.Stdin, json: wantsJSON(args)}
+	// Startup failures go through the same printer as every other command:
+	// no timestamp, a next step, and the JSON envelope with --json.
+	fail := func(err error) { os.Exit(c.finish(err)) }
+	helpNext := "finch " + name + " -h"
+	if err := rf.fs.Parse(args); err != nil {
+		fail(newCLIError(codeUsage, helpNext, "%s: %v", name, err))
 	}
+	if err := validateRelayPositionals(rf.fs.Args()); err != nil {
+		fail(newCLIError(codeUsage, helpNext, "%v", err))
+	}
+	hub, ticket, box, upstream, statePath := rf.hub, rf.ticket, rf.box, rf.upstream, rf.statePath
 
 	// Argv-free ticket intake (--ticket - from stdin, FINCH_TICKET from env):
 	// keep the refresh-token-minting ticket off the process table / shell
 	// history on the single-service `finch join` path.
-	*ticket = resolveTicket(*ticket)
+	t, err := resolveTicketFrom(*ticket, os.Stdin)
+	if err != nil {
+		fail(newCLIError(codeUsage, helpNext, "%v", err))
+	}
+	*ticket = t
 
 	// Config-driven (cloudflared-style) when --config is given, or a finch.yml is
 	// found in the search path and no ticket was given. The search prefers the
 	// working dir (project-local manifests keep working) then falls back to the
 	// dotfile home (~/.finch/finch.yml, ~/.config/finch/finch.yml) so a box with a
 	// home-dir manifest serves from anywhere, not just when cwd happens to be home.
-	cfgPath := *configPath
+	cfgPath := *rf.configPath
 	if cfgPath == "" && *ticket == "" {
 		cfgPath = findManifest()
 	}
 	if cfgPath != "" {
 		cfg, err := loadConfig(cfgPath, hostName)
 		if err != nil {
-			log.Fatalf("finch: %v", err)
+			fail(newCLIError(codeInternal, "", "%v", err))
 		}
-		runConfig(cfg)
+		if err := runConfig(cfg); err != nil {
+			fail(err)
+		}
 		return
 	}
 	normalizedHub, err := validateHubTransportURL(*hub)
 	if err != nil {
-		log.Fatalf("finch: %v", err)
+		fail(newCLIError(codeUsage, helpNext, "%v", err))
 	}
 	*hub = normalizedHub
 
@@ -338,19 +372,18 @@ func Main() {
 	// original `finch join --ticket … --upstream …` one-liner keep serving (a
 	// hub-pushed update re-execs with that same argv).
 	if _, err := parseUpstreamTransportURL(*upstream); err != nil {
-		log.Fatalf("finch: --upstream %q is invalid: %v", *upstream, err)
+		fail(newCLIError(codeUsage, helpNext, "--upstream %q is invalid: %v", *upstream, err))
 	}
 	if *ticket != "" {
 		// First run: enroll inline, then resume from the saved credential.
 		if saved, _ := loadState(*statePath); saved == nil || saved.RefreshToken == "" || saved.Hub != *hub {
 			if _, _, eerr := enrollToState(*hub, *box, *ticket, *statePath); eerr != nil {
-				log.Fatalf("finch: enroll failed: %v", eerr)
+				fail(newCLIError(codeUpstream, "", "enroll failed: %v", eerr))
 			}
 			log.Printf("finch: enrolled — credential saved to %s", *statePath)
 		}
 	} else if saved, _ := loadState(*statePath); saved == nil || saved.RefreshToken == "" || saved.Hub != *hub {
-		log.Fatalf("finch: nothing to serve — no finch.yml found (./finch.yml, ~/.finch/finch.yml, ~/.config/finch/finch.yml) "+
-			"and no credential for %s at %s.\nRun `finch login`, then `finch add <app_path> --service <url>`.", *hub, *statePath)
+		fail(nothingToServe())
 	}
 	// Refuse to start if another finch run already holds this state — a second
 	// process would dial out for the same slugs and supersede the incumbent
@@ -358,7 +391,7 @@ func Main() {
 	// owner; this stops a stray manual `finch run` from fighting it.)
 	release, ok := lockState(*statePath)
 	if !ok {
-		log.Fatalf("finch: another finch run already holds %s — refusing to start a second relay", *statePath)
+		fail(newCLIError(codeInternal, "finch service status", "another 'finch run' is already serving this machine; stop it first (or check the background service)"))
 	}
 	defer release()
 
@@ -370,13 +403,24 @@ func Main() {
 	defer stop()
 	err = superviseRelay(ctx, relayOptions{
 		Hub: *hub, Box: *box, Upstream: *upstream, CredentialPath: *statePath,
-		Ticket: *ticket, ForwardAll: *forwardAll, WatchManifest: true,
+		Ticket: *ticket, ForwardAll: *rf.forwardAll, WatchManifest: true,
 	})
 	if errors.Is(err, errManifestChanged) {
 		if err := serveFoundManifest(ctx, hostName); err != nil {
-			log.Fatalf("finch: %v", err)
+			fail(newCLIError(codeInternal, "", "%v", err))
 		}
 	}
+}
+
+// nothingToServe is `finch run` on a machine with no finch.yml and no
+// single-service credential: say what to do, in the order to do it.
+func nothingToServe() *cliError {
+	next := "finch add <name> --service <url>"
+	if cred, _ := readCliCred(); cred == nil || cred.Token == "" {
+		next = "finch login --start"
+	}
+	return newCLIError(codeNotFound, next,
+		"nothing to serve yet: no finch.yml lists a service (looked in ./finch.yml, ~/.finch/finch.yml and ~/.config/finch/finch.yml). Run 'finch login', then 'finch add <name> --service <url>'")
 }
 
 // serveFoundManifest serves the finch.yml findManifest discovers — the handoff
@@ -640,7 +684,7 @@ func relayDialURL(jr *joinResp, hub string) string {
 func relayConnectURL(base, connectToken string) (string, error) {
 	u, err := url.Parse(strings.TrimSpace(base))
 	if err != nil || u.RawQuery != "" || u.Fragment != "" {
-		return "", fmt.Errorf("invalid Finch relay base URL")
+		return "", fmt.Errorf("invalid finch relay base URL")
 	}
 	q := u.Query()
 	q.Set("ct", connectToken)
@@ -817,9 +861,9 @@ func serveLink(parent context.Context, wsURL string, upstream *url.URL, forwardA
 	dialCancel()
 	if err != nil {
 		if response != nil {
-			return fmt.Errorf("Finch relay dial failed (HTTP %d)", response.StatusCode)
+			return fmt.Errorf("finch relay dial failed (HTTP %d)", response.StatusCode)
 		}
-		return fmt.Errorf("Finch relay dial failed")
+		return fmt.Errorf("finch relay dial failed")
 	}
 	defer c.Close(websocket.StatusNormalClosure, "bye")
 	c.SetReadLimit(maxRelayFrameBytes)
@@ -942,6 +986,11 @@ func serveLink(parent context.Context, wsURL string, upstream *url.URL, forwardA
 	}
 }
 
+// upstreamUnreachableMessage is the err frame for a local service that does
+// not answer. The hub (worker/src/index.ts) recognizes it and answers callers
+// with JSON; keep the two in step.
+const upstreamUnreachableMessage = "finch reached the machine, but the local service isn't answering"
+
 // relayChunkSize is the upstream read granularity. We read the body in ~32KiB
 // slices and base64-encode each into one `chunk` frame, so a streaming/SSE/
 // long-running upstream is relayed incrementally instead of buffered whole.
@@ -1001,9 +1050,17 @@ func forward(ctx context.Context, upstream *url.URL, f frame, write func(frame) 
 
 	resp, err := relayClient(upstream, forwardAll).Do(req)
 	if err != nil {
-		// Dial / connect failure — pre-head, so the DO maps it to a 502 and may
-		// still fail over to another box.
-		write(frame{ID: f.ID, Type: "err", Status: 502, Message: err.Error()})
+		// Dial / connect failure — pre-head, so the DO maps it to a 502. The
+		// caller may be anyone (a public service), so the frame never carries
+		// the local URL or the dial error; this machine's log keeps them.
+		if ctx.Err() == nil {
+			log.Printf("finch: %s did not answer: %v", upstream, err)
+		}
+		msg := upstreamUnreachableMessage
+		if strings.Contains(err.Error(), "redirect blocked") {
+			msg = "the local service redirected outside what finch forwards"
+		}
+		write(frame{ID: f.ID, Type: "err", Status: 502, Message: msg})
 		return
 	}
 	defer resp.Body.Close()
@@ -1282,17 +1339,17 @@ func loadConfig(path, hostName string) (*config, error) {
 	seen := map[string]bool{}
 	for i, ing := range c.Ingress {
 		if ing.AppPath == "" || ing.Service == "" {
-			return nil, fmt.Errorf("ingress #%d: both `app_path` and `service` are required", i+1)
+			return nil, fmt.Errorf("finch.yml: service #%d needs both app_path and service", i+1)
 		}
 		if err := validateServiceID(ing.AppPath); err != nil {
-			return nil, fmt.Errorf("ingress app_path: %w", err)
+			return nil, fmt.Errorf("finch.yml: %w", err)
 		}
 		if _, err := parseUpstreamTransportURL(ing.Service); err != nil {
-			return nil, fmt.Errorf("ingress %q: %w", ing.AppPath, err)
+			return nil, fmt.Errorf("finch.yml: service %q: %w", ing.AppPath, err)
 		}
 		foldedPath := strings.ToLower(ing.AppPath)
 		if seen[foldedPath] {
-			return nil, fmt.Errorf("ingress app_path %q collides case-insensitively with another service", ing.AppPath)
+			return nil, fmt.Errorf("finch.yml: service %q differs from another only in upper/lower case", ing.AppPath)
 		}
 		seen[foldedPath] = true
 	}
@@ -1305,7 +1362,7 @@ const maxAppPathLength = 63
 
 func validateServiceID(id string) error {
 	if len(id) > maxAppPathLength || !validAppPath(id) {
-		return fmt.Errorf("service id %q must be a safe URL segment of at most %d characters", id, maxAppPathLength)
+		return fmt.Errorf("service name %q must use letters, digits and - _ . (not first or last), at most %d characters", id, maxAppPathLength)
 	}
 	return nil
 }

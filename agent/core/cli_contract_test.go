@@ -29,12 +29,16 @@ func TestCLIErrorContract(t *testing.T) {
 		wantNext string
 	}{
 		{name: "unknown command", args: []string{"frobnicate", "--json"}, wantExit: 2, wantCode: "USAGE", wantNext: "finch help"},
-		{name: "unknown flag", args: []string{"status", "--bogus", "--json"}, wantExit: 2, wantCode: "USAGE", wantNext: "finch help"},
-		{name: "add without --service", args: []string{"add", "notes", "--json"}, wantExit: 2, wantCode: "USAGE", wantNext: "finch help"},
-		{name: "add with a non-http service", args: []string{"add", "notes", "--service", "ftp://x", "--json"}, wantExit: 2, wantCode: "USAGE", wantNext: "finch help"},
-		{name: "login --start and --poll together", args: []string{"login", "--start", "--poll", "--json"}, wantExit: 2, wantCode: "USAGE", wantNext: "finch help"},
-		{name: "connect to an unknown client", args: []string{"connect", "notes", "--client", "emacs", "--json"}, wantExit: 2, wantCode: "USAGE", wantNext: "finch help"},
-		{name: "service without an action", args: []string{"service", "--json"}, wantExit: 2, wantCode: "USAGE", wantNext: "finch help"},
+		// A usage mistake points at that command's own help.
+		{name: "unknown flag", args: []string{"status", "--bogus", "--json"}, wantExit: 2, wantCode: "USAGE", wantNext: "finch status -h"},
+		{name: "add without --service", args: []string{"add", "notes", "--json"}, wantExit: 2, wantCode: "USAGE", wantNext: "finch add -h"},
+		{name: "add with a non-http service", args: []string{"add", "notes", "--service", "ftp://x", "--json"}, wantExit: 2, wantCode: "USAGE", wantNext: "finch add -h"},
+		{name: "add without a scheme", args: []string{"add", "notes", "--service", "localhost:8000", "--json"}, wantExit: 2, wantCode: "USAGE", wantNext: "finch add notes --service http://localhost:8000"},
+		{name: "add with a bad name", args: []string{"add", "Bad Name!", "--service", "http://127.0.0.1:8000", "--json"}, wantExit: 2, wantCode: "USAGE", wantNext: "finch add -h"},
+		{name: "logs with a bad limit", args: []string{"logs", "notes", "--limit", "0", "--json"}, wantExit: 2, wantCode: "USAGE", wantNext: "finch logs -h"},
+		{name: "login --start and --poll together", args: []string{"login", "--start", "--poll", "--json"}, wantExit: 2, wantCode: "USAGE", wantNext: "finch login -h"},
+		{name: "connect to an unknown client", args: []string{"connect", "notes", "--client", "emacs", "--json"}, wantExit: 2, wantCode: "USAGE", wantNext: "finch connect -h"},
+		{name: "service without an action", args: []string{"service", "--json"}, wantExit: 2, wantCode: "USAGE", wantNext: "finch service -h"},
 		{name: "add while not logged in", args: []string{"add", "notes", "--service", "http://127.0.0.1:8000", "--json"}, wantExit: 12, wantCode: "NOT_LOGGED_IN", wantNext: "finch login --start"},
 		{name: "test while not logged in", args: []string{"test", "notes", "--json"}, wantExit: 12, wantCode: "NOT_LOGGED_IN", wantNext: "finch login --start"},
 		{
@@ -117,8 +121,13 @@ func TestCLIErrorContract(t *testing.T) {
 			if pcode != tc.wantExit || !strings.HasPrefix(perr, "finch: ") || strings.Contains(perr, `"schema_version"`) {
 				t.Fatalf("plain mode: exit=%d stderr=%q", pcode, perr)
 			}
-			if tc.wantNext != "" && !strings.Contains(perr, "next: "+tc.wantNext) {
+			// A person is told to run plain 'finch login' (it opens the
+			// browser and waits); --start/--poll is the agent's form.
+			if tc.wantNext != "" && !strings.Contains(perr, "next: "+humanNext(tc.wantNext)+"\n") {
 				t.Fatalf("plain mode does not name the next command: %q", perr)
+			}
+			if strings.Contains(perr, "next: finch login --start") {
+				t.Fatalf("plain mode sends a person to the agent login: %q", perr)
 			}
 		})
 	}
@@ -518,7 +527,7 @@ func TestJSONModeKeepsStderrToTheEnvelope(t *testing.T) {
 	// The same note still reaches a human.
 	h.set(func(h *fakeHub) { h.authDown = false })
 	stdout, _, code = finch(t, "add", "Api", "--service", "http://127.0.0.1:9000", "--config", cfg)
-	if code != 0 || !strings.Contains(stdout, `"Api" was registered as "api"`) {
+	if code != 0 || !strings.Contains(stdout, `so "Api" is published as "api"`) {
 		t.Fatalf("human add: exit=%d stdout=%q", code, stdout)
 	}
 }
@@ -586,8 +595,12 @@ func TestTestCommandClassifiesRelayedStatuses(t *testing.T) {
 		{name: "revoked finch login", token: "cli_revoked", status: 200, wantExit: 12, wantCode: "NOT_LOGGED_IN", wantNext: "finch login --start"},
 		{name: "server's own 404", status: 404, body: `{"detail":"Not Found"}`, wantExit: 1, wantCode: "UPSTREAM", wantMessage: "no MCP endpoint at /mcp"},
 		{name: "service not in the account", service: "ghost", wantExit: 1, wantCode: "NOT_FOUND", wantNext: "finch fleet", wantMessage: `no service named "ghost"`},
-		{name: "SDK 406 without SSE accept", status: 406, body: sdk406, wantExit: 1, wantCode: "UPSTREAM", wantNext: "finch connect notes --client <client>", wantMessage: "does not mean the service is down"},
-		{name: "SDK 400 missing session", status: 400, body: sdk400, wantExit: 1, wantCode: "UPSTREAM", wantNext: "finch connect notes --client <client>", wantMessage: "Missing session ID"},
+		// The hub runs a full MCP session (#49), so a 406/400 now means the
+		// server refused the handshake itself: report it neutrally.
+		{name: "SDK 406 without SSE accept", status: 406, body: sdk406, wantExit: 1, wantCode: "UPSTREAM", wantMessage: "the server rejected the MCP handshake: notes answered tools/list with HTTP 406"},
+		{name: "SDK 400 missing session", status: 400, body: sdk400, wantExit: 1, wantCode: "UPSTREAM", wantMessage: "the server rejected the MCP handshake: notes answered tools/list with HTTP 400 (Bad Request: Missing session ID)"},
+		{name: "local service down", status: 502, body: `{"error":"finch reached the machine, but the local service isn't answering","service":"notes"}`, wantExit: 1, wantCode: "UPSTREAM", wantMessage: "finch is connected, but nothing answers at its local URL on the machine that publishes notes"},
+		{name: "machine offline", status: 503, body: `{"error":"service offline: no machine serving it is connected to finch","service":"notes"}`, wantExit: 1, wantCode: "UPSTREAM", wantNext: "finch service status", wantMessage: "notes is offline"},
 		{name: "server's own 403", status: 403, body: `{"error":"forbidden"}`, wantExit: 1, wantCode: "UPSTREAM", wantMessage: "HTTP 403: forbidden"},
 		{name: "account without a public hostname", status: 409, body: `{"error":"no public hostname for this account","hint":"claim one"}`, wantExit: 1, wantCode: "NOT_FOUND", wantNext: "finch domain add <host>", wantMessage: "no public hostname"},
 		{name: "server's own 409", status: 409, body: `{"error":"conflict"}`, wantExit: 1, wantCode: "UPSTREAM", wantMessage: "HTTP 409: conflict"},
@@ -701,17 +714,24 @@ func TestHelpAndGuideJSON(t *testing.T) {
 			continue
 		}
 		rows, _ := got["commands"].([]any)
-		if len(rows) < 20 {
+		if len(rows) < 15 {
 			t.Fatalf("help commands=%v", got["commands"])
 		}
 		first, _ := rows[0].(map[string]any)
-		if first["usage"] != "login [--hub URL]" || !strings.HasPrefix(first["summary"].(string), "Log in and wait") {
+		if first["name"] != "login" || first["usage"] != "finch login [--headless]" || !strings.HasPrefix(first["summary"].(string), "Sign in to finch") {
 			t.Fatalf("first row=%v", first)
 		}
 		for _, r := range rows {
 			m := r.(map[string]any)
-			if len(m) != 2 || m["usage"] == "" || m["summary"] == "" {
+			if m["name"] == "" || m["usage"] == "" || m["summary"] == "" {
 				t.Fatalf("bad row %v", m)
+			}
+			// Aliases are structured, never folded into the summary.
+			if m["name"] == "fleet" && !reflect.DeepEqual(m["aliases"], []any{"ls"}) {
+				t.Fatalf("fleet row=%v", m)
+			}
+			if strings.Contains(m["summary"].(string), "alias") {
+				t.Fatalf("alias in a summary: %v", m)
 			}
 		}
 	}

@@ -82,7 +82,7 @@ func checkInvocations(t *testing.T, source string, snippets []string) (problems 
 				rest = rest[:i]
 			}
 			for _, f := range flagToken.FindAllStringSubmatch(rest, -1) {
-				if !strings.Contains(help, "  -"+f[1]+"\n") && !strings.Contains(help, "  -"+f[1]+" ") {
+				if !strings.Contains(help, "  --"+f[1]+"\n") && !strings.Contains(help, "  --"+f[1]+" ") {
 					problems = append(problems, fmt.Sprintf("%s documents `finch %s --%s`, which `finch %s -h` does not define", source, cmd, f[1], cmd))
 				}
 			}
@@ -108,7 +108,7 @@ func TestAgentDocsOnlyUseRealCommandsAndFlags(t *testing.T) {
 	if problems, _ := checkInvocations(t, "fixture", fixture); len(problems) != 2 {
 		t.Fatalf("checker verdicts on %q: %v, want exactly 2 problems", fixture, problems)
 	}
-	requireClean(t, "finch guide", indentedCommands(guideText), 10)
+	requireClean(t, "finch guide", codeSnippets(guideText), 10)
 	requireClean(t, "finch help", indentedCommands(usageText), 5)
 	public := filepath.Join("..", "..", "web", "public")
 	if _, err := os.Stat(public); err != nil {

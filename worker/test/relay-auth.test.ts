@@ -359,7 +359,7 @@ describe("relay auth — callers on a key-gated service", () => {
     expect(res.headers.get("content-type")).toContain("application/json");
     expect(res.headers.get("set-cookie")).toBeNull();
     expect((await res.json()) as any).toMatchObject({
-      error: expect.stringContaining("bearer key"),
+      error: expect.stringContaining("needs a finch_ key (Authorization: Bearer finch_"),
     });
 
     agent.close(1000, "done");
@@ -383,7 +383,7 @@ describe("relay auth — callers on a key-gated service", () => {
     expect(res.headers.get("location")).toBeNull();
     expect(res.headers.get("www-authenticate")).toContain("resource_metadata=");
     expect((await res.json()) as any).toMatchObject({
-      error: expect.stringContaining("bearer key"),
+      error: expect.stringContaining("needs a finch_ key (Authorization: Bearer finch_"),
     });
     agent.close(1000, "done");
   });
@@ -592,7 +592,7 @@ describe("relay auth — callers on a key-gated service", () => {
     );
     expect(res.status).toBe(403);
     expect((await res.json()) as any).toEqual({
-      error: "token identity does not own this tenant",
+      error: "this sign-in belongs to a different finch account than the one that publishes this service",
     });
     expect(relayed).toBe(false);
     agent.close(1000, "done");

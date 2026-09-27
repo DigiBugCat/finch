@@ -370,11 +370,72 @@ export function boxStub(
 }
 
 /** Small JSON helper. */
-export function json(status: number, body: unknown): Response {
+export function json(
+  status: number,
+  body: unknown,
+  headers: Record<string, string> = {},
+): Response {
   return new Response(JSON.stringify(body), {
     status,
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...headers },
   });
+}
+
+/** Seconds a throttled caller should wait before retrying (every 429). */
+export const RETRY_AFTER_SECONDS = "60";
+
+/** The 429 every rate limiter answers with. */
+export function rateLimited(message = "rate limited"): Response {
+  return json(429, { error: message }, { "retry-after": RETRY_AFTER_SECONDS });
+}
+
+// What a remote caller sees when the machine answered but the local service
+// did not. The 1.8 agent sends exactly this as its err frame; older agents
+// send Go's raw error (`Post "http://127.0.0.1:8000/mcp": dial tcp …`), which
+// names the machine's loopback URL. Both become this JSON.
+export const LOCAL_SERVICE_DOWN =
+  "finch reached the machine, but the local service isn't answering";
+const GO_URL_ERROR_RE =
+  /^(?:Get|Post|Put|Patch|Delete|Head|Options|Connect|Trace) "[a-z]+:\/\//;
+
+/** Turn the relay DO's bare-text err-frame answer (the agent failed before
+ *  the local service produced a response) into a JSON error that never
+ *  names the machine's local URL. A response the local service itself sent
+ *  (a head frame) carries its own headers, so it never matches, and is
+ *  returned untouched. */
+async function classifyRelayError(res: Response, service: string): Promise<Response> {
+  if (res.status !== 502 && res.status !== 403) return res;
+  const ct = res.headers.get("content-type") || "";
+  const bare = [...res.headers.keys()].every((k) => k === "content-type" || k === "content-length");
+  if (!bare || !ct.startsWith("text/plain")) return res;
+  const text = await res.text();
+  if (res.status === 502 && (text === LOCAL_SERVICE_DOWN || GO_URL_ERROR_RE.test(text) || /\bdial tcp\b|connection refused/.test(text))) {
+    return json(502, { error: LOCAL_SERVICE_DOWN, service });
+  }
+  if (res.status === 502 && text === "the local service redirected outside what finch forwards") {
+    return json(502, { error: text, service });
+  }
+  if (res.status === 403 && text.startsWith("rejected path")) {
+    return json(403, {
+      error: "finch does not forward this path for this service (only its MCP endpoint, unless the service was added with --forward-all)",
+      service,
+    });
+  }
+  return new Response(text, { status: res.status, headers: res.headers });
+}
+
+/** The 503 for a service with no connected machine. X-Finch-Offline stays on
+ *  it: POST /api/cli/call fails over to the next machine on that signal. */
+function serviceOffline(service: string): Response {
+  return json(
+    503,
+    {
+      error: "service offline: no machine serving it is connected to finch",
+      service,
+      hint: "on the machine that publishes it, run: finch service status",
+    },
+    { "retry-after": "30", "X-Finch-Offline": "1" },
+  );
 }
 
 /** Call a TenantDO op via its internal fetch RPC. */
@@ -594,12 +655,28 @@ export default {
       });
     }
 
+    // www.finchmcp.com is the site's apex under another name.
+    if (/^www\.finchmcp\.com(?::\d+)?$/i.test(host)) {
+      return Response.redirect(`https://finchmcp.com${path}${url.search}`, 301);
+    }
+
+    // /.well-known/* is reserved: never a service name.
+    if (parts[0] === ".well-known") {
+      return json(404, { error: "not found", path });
+    }
+
     // ---- MCP / relay plane. Tenant id resolves from the host slug via the
     //      singleton RouterDO (slug→tenantId). FAIL CLOSED on an unknown slug. ----
+    // A host that can never name an account (the apex, hub.finchmcp.com's
+    // unmatched paths, workers.dev) is a plain 404 — only dev falls back to
+    // DEFAULT_TENANT there.
+    if (!hostKeyFromHost(host) && !(env.DEV === "1" && env.DEFAULT_TENANT)) {
+      return json(404, { error: "not found", path });
+    }
     const tenant = await resolveTenant(host, env);
     if (!tenant) {
       return json(404, {
-        error: "tenant could not be resolved from host",
+        error: "no finch account at this address — check the URL ('finch fleet' prints yours)",
         host,
       });
     }
@@ -689,7 +766,7 @@ export default {
       // (no binding). (security M5 / code-review #6)
       const ip = clientIp(req);
       if (!(await rateLimitOk(env.RELAY_LIMIT, `${tenant}:${ip}`))) {
-        return json(429, { error: "rate limited" });
+        return rateLimited();
       }
 
       let pinned = "";
@@ -730,23 +807,9 @@ export default {
       const pool = await pickHealthyPool(env, tenant, service);
       // No such service: a plain 404, before any credential is looked at.
       if (!pool) return json(404, { error: "no such service", service });
-      if (!pool.length) {
-        // No healthy box at all. Record this 503 too, so a load-balanced
-        // offline call is just as visible in the dashboard (logs / recentCalls /
-        // err) as a specific-box offline 503. Best-effort caller attribution.
-        const caller = await callerLabel(req, env, tenant, service);
-        ctx.waitUntil(
-          tenantOp(env, tenant, "recordCall", {
-            service,
-            box: "—",
-            status: 503,
-            ms: 0,
-            caller,
-            route: path,
-          }).catch(() => {}),
-        );
-        return json(503, { error: "service offline", service });
-      }
+      // An empty pool (no machine connected) still authenticates first, so an
+      // OAuth client gets its 401 challenge and can finish signing in while
+      // the machine sleeps; relayMcp answers the 503 after auth.
       return relayMcp(req, env, ctx, tenant, service, pool, path, upstream);
     }
 
@@ -779,32 +842,8 @@ export async function pickHealthyPool(
   return healthy.map((m) => m.name as string);
 }
 
-/** Best-effort caller attribution for a request: resolve the presented finch_
- *  key to its label via the TenantDO, falling back to "finch_key" / "anonymous".
- *  Never throws and never gates the response — used only to label metrics for
- *  outcomes (like the LB-offline 503) that don't go through relayMcp's auth. */
-async function callerLabel(
-  req: Request,
-  env: Env,
-  tenant: string,
-  service: string,
-): Promise<string> {
-  try {
-    const auth = req.headers.get("authorization") || "";
-    const m = auth.match(/^Bearer\s+(finch_[A-Za-z0-9_-]+)$/);
-    if (!m) return "anonymous";
-    const hash = await hashKey(m[1]);
-    const check = await tenantOp<{ allowed: boolean; keyLabel: string }>(
-      env,
-      tenant,
-      "checkKey",
-      { hash, service },
-    );
-    return check.keyLabel || "finch_key";
-  } catch {
-    return "finch_key";
-  }
-}
+const OAUTH_WRONG_ACCOUNT =
+  "this sign-in belongs to a different finch account than the one that publishes this service";
 
 /** The relay's 401 OAuth `WWW-Authenticate: Bearer` challenge (RFC 6750 §3).
  *
@@ -865,7 +904,8 @@ async function relayMcp(
     (await verifyAssertion(req.headers.get("x-finch-auth") || "", env.FINCH_SERVICE_SECRET)) ===
       tenant;
 
-  let caller = "dashboard";
+  // The label `finch logs` shows for `finch test` / `finch call`.
+  let caller = "finch-cli";
   let edgeCaller: RelayCaller | null = svcAuthed
     ? { sub: "service:finch-dashboard", authMethod: "service" }
     : null;
@@ -895,13 +935,13 @@ async function relayMcp(
           service,
         });
         if (!gate.allowed) {
-          return json(403, { error: "token identity does not own this tenant" });
+          return json(403, { error: OAUTH_WRONG_ACCOUNT });
         }
         oauthAuthed = true;
         caller = `oauth:${id}`;
         edgeCaller = { sub: `user:${id}`, authMethod: "oauth" };
       } else if (who) {
-        return json(403, { error: "token identity does not own this tenant" });
+        return json(403, { error: OAUTH_WRONG_ACCOUNT });
       }
     }
   }
@@ -943,17 +983,19 @@ async function relayMcp(
           // everything the AS supports) — identity only, see MCP_SCOPES.
           headers["www-authenticate"] = relayBearerChallenge(req);
         }
-        return new Response(
-          JSON.stringify({ error: "missing or malformed finch_ bearer key" }),
-          { status: 401, headers },
-        );
+        const message = env.CLERK_ISSUER
+          ? "this service needs a finch_ key (Authorization: Bearer finch_…) or an OAuth sign-in"
+          : "this service needs a finch_ key (Authorization: Bearer finch_…)";
+        return new Response(JSON.stringify({ error: message }), { status: 401, headers });
       }
       const error =
         check.reason === "scope"
-          ? "key scope does not include this service"
+          ? "this finch_ key is not scoped to this service (mint one with: finch keys mint <label> --service <name>)"
           : check.reason === "expired"
-            ? "key has expired"
-            : "key not allowed for this service";
+            ? "this finch_ key has expired"
+            : check.reason === "no-service"
+              ? "no such service"
+              : "unknown or revoked finch_ key (see: finch keys list)";
       return json(403, { error });
     }
     caller = check.public ? "public" : check.keyLabel || "finch_key";
@@ -1053,8 +1095,8 @@ async function relayMcp(
   }
 
   const start = Date.now();
-  let res = json(503, { error: "service offline", service });
-  let usedBox = pool[0];
+  let res = serviceOffline(service);
+  let usedBox = pool[0] ?? "—";
   for (const box of pool) {
     usedBox = box;
     // Normalize the forwarded URL to /<service>/<box>/<rest>. BoxDO
@@ -1073,9 +1115,9 @@ async function relayMcp(
 
     const stub = boxStub(env, tenant, service, box);
     try {
-      res = await stub.fetch(relayReq);
-    } catch (e) {
-      res = json(502, { error: `relay failed: ${e}` });
+      res = await classifyRelayError(await stub.fetch(relayReq), service);
+    } catch {
+      res = json(502, { error: "finch could not reach the machine", service });
     }
     // FAIL OVER only on the DO's own "service offline" signal (no agent socket
     // for this box) — a stale pick. Any other status (including an upstream
@@ -1096,6 +1138,10 @@ async function relayMcp(
       continue; // try the next sibling
     }
     break;
+  }
+  if (res.status === 503 && res.headers.get("X-Finch-Offline") === "1") {
+    // Every pick was stale (or there was none): the caller-facing 503.
+    res = serviceOffline(service);
   }
   const ms = Date.now() - start;
 
