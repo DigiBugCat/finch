@@ -289,9 +289,17 @@ func loginPoll(c *cli, hubFlag string, hubSet bool) error {
 	}
 	switch status {
 	case "approved":
-		clearPendingLogin() // the hub consumed the code
+		// The hub consumed the code, but the pending marker stays until the
+		// new token is saved (completeLogin clears it then): if the save
+		// fails, the switch did not happen, and control commands must not
+		// quietly fall back to the previously saved login — possibly
+		// another account.
 		account, err := completeLogin(p.Hub, token, email)
 		if err != nil {
+			if ce, ok := err.(*cliError); ok {
+				ce.Next = "finch login --start"
+				ce.Message += "; the approved login was not kept, so fix that and run 'finch login --start' again (until then the previously saved login stays blocked; 'finch login --cancel' unblocks it)"
+			}
 			return err
 		}
 		return reportLoggedIn(c, p.Hub, account)

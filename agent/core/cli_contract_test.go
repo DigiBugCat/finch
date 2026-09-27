@@ -390,6 +390,42 @@ func TestPendingLoginBlocksTheSavedLogin(t *testing.T) {
 	}
 }
 
+// An approved account switch whose new token cannot be saved did not happen:
+// the pending marker stays, so control commands keep refusing to act on the
+// previously saved login (possibly another tenant) instead of silently
+// falling back to it.
+func TestFailedLoginSaveKeepsTheSavedLoginBlocked(t *testing.T) {
+	home := isolate(t)
+	h := newFakeHub(t)
+	loginTo(t, h)
+	if _, stderr, code := finch(t, "login", "--start", "--hub", h.url(), "--json"); code != 0 {
+		t.Fatalf("login --start: exit=%d stderr=%q", code, stderr)
+	}
+	h.set(func(h *fakeHub) { h.deviceState = "approved" })
+	finchDir := filepath.Join(home, ".finch")
+	// A group-writable credential dir makes the atomic save refuse (files can
+	// still be removed from it, so a premature clear would go through).
+	if err := os.Chmod(finchDir, 0o770); err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr, code := finch(t, "login", "--poll", "--json")
+	if err := os.Chmod(finchDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	env := decodeJSONError(t, stderr)
+	if code != 1 || stdout != "" || env.Error.Code != "INTERNAL" || env.Error.Next != "finch login --start" ||
+		!strings.Contains(env.Error.Message, "could not save the login") || !strings.Contains(env.Error.Message, "stays blocked") {
+		t.Fatalf("exit=%d stdout=%q env=%+v", code, stdout, env)
+	}
+	if !fileExists(pendingLoginPath()) {
+		t.Fatal("the pending login was cleared although the new token was never saved")
+	}
+	_, stderr, code = finch(t, "fleet", "--json")
+	if env := decodeJSONError(t, stderr); code != 10 || env.Error.Code != "APPROVAL_PENDING" {
+		t.Fatalf("fleet fell back to the old login: exit=%d env=%+v", code, env)
+	}
+}
+
 // A relative credentials-dir belongs to the manifest: `finch add --config`
 // run from another directory must write the credential where the service
 // (which runs in the manifest's directory) and a later `finch run --config`
