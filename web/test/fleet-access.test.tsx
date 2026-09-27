@@ -1,6 +1,9 @@
 // How people reach /fleet: the middleware gates it behind sign-in (Clerk's
-// auth.protect sends a signed-out visit to sign-in and back), the signed-in
-// nav links to it, and a sign-in or sign-up with nowhere else to go lands there.
+// auth.protect sends a signed-out visit to sign-in and back), and the signed-in
+// nav links to it. Where a sign-in or sign-up with no redirect_url lands is set
+// by the <SignIn>/<SignUp> fallbackRedirectUrl props, which Clerk ranks above
+// the NEXT_PUBLIC_CLERK_*_FALLBACK_REDIRECT_URL vars; the last block keeps the
+// two in step so a change to one can't silently do nothing.
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
@@ -25,10 +28,21 @@ vi.mock('@clerk/nextjs/server', () => ({
   },
 }));
 
-const clerk = vi.hoisted(() => ({ auth: { isLoaded: true, isSignedIn: false } }));
+const clerk = vi.hoisted(() => ({
+  auth: { isLoaded: true, isSignedIn: false },
+  props: {} as Record<string, Record<string, unknown>>,
+}));
 vi.mock('@clerk/nextjs', () => ({
   useAuth: () => clerk.auth,
   UserButton: () => <button type="button">Open account menu</button>,
+  SignIn: (props: Record<string, unknown>) => {
+    clerk.props.SignIn = props;
+    return null;
+  },
+  SignUp: (props: Record<string, unknown>) => {
+    clerk.props.SignUp = props;
+    return null;
+  },
 }));
 
 import SiteNav from '@/components/fieldguide/SiteNav';
@@ -81,11 +95,20 @@ describe('the signed-in nav', () => {
 describe('where sign-in and sign-up land', () => {
   const wrangler = parseJsonc(readFileSync(resolve(import.meta.dirname, '../wrangler.jsonc'), 'utf8'));
 
-  it('sends a fresh sign-in or sign-up to /fleet in every deployed env', () => {
+  it('lands where the rendered <SignIn> and <SignUp> say, and the env fallbacks agree', async () => {
+    clerk.props = {};
+    const { default: SignInPage } = await import('@/app/sign-in/[[...sign-in]]/page');
+    const { default: SignUpPage } = await import('@/app/sign-up/[[...sign-up]]/page');
+    render(<SignInPage />);
+    render(<SignUpPage />);
+    const signIn = clerk.props.SignIn?.fallbackRedirectUrl;
+    const signUp = clerk.props.SignUp?.fallbackRedirectUrl;
+    expect(signIn).toMatch(/^\//);
+    expect(signUp).toMatch(/^\//);
     for (const env of ['staging', 'production']) {
       const vars = wrangler.env[env].vars;
-      expect(vars.NEXT_PUBLIC_CLERK_SIGN_IN_FALLBACK_REDIRECT_URL, env).toBe('/fleet');
-      expect(vars.NEXT_PUBLIC_CLERK_SIGN_UP_FALLBACK_REDIRECT_URL, env).toBe('/fleet');
+      expect(vars.NEXT_PUBLIC_CLERK_SIGN_IN_FALLBACK_REDIRECT_URL, env).toBe(signIn);
+      expect(vars.NEXT_PUBLIC_CLERK_SIGN_UP_FALLBACK_REDIRECT_URL, env).toBe(signUp);
     }
   });
 });

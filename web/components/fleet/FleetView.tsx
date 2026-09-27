@@ -157,6 +157,9 @@ function ServiceCard({ svc, latest }: { svc: FleetService; latest: string }) {
       <div className="fl-field">
         <span className="iw-label">From a terminal</span>
         <ul className="fl-actions">
+          {(svc.status === 'waiting' || svc.machines.some((m) => m.pending)) && (
+            <li><span>Let its waiting machine serve it</span><Command command={cmd.approve(svc.id)} /></li>
+          )}
           <li><span>Every recent call</span><Command command={cmd.logs(svc.id)} /></li>
           <li><span>Check it answers</span><Command command={cmd.test(svc.id)} /></li>
           <li><span>Connect it to Claude Code</span><Command command={cmd.connect(svc.id)} /></li>
@@ -193,7 +196,7 @@ function Keys({ keys, firstService }: { keys: FleetKey[]; firstService: string }
                 <span className="fl-key-label">{k.label}</span>
                 <span className="fl-muted">
                   Reaches {reachText(k)} · created {k.created || 'earlier'}
-                  {k.expires ? ` · expires ${k.expires}` : ''}
+                  {k.expires ? ` · ${k.expired ? 'expired' : 'expires'} ${k.expires}` : ''}
                 </span>
               </div>
               <Command command={cmd.revoke(k.id)} what={`the command to revoke ${k.label}`} />

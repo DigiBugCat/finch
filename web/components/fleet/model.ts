@@ -55,8 +55,15 @@ export interface FleetKey {
   /** Every service, or the named ones. */
   reach: 'all' | string[];
   created: string;
-  /** "" when the key does not expire. */
+  /**
+   * The day the hub stops accepting the key (YYYY-MM-DD), or "" when it never
+   * will. Every key is stamped with a date at mint, but the hub only enforces
+   * it when the account turns expiry on (settings.enforceExpiry), so a date is
+   * shown only then.
+   */
   expires: string;
+  /** Past its enforced expiry date: the hub already rejects it. */
+  expired: boolean;
 }
 
 export interface OldMachine {
@@ -124,21 +131,47 @@ export function timeAgo(ts: number, now: number): string {
 /**
  * Who made a call, as a person reads it. The relay records a key's label, or
  * oauth:<Clerk user id> for a signed-in connector (on a single-user account
- * that is always the owner), "anonymous" for a public service called without a
- * key, and "dashboard" for the hub's own first-party calls (finch test / call).
+ * that is always the owner), "public" for a public service called without a
+ * key ("anonymous" when that call found the machine offline), and "dashboard"
+ * for the hub's own first-party calls (finch test / call).
  */
 export function callerLabel(raw: string): string {
   if (raw.startsWith('oauth:')) return 'you, signed in (OAuth)';
-  if (raw === 'anonymous') return 'no key (public)';
+  if (raw === 'public' || raw === 'anonymous') return 'no key (public)';
   if (raw === 'dashboard') return 'finch test or call';
   if (!raw) return 'unknown';
   return `key: ${raw}`;
 }
 
+/**
+ * "waiting" means a machine joined and needs `finch approve`. A service is
+ * "invited" from `finch add` until its first machine joins; there is nothing
+ * to approve yet, so it reads as offline (the card says no machine connected).
+ */
 function serviceStatus(state: string): ServiceStatus {
   if (state === 'online' || state === 'in_use') return 'online';
-  if (state === 'pending' || state === 'invited') return 'waiting';
+  if (state === 'pending') return 'waiting';
   return 'offline';
+}
+
+const SEMVER = /^v?(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$/;
+
+/**
+ * True only when `version` is an older release than `latest`. The hub flags a
+ * machine as outdated on any difference, which would also tell a machine on a
+ * newer or locally built finch to "update"; anything that isn't plain semver
+ * is never called old.
+ */
+export function olderThan(version: string, latest: string): boolean {
+  const a = SEMVER.exec(version.trim());
+  const b = SEMVER.exec(latest.trim());
+  if (!a || !b) return false;
+  for (let i = 1; i <= 3; i++) {
+    const d = Number(a[i]) - Number(b[i]);
+    if (d !== 0) return d < 0;
+  }
+  // Same x.y.z: a prerelease of the latest (1.8.0-rc.1) is older than it.
+  return Boolean(a[4]) && !b[4];
 }
 
 function tookLabel(ms: number): string {
@@ -162,6 +195,7 @@ export function toFleetView(raw: unknown, now: number): FleetView {
   // the stored address only if an older hub didn't send it.
   const base = str(state.serviceBase).replace(/\/+$/, '') || (address ? `https://${address}` : '');
   const latestAgent = str(state.latestAgent);
+  const enforceExpiry = settings.enforceExpiry === true;
 
   const services: FleetService[] = arr(state.services).flatMap((s) => {
     const svc = obj(s);
@@ -176,7 +210,7 @@ export function toFleetView(raw: unknown, now: number): FleetView {
         online: box.online === true,
         pending: str(box.state) === 'pending',
         lastSeen: timeAgo(num(box.lastSeenAt), now),
-        outdated: box.outdated === true,
+        outdated: olderThan(str(box.version), latestAgent),
       };
     });
     const calls: FleetCall[] = arr(svc.recentCalls).map((c) => {
@@ -214,12 +248,14 @@ export function toFleetView(raw: unknown, now: number): FleetView {
     const reach: FleetKey['reach'] = scope.all === true
       ? 'all'
       : arr(scope.services).filter((x): x is string => typeof x === 'string');
+    const expiresAt = enforceExpiry ? num(key.expiresAt) : 0;
     return [{
       id,
       label: str(key.label) || id,
       reach,
       created: str(key.created),
-      expires: isoDay(num(key.expiresAt)),
+      expires: isoDay(expiresAt),
+      expired: expiresAt > 0 && now > expiresAt,
     }];
   });
 
@@ -244,6 +280,7 @@ export const cmd = {
   connect: (id: string) => `finch connect ${shellArg(id)} --client claude-code`,
   auth: (id: string, mode: AuthMode) => `finch auth ${shellArg(id)} ${mode}`,
   rm: (id: string) => `finch rm ${shellArg(id)}`,
+  approve: (id: string) => `finch approve ${shellArg(id)}`,
   revoke: (keyId: string) => `finch keys revoke ${shellArg(keyId)}`,
   mint: (service: string) => `finch keys mint my-client --service ${shellArg(service)}`,
   update: () => 'finch update',

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { callTime, callerLabel, cmd, timeAgo, toFleetView } from '@/components/fleet/model';
+import { callTime, callerLabel, cmd, olderThan, timeAgo, toFleetView } from '@/components/fleet/model';
 import { NOW, SECRETS, emptyState, stateWithServices } from './fleet-fixtures';
 
 describe('toFleetView: mapping the hub state for /fleet', () => {
@@ -30,8 +30,10 @@ describe('toFleetView: mapping the hub state for /fleet', () => {
     ]);
 
     expect(view.keys).toEqual([
-      { id: 'k_1234abcd', label: 'claude-code', reach: 'all', created: '2026-09-20', expires: '' },
-      { id: 'k_9876fedc', label: 'nightly-script', reach: ['notes'], created: '2026-09-21', expires: '2026-12-01' },
+      { id: 'k_1234abcd', label: 'claude-code', reach: 'all', created: '2026-09-20', expires: '', expired: false },
+      // Stamped with a date at mint, but this account doesn't enforce expiry,
+      // so the hub keeps accepting the key after it: no date is shown.
+      { id: 'k_9876fedc', label: 'nightly-script', reach: ['notes'], created: '2026-09-21', expires: '', expired: false },
     ]);
 
     expect(view.oldMachines).toEqual([{ service: 'notes', machine: 'old-laptop', version: '1.7.1' }]);
@@ -83,6 +85,63 @@ describe('toFleetView: mapping the hub state for /fleet', () => {
     expect(view.keys).toEqual([]);
   });
 
+  it('shows a key’s expiry date only when the account enforces expiry', () => {
+    const state = stateWithServices();
+    const keys = state.keys as any[];
+    keys.push({ id: 'k_old', label: 'old-script', created: '2026-01-02', scope: { all: true }, expiresAt: NOW - 86_400_000 });
+    const off = toFleetView(state, NOW).keys;
+    expect(off.map((k) => [k.id, k.expires, k.expired])).toEqual([
+      ['k_1234abcd', '', false],
+      ['k_9876fedc', '', false],
+      ['k_old', '', false],
+    ]);
+
+    (state.settings as any).enforceExpiry = true;
+    const on = toFleetView(state, NOW).keys;
+    expect(on.map((k) => [k.id, k.expires, k.expired])).toEqual([
+      ['k_1234abcd', '', false], // no stamped date: never expires
+      ['k_9876fedc', '2026-12-01', false],
+      ['k_old', '2026-09-26', true],
+    ]);
+
+    // Only the literal true turns it on, like the hub's own check.
+    (state.settings as any).enforceExpiry = 'true';
+    expect(toFleetView(state, NOW).keys[1].expires).toBe('');
+  });
+
+  it('calls a machine old only when its version is older than the latest release', () => {
+    const state = stateWithServices();
+    const svc = (state.services as any[])[0];
+    // The hub flags any version that differs from its latest, newer ones too.
+    svc.boxes = [
+      { name: 'ahead', version: '1.9.0', state: 'online', online: true, outdated: true },
+      { name: 'local-build', version: 'dev', state: 'online', online: true, outdated: true },
+      { name: 'rc', version: '1.8.0-rc.1', state: 'online', online: true, outdated: true },
+      { name: 'behind', version: '1.7.10', state: 'offline', outdated: true },
+      { name: 'current', version: '1.8.0', state: 'online', online: true, outdated: false },
+    ];
+    const view = toFleetView(state, NOW);
+    expect(view.services[0].machines.map((m) => [m.name, m.outdated])).toEqual([
+      ['ahead', false],
+      ['local-build', false],
+      ['rc', true],
+      ['behind', true],
+      ['current', false],
+    ]);
+    expect(view.oldMachines.map((m) => m.machine)).toEqual(['rc', 'behind']);
+
+    // An older hub that names no latest version flags nothing.
+    delete state.latestAgent;
+    expect(toFleetView(state, NOW).oldMachines).toEqual([]);
+  });
+
+  it('reads a just-added service with no machine as offline, not waiting for approval', () => {
+    const state = stateWithServices();
+    const svc = (state.services as any[])[1];
+    svc.state = 'invited';
+    expect(toFleetView(state, NOW).services[1].status).toBe('offline');
+  });
+
   it('marks a joined-but-unapproved machine as waiting, and never online on the hub’s say-so alone', () => {
     const state = stateWithServices();
     const svc = (state.services as any[])[0];
@@ -102,8 +161,23 @@ describe('fleet helpers', () => {
     expect(callerLabel('claude-code')).toBe('key: claude-code');
     expect(callerLabel('oauth:user_2mXf8Q')).toBe('you, signed in (OAuth)');
     expect(callerLabel('anonymous')).toBe('no key (public)');
+    expect(callerLabel('public')).toBe('no key (public)');
     expect(callerLabel('dashboard')).toBe('finch test or call');
     expect(callerLabel('')).toBe('unknown');
+  });
+
+  it('compares release versions', () => {
+    expect(olderThan('1.7.1', '1.8.0')).toBe(true);
+    expect(olderThan('1.9.9', '1.10.0')).toBe(true); // numeric, not string, order
+    expect(olderThan('v1.7.1', '1.8.0')).toBe(true);
+    expect(olderThan('1.8.0', '1.8.0')).toBe(false);
+    expect(olderThan('2.0.0', '1.8.0')).toBe(false);
+    expect(olderThan('1.8.0-rc.1', '1.8.0')).toBe(true);
+    expect(olderThan('1.8.0', '1.8.0-rc.1')).toBe(false);
+    for (const odd of ['', 'dev', '1.8', 'latest', '1.8.0.1']) {
+      expect(olderThan(odd, '1.8.0'), odd).toBe(false);
+      expect(olderThan('1.7.0', odd), odd).toBe(false);
+    }
   });
 
   it('formats times in UTC, relative to the read', () => {
@@ -117,6 +191,7 @@ describe('fleet helpers', () => {
   it('builds the exact CLI commands, quoting only what needs it', () => {
     expect(cmd.logs('notes')).toBe('finch logs notes');
     expect(cmd.rm('notes')).toBe('finch rm notes');
+    expect(cmd.approve('notes')).toBe('finch approve notes');
     expect(cmd.revoke('k_1234abcd')).toBe('finch keys revoke k_1234abcd');
     expect(cmd.auth('notes', 'public')).toBe('finch auth notes public');
     expect(cmd.connect('notes')).toBe('finch connect notes --client claude-code');

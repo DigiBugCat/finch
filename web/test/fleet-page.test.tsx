@@ -162,10 +162,49 @@ describe('/fleet with services', () => {
     const keys = screen.getByRole('region', { name: 'Keys' });
     expect(keys).toHaveTextContent('claude-code');
     expect(keys).toHaveTextContent('Reaches every service · created 2026-09-20');
-    expect(keys).toHaveTextContent('Reaches notes · created 2026-09-21 · expires 2026-12-01');
+    // The account doesn't enforce expiry, so the stamped date means nothing yet.
+    expect(keys).toHaveTextContent('Reaches notes · created 2026-09-21');
+    expect(keys).not.toHaveTextContent('expire');
 
     const update = screen.getByRole('region', { name: 'Update available' });
     expect(update).toHaveTextContent('finch 1.8.0 is out. 1 machine still runs an older version: old-laptop (notes, 1.7.1)');
+  });
+
+  it('shows expiry dates when the account enforces them', async () => {
+    state = () => {
+      const s = stateWithServices();
+      (s.settings as any).enforceExpiry = true;
+      (s.keys as any[]).push({ id: 'k_old', label: 'old-script', created: '2026-01-02', scope: { all: true }, expiresAt: NOW - 86_400_000 });
+      return Response.json(s);
+    };
+    await renderPage();
+    const keys = screen.getByRole('region', { name: 'Keys' });
+    expect(keys).toHaveTextContent('Reaches notes · created 2026-09-21 · expires 2026-12-01');
+    expect(keys).toHaveTextContent('Reaches every service · created 2026-01-02 · expired 2026-09-26');
+  });
+
+  it('offers finch approve only for a service with a machine waiting for approval', async () => {
+    const { container, unmount } = await renderPage();
+    const commands = () => Array.from(container.querySelectorAll('.fl-cmd code')).map((c) => c.textContent);
+    expect(commands().filter((c) => c?.startsWith('finch approve'))).toEqual([]);
+    unmount();
+
+    state = () => {
+      const s = stateWithServices();
+      const svcs = s.services as any[];
+      svcs[0].state = 'pending';
+      svcs[0].boxes = [{ name: 'new-box', os: 'linux', version: '1.8.0', state: 'pending', connected: true, online: false }];
+      svcs[1].state = 'invited'; // just added, no machine yet: nothing to approve
+      return Response.json(s);
+    };
+    const again = await renderPage();
+    const notes = within(again.container).getByRole('article', { name: 'notes' });
+    expect(notes).toHaveTextContent('Waiting for approval');
+    expect(notes).toHaveTextContent('waiting for approval');
+    expect(within(notes).getByText('finch approve notes')).toBeInTheDocument();
+    const demo = within(again.container).getByRole('article', { name: 'demo' });
+    expect(demo).toHaveTextContent('Offline');
+    expect(demo).not.toHaveTextContent(/approv/i);
   });
 
   it('never renders a key value, hash, last digits, email, IP or call body', async () => {
@@ -247,6 +286,23 @@ describe('/fleet when something is off', () => {
     authMock.mockResolvedValue({ userId: null });
     await expect(FleetPage()).rejects.toMatchObject({ to: '/sign-in?redirect_url=%2Ffleet' });
     expect(hubCalls).toEqual([]);
+  });
+
+  it('shows the unavailable panel, not a sign-in loop, when the hub refuses the web', async () => {
+    // A signed-in person, but the hub answers 401 (say, a service secret that
+    // doesn't match during a rotation). Sign-in would bounce straight back.
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    for (const path of ['/api/member-context', '/api/state']) {
+      const hub = vi.fn(async (url: string, init: RequestInit = {}) => {
+        if (url.endsWith(path)) return Response.json({ error: 'unauthorized' }, { status: 401 });
+        return fakeHub(url, init);
+      });
+      vi.stubGlobal('fetch', hub);
+      const { unmount } = await renderPage();
+      expect(screen.getByRole('heading', { name: "finch couldn't read your fleet just now" }), path).toBeInTheDocument();
+      expect(screen.getByText('The hub didn’t answer. Your services are unaffected; this page only reads.')).toBeInTheDocument();
+      unmount();
+    }
   });
 
   it('says so calmly when the hub fails, and offers the CLI instead', async () => {
