@@ -194,7 +194,7 @@ func runLogin(c *cli, args []string) error {
 		return usageError("%v", err)
 	}
 	if token != "" {
-		if fromArgv {
+		if fromArgv && !c.json { // --json keeps stderr for the one error envelope
 			fmt.Fprintln(c.stderr, "finch: warning: the CLI token was passed on the command line, so it lands in the process table (/proc/<pid>/cmdline) and shell/SSH history")
 			fmt.Fprintln(c.stderr, "finch:          prefer:  finch token | ssh newbox 'finch login --token -'   (or set FINCH_CLI_TOKEN)")
 		}
@@ -299,38 +299,38 @@ func loginBlocking(c *cli, hub string, headless bool) error {
 	if err != nil {
 		return err
 	}
-	c.printf("\n  To finish login, open this page on any device (your phone or laptop\n  is fine — you do NOT need a browser on this machine):\n\n      %s\n\n  and confirm this code:  %s\n\n", p.VerificationURIComplete, p.UserCode)
+	c.live("\n  To finish login, open this page on any device (your phone or laptop\n  is fine — you do NOT need a browser on this machine):\n\n      %s\n\n  and confirm this code:  %s\n\n", p.VerificationURIComplete, p.UserCode)
 	if !headless {
 		openURL(p.VerificationURIComplete)
 	}
-	c.printf("  Waiting for approval")
+	c.live("  Waiting for approval")
 	for !p.expired() {
 		loginSleep(time.Duration(p.Interval) * time.Second)
 		status, token, email, err := pollDeviceLogin(p)
 		if err != nil {
 			var ce *cliError
 			if asCLIError(err, &ce) && ce.Code == codeUpstream {
-				c.printf(".") // transient: keep waiting
+				c.live(".") // transient: keep waiting
 				continue
 			}
 			return err
 		}
 		switch status {
 		case "approved":
-			c.printf("  ✓\n")
+			c.live("  ✓\n")
 			account, err := completeLogin(hub, token, email)
 			if err != nil {
 				return err
 			}
 			return reportLoggedIn(c, hub, account)
 		case "expired":
-			c.printf("\n")
+			c.live("\n")
 			return newCLIError(codeExpired, "finch login", "the login code expired before it was approved")
 		default:
-			c.printf(".")
+			c.live(".")
 		}
 	}
-	c.printf("\n")
+	c.live("\n")
 	return newCLIError(codeExpired, "finch login", "timed out waiting for approval")
 }
 

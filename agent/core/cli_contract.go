@@ -99,9 +99,20 @@ type cli struct {
 	json   bool
 }
 
-// printf writes human output. With --json the stdout stream is reserved for the
-// payload, so human progress text goes to stderr instead.
+// printf writes human output. With --json it writes nothing: stdout is reserved
+// for the payload and stderr for the one-line error envelope, so an agent can
+// parse either stream whole. Anything a --json caller needs belongs in the
+// payload or the error message.
 func (c *cli) printf(format string, a ...any) {
+	if c.json {
+		return
+	}
+	fmt.Fprintf(c.stdout, format, a...)
+}
+
+// live writes text a human must see while the command is still running (the
+// blocking login's link and code). With --json it goes to stderr.
+func (c *cli) live(format string, a ...any) {
 	w := c.stdout
 	if c.json {
 		w = c.stderr

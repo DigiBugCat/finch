@@ -141,8 +141,9 @@ type fakeHub struct {
 	authCalls   []string // "id=mode"
 	callMethods []string
 	// call answers /api/cli/call for a known service: status + body.
-	call func(method string) (int, string, string)
-	down bool // every authed route answers 503
+	call     func(method string) (int, string, string)
+	down     bool // every authed route answers 503
+	authDown bool // POST /api/cli/auth answers 503
 }
 
 func newFakeHub(t *testing.T) *fakeHub {
@@ -273,15 +274,21 @@ func (h *fakeHub) serve(w http.ResponseWriter, r *http.Request) {
 		if !h.body(w, r, &b) {
 			return
 		}
-		if !slugRE.MatchString(b.Name) {
+		// The real hub slugifies the name into the service id (lowercase).
+		id := strings.ToLower(b.Name)
+		if !slugRE.MatchString(id) {
 			writeJSON(w, 400, map[string]string{"error": "bad name"})
 			return
 		}
-		h.services[b.Name] = "key"
-		writeJSON(w, 200, map[string]any{"id": b.Name, "ticket": "tkt_" + b.Name, "url": h.srv.URL + "/" + b.Name + "/mcp", "install": "x", "expiresAt": 1})
+		h.services[id] = "key"
+		writeJSON(w, 200, map[string]any{"id": id, "ticket": "tkt_" + id, "url": h.srv.URL + "/" + id + "/mcp", "install": "x", "expiresAt": 1})
 	case "POST /api/cli/auth":
 		var b struct{ Service, Mode string }
 		if !h.body(w, r, &b) {
+			return
+		}
+		if h.authDown {
+			writeJSON(w, 503, map[string]string{"error": "tenant store unavailable"})
 			return
 		}
 		if _, ok := h.services[b.Service]; !ok {

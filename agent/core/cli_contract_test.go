@@ -323,6 +323,33 @@ func TestAddPublicPrintsURL(t *testing.T) {
 	}
 }
 
+// With --json, a command that printed progress before failing must still leave
+// exactly the one error envelope on stderr (decodeJSONError insists on one
+// line), and its success payload alone on stdout.
+func TestJSONModeKeepsStderrToTheEnvelope(t *testing.T) {
+	home := isolate(t)
+	h := newFakeHub(t)
+	loginTo(t, h)
+	cfg := filepath.Join(home, "finch.yml")
+	h.set(func(h *fakeHub) { h.authDown = true })
+
+	// "Notes" is registered as "notes" (a human-mode note), then --public fails.
+	stdout, stderr, code := finch(t, "add", "Notes", "--service", "http://127.0.0.1:8000", "--public", "--config", cfg, "--json")
+	if code != 1 || stdout != "" {
+		t.Fatalf("exit=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if env := decodeJSONError(t, stderr); env.Error.Code != "UPSTREAM" || !strings.Contains(env.Error.Message, "notes") {
+		t.Fatalf("envelope=%+v", env.Error)
+	}
+
+	// The same note still reaches a human.
+	h.set(func(h *fakeHub) { h.authDown = false })
+	stdout, _, code = finch(t, "add", "Api", "--service", "http://127.0.0.1:9000", "--config", cfg)
+	if code != 0 || !strings.Contains(stdout, `"Api" was registered as "api"`) {
+		t.Fatalf("human add: exit=%d stdout=%q", code, stdout)
+	}
+}
+
 func TestTestCommandJSON(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
