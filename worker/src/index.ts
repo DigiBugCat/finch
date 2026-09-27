@@ -21,6 +21,7 @@ import { RouterDO, routerLookup } from "./router-do";
 import { AviaryEnrollmentDO } from "./aviary-enrollment-do";
 import { DirectoryDO } from "./directory-do";
 import { handleApi, isApiPath } from "./api";
+import { installScript } from "./install-script";
 import {
   hashKey,
   verifyToken,
@@ -1176,63 +1177,4 @@ async function relayMcp(
   );
 
   return res;
-}
-
-/** The `finch` agent installer served at GET /install. The enroll one-liner is
- *  `curl -fsSL <host>/install | sh && finch join --ticket <tkt>`, so this script
- *  only needs to land the `finch` binary on PATH — the operator runs the
- *  `finch join --ticket …` half itself. Detects OS/arch and fetches the matching
- *  release binary from the hub-relative /releases path, then installs it. Kept
- *  POSIX-sh so it runs under `sh` on macOS and Linux. */
-function installScript(base: string): string {
-  return `#!/bin/sh
-# finch agent installer — run via: curl -fsSL ${base}/install | sh
-# Installs the 'finch' relay agent, then run:
-#   finch join --hub ${base} --ticket <ticket> --upstream http://127.0.0.1:8000
-set -eu
-
-HUB="${base}"
-BIN_DIR="\${FINCH_BIN_DIR:-/usr/local/bin}"
-
-os="$(uname -s | tr '[:upper:]' '[:lower:]')"
-arch="$(uname -m)"
-case "$arch" in
-  x86_64|amd64) arch="amd64" ;;
-  arm64|aarch64) arch="arm64" ;;
-  armv7l|armv7) arch="armv7" ;;
-  armv6l|armv6) arch="armv6" ;;
-  *) echo "finch: unsupported architecture: $arch" >&2; exit 1 ;;
-esac
-case "$os" in
-  darwin|linux) ;;
-  *) echo "finch: unsupported OS: $os" >&2; exit 1 ;;
-esac
-
-url="$HUB/releases/finch-\${os}-\${arch}"
-tmp="$(mktemp)"
-echo "finch: downloading $url"
-if command -v curl >/dev/null 2>&1; then
-  curl -fsSL "$url" -o "$tmp"
-elif command -v wget >/dev/null 2>&1; then
-  wget -qO "$tmp" "$url"
-else
-  echo "finch: need curl or wget to install" >&2; exit 1
-fi
-chmod +x "$tmp"
-
-if [ -w "$BIN_DIR" ]; then
-  mv "$tmp" "$BIN_DIR/finch"
-else
-  echo "finch: installing to $BIN_DIR (needs sudo)"
-  sudo mv "$tmp" "$BIN_DIR/finch"
-fi
-
-echo "finch: installed to $BIN_DIR/finch"
-echo ""
-echo "  Next:   finch login --hub $HUB     # log in (once)"
-echo "  Then:   finch add <name> --service http://127.0.0.1:8000 && finch run"
-echo ""
-echo "  Driving finch with an AI agent? Run 'finch guide' for a full manual,"
-echo "  or just tell it: \\"use finch — run 'finch guide' first.\\""
-`;
 }
