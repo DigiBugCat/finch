@@ -24,6 +24,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -1137,6 +1138,14 @@ func runAdd(c *cli, args []string) error {
 	// lands in the manifest), then append a ticketless ingress rule.
 	statePath := filepath.Join(credDir, id+".json")
 	if _, _, err := enrollToState(cred.Hub, box, ticket, statePath); err != nil {
+		var pe *persistError
+		if errors.As(err, &pe) {
+			// The join succeeded: the hub has the service and the ticket is
+			// spent. Retrying `finch add` would register "<name>-2" beside it.
+			return newCLIError(codeInternal, "finch rm "+id,
+				"the hub registered %q, but saving its credential locally failed (%v). Nothing was added to %s. Make %s writable, then run 'finch rm %s' and 'finch add %s --service %s' again",
+				id, pe, *configPath, filepath.Dir(pe.Path), id, wantPath, *service)
+		}
 		return newCLIError(codeUpstream, "", "enroll %s: %v", id, err)
 	}
 	if err := appendIngress(*configPath, cred.Hub, id, *service, box); err != nil {
@@ -1201,6 +1210,14 @@ func runEnroll(c *cli, args []string) error {
 	}
 	id, statePath, err := enrollWithTicket(*hub, *box, ticketVal, expandHome(*credDir))
 	if err != nil {
+		var pe *persistError
+		if errors.As(err, &pe) {
+			// The join succeeded: the hub registered the box and the one-shot
+			// ticket is spent, so re-running this command cannot succeed.
+			return newCLIError(codeInternal, "",
+				"the hub registered %q, but saving its credential locally failed (%v). The ticket is used up: make %s writable (or pick another --credentials-dir), remove %q in the dashboard (or with 'finch rm %s' from a logged-in box), and enroll again with a new ticket",
+				pe.Service, pe, filepath.Dir(pe.Path), pe.Service, pe.Service)
+		}
 		return newCLIError(codeUpstream, "", "enroll failed: %v", err)
 	}
 	if c.json {

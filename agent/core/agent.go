@@ -444,6 +444,22 @@ func enrollToState(hub, box, ticket, statePath string) (*agentState, *joinResp, 
 	return st, jr, nil
 }
 
+// persistError is a LOCAL failure to save the credential a successful /join
+// returned (unwritable credentials-dir, full disk). The hub has already
+// consumed the one-shot ticket and registered the box, so it is not a hub
+// failure and retrying the join cannot fix it.
+type persistError struct {
+	Path    string
+	Service string
+	Err     error
+}
+
+func (e *persistError) Error() string {
+	return fmt.Sprintf("persisting credential to %s: %v", e.Path, e.Err)
+}
+
+func (e *persistError) Unwrap() error { return e.Err }
+
 // persistJoin writes the credential a successful /join returned to statePath
 // (0600). Only /join returns the long-lived refresh token, so it must be present.
 func persistJoin(hub string, jr *joinResp, statePath string) (*agentState, error) {
@@ -452,7 +468,7 @@ func persistJoin(hub string, jr *joinResp, statePath string) (*agentState, error
 	}
 	st := &agentState{Hub: hub, Tenant: jr.Tenant, Service: jr.Service, Box: jr.Box, RefreshToken: jr.RefreshToken}
 	if err := saveState(statePath, st); err != nil {
-		return nil, fmt.Errorf("persisting credential to %s: %w", statePath, err)
+		return nil, &persistError{Path: statePath, Service: jr.Service, Err: err}
 	}
 	return st, nil
 }
