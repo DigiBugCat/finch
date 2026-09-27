@@ -189,8 +189,8 @@ export default function HeroPlate() {
           <div className="fg-hero-eyebrow iw-label">
             <span className="iw-label-indigo">Plate I</span>
             <span>Free</span>
+            <span>Open source (MIT)</span>
             <span>macOS and Linux</span>
-            <span>MIT</span>
           </div>
           <h1 id="fg-hero-title">Localhost, with a front door.</h1>
           <p>

@@ -41,13 +41,29 @@ const read = (p: string) => readFileSync(resolve(root, p), 'utf8');
 
 describe('site metadata', () => {
   it('uses the field-guide title and description, for Open Graph too', () => {
-    expect(metadata.title).toBe('finch — localhost, with a front door');
+    // The landing's title, and a template for every other page ("Page not
+    // found · finch"); the docs layout sets its own "· finch docs" template.
+    expect(metadata.title).toEqual({ default: 'finch — localhost, with a front door', template: '%s · finch' });
     expect(metadata.description).toMatch(/^finch gives the MCP server on your Mac or Linux machine a stable https address/);
     expect(metadata.openGraph).toMatchObject({
       title: 'finch — localhost, with a front door',
       description: metadata.description,
-      url: 'https://finchmcp.com',
+      siteName: 'finch',
     });
+    // No og:url pinned to the home page: every page inherits openGraph, and a
+    // docs page must not claim to be the landing.
+    expect(metadata.openGraph).not.toHaveProperty('url');
+    // The share image is large, so ask for the large card.
+    expect(metadata.twitter).toMatchObject({ card: 'summary_large_image' });
+  });
+
+  it('ships a real share image with alt text', () => {
+    const png = readFileSync(resolve(root, 'app/opengraph-image.png'));
+    expect(png.readUInt32BE(0)).toBe(0x89504e47); // PNG signature
+    // 1200 x 630, the size every link preview expects.
+    expect([png.readUInt32BE(16), png.readUInt32BE(20)]).toEqual([1200, 630]);
+    expect(png.length).toBeLessThan(300 * 1024);
+    expect(read('app/opengraph-image.alt.txt').trim()).toMatch(/^finch: /);
   });
 });
 
@@ -71,12 +87,42 @@ describe('fonts', () => {
 });
 
 describe('site icon', () => {
-  it('declares /icon.svg as the only icon, with no file-convention icon beside it', () => {
-    expect(metadata.icons).toEqual({ icon: [{ url: '/icon.svg', type: 'image/svg+xml' }] });
+  it('declares each icon once: favicon.ico, the SVG and the iOS home-screen PNG', () => {
+    expect(metadata.icons).toEqual({
+      icon: [
+        { url: '/favicon.ico', sizes: '48x48' },
+        { url: '/icon.svg', type: 'image/svg+xml' },
+      ],
+      apple: [{ url: '/apple-touch-icon.png', sizes: '180x180' }],
+    });
     expect(read('public/icon.svg')).toMatch(/<svg[\s>]/);
     // Next serves app/favicon.ico, app/icon.* and app/apple-icon.* on its own,
-    // adding a second icon to every page's <head>.
+    // adding a second copy of each icon to every page's <head>.
     const conventional = readdirSync(resolve(root, 'app')).filter((f) => /^(favicon|icon|apple-icon)\./.test(f));
     expect(conventional).toEqual([]);
+  });
+
+  it('serves a real /favicon.ico (browsers ask for it whatever the page says)', () => {
+    const ico = readFileSync(resolve(root, 'public/favicon.ico'));
+    // ICONDIR: reserved 0, type 1 (icon), then the image count.
+    expect([ico.readUInt16LE(0), ico.readUInt16LE(2)]).toEqual([0, 1]);
+    const count = ico.readUInt16LE(4);
+    const sizes: number[] = [];
+    for (let i = 0; i < count; i++) {
+      const entry = 6 + i * 16;
+      const size = ico.readUInt8(entry);
+      const bytes = ico.readUInt32LE(entry + 8);
+      const offset = ico.readUInt32LE(entry + 12);
+      // Each image is a whole PNG inside the file.
+      expect(offset + bytes).toBeLessThanOrEqual(ico.length);
+      expect(ico.readUInt32BE(offset)).toBe(0x89504e47);
+      expect(ico.readUInt32BE(offset + 16)).toBe(size);
+      sizes.push(size);
+    }
+    expect(sizes).toEqual([16, 32, 48]);
+
+    const apple = readFileSync(resolve(root, 'public/apple-touch-icon.png'));
+    expect(apple.readUInt32BE(0)).toBe(0x89504e47);
+    expect([apple.readUInt32BE(16), apple.readUInt32BE(20)]).toEqual([180, 180]);
   });
 });

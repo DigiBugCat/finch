@@ -17,3 +17,8 @@ export const MANUAL_STEPS = [
   'finch add notes --service http://127.0.0.1:8000',
   'finch service install',
 ] as const;
+
+/** The account address the examples use. Real ones look like this: finch
+ *  picks a word, a bird and a number for each account. */
+export const EXAMPLE_SLUG = 'sunny-wren-42';
+export const EXAMPLE_URL = `https://${EXAMPLE_SLUG}.finchmcp.com/notes/mcp`;
