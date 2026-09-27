@@ -765,7 +765,7 @@ export default {
  *  failover). Uses the UNIFIED liveness rule (connected AND not pending) so the
  *  picker and the dashboard agree. Reads TenantDO getState. Empty if none is
  *  online; null if the tenant has no such service. */
-async function pickHealthyPool(
+export async function pickHealthyPool(
   env: Env,
   tenant: string,
   service: string,

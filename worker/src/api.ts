@@ -16,7 +16,7 @@
 // for exactly that id. There are no shared members, invitations, workspaces,
 // ACL rules, or per-user app grants.
 
-import { rateLimitOk, clientIp, json, tenantOp, boxStub, type Env } from "./index";
+import { rateLimitOk, clientIp, json, tenantOp, boxStub, pickHealthyPool, type Env } from "./index";
 import {
   serviceOk,
   signToken,
@@ -36,6 +36,7 @@ import {
   routerDeviceDescribe,
 } from "./router-do";
 import { signAssertion, verifyAssertionPayload } from "./auth";
+import { cliMcpCall, type McpSend } from "./cli-call";
 
 async function tenantOpRaw(env: Env, tenant: string, op: string, args: Record<string, unknown> = {}): Promise<Response> {
   const id = env.TENANT.idFromName(tenant);
@@ -463,31 +464,64 @@ async function handleApiInner(
       return json(200, await tenantOp(env, cliTenant, "revokeCliTokens"));
     }
 
-    // POST /api/cli/call {service, method, params} — relay an MCP call to the
-    // tenant's own service, so an agent can test it from the CLI (no throwaway
-    // finch_ key). Relays via the SELF binding using a first-party service
-    // assertion for cliTenant (relayMcp's trusted internal path).
+    // POST /api/cli/call {service, method, params} — run one MCP request
+    // against the tenant's own service, so an agent can test it from the CLI
+    // (no throwaway finch_ key). cli-call.ts speaks real MCP (initialize
+    // handshake, SSE or JSON replies, session id, 2026-07-28 stateless
+    // fallback) and answers with the single JSON-RPC response. Every HTTP
+    // exchange goes via the SELF binding using a first-party service assertion
+    // for cliTenant (relayMcp's trusted internal path).
     if (path === "/api/cli/call" && method === "POST") {
       const b = await readJson(req);
       const service = String(b.service || "").trim();
       const rpcMethod = String(b.method || "").trim();
       if (!service || !rpcMethod) return json(400, { error: "service and method required" });
+      const params = b.params ?? {};
+      if (typeof params !== "object" || params === null || Array.isArray(params)) {
+        return json(400, { error: "params must be a JSON object" });
+      }
+      // One assertion covers the whole exchange: it outlives the call's own
+      // deadline (CLI_CALL_DEADLINE_MS) with margin.
       const exp = Math.floor(Date.now() / 1000) + 120;
       const assertion = await signAssertion({ tenant: cliTenant, exp }, env.FINCH_SERVICE_SECRET);
       const scheme = isLoopbackHost(host) ? "http" : "https";
-      const res = await env.SELF.fetch(`${scheme}://${host}/${encodeURIComponent(service)}/mcp`, {
-        method: "POST",
-        headers: {
-          "X-Finch-Service": env.FINCH_SERVICE_SECRET,
-          "X-Finch-Auth": assertion,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: rpcMethod, params: b.params ?? {} }),
-      });
-      return new Response(await res.text(), {
-        status: res.status,
-        headers: { "content-type": res.headers.get("content-type") ?? "application/json" },
-      });
+      // SESSION AFFINITY: the exchange is several HTTP requests and a stateful
+      // server's Mcp-Session-Id only exists on the box that answered
+      // initialize, but the load-balanced /<svc>/mcp route picks a box per
+      // request. So pin every request to one box via /<svc>/<box>/mcp. Until
+      // the first real answer, a stale pick (the DO's X-Finch-Offline 503)
+      // moves on to the next healthy box, like relayMcp's own failover.
+      const pool = await pickHealthyPool(env, cliTenant, service);
+      if (!pool) return json(404, { error: "no such service", service });
+      if (!pool.length) return json(503, { error: "service offline", service });
+      let pick = 0;
+      let committed = false;
+      const send: McpSend = async (init) => {
+        while (true) {
+          const url =
+            `${scheme}://${host}/${encodeURIComponent(service)}` +
+            `/${encodeURIComponent(pool[pick])}/mcp`;
+          const res = await env.SELF.fetch(url, {
+            method: init.method,
+            headers: {
+              ...init.headers,
+              "X-Finch-Service": env.FINCH_SERVICE_SECRET,
+              "X-Finch-Auth": assertion,
+            },
+            body: init.body,
+            signal: init.signal,
+          });
+          const offline = res.status === 503 && res.headers.get("X-Finch-Offline") === "1";
+          if (offline && !committed && pick + 1 < pool.length) {
+            await res.body?.cancel().catch(() => {});
+            pick++;
+            continue;
+          }
+          committed = true;
+          return res;
+        }
+      };
+      return cliMcpCall(send, rpcMethod, params, { service });
     }
 
     return json(404, { error: "unknown CLI route", path });
