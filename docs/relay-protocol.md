@@ -1,224 +1,108 @@
-# finch relay protocol v2 — streaming, MCP-unaware (design + plan)
+# Relay protocol
 
-Status: **shipped, with a deliberately simpler design than this spec.** The
-goals are LIVE: a streaming, MCP-unaware relay (`head` → `chunk…` → `end` over
-per-request ids, with pause/resume `WINDOW` backpressure). Several of this spec's
-mechanisms were **superseded by simpler choices** that are sufficient for MCP —
-recorded here so the ambition isn't mistaken for a backlog:
+Status: **current.** The wire format between the hub and the `finch` agent on
+your machine. The TypeScript side is `worker/src/relay-frames.ts` and
+`worker/src/box-do.ts`; the Go side is `agent/core/relay_loop.go` and
+`agent/core/agent.go`. The original, more ambitious v2 plan (binary frames,
+multiplexing several local servers on one socket, session affinity) is kept in
+[`archive/relay-protocol-v2-plan.md`](archive/relay-protocol-v2-plan.md); it
+was not built as written.
 
-- **Multi-server per box → one connection per appliance** (not `OPEN.route`
-  multiplexing on a single socket). Each `finch.toml` `[[ingress]]` rule is its
-  own appliance with its own outbound WebSocket. Idle appliances hibernate
-  independently (~$0), so the extra sockets cost nothing at rest — and the wire
-  stays trivially simple. **This is the design, not a gap.**
-- **No load balancing / session affinity.** An appliance is served by one box;
-  finch is not a load-balancer and won't pin `Mcp-Session-Id` across a multi-box
-  pool. (Running >1 box for one appliance is best-effort failover only, no
-  session stickiness.) **Out of scope by choice.**
-- **Request body is buffered, not streamed.** MCP requests are small JSON-RPC
-  POSTs; the *response* is what gets large (SSE, long-running tools), and that
-  streams. Buffering a tiny request is correct and cheap — request-body
-  streaming buys nothing for MCP.
-- **JSON frames with base64 bodies** (not binary msgpack/CBOR). Binary-safe
-  today; the ~33% body overhead is a future micro-optimization, not a
-  correctness gap.
+## Shape
 
-**Genuinely future (optional, not blocking anything):** a stdio↔Streamable-HTTP
-bridge so boxes can host MCP servers that speak stdio instead of HTTP. Until
-then, `service` is an HTTP URL.
+The relay is an HTTP tunnel that does not parse MCP. It moves an HTTP request
+from a public caller to your local server and streams the response back, so
+unmodified Streamable-HTTP servers (FastMCP, the MCP SDKs) work, including SSE,
+progress notifications and long-running tools.
 
-## Privacy boundary
-
-The production public hop is HTTPS/TLS and the agent's outbound WebSocket is
-WSS/TLS. These are transport-encryption boundaries, not E2EE: Cloudflare
-terminates the connections and the relay processes payload plaintext while
-forwarding it. Ordinary request and response bytes must remain transient and
-must never be placed in application logs, Durable Object storage, call history,
-traces, or metrics. Retained per-call state is restricted to the operational
-metadata documented in [`privacy.md`](privacy.md).
-
-The wire-format reference below stands; treat the OPEN.route / SessionDO /
-binary-frame sections as the original v2 ambition, superseded as noted above.
-
-## Why
-
-The relay today (`worker/src/appliance-do.ts`, `agent/main.go`) is **MCP-aware and
-buffered**, and that is the root of every fidelity gap:
-
-- `appliance-do.ts` returns **501** for any request whose `Accept` contains
-  `text/event-stream` — which a spec-compliant MCP client sends on *every* POST,
-  including `initialize`. So real Streamable-HTTP clients can't even handshake.
-- The whole request and response are buffered as one JSON `frame` (`req.text()`
-  on the way in, `io.ReadAll` on the box) — so SSE, progress notifications,
-  server-initiated sampling/elicitation, and long-running ("thinking") tools
-  cannot stream and **deadlock** when the server tries to talk back mid-call.
-- A hard **30s** cap (`REQUEST_TIMEOUT_MS`) + 28s on the agent + a 4 MiB body cap
-  kill any long or large call. These are self-imposed — Cloudflare puts no
-  wall-clock limit on a Worker/DO blocked on I/O.
-
-Fix: **stop parsing MCP.** Make the relay a protocol-agnostic, multiplexed,
-raw-HTTP **byte tunnel** (the cloudflared/ngrok shape, via yamux-style framing).
-Then unmodified FastMCP + unmodified MCP clients "just work" because nothing in
-the middle understands MCP — it moves bytes of an HTTP stream, full-duplex.
-
-## Model
-
-One WebSocket per box (unchanged: the agent dials OUT to
-`/<appliance>/<machine>/_connect`, the `ApplianceDO` accepts it; hibernation and
-the connect-token gate are preserved). Over that one socket we multiplex many
-independent, full-duplex **logical streams** (`sid`), one per in-flight HTTP
-request. Each stream carries a **raw HTTP request/response** — headers as opaque
-pairs, body as opaque bytes. Server-initiated traffic (a sampling request the
-box's server sends back mid-call) is just another stream interleaved on the same
-socket, so bidirectionality is free.
-
-```
-client → Worker → ApplianceDO ── OPEN(sid,route,method,path,headers) ──▶ finchd
-                              ── DATA(sid, up, bytes)… END(sid, up) ────▶
-         (returns Response    ◀── HEAD(sid, status, headers) ───────────  (emitted
-          the instant HEAD    ◀── DATA(sid, down, bytes)… ───────────────  the INSTANT
-          arrives; streams)   ◀── END(sid, down) ─────────────────────────  the app
-                              ◀── (or) OPEN(sid', …) a server→client req     produces it)
+```text
+caller ── HTTPS ──▶ hub Worker ──▶ BoxDO ══ WSS ══ finch agent ── HTTP(S) ──▶ local server
+                   auth, strip           one socket per
+                   credentials           service per machine
 ```
 
-## Frame format
+- **One WebSocket per service per machine.** Each rule in `finch.yml` is its
+  own connection, dialed out by the agent to
+  `wss://<host>/<service>/<machine>/_connect?ct=<connect token>`. Idle sockets
+  hibernate, so extra services cost nothing at rest.
+- **Many requests per socket.** Each relayed request has its own string `id`;
+  frames for different ids interleave.
+- **Request bodies are buffered** (up to 4 MiB); **response bodies stream.**
+- **No session affinity.** A service served by several machines gets
+  best-effort failover, not `Mcp-Session-Id` stickiness.
 
-Binary, length-prefixed (NOT JSON strings — that's what makes today's bodies
-UTF-8-lossy and 4 MiB-capped). One WS message carries one frame. Wire encoding:
+## Frames
 
-```
-struct frame {
-  u8   type;        // 1=OPEN 2=HEAD 3=DATA 4=END 5=RESET 6=WINDOW
-  u32  sid;         // stream id (odd = client-initiated, even = server-initiated)
-  u8   flags;       // type-specific (e.g. DATA dir: 0=up/req-side, 1=down/res-side)
-  u32  len;         // length of payload
-  u8[] payload;     // type-specific (see below)
-}
-```
+One WebSocket text message is one frame: a UTF-8 JSON object with `id` and
+`type`. Body bytes travel as standard, padded base64.
 
-| Frame  | Direction        | Payload | Meaning |
-|--------|------------------|---------|---------|
-| OPEN   | hub→box, box→hub | `{route, method, path, headers:[[k,v]…]}` (msgpack/CBOR) | a request begins on `sid`. `route` selects the local server (multi-server-per-box). `headers` is a **list of pairs** (preserves duplicates — today's map collapses them). |
-| HEAD   | box→hub, hub→box | `{status, headers:[[k,v]…]}` | response status+headers, emitted **before** the body — this is what unblocks SSE. The peer returns `new Response(stream, {status, headers})` immediately. |
-| DATA   | either           | raw bytes | a body chunk for `sid` in the `flags` direction. Binary-safe. A large body rides as many sub-32-MiB DATA frames. |
-| END    | either           | — | half-close one direction of `sid` (EOF on that body). |
-| RESET  | either           | `{code}` | abort `sid` (client disconnect → propagate `http.disconnect`; app error). |
-| WINDOW | either           | `{credits}` | grant N more bytes of send-credit for `sid` (flow control — see below). |
+| Frame | Direction | Fields | Meaning |
+|---|---|---|---|
+| `req` | hub → agent | `method`, `path`, `headers` (name → value), `body` (string), optional `assertion` | A request begins. `path` is relative to the service and may include a query. `assertion` is the hub-minted caller JWS, delivered on its own field. |
+| `head` | agent → hub | `status`, `headers` (ordered `[name, value]` pairs, lowercase, duplicates kept) | Sent as soon as the local server's status and headers are known, before any body. |
+| `chunk` | agent → hub | `data` (base64) | A slice of the response body. |
+| `end` | agent → hub | | The response body is complete. |
+| `err` | agent → hub | `status`, `message` | The request failed before `head` (for example the local server is down, or the path was refused). |
+| `reset` | either | optional `message` | Abort one in-flight request (caller disconnected, stream error). |
+| `window` | hub → agent | `credits` | Flow control for one `id`: `0` pauses `chunk` frames, a positive value resumes them. |
 
-`sid` lifecycle: allocate on OPEN → DATA*/HEAD/DATA* → END each direction →
-freed. Client-initiated `sid` are odd, server-initiated (sampling/elicitation)
-are even, so the two sides never collide. PING/PONG stay WS-protocol control
-frames via `setWebSocketAutoResponse` (free, no DO wake) — keep as today.
+Per id, the agent sends `head`, then zero or more `chunk`, then `end`, in that
+order, or a single `err` instead of `head`. Keepalive uses WebSocket
+ping/pong, which does not wake a hibernated Durable Object.
 
-## Flow control (mandatory, not optional)
+The golden vectors in `worker/test/relay-vectors.json` are round-tripped by
+both codecs (`worker/test/relay-codec.test.ts`,
+`agent/core/relay_vectors_test.go`). Change a shape there first.
 
-32 MiB is a per-**message** cap, not a window. Without per-stream credits, one
-slow public reader head-of-line-blocks the socket or OOMs the shared DO heap
-across all `sid`. So: each `sid` has a bounded send window; the receiver grants
-`WINDOW(credits)` as it drains DATA to the public client; the sender pauses that
-stream's body when credits hit zero. This is the one piece today's coarse
-one-frame design can't get wrong because it never streams — and the one the v2
-design must get right or the deadlock just moves from "SSE buffering" to "window
-starvation."
+## Flow control, timeouts and limits
 
-## Timeouts — idle, not total
+| Limit | Value | Where |
+|---|---|---|
+| Request body | 4 MiB (413 above it) | Worker and `BoxDO` |
+| Request bodies being read at once, per socket | 8 MiB reserved | `BoxDO` |
+| Concurrent requests per socket | 32 | `BoxDO` |
+| Response buffer high-water mark | 1 MiB per request; above it the hub sends `window {credits:0}` | `BoxDO` |
+| Hard response buffer caps, for an agent that ignores the pause | 8 MiB unread per request, 32 MiB per socket (the request is reset) | `BoxDO` |
+| Time to `head` | 120 seconds | `BoxDO` |
+| Idle time between frames after `head` | 300 seconds | `BoxDO` |
+| Response headers | 64 KiB | `BoxDO` |
 
-Delete `REQUEST_TIMEOUT_MS` (30s) and the agent's 28s `context.WithTimeout`. Gate
-each `sid` on an **idle** timeout (≥300s, reset on any DATA/HEAD frame). A tool
-that emits a progress event every ~15s stays alive indefinitely; a genuinely
-silent stream is reaped. Cloudflare allows this — an actively-streaming Worker
-response has no duration limit.
+There is no total duration cap: a tool that keeps sending progress events stays
+alive.
 
-## Header fidelity
+## Routing
 
-The relay forwards request headers byte-for-byte except those the hub accepts a
-credential in: `Authorization`, `Proxy-Authorization`, every `X-Finch-*` header
-(the namespace is hub-reserved; `X-Finch-Assertion` is minted afterwards), and
-any stale cookie pair from the retired browser login wall (`finch_session`,
-`__Host-finch_session`) inside `Cookie`. The scrub is by **name**, never by
-value — MCP 2026-07-28's `Mcp-Name` / `Mcp-Param-*` mirror the JSON-RPC body,
-and deleting one because a tool or argument happened to contain `finch_` makes
-the server reject the call as a header/body mismatch (400, -32020). Unknown
-`Mcp-*` headers, and `GET` / `DELETE`, pass through untouched.
+- `/<service>/…` picks a healthy machine for the service. If the pick answers
+  with the Durable Object's `X-Finch-Offline` 503, the hub tries the next one.
+- `/<service>/<machine>/…` pins a machine when the second segment names a
+  registered machine of that service.
+- `/<service>/<machine>/_connect` is reserved for the agent's socket.
 
-## Session affinity
+The agent only forwards paths under the service's base path: the path in the
+`service` URL when it has one (`http://127.0.0.1:8000/mcp` → `/mcp`), otherwise
+`/mcp`. With `forward_all: true` in `finch.yml` it forwards everything under
+`/<service>/`. It collapses `.` and `..` before checking, refuses scheme or host
+injection, and takes scheme and host only from its configuration.
 
-The relay does **not** parse MCP bodies, but it may read the `Mcp-Session-Id`
-**response header** off a `HEAD` frame (a header is just a header). On first
-sight, write `sessionId → machine` to a per-session sharded `SessionDO`
-(`idFromName(sessionId)`); route subsequent requests carrying that
-`Mcp-Session-Id` to the pinned machine; tear the mapping down on `DELETE /mcp`.
-Single-machine appliances (the common IoT case) need none of this — they pin
-trivially. (Do **not** use cookie affinity — MCP clients drop `Set-Cookie`.)
+## Headers
 
-The hub's own MCP client — `POST /api/cli/call`, behind `finch test` and
-`finch call` (`worker/src/cli-call.ts`) — does not wait for this: it runs the
-whole initialize → call → `DELETE` exchange against one box's pinned
-`/<service>/<box>/mcp` path, failing over to the next healthy box only while
-the pick is answering the DO's `X-Finch-Offline` 503.
+Request headers pass through by name, except the ones the hub reads
+credentials from: `Authorization`, `Proxy-Authorization`, every `X-Finch-*`
+header (the hub adds `X-Finch-Assertion` afterwards), and stale finch session
+cookies inside `Cookie`. The scrub is by name, never by value, so MCP headers
+such as `Mcp-Name` and `Mcp-Param-*` that mirror the JSON-RPC body are never
+altered. Hop-by-hop headers are dropped in both directions. A `Set-Cookie` from
+your server loses any `Domain` attribute, so it stays on its own host.
 
-## What changes in the existing code
+## The hub's own MCP client
 
-- `appliance-do.ts`: delete the 501 SSE reject, `req.text()` buffering, the
-  single `Promise<Frame>`, and `REQUEST_TIMEOUT_MS`. The `pending: Map<id,fn>`
-  becomes `streams: Map<sid,{controller, creditsUp, creditsDown}>`. Return
-  `new Response(readableStream, {status, headers})` fed from `HEAD`+`DATA(down)`.
-- `index.ts`: drop the `MAX_RELAY_BODY_BYTES` whole-body cap and the
-  `req.arrayBuffer()` buffer in `relayMcp`; stream `req.body` into `DATA(up)`.
-  Keep the finch_ auth + key-strip (that's the trust boundary; the strip is now
-  by header name — see Header fidelity above).
-- `agent/main.go`: replace the `frame{…Body string}` model + `io.ReadAll`
-  (`forward()`) with a yamux session + `httputil.ReverseProxy` (streams natively,
-  no buffering). `--upstream` becomes a `route → upstream` table (multi-server).
-  Keep the `resolveUpstream` SSRF guard — generalized per-route.
+`POST /api/cli/call` (behind `finch test` and `finch call`) runs a complete MCP
+exchange (initialize, the call, then `DELETE`) against one machine's pinned
+`/<service>/<machine>/mcp` path, moving to the next healthy machine only while
+the pick answers with the offline 503. Its code is `worker/src/cli-call.ts`.
 
-## Golden test vectors (Phase-0 deliverable)
+## Privacy
 
-A versioned fixture file the TS and Go codecs both round-trip, so the two
-implementations can't drift (a framing bug is a class today's one-JSON-frame
-design simply cannot have). At minimum:
-
-1. OPEN with duplicate headers (`set-cookie` ×2) → both survive the round-trip.
-2. A 100 MB body as a run of 32-MiB-bounded DATA frames → reassembles byte-exact.
-3. A binary (non-UTF-8) body → byte-exact (today's string body corrupts it).
-4. HEAD-before-body: HEAD arrives, then 3 DATA(down), then END → the consumer
-   sees status+headers before any body byte.
-5. Interleaved `sid`: two concurrent streams' frames interleaved → demuxed
-   correctly, no cross-talk.
-6. WINDOW starvation: sender blocks at 0 credits, resumes on WINDOW → no deadlock.
-7. RESET mid-stream → the consumer's ReadableStream errors promptly (no 30s hang).
-
-## Phased implementation plan
-
-0. **Spec + golden vectors** (this doc + the fixtures). The contract. Fuzz it.
-1. **Codec library** — pure, networkless, in BOTH `worker/` (TS) and `agent/`
-   (Go). Unit + cross-impl fuzz. No behavior change shipped.
-2. **ApplianceDO → dumb pump** behind a feature flag: `streams` map +
-   `new Response(readableStream)`; delete the 501/buffer/30s cap; add per-stream
-   idle timeout + a DO alarm heartbeat (keeps the object resident while a stream
-   is open; `RESET` every in-flight client on eviction). Old frame agents still
-   work during rollout.
-3. **finchd mux client** — yamux + `httputil.ReverseProxy`, single `--upstream`,
-   WINDOW backpressure, no `io.ReadAll`. Ship as the streaming replacement.
-4. **stdio bridge** — `route` type that spawns a stdio MCP server and bridges
-   stdio↔Streamable-HTTP. Unlocks the stdio IoT wedge. Integration-test against a
-   real stdio server.
-5. **multi-server** — `OPEN.route` selects among N local servers on one socket;
-   wire per-server health into the dashboard.
-6. **session affinity** — `SessionDO` keyed by `Mcp-Session-Id`; replace the
-   per-request machine shuffle for sessioned requests.
-7. **cut over** — finchd default across releases; delete the legacy frame path.
-
-## Honest risks
-
-- Cross-impl codec drift (TS vs Go) — mitigated by the golden vectors + fuzz.
-- In-flight streams **PIN and BILL** the ApplianceDO (not hibernatable while a
-  request is in flight); a long idle `GET /mcp` needs the alarm heartbeat +
-  airtight `RESET`-on-eviction, and a per-tenant concurrent-stream cap ships
-  with this change (that's when the cost first exists).
-- DO input-gate concurrency: `webSocketMessage` interleaving with the awaiting
-  fetch handler feeding the stream controller is the real race surface — written
-  defensively, and in-flight stream state can't rely on `serializeAttachment`
-  (per-socket) surviving eviction.
-- The stdio↔Streamable-HTTP bridge is the hardest fidelity surface and serves the
-  headline wedge — resource it properly.
+HTTPS and WSS protect each hop, but finch is not end-to-end encrypted: the relay
+handles plaintext while forwarding. Bodies are never written to logs, Durable
+Object storage, call records or metrics. See [`privacy.md`](privacy.md).

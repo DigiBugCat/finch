@@ -1,4 +1,6 @@
-# Custom-hostname ownership verification — design note
+# Custom-hostname ownership verification (proposal, not built)
+
+> **Historical proposal.** A July 2026 design for proving domain ownership before a custom hostname is registered. It was not built; custom hostnames are still first-come. Line numbers refer to code that has since moved.
 
 Status: **not implemented**. Written up from the 2026-07-26 security review
 (finding 5, LOW), which was confirmed but reduced in scope. This is the design
