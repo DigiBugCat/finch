@@ -281,6 +281,10 @@ When `next` is present, it is the command to run next. Exit codes are
   `finch.yml`, and its saved credential on this machine, and restarts the
   background service if it runs. When that was the last service and the
   background service is installed, its `"next"` is `finch service uninstall`.
+  If this machine's `notes` belongs to another account than the one you are
+  logged in to, it exits `2` with `USAGE` and changes nothing: ask your human
+  whether to log in to that account or to run `finch rm notes --local-only`,
+  which removes it from this machine only and leaves it in its account.
 - `finch service uninstall --json` stops the background service (it exits `1`
   and keeps the unit if finch could not be stopped).
 - `finch uninstall --json` removes everything finch set up on this machine:

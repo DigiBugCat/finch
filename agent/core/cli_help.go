@@ -129,10 +129,13 @@ var commandDocs = []cmdDoc{
 	},
 	{
 		name:    "rm",
-		usage:   []string{"rm <name>"},
+		usage:   []string{"rm <name> [--local-only]"},
 		summary: "Remove a service from your account and from this machine",
 		details: "Removes the service from your account, its entry in finch.yml and its saved\n" +
-			"credential, then restarts the background service if it is running.",
+			"credential, then restarts the background service if it is running. If this\n" +
+			"machine's service belongs to another account than the one you are logged in\n" +
+			"to, rm changes nothing: log in to that account, or use --local-only to remove\n" +
+			"it from this machine only and leave it in its account.",
 		example: "finch rm notes",
 	},
 	{

@@ -216,6 +216,111 @@ func TestRmRemovesTheServiceEverywhere(t *testing.T) {
 	}
 }
 
+// A machine whose local service was enrolled in account A, while the CLI is
+// now logged in to account B: rm must neither release B's same-named service
+// nor delete A's rule and credential. It refuses, naming both accounts and
+// the two ways out; --local-only then removes just this machine's state.
+func TestRmRefusesAnotherAccountsLocalService(t *testing.T) {
+	home := isolate(t)
+	h := newFakeHub(t)
+	loginTo(t, h)
+	cfg := filepath.Join(home, "finch.yml")
+	if _, stderr, code := finch(t, "add", "notes", "--service", "http://127.0.0.1:8000", "--config", cfg); code != 0 {
+		t.Fatalf("add: %q", stderr)
+	}
+	credPath := filepath.Join(home, ".finch", "notes.json")
+	st, err := loadState(credPath)
+	if err != nil || st == nil || st.Tenant != "user_1" {
+		t.Fatalf("credential=%+v err=%v", st, err)
+	}
+	intact := func(t *testing.T) {
+		t.Helper()
+		h.mu.Lock()
+		released := append([]string(nil), h.released...)
+		_, stillInAccount := h.services["notes"]
+		h.mu.Unlock()
+		if len(released) != 0 || !stillInAccount {
+			t.Fatalf("released %v from the logged-in account", released)
+		}
+		c, err := loadConfig(cfg, "host")
+		if err != nil || len(c.Ingress) != 1 || !fileExists(credPath) {
+			t.Fatalf("local state touched: finch.yml=%+v err=%v credential=%v", c, err, fileExists(credPath))
+		}
+	}
+
+	// The credential says account user_2 (the same hub).
+	st.Tenant = "user_2"
+	if err := saveState(credPath, st); err != nil {
+		t.Fatal(err)
+	}
+	_, stderr, code := finch(t, "rm", "notes", "--config", cfg, "--json")
+	env := decodeJSONError(t, stderr)
+	if code != 2 || env.Error.Code != "USAGE" || env.Error.Next != "finch login --start" {
+		t.Fatalf("exit=%d env=%+v", code, env)
+	}
+	for _, want := range []string{"account user_2 on " + h.url(), "owner@example.com (account user_1) on " + h.url(), "nothing was removed", "finch rm notes --local-only --config " + cfg} {
+		if !strings.Contains(env.Error.Message, want) {
+			t.Errorf("message lacks %q: %s", want, env.Error.Message)
+		}
+	}
+	intact(t)
+
+	// Even when the logged-in account has no such service (the hub's 404),
+	// another account's local service is left alone.
+	h.set(func(h *fakeHub) { delete(h.services, "notes") })
+	if _, _, code := finch(t, "rm", "notes", "--config", cfg, "--json"); code != 2 {
+		t.Fatalf("rm with a 404 from the logged-in account: exit=%d", code)
+	}
+	h.set(func(h *fakeHub) { h.services["notes"] = "key" })
+	intact(t)
+
+	// A saved login that never learned its tenant asks the hub (user_1).
+	if err := saveCliCred(&cliCred{Hub: h.url(), Token: fakeCLIToken}); err != nil {
+		t.Fatal(err)
+	}
+	if _, stderr, code := finch(t, "rm", "notes", "--config", cfg); code != 2 || !strings.Contains(stderr, "account user_1 on "+h.url()) {
+		t.Fatalf("rm with an untenanted login: exit=%d stderr=%q", code, stderr)
+	}
+	intact(t)
+	loginTo(t, h)
+
+	// A credential from another hub names that hub in the next command.
+	st.Tenant, st.Hub = "user_1", "https://other-hub.example.com"
+	if err := saveState(credPath, st); err != nil {
+		t.Fatal(err)
+	}
+	_, stderr, code = finch(t, "rm", "notes", "--config", cfg, "--json")
+	env = decodeJSONError(t, stderr)
+	if code != 2 || env.Error.Next != "finch login --start --hub https://other-hub.example.com" || !strings.Contains(env.Error.Message, "account user_1 on https://other-hub.example.com") {
+		t.Fatalf("other hub: exit=%d env=%+v", code, env)
+	}
+	intact(t)
+
+	// --local-only removes this machine's rule and credential and never
+	// touches the account; it needs no login.
+	if err := os.Remove(cliCredPath()); err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr, code := finch(t, "rm", "notes", "--local-only", "--config", cfg, "--json")
+	if code != 0 {
+		t.Fatalf("rm --local-only: exit=%d stderr=%q", code, stderr)
+	}
+	got := decodeJSONOut(t, stdout)
+	if got["local_only"] != true || got["account"] != false || got["config_entry"] != true || got["credential"] != credPath {
+		t.Fatalf("payload=%v", got)
+	}
+	h.mu.Lock()
+	released, stillInAccount := append([]string(nil), h.released...), h.services["notes"] != ""
+	h.mu.Unlock()
+	if len(released) != 0 || !stillInAccount || fileExists(credPath) {
+		t.Fatalf("released=%v in account=%v credential=%v", released, stillInAccount, fileExists(credPath))
+	}
+	_, stderr, code = finch(t, "rm", "notes", "--local-only", "--config", cfg, "--json")
+	if env := decodeJSONError(t, stderr); code != 1 || env.Error.Code != "NOT_FOUND" {
+		t.Fatalf("rm --local-only of nothing: exit=%d env=%+v", code, env)
+	}
+}
+
 // Removing the last service while the background service is installed says
 // to remove that too: with nothing to serve, 'finch run' would exit at every
 // start and launchd / systemd would keep restarting it.

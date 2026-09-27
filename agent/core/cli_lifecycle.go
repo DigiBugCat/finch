@@ -26,49 +26,72 @@ import (
 
 // runRm: finch rm <name> — remove a service from the account, its finch.yml
 // entry and its saved credential, then restart a running background service
-// so it stops serving the removed name.
+// so it stops serving the removed name. With --local-only it leaves the
+// account alone and removes only this machine's rule and credential.
+//
+// The local credential records the hub and account (tenant) it was enrolled
+// in. When that is not the account the CLI is logged in to, rm refuses before
+// touching anything: releasing the name from the logged-in account and then
+// deleting another account's rule and credential would take the other
+// account's service offline here and throw away its refresh credential.
 func runRm(c *cli, args []string) error {
 	fs := newFlagSet("rm")
 	configPath := fs.String("config", defaultManifestPath(), "the `finch.yml` to remove the service from")
+	localOnly := fs.Bool("local-only", false, "remove the service from this machine only (its finch.yml entry and credential), leaving it in the account")
 	fs.Bool("json", false, "JSON output")
 	pos, err := c.parseArgs(fs, args)
 	if err != nil {
 		return err
 	}
 	if len(pos) != 1 {
-		return usageError("usage: finch rm <name>")
+		return usageError("usage: finch rm <name> [--local-only]")
 	}
 	name := pos[0]
 	if err := validateServiceName(name); err != nil {
 		return err
 	}
-	cred, err := requireCred()
-	if err != nil {
-		return err
-	}
-	inAccount := true
-	if _, err := cliRequest("POST", cred.Hub, "/api/cli/services/release", cred.Token, map[string]string{"id": name}); err != nil {
-		var he *hubError
-		if !asHubError(err, &he) || he.Status != 404 {
-			return hubFailure(err, "remove "+name, "finch fleet")
-		}
-		inAccount = false // gone from the account already; still clean up here
-	}
-
 	host, _ := os.Hostname()
 	_, credDir := addPaths(*configPath, host) // before the entry goes
+	credPath := filepath.Join(credDir, name+".json")
+
+	inAccount := false
+	if !*localOnly {
+		cred, err := requireCred()
+		if err != nil {
+			return err
+		}
+		if owner, _ := loadState(credPath); owner != nil && owner.Hub != "" {
+			if err := checkRmOwnership(cred, owner, name, *configPath); err != nil {
+				return err
+			}
+		}
+		inAccount = true
+		if _, err := cliRequest("POST", cred.Hub, "/api/cli/services/release", cred.Token, map[string]string{"id": name}); err != nil {
+			var he *hubError
+			if !asHubError(err, &he) || he.Status != 404 {
+				return hubFailure(err, "remove "+name, "finch fleet")
+			}
+			inAccount = false // gone from the account already; still clean up here
+		}
+	}
+
 	removedEntry, err := removeIngress(*configPath, name)
 	if err != nil {
+		if !inAccount {
+			return newCLIError(codeInternal, "", "could not update %s: %v", *configPath, err)
+		}
 		return newCLIError(codeInternal, "", "removed %s from your account, but could not update %s: %v", name, *configPath, err)
 	}
-	credPath := filepath.Join(credDir, name+".json")
 	removedCred := false
 	if err := os.Remove(credPath); err == nil {
 		removedCred = true
 	} else if !os.IsNotExist(err) {
-		return newCLIError(codeInternal, "", "removed %s, but could not delete its credential %s: %v", name, credPath, err)
+		return newCLIError(codeInternal, "", "could not delete the credential %s of %s: %v", credPath, name, err)
 	}
 	if !inAccount && !removedEntry && !removedCred {
+		if *localOnly {
+			return newCLIError(codeNotFound, "finch status", "no service named %q on this machine (in %s)", name, *configPath)
+		}
 		return newCLIError(codeNotFound, "finch fleet", "no service named %q in your account or on this machine", name)
 	}
 
@@ -90,6 +113,9 @@ func runRm(c *cli, args []string) error {
 	}
 	if c.json {
 		p := map[string]any{"removed": name, "account": inAccount, "config_entry": removedEntry, "restarted": restarted}
+		if *localOnly {
+			p["local_only"] = true
+		}
 		if removedCred {
 			p["credential"] = credPath
 		}
@@ -99,6 +125,8 @@ func runRm(c *cli, args []string) error {
 		return c.emit(p)
 	}
 	switch {
+	case *localOnly:
+		c.printf("finch: removed %s from this machine only; it is still in its account\n", name)
 	case inAccount:
 		c.printf("finch: removed %s from your account\n", name)
 	default:
@@ -117,6 +145,60 @@ func runRm(c *cli, args []string) error {
 		c.printf("       no services left on this machine; run 'finch service uninstall' to stop the background service\n")
 	}
 	return nil
+}
+
+// checkRmOwnership refuses `finch rm` when the service's local credential
+// belongs to another hub or account than the CLI login. The login's tenant is
+// asked of the hub when the saved login predates recording it.
+func checkRmOwnership(cred *cliCred, owner *agentState, name, configPath string) error {
+	loginHub, ownerHub := sameHubForm(cred.Hub), sameHubForm(owner.Hub)
+	loginTenant := cred.Tenant
+	if ownerHub == loginHub && owner.Tenant != "" && loginTenant == "" {
+		who, err := cliRequest("GET", cred.Hub, "/api/cli/whoami", cred.Token, nil)
+		if err != nil {
+			return hubFailure(err, "check which account you are logged in to", "finch status")
+		}
+		loginTenant, _ = who["tenant"].(string)
+	}
+	if ownerHub == loginHub && (owner.Tenant == "" || loginTenant == "" || owner.Tenant == loginTenant) {
+		return nil
+	}
+	ownerAcct := describeAccount("", owner.Tenant, owner.Hub)
+	loginAcct := describeAccount(cred.Email, loginTenant, cred.Hub)
+	next := "finch login --start"
+	if ownerHub != loginHub {
+		next += " --hub " + strings.TrimRight(owner.Hub, "/")
+	}
+	localOnly := "finch rm " + name + " --local-only"
+	if configPath != defaultManifestPath() {
+		localOnly += " --config " + configPath
+	}
+	return newCLIError(codeUsage, next,
+		"%s on this machine belongs to %s, but you are logged in to %s; nothing was removed. "+
+			"Log in to %s to remove it from that account and this machine, or run '%s' to remove it from this machine only (it stays in its account)",
+		name, ownerAcct, loginAcct, ownerAcct, localOnly)
+}
+
+// sameHubForm reduces a hub URL to the form two logins to the same hub share.
+func sameHubForm(hub string) string {
+	return strings.ToLower(strings.TrimRight(strings.TrimSpace(hub), "/"))
+}
+
+// describeAccount names an account for a message: "owner@example.com
+// (account user_1) on https://finchmcp.com".
+func describeAccount(email, tenant, hub string) string {
+	var who string
+	switch {
+	case email != "" && tenant != "":
+		who = email + " (account " + tenant + ")"
+	case email != "":
+		who = email
+	case tenant != "":
+		who = "account " + tenant
+	default:
+		who = "an account"
+	}
+	return who + " on " + strings.TrimRight(hub, "/")
 }
 
 // ---- finch logs ----------------------------------------------------------
