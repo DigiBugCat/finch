@@ -30,13 +30,50 @@ export default function ServicesAndBoxes() {
       <h2>Adding a service</h2>
       <p>Your service must already be running locally, then:</p>
       <Code>{`finch add printer --service http://127.0.0.1:8000
-finch run
-<span class="o">✓ https://your-slug.finchmcp.com/printer/</span>`}</Code>
+<span class="o">finch: added "printer" → http://127.0.0.1:8000</span>
+<span class="o">       public URL: https://your-slug.finchmcp.com/printer/mcp</span>
+finch service install
+finch test printer`}</Code>
       <p>
-        <code>finch add</code> writes or extends <code>finch.yml</code>. The file holds
+        <code>finch add</code> writes or extends <code>finch.yml</code> and prints the
+        public URL (the <code>url</code> field with <code>--json</code>). The file holds
         no secrets, so it is safe to commit. Credentials live on disk elsewhere, never
         in <code>finch.yml</code>.
       </p>
+      <p>
+        By default callers need a <code>finch_</code> key or an OAuth sign-in. Add{' '}
+        <code>--public</code> to open the endpoint to anyone with the URL, for a public
+        website or a demo; <code>finch auth printer key</code> closes it again.
+      </p>
+
+      <h2>Running in the background</h2>
+      <p>
+        <code>finch run</code> serves in the foreground and stops when the terminal
+        closes. To keep a service up across logouts and reboots, install finch as a
+        login service:
+      </p>
+      <Code>{`finch service install      <span class="c"># launchd on macOS, systemd --user on Linux</span>
+finch service status       <span class="c"># installed? running?</span>
+finch service uninstall    <span class="c"># stop and remove it</span>`}</Code>
+      <p>
+        On macOS this writes a LaunchAgent at{' '}
+        <code>~/Library/LaunchAgents/com.finchmcp.finch.plist</code> and logs to{' '}
+        <code>~/.finch/finch.log</code>. On Linux it writes a systemd user unit,{' '}
+        <code>finch.service</code>; read its log with{' '}
+        <code>journalctl --user -u finch.service</code>. Either way it needs no root,
+        starts at login, restarts <code>finch run</code> if it exits, and serves the{' '}
+        <code>finch.yml</code> that <code>finch add</code> wrote. Running{' '}
+        <code>install</code> again is safe, for example after moving the binary. Stop any{' '}
+        <code>finch run</code> you started in a terminal first, since only one serve per
+        machine can hold the relay.
+      </p>
+      <div className="docs-note">
+        <b>Headless Linux box?</b> A systemd user service stops when you log out unless
+        lingering is on. Enable it once with{' '}
+        <code>sudo loginctl enable-linger $USER</code> so finch starts at boot and keeps
+        running with nobody logged in. <code>finch service install</code> tells you when
+        it is off.
+      </div>
 
       <h2>finch.yml</h2>
       <Code>{`hub: https://finchmcp.com
@@ -54,11 +91,13 @@ ingress:
       <p>
         Run <code>finch add</code> once per service. Each call appends an ingress rule,
         and one <code>finch run</code> process fronts them all. It auto-approves new
-        services while you are logged in.
+        services while you are logged in. A running serve reads <code>finch.yml</code>{' '}
+        when it starts, so after adding a service run <code>finch service install</code>{' '}
+        again (it restarts the service) or restart your <code>finch run</code>.
       </p>
       <Code>{`finch add printer --service http://127.0.0.1:8000
 finch add scraper --service http://127.0.0.1:8001
-finch run`}</Code>
+finch service install`}</Code>
       <p>To remove a service:</p>
       <Code>{`finch rm printer`}</Code>
 
@@ -102,10 +141,11 @@ finch run`}</Code>
       </p>
       <Code>{`finch update`}</Code>
       <p>
-        The agent downloads the new binary from the hub and swaps it in place. If a
-        systemd service manages the agent it restarts cleanly; otherwise the process
-        replaces itself in place. Either way the update is atomic: a failed download
-        never touches the running binary.
+        The agent downloads the new binary from the hub and swaps it in place. When{' '}
+        <code>finch service install</code> manages the serve, launchd or systemd
+        restarts it cleanly on the new version; otherwise restart your{' '}
+        <code>finch run</code>. Either way the update is atomic: a failed download never
+        touches the running binary.
       </p>
 
       <h2>Enrolling another box</h2>
@@ -121,7 +161,7 @@ finch run`}</Code>
         <code>--token -</code>, or set <code>FINCH_CLI_TOKEN</code>.
       </div>
       <Code>{`finch token | ssh user@newbox "finch login --token -"
-ssh user@newbox "finch add api --service http://127.0.0.1:9000 && finch run"`}</Code>
+ssh user@newbox "finch add api --service http://127.0.0.1:9000 && finch service install"`}</Code>
 
       <h2>Inspecting state</h2>
       <Code>{`finch status --json     <span class="c"># am I logged in? what does finch.yml serve?</span>

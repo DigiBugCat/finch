@@ -1,10 +1,14 @@
+> **AI agents: read https://finchmcp.com/agents.md first.** It is the step-by-step guide for publishing a local MCP server with finch on your human's behalf: install, a two-step login with one human approval, `finch add`, `finch service install`, `finch test`, and `finch connect`, plus the exit codes, the JSON error format, and the security rules. Follow it rather than the summary below.
+
 # Finch
 
-> Finch turns a local HTTP or MCP service on your own machine into a secure public endpoint. The box dials out to the Finch hub, so nothing listens and no ports open. Auth is checked at the edge before a request reaches your box. Clients reach services at https://<slug>.finchmcp.com/<app_path>/ (MCP servers answer at /<app_path>/mcp) with an Authorization: Bearer finch_<key> header.
+> Finch turns a local HTTP or MCP service on your own machine into a secure public endpoint. The machine dials out to the Finch hub, so nothing listens and no ports open. Auth is checked at the edge before a request reaches your machine. Clients reach services at https://<slug>.finchmcp.com/<name>/ (MCP servers answer at /<name>/mcp) with an Authorization: Bearer finch_<key> header, or by signing in with OAuth. A service can also be made public (no key needed).
 
-Finch is operated from a CLI. Every command is non-interactive and supports --json. If you are an AI agent driving Finch, install it and run `finch guide`: it prints a complete, self-contained operating manual.
+Finch is operated from a CLI on macOS and Linux. Every command accepts --json: success payloads carry "schema_version":1, and errors go to stderr as {"schema_version":1,"error":{"code","message","next"}}. Exit codes: 0 ok, 1 error, 2 usage, 10 waiting for approval, 11 expired, 12 not logged in. The installed binary prints the agent manual with `finch guide`.
 
-Core loop: `finch login` (one-time approval — prints a link + code, you open the link on ANY device incl. your phone, so a headless box needs no local browser; over SSH use `finch login --headless` to skip the local browser spawn and flush the link straight to your terminal) → `finch add <app_path> --service http://127.0.0.1:<port>` → `finch run` → paste the printed URL into any MCP client with a key from `finch keys mint`. Fully unattended provisioning (no human): from a box that is already logged in, `finch token | ssh newbox "finch login --token -"`.
+Agent flow: `finch status --json` → `finch login --start --json` (show the human the link and code) → `finch login --poll --json` every `interval` seconds until exit 0 → `finch add <name> --service http://127.0.0.1:<port> --json` (prints the public URL) → `finch service install --json` (runs `finch run` as a launchd or systemd user service) → `finch test <name> --json` → `finch connect <name> --client claude-code|cursor|codex|json`. `finch connect` mints a finch_ key for that client and writes it into the client's config without printing it.
+
+The one paste for humans: "Read https://finchmcp.com/agents.md and use finch to publish my MCP server on http://127.0.0.1:8000 as notes. Show me the sign-in link when you get it. Run it as a background service, check it with finch test, then connect it to this agent."
 
 ## Base case: hello world, end to end
 
@@ -25,33 +29,31 @@ if __name__ == "__main__":
 EOF
 python server.py &                                   # serves MCP on http://127.0.0.1:8000
 
-curl -fsSL https://finchmcp.com/install | sh         # install finch (macOS/Linux)
-finch login                                          # prints a link + code; open on any device (phone ok) — no local browser needed
-finch add hello --service http://127.0.0.1:8000      # writes finch.yml (no secrets)
-finch run                                            # -> https://<slug>.finchmcp.com/hello/
+curl -fsSL https://finchmcp.com/install | sh         # install finch (macOS/Linux, never prompts for sudo)
+finch login --start                                  # prints a link + code; approve on any device (phone ok)
+finch login --poll                                   # repeat until it reports approved (exit 0)
+finch add hello --service http://127.0.0.1:8000      # writes finch.yml (no secrets), prints the public URL
+finch service install                                # keeps it running (launchd / systemd --user)
 
-# verify from another shell
-finch test hello                                     # lists the greet tool
+finch test hello                                     # lists the greet tool; non-zero exit if it fails
 finch call hello greet --args '{"name": "world"}'    # -> Hello, world!
-
-# give a client access
-finch keys mint my-claude --service hello            # finch_ key, shown once
-# MCP endpoint: https://<slug>.finchmcp.com/hello/mcp with Authorization: Bearer finch_...
+finch connect hello --client claude-code             # wires it into Claude Code with a fresh finch_ key
 ```
 
 ## Docs
 
+- [Agent guide](https://finchmcp.com/agents.md): the step-by-step agent flow, exit codes, error table, and security rules
 - [Quickstart](https://finchmcp.com/docs): install, log in, add a service, run, connect a client
 - [AviaryMCP](https://finchmcp.com/docs/aviarymcp): public Python SDK release candidate on PyPI; one tool registry for MCP, REST, and OpenAPI, published with `finch add` like any local service
-- [Services & boxes](https://finchmcp.com/docs/services): the service/box model, finch.yml, states, enrolling more boxes
+- [Services & boxes](https://finchmcp.com/docs/services): the service/box model, finch.yml, running as a background service, states
 - [Keys & auth](https://finchmcp.com/docs/auth): finch_ keys, mint/list/revoke, the CLI admin token, how auth is checked at the edge
 - [Access control](https://finchmcp.com/docs/acls): finch_ keys scoped per service, OAuth, public services; one key per agent
 - [Domains](https://finchmcp.com/docs/domains): the automatic <slug>.finchmcp.com hub domain and custom hostnames
-- [CLI reference](https://finchmcp.com/docs/cli): every command, grouped, with the finch.yml format
+- [CLI reference](https://finchmcp.com/docs/cli): every command, the JSON and exit-code contract, and the finch.yml format
 
 ## Install
 
-- [Install script](https://finchmcp.com/install): `curl -fsSL https://finchmcp.com/install | sh` (macOS and Linux)
+- [Install script](https://finchmcp.com/install): `curl -fsSL https://finchmcp.com/install | sh` (macOS and Linux). It never prompts for sudo: it installs to /usr/local/bin when that is writable, otherwise to ~/.local/bin (and prints a PATH hint). Set FINCH_INSTALL_DIR to choose the directory.
 
 ## Optional
 
@@ -75,7 +77,7 @@ mcp.run(transport="http", host="127.0.0.1", port=8000)
 
 ```bash
 finch add calculator --service http://127.0.0.1:8000
-finch run
+finch service install
 ```
 
 AviaryMCP exposes the same registered tools at `/mcp`, `/api/v1/tools`, `/api/v1/tools/<tool>`, and `/api/v1/openapi.json`, so through Finch they answer under `https://<slug>.finchmcp.com/calculator/`.
