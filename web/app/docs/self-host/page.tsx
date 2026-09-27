@@ -77,7 +77,11 @@ export default function SelfHost() {
           and certificates, so no wildcard DNS is needed. Your <code>workers.dev</code>{' '}
           subdomain works too.
         </li>
-        <li>The repository, checked out at a release tag so the hub matches the published binaries:</li>
+        <li>
+          The repository, checked out at a release tag so the hub matches the published
+          binaries. This guide is written for <code>v1.8.0</code>; a newer tag works the same
+          way if <code>RELEASES_BASE</code> names that tag too:
+        </li>
       </ul>
       <Code>{`git clone ${REPO} && cd finch
 git checkout v1.8.0`}</Code>
@@ -125,18 +129,24 @@ git checkout v1.8.0`}</Code>
             <tr><td><code>CLERK_ISSUER</code></td><td>Clerk&apos;s Frontend API URL. Turns on OAuth sign-in for MCP clients.</td></tr>
             <tr><td><code>VANITY_SUFFIXES</code></td><td>Your hub hostname (<code>finch.example.dev</code>). Required on your own domain: with <code>VANITY_TENANT</code>, only your account can register it, so no one else can take over the hub. Not needed on <code>workers.dev</code>.</td></tr>
             <tr><td><code>VANITY_TENANT</code></td><td>Your Clerk user ID, the same value as <code>DEFAULT_TENANT</code>.</td></tr>
-            <tr><td><code>FINCH_SERVICE_SECRET</code> (secret)</td><td>Shared with the website; authenticates its calls and signs CLI tokens.</td></tr>
+            <tr><td><code>FINCH_SERVICE_SECRET</code> (secret)</td><td>Shared with the website; authenticates its calls and signs CLI tokens. It is a hub-wide credential: whoever holds it can act for any account on the hub.</td></tr>
             <tr><td><code>TICKET_SECRET</code> (secret)</td><td>Signs the tokens your machines use to connect.</td></tr>
-            <tr><td><code>FINCH_ASSERTION_PRIVATE_JWKS</code> (secret, optional)</td><td>Signs <code>X-Finch-Assertion</code>, the caller identity your services can verify. Goes with <code>FINCH_ASSERTION_ACTIVE_KID</code> and <code>FINCH_ASSERTION_ISSUER</code>.</td></tr>
+            <tr><td><code>FINCH_ASSERTION_PRIVATE_JWKS</code> (secret, required by the guide&apos;s block)</td><td>Signs <code>X-Finch-Assertion</code>, the caller identity your services can verify. The guide&apos;s block sets <code>FINCH_ASSERTION_ACTIVE_KID</code> and <code>FINCH_ASSERTION_ISSUER</code>, which turn signing on; without this secret every authenticated call fails with 503. To run without assertions, remove those two and skip this secret.</td></tr>
             <tr><td><code>RELEASES_BASE</code> or an R2 <code>RELEASES</code> bucket</td><td>Where binaries come from. Point <code>RELEASES_BASE</code> at <code>{`${REPO}/releases/download/v1.8.0`}</code> to use this repository&apos;s release.</td></tr>
           </tbody>
         </table>
       </div>
-      <p>Set the secrets with fresh values and deploy:</p>
+      <p>
+        Set the secrets with fresh values and deploy. The assertion key&apos;s <code>kid</code>{' '}
+        (<code>selfhost-2026-09</code> here) must match <code>FINCH_ASSERTION_ACTIVE_KID</code>:
+      </p>
       <Code>{`cd worker && npm ci
 SERVICE_SECRET="$(openssl rand -hex 32)"
 printf %s "$SERVICE_SECRET" | npx wrangler secret put FINCH_SERVICE_SECRET --env selfhost
 openssl rand -hex 32 | npx wrangler secret put TICKET_SECRET --env selfhost
+node scripts/generate-assertion-jwks.mjs selfhost-2026-09 \\
+  | node scripts/validate-assertion-jwks.mjs selfhost-2026-09 --passthrough \\
+  | npx wrangler secret put FINCH_ASSERTION_PRIVATE_JWKS --env selfhost
 node scripts/deploy-preflight.mjs selfhost
 npx wrangler deploy --env selfhost`}</Code>
       <p>The website needs the same <code>FINCH_SERVICE_SECRET</code>, so deploy it from the same shell or keep the value somewhere safe.</p>

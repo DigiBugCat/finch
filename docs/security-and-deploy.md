@@ -61,13 +61,38 @@ A key-gated service (the default) accepts one of:
 
 A service marked `--public` accepts anyone with the URL.
 
-Before relaying, the hub removes `Authorization`, `Proxy-Authorization`, every
-`X-Finch-*` header and stale finch session cookies, so a caller's credential
-never reaches your local server. For an authenticated caller it then adds a
-short-lived ES256 **caller assertion** (`X-Finch-Assertion`), which a service
-can verify against the hub's JWKS to learn who is calling
-([`worker/CALLER_ASSERTIONS.md`](../worker/CALLER_ASSERTIONS.md)). Public
-services receive no assertion.
+Before relaying, the hub removes the credentials it reads, so a caller's key
+or token never reaches your local server:
+
+- by name: `Authorization`, `Proxy-Authorization` and every `X-Finch-*`
+  header (which carry the service secret and the first-party assertion);
+- by value: any other header whose value contains the exact bearer token
+  presented in `Authorization` on that request (a client that copies its key
+  into `X-Api-Key`, say). Other text that merely looks like a key, such as
+  `Mcp-Name: finch_search`, is left alone.
+
+Everything else passes through, including the whole `Cookie` header. That
+includes the retired `__Host-finch_session` and `finch_session` cookies of the
+removed browser login wall; the hub no longer reads or strips them, and they
+expired within 12 hours of that feature's removal.
+
+The hub then adds a short-lived ES256 **caller assertion**
+(`X-Finch-Assertion`), which a service can verify against the hub's JWKS to
+learn who is calling
+([`worker/CALLER_ASSERTIONS.md`](../worker/CALLER_ASSERTIONS.md)), whenever
+assertions are configured and the call was authenticated by:
+
+- a `finch_` key on a key-gated service (`sub` is `key:<id>`);
+- a Clerk OAuth token, on any service (`sub` is `user:<id>`); or
+- the first-party `finch test` / `finch call` path (`sub` is
+  `service:finch-dashboard`), on any service.
+
+A public service therefore gets no assertion for a keyless call or a call
+with a `finch_` key, but does get one when the caller signed in with OAuth or
+used `finch test`. On a public service the OAuth check admits any user of the
+hub's Clerk instance, not only the account owner, so the assertion there says
+who called, not that they were allowed to. Treat an assertion as
+authorization only on a key-gated service.
 
 On your machine, the agent confines relayed paths to the service's base path
 (`/mcp` by default, or the whole service with `forward_all`), collapses `.` and
@@ -76,11 +101,21 @@ never from the request.
 
 ### Web to hub
 
-The web calls the hub over a Worker **service binding** (`FINCH_HUB`), so the
-control API is not reached over the public internet. Each call carries the
-shared `FINCH_SERVICE_SECRET` and an HMAC-signed assertion naming the signed-in
-user's account, so the secret alone cannot act for an arbitrary account. The
-web confirms the signed-in Clerk user owns the account before every call.
+The web calls the hub over a Worker **service binding** (`FINCH_HUB`). Each
+call carries the shared `FINCH_SERVICE_SECRET` and a short-lived assertion,
+`{tenant, exp}` HMAC-signed with that same secret, naming the signed-in user's
+account. The web builds the assertion from the signed-in Clerk user's own ID
+and confirms with the hub that this user is the account's owner.
+
+The assertion stops a caller without the secret from choosing an account; it
+is no boundary for someone who has the secret. **`FINCH_SERVICE_SECRET` is a
+fleet-wide credential.** The hub also accepts it on requests from the public
+internet, not only over the binding, and whoever holds it can sign an
+assertion for any account and use the control API as that account, sign CLI
+tokens (they are HMAC-signed with the same secret, bound to a per-account
+epoch), and relay calls to any account's services the way `finch test` does.
+Keep it only in the hub's and web's Worker secrets, and rotate it on both
+together if it may have leaked.
 
 ### Isolation between accounts
 
@@ -100,8 +135,17 @@ any `Set-Cookie` your service sends, so cookies stay host-only.
 
 ### Limits
 
-- The relay is rate limited per account and IP (600 requests per 60 seconds),
-  and `/join` per IP (10 per 60 seconds), before any Durable Object is touched.
+- The relay is rate limited per account and IP (600 requests per 60
+  seconds). The limiter needs the account, so it runs after the host is
+  resolved: a request on an account subdomain or custom hostname first looks
+  the host up in the global `RouterDO`, and a host `RouterDO` does not know
+  answers 404 without reaching the limiter. (A request on a host with no
+  lookup key, such as `workers.dev` in single-account mode, skips `RouterDO`.)
+  The limiter does run before the relay's `TenantDO` and `BoxDO` work: the
+  machine pin check, the key check and the relay itself.
+- `/join` and `/refresh` are limited per IP (10 per 60 seconds) before any
+  Durable Object is touched; the CLI API has its own per-IP and per-account
+  limits on the same binding.
 - Request bodies are capped at 4 MiB. Responses stream with flow control; see
   [`relay-protocol.md`](relay-protocol.md).
 - An unknown host fails closed with 404. The dev-only `DEFAULT_TENANT` fallback
@@ -123,7 +167,7 @@ any `Set-Cookie` your service sends, so cookies stay host-only.
 
 | Name | Kind | What it does |
 |---|---|---|
-| `FINCH_SERVICE_SECRET` | secret | Shared with the web; authenticates web-to-hub calls and signs account assertions and CLI tokens. |
+| `FINCH_SERVICE_SECRET` | secret | Shared with the web; authenticates web-to-hub calls and signs account assertions and CLI tokens. Fleet-wide: its holder can act for any account (see [Web to hub](#web-to-hub)). |
 | `TICKET_SECRET` | secret | HMAC key for join tickets, refresh tokens and connect tokens. |
 | `FINCH_ASSERTION_PRIVATE_JWKS` | secret | ES256 private JWKS for caller assertions. Generate with `worker/scripts/generate-assertion-jwks.mjs`. |
 | `CF_API_TOKEN` | secret, optional | Cloudflare for SaaS token for bring-your-own custom hostnames. |
@@ -186,8 +230,10 @@ the account owner, the first-party `/api/cli/call` assertion, or anyone on a
 public service. A caller without a credential on a key-gated service gets a 401
 with an OAuth challenge; there is no browser login wall or session cookie.
 
-Accounts created before September 2026 were migrated once when this model
-shipped; what that migration deleted is recorded in
+Accounts created before September 2026 are migrated once, lazily: the purge
+runs when an account's `TenantDO` is first loaded after the single-user
+release, so an account that has not been used since keeps its legacy rows
+until then. What the migration deletes, and why it is lazy, is recorded in
 [`archive/single-user-migration.md`](archive/single-user-migration.md).
 
 ## Known gaps

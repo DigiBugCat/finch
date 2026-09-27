@@ -37,13 +37,15 @@ finch gives your account the first time you use it. Every service you add lives
 under it, at `https://<your-slug>.finchmcp.com/<service>/mcp`.
 
 `finch connect` mints a key for that one service and writes it into the
-client's configuration without printing it. From there:
+client's configuration without printing it. From there (these commands
+require finch 1.8.0 or later; `finch version` shows yours and `finch update`
+upgrades it):
 
 | To | Run |
 |---|---|
 | See your services and their URLs | `finch status` or `finch fleet` |
 | See recent calls (time, route, caller, status, duration) | `finch logs notes` |
-| Point a service at a different local port | `finch add notes --service http://127.0.0.1:9000` (re-running `add` updates it) |
+| Point a service at a different local port | `finch add notes --service http://127.0.0.1:9000` (re-running `add` on the machine that publishes it updates it) |
 | Publish a web app or REST API, not just `/notes/mcp` | `finch add site --service http://127.0.0.1:3000 --forward-all` |
 | Open a service to anyone with the URL | add `--public` to `finch add` |
 | Remove a service, here and on the hub | `finch rm notes` |
@@ -77,7 +79,7 @@ machine's WebSocket.
 
 ```text
 client ─ POST /notes/mcp (Bearer finch_…) ─▶ Worker
-   rate limit → check the key or OAuth token → strip it → pick a machine
+   find the account → rate limit → check the key or OAuth token → strip it → pick a machine
       └─▶ Durable Object ── req ──▶ finch on your machine ── HTTP ──▶ local server
                          ◀─ head ──  (status and headers, as soon as they exist)
                          ◀─ chunk ─  chunk … (the body streams)
@@ -92,8 +94,9 @@ client ─ POST /notes/mcp (Bearer finch_…) ─▶ Worker
 - **Callers to your service.** A service needs a `finch_` key (hashed at rest,
   scoped to services) or a Clerk OAuth sign-in by you, unless you made it
   public. finch removes the credential before relaying, so your server never
-  sees it; for every authenticated caller (key or OAuth) it adds a signed
-  `X-Finch-Assertion` your server can verify ([`worker/CALLER_ASSERTIONS.md`](worker/CALLER_ASSERTIONS.md)).
+  sees it. On a key-gated service it adds a signed `X-Finch-Assertion` naming
+  the caller, which your server can verify; public services get one only for
+  OAuth and `finch test` calls ([`worker/CALLER_ASSERTIONS.md`](worker/CALLER_ASSERTIONS.md)).
 - **The relay does not parse MCP.** It moves HTTP bytes, so unmodified
   Streamable-HTTP servers (FastMCP, the MCP SDKs) work, including SSE, progress
   notifications and long-running tools. By default only `/<service>/mcp` is

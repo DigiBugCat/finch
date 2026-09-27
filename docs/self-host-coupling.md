@@ -1,7 +1,6 @@
 # Self-hosting: where finchmcp.com is hard-coded
 
-Status: **current** (audited 2026-09-27 against `main` at finch 1.7.1, with the
-1.8.0 changes in flight). A checklist of the code changes needed before finch
+Status: **current** (audited 2026-09-27 against `main` at finch 1.8.0). A checklist of the code changes needed before finch
 can run with per-account subdomains on a second domain (`<slug>.example.dev`).
 Until they land, self-hosting uses single-account mode; see
 [`self-host.md`](self-host.md).
@@ -84,7 +83,7 @@ like `agentVersion`), and a site origin for the web read from
 Most CLI commands already honour `--hub`, `FINCH_HUB`, the hub saved by `finch login`
 in `~/.finch/cli.json`, and `hub:` in `finch.yml`. What remains:
 
-- [ ] One default hub literal instead of seven: `core/agent.go`
+- [ ] One default hub literal instead of six: `core/agent.go`
   (`agentDefaultHub`, and `loadConfig`'s default), `core/relay_loop.go`
   (`relayOptions.hub`), `core/transport_security.go`
   (`validateHubTransportURL`), `core/cli_update.go` (fallback when there is no
@@ -99,8 +98,11 @@ in `~/.finch/cli.json`, and `hub:` in `finch.yml`. What remains:
   then `agentDefaultHub()`.
 - [ ] Install hints in errors: `core/cli_update.go` and `core/cli_service.go`
   print `curl -fsSL https://finchmcp.com/install | sh`. Use the current hub.
-- [ ] Help and guide text: `core/cli.go` (`guideText`, the `finch add` usage
-  line) name `finchmcp.com` and `https://finchmcp.com/agents.md`.
+- [ ] Help and guide text: `core/cli_help.go` (the `finch add` help, the
+  `finch guide` summary and the top-level help), the `finch login --hub` flag
+  description in `core/cli_login.go`, and `core/agents.md` (what `finch
+  guide` prints, embedded at build) name `finchmcp.com` and
+  `https://finchmcp.com/agents.md`.
 - [ ] The launchd label `com.finchmcp.finch` (`core/cli_service.go`). Harmless;
   only matters if two differently built CLIs share a machine.
 - [ ] `README.md`, `finch.example.yml` and `Dockerfile` examples use

@@ -86,13 +86,25 @@ injection, and takes scheme and host only from its configuration.
 
 ## Headers
 
-Request headers pass through by name, except the ones the hub reads
-credentials from: `Authorization`, `Proxy-Authorization`, every `X-Finch-*`
-header (the hub adds `X-Finch-Assertion` afterwards), and stale finch session
-cookies inside `Cookie`. The scrub is by name, never by value, so MCP headers
-such as `Mcp-Name` and `Mcp-Param-*` that mirror the JSON-RPC body are never
-altered. Hop-by-hop headers are dropped in both directions. A `Set-Cookie` from
-your server loses any `Domain` attribute, so it stays on its own host.
+Request headers pass through unchanged, except:
+
+- **By name:** `Authorization`, `Proxy-Authorization` and every `X-Finch-*`
+  header are removed (the hub adds `X-Finch-Assertion` afterwards).
+- **By value, for the presented credential only:** when the request carried
+  `Authorization: Bearer <token>` (16 characters or more), any remaining
+  header whose value contains that exact token is removed too, so a client
+  that copies its key into another header (`X-Api-Key`, a custom auth header)
+  does not leak it to your server. Nothing else is matched by value: MCP
+  headers such as `Mcp-Name: finch_search` and `Mcp-Param-*`, which mirror
+  the JSON-RPC body, reach your server as sent, and so does any `finch_`
+  text that is not the token on this request.
+- **Hop-by-hop** headers are dropped in both directions.
+
+`Cookie` is forwarded byte for byte, including the retired
+`__Host-finch_session` / `finch_session` cookies from the removed browser
+login wall (the hub no longer reads them; they expired within 12 hours of its
+removal). A `Set-Cookie` from your server loses any `Domain` attribute, so it
+stays on its own host.
 
 ## The hub's own MCP client
 

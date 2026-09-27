@@ -10,7 +10,10 @@ Install or update with `curl -fsSL https://finchmcp.com/install | sh`, or run
 
 ## [Unreleased]
 
-Planned as 1.8.0.
+## [1.8.0] - 2026-09-27
+
+The CLI and hub changes below are #58. `/agents.md`, `/llms.txt` and
+`finch guide` now use commands that need finch 1.8.0 or later.
 
 ### CLI
 
@@ -18,25 +21,37 @@ Planned as 1.8.0.
   `finch <command> -h` print that command's usage, flags and an example.
 - `finch login` opens your browser and waits for you to approve; people no
   longer need the two-step `--start` / `--poll` flow, which stays for agents.
-- `finch update` says when you already have the latest version and exits
-  without downloading; `--force` reinstalls anyway.
-- Re-running `finch add <name> --service <url>` for an existing service
-  updates its local address instead of creating `<name>-2`.
+- `finch update` asks the hub for the latest version first, says when you
+  already have it and exits without downloading, and reports a failed check
+  instead of reinstalling; `--force` reinstalls anyway.
+- Re-running `finch add <name> --service <url>` for a service this machine
+  publishes updates its local address (and `--public` / `--forward-all`)
+  instead of creating `<name>-2`. A name another machine publishes is refused
+  with a clear message.
 - `finch add --forward-all` forwards every path of the service, for web apps
   and REST APIs. Without it only `/<name>/mcp` is forwarded, as before.
-- `finch rm <name>` also removes the service from `finch.yml` and deletes its
-  saved credential on this machine.
+- `finch rm <name>` also removes the service from `finch.yml`, deletes its
+  saved credential on this machine, and restarts a running background
+  service. It refuses a service enrolled under a different account than the
+  one you are logged in to; `finch rm <name> --local-only` removes just this
+  machine's entry and credential.
 - New `finch logs <name> [--limit N] [--json]`: recent calls with time, route,
   caller, status and duration.
 - `finch status` and `finch fleet` show each service's public URL (`url` in
   `--json`). `finch status --json` also reports `logged_in`; `loggedIn` stays
   for compatibility.
 - New `finch uninstall [--json]`: stops and removes the background service,
-  deletes local credentials and configuration, revokes the keys this machine
-  created with `finch connect`, removes the client entries finch added, and
-  prints what it did and how to delete the binary.
-- `finch test` reports a server that rejects the MCP handshake plainly, instead
-  of saying it cannot check FastMCP servers.
+  deletes local credentials and configuration, removes the client entries
+  finch added, revokes the keys that `finch connect` recorded creating on this
+  machine, and prints what it did and how to delete the binary. Keys created
+  by an older `finch connect` were not recorded, so they are listed as
+  candidates (`candidate_key_ids`) for you to revoke, not revoked.
+- `finch test` says "the server rejected the MCP handshake" instead of saying
+  it cannot check FastMCP servers, and names the local URL when nothing
+  answers there.
+- `finch connect --client codex` handles Codex configs that quote the
+  `["mcp_servers"]` table name (#50).
+- The agent no longer sends the local URL or its connection error to the hub.
 
 ### Hub
 
@@ -45,10 +60,24 @@ Planned as 1.8.0.
   of a raw connection error that exposed the local address.
 - An MCP request without credentials gets the 401 OAuth challenge even while
   the machine is offline, so connectors such as claude.ai can start sign-in.
+  The offline 503 says what to check and sends `Retry-After`.
 - Authentication errors say which problem it is: no key, an unknown or revoked
   key, or a key that is not allowed for this service.
 - Error messages no longer mention "tenant"; an unknown address says there is
-  no finch account there. Unknown hub API paths answer 404 instead of 401.
+  no finch account there. Unknown hub API paths answer 404 and wrong methods
+  405, before credentials are checked. Every 429 sends `Retry-After`.
+- New `GET /api/cli/version` and `/api/cli/logs` (behind `finch update` and
+  `finch logs`).
+- The installer names the version it installed, suggests a shell profile line
+  when the install directory is not on your `PATH`, and refuses to install
+  over a directory (#50).
+
+### Website
+
+- New **Your fleet** page at `/fleet`: a read-only, signed-in view of your
+  account address, each service's public URL, who can call it, its machines
+  and recent calls. Keys are listed by label, never by value, and every action
+  is shown as the `finch` command to run (#55).
 
 ### Repository
 
@@ -109,7 +138,9 @@ Each account belongs to one person.
   straight at Clerk as the authorization server, which fixes sign-in with
   current MCP SDKs (#40).
 - The relay handles MCP 2026-07-28 clients: credentials are removed by header
-  name, so tools or arguments containing `finch_` are no longer altered (#41).
+  name, plus any header carrying the exact bearer token presented on that
+  request, so tools or arguments containing `finch_` are no longer altered
+  (#41).
 - The website reaches the hub over a private Cloudflare service binding (#39).
 
 ### Removed
@@ -119,8 +150,11 @@ Each account belongs to one person.
   CLI command now or gone (#43, #44, #45).
 - The tray app and the Android SDK (#44).
 - Data from the removed team features: other members, invitations, groups,
-  access rules and access requests were deleted by a one-time migration, and
-  keys labelled for other people were revoked (#47).
+  access rules and access requests are deleted, and keys labelled for other
+  people revoked, by a one-time migration (#47). It runs for each account the
+  first time that account is used after the release, so an account that has
+  not been used since keeps those records until then
+  ([details](docs/archive/single-user-migration.md)).
 
 ### Security
 
@@ -130,6 +164,7 @@ Each account belongs to one person.
   hardening from production audits (#27, #29, #31, #33, #34).
 - Fixed production sign-in after the hardening (#37).
 
-[Unreleased]: https://github.com/DigiBugCat/finch/compare/v1.7.1...HEAD
+[Unreleased]: https://github.com/DigiBugCat/finch/compare/v1.8.0...HEAD
+[1.8.0]: https://github.com/DigiBugCat/finch/compare/v1.7.1...v1.8.0
 [1.7.1]: https://github.com/DigiBugCat/finch/compare/v1.7.0...v1.7.1
 [1.7.0]: https://github.com/DigiBugCat/finch/compare/v1.6.0...v1.7.0

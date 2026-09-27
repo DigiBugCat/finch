@@ -1,6 +1,6 @@
 # Single-user migration (September 2026, historical)
 
-> **Historical.** What the one-time single-user migration (#47, shipped in finch 1.7.0) deleted when every account became one tenant. It shipped to production with finch 1.7.0 (#51) and is kept as the record of what was removed and why.
+> **Historical.** What the single-user migration (#47, shipped in finch 1.7.0) deletes now that every account is one tenant. The `v7` class deletion ran at deploy; each account's own purge runs lazily, the first time its `TenantDO` loads, so an account untouched since then still holds its legacy rows (see "A tenant no request touches" below). It shipped to production with finch 1.7.0 (#51) and is kept as the record of what was removed and why.
 
 ## What the migration did (owner-approved, destructive)
 

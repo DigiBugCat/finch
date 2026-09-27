@@ -101,7 +101,9 @@ not part of the retained recent-call record.
 finch also retains control-plane data that is not message content:
 
 - account identifiers and the account owner's Clerk user id and email (an
-  account is one Clerk user; there are no other members);
+  account is one Clerk user; an account older than September 2026 may still
+  hold rows about other people until it is next used, see
+  [Records from retired features](#records-from-retired-features));
 - service, machine, group label, tag, hostname, and settings metadata;
 - key metadata, including the key hash, label, scope, last four characters,
   creation time, and expiry (the plaintext `finch_` key is returned only when
@@ -118,8 +120,20 @@ absent from storage and logs.
 ### Records from retired features
 
 The team, sharing and device-enrollment features removed in September 2026
-wrote records that named other people. The one-time single-user migration
-deleted them; nothing from them is retained. What it deleted is recorded in
+wrote records that named other people. The single-user migration removes
+them in two ways:
+
+- The global device-enrollment records and the Clerk-user-to-account index
+  were deleted outright when the release deployed (Durable Object migration
+  `v7`).
+- Each account's own legacy rows (other members, invitations, groups, access
+  rules, access requests, and audit rows about them) are deleted lazily, the
+  first time that account's `TenantDO` is loaded after the release. An
+  account that has not received a request since then **still holds its
+  legacy rows** until it does. There is no complete index of such accounts,
+  and the code has no sweep that visits them.
+
+What the migration deletes, and the exact conditions, are recorded in
 [`archive/single-user-migration.md`](archive/single-user-migration.md).
 
 ## Approved language

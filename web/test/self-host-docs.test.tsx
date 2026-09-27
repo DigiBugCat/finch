@@ -111,6 +111,24 @@ describe('docs/self-host.md configuration blocks', () => {
     expect(guide).toMatch(/This is required, not a nicety/);
   });
 
+  it('require the assertion secret whenever the block turns assertions on', () => {
+    // The hub treats ACTIVE_KID or the JWKS as "assertions on", and then fails
+    // every authenticated relay with 503 if the signer is incomplete. So the
+    // guide and the page must set the secret up, never call it optional.
+    const { hub } = guideBlocks();
+    expect(hub.vars.FINCH_ASSERTION_ACTIVE_KID).toBeTruthy();
+    expect(hub.vars.FINCH_ASSERTION_ISSUER).toBeTruthy();
+    const kid = hub.vars.FINCH_ASSERTION_ACTIVE_KID;
+    const put = new RegExp(`generate-assertion-jwks\\.mjs ${kid}[\\s\\S]*?secret put FINCH_ASSERTION_PRIVATE_JWKS --env selfhost`);
+    expect(guide).toMatch(put);
+    expect(guide).not.toMatch(/optional[^\n]*assertion|assertion[^\n]*optional/i);
+
+    const { container } = render(<SelfHost />);
+    const code = [...container.querySelectorAll('pre code')].map((el) => el.textContent ?? '').join('\n');
+    expect(code).toMatch(put);
+    expect(container.textContent ?? '').not.toMatch(/optional[^.]*assertion|assertion[^.]*optional/i);
+  });
+
   it('bind the website to the hub it deploys and pin an exact https origin', () => {
     const { hub, web } = guideBlocks();
     const services = Object.fromEntries(

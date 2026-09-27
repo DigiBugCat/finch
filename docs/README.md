@@ -27,6 +27,6 @@ Kept for the record. Each file starts with a note saying what it was.
 | [`archive/code-review-2026-06.md`](archive/code-review-2026-06.md) | The pre-launch correctness review, including the removed dashboard. |
 | [`archive/design-2026-06.md`](archive/design-2026-06.md) | Original design rationale, cost model and first roadmap. |
 | [`archive/relay-protocol-v2-plan.md`](archive/relay-protocol-v2-plan.md) | The streaming relay plan, most of which shipped in a simpler form. |
-| [`archive/single-user-migration.md`](archive/single-user-migration.md) | What the September 2026 single-user migration deleted. |
+| [`archive/single-user-migration.md`](archive/single-user-migration.md) | What the September 2026 single-user migration deletes, and why each account's purge runs lazily. |
 | [`archive/device-protocol.md`](archive/device-protocol.md) | A mailbox protocol for small devices. Not built. |
 | [`archive/hostname-ownership-design.md`](archive/hostname-ownership-design.md) | Ownership checks for custom hostnames. Not built. |

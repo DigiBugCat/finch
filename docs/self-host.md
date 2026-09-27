@@ -1,6 +1,6 @@
 # Run your own finch
 
-Status: **current** for finch 1.8. This guide deploys your own hub and website
+Status: **current** for finch 1.8.0 and later. This guide deploys your own hub and website
 on your own Cloudflare account and points the `finch` CLI at them. The website
 at [finchmcp.com](https://finchmcp.com) runs the same code; you never need it
 to self-host.
@@ -41,7 +41,10 @@ it is exercised on every merge.
 - A Clerk account.
 - Node 22 and `npx wrangler login` done once.
 - A clone of this repository, checked out at a release tag, so the hub's
-  version matches the published binaries:
+  version matches the published binaries. The guide is written for
+  `v1.8.0`; a newer tag from the
+  [releases page](https://github.com/DigiBugCat/finch/releases) works the same
+  way, as long as `RELEASES_BASE` below names the same tag:
 
   ```sh
   git clone https://github.com/DigiBugCat/finch && cd finch
@@ -106,7 +109,10 @@ repeated) and replace the example values.
     // account can register it with `finch domain add` and take over the hub.
     "VANITY_SUFFIXES": "finch.example.dev",
     "VANITY_TENANT": "user_REPLACE_WITH_YOUR_CLERK_USER_ID",
-    // Caller assertions (optional; remove both lines to turn them off).
+    // Caller assertions. With this key id set, the hub signs every
+    // authenticated relayed call and REQUIRES the FINCH_ASSERTION_PRIVATE_JWKS
+    // secret (set below); without it those calls fail with 503. To run
+    // without assertions, delete these two lines and skip that secret.
     "FINCH_ASSERTION_ACTIVE_KID": "selfhost-2026-09",
     "FINCH_ASSERTION_ISSUER": "https://finch.example.dev",
     // Without an R2 bucket, pin downloads to the release you checked out.
@@ -164,9 +170,9 @@ public hub.
 | `CLERK_ISSUER` | var | for OAuth | Clerk's Frontend API URL. Turns on OAuth sign-in for MCP clients; leave it out and only `finch_` keys work. |
 | `FINCH_SERVICE_SECRET` | secret | yes | Shared with the website. Authenticates website-to-hub calls and signs CLI tokens. |
 | `TICKET_SECRET` | secret | yes | Signs join tickets, refresh tokens and connect tokens for your machines. |
-| `FINCH_ASSERTION_PRIVATE_JWKS` | secret | optional | ES256 key that signs `X-Finch-Assertion`, the caller identity your services can verify. Set it together with `FINCH_ASSERTION_ACTIVE_KID` and `FINCH_ASSERTION_ISSUER`, or leave all three out. |
-| `FINCH_ASSERTION_ACTIVE_KID` | var | with the JWKS | Which key in the JWKS signs. |
-| `FINCH_ASSERTION_ISSUER` | var | with the JWKS | The `iss` of assertions; the hub serves the public keys at `<issuer>/.well-known/finch-jwks.json`. Use the hub origin. |
+| `FINCH_ASSERTION_PRIVATE_JWKS` | secret | yes, with the block above | ES256 key that signs `X-Finch-Assertion`, the caller identity your services can verify. The block above sets `FINCH_ASSERTION_ACTIVE_KID`, which turns signing on, so this secret must exist and contain that `kid`. If it is missing or wrong, every call made with a key, an OAuth token or `finch test` fails with `503 caller assertion signer unavailable`. |
+| `FINCH_ASSERTION_ACTIVE_KID` | var | yes, with the block above | Which key in the JWKS signs. Setting it (or the JWKS) turns assertions on. |
+| `FINCH_ASSERTION_ISSUER` | var | yes, with the block above | The `iss` of assertions; the hub serves the public keys at `<issuer>/.well-known/finch-jwks.json`. Use the hub origin. |
 | `RELEASES` | R2 binding | optional | Bucket the hub serves `/releases/<asset>` from. |
 | `RELEASES_BASE` | var | optional | Where `/releases/<asset>` redirects when there is no bucket. Defaults to this repository's latest GitHub release. |
 | `SELF` | service binding | yes | The hub bound to itself, used by `finch test` and `finch call`. |
@@ -175,6 +181,7 @@ public hub.
 | `CF_SAAS_ZONE_ID`, `CF_API_TOKEN`, `BYO_CNAME_TARGET` | vars and secret | no | Custom hostnames on other domains (`finch domain add`). Not needed in single-account mode. |
 
 Set the secrets. Generate fresh values; never reuse the ones in `.dev.vars`.
+All three are required by the block above.
 
 ```sh
 cd worker
@@ -182,7 +189,7 @@ npm ci
 SERVICE_SECRET="$(openssl rand -hex 32)"    # the website needs this value too
 printf %s "$SERVICE_SECRET" | npx wrangler secret put FINCH_SERVICE_SECRET --env selfhost
 openssl rand -hex 32 | npx wrangler secret put TICKET_SECRET --env selfhost
-# Optional caller assertions (the kid must match FINCH_ASSERTION_ACTIVE_KID):
+# The caller-assertion signing key (the kid must match FINCH_ASSERTION_ACTIVE_KID):
 node scripts/generate-assertion-jwks.mjs selfhost-2026-09 \
   | node scripts/validate-assertion-jwks.mjs selfhost-2026-09 --passthrough \
   | npx wrangler secret put FINCH_ASSERTION_PRIVATE_JWKS --env selfhost
@@ -190,6 +197,22 @@ node scripts/generate-assertion-jwks.mjs selfhost-2026-09 \
 
 Deploy the website from the same shell so `$SERVICE_SECRET` is still set, or
 keep the value in a password manager until then.
+
+`deploy-preflight` checks for the assertion secret only in the `staging` and
+`production` environments, so for `selfhost` check it yourself:
+`npx wrangler secret list --env selfhost` should list all three names.
+
+**Running without caller assertions.** Delete `FINCH_ASSERTION_ACTIVE_KID`
+and `FINCH_ASSERTION_ISSUER` from the block and do not upload
+`FINCH_ASSERTION_PRIVATE_JWKS`. The hub then relays calls without
+`X-Finch-Assertion`, and `/.well-known/finch-jwks.json` answers 404. Setting
+only some of the three is a broken configuration: authenticated calls fail
+with 503 rather than going out unsigned.
+
+`FINCH_SERVICE_SECRET` is a hub-wide credential. Whoever holds it can sign a
+website assertion or a CLI token for any account on the hub, and relay calls
+to any service the way `finch test` does, so keep it only in the two Workers'
+secrets.
 
 ### Release binaries
 
@@ -313,7 +336,7 @@ finch connect notes --client claude-code
 | `finch test hello` | Lists the server's tools |
 | `curl -i https://finch.example.dev/hello/mcp` | `401` with a `WWW-Authenticate: Bearer` challenge |
 | `curl https://finch.example.dev/.well-known/oauth-protected-resource/hello/mcp` | `authorization_servers` is your Clerk Frontend API URL |
-| `curl https://finch.example.dev/.well-known/finch-jwks.json` (if you set up assertions) | A JWKS with your `kid` |
+| `curl https://finch.example.dev/.well-known/finch-jwks.json` | A JWKS with your `kid` (404 means assertions are off; 503 means the secret does not hold that `kid`) |
 
 ## Updating
 
