@@ -31,6 +31,12 @@ describe('sitemap.xml', () => {
     for (const path of ['/docs', ...docsDirs]) {
       expect({ path, listed: (SITEMAP_PATHS as readonly string[]).includes(path) }).toEqual({ path, listed: true });
     }
+    // ...and every docs path it lists is a page on disk, so it never sends a
+    // crawler (or the landing's links) to a 404.
+    for (const path of SITEMAP_PATHS.filter((p) => p.startsWith('/docs/'))) {
+      const page = resolve(appDir, `.${path}`, 'page.tsx');
+      expect({ path, exists: existsSync(page) }).toEqual({ path, exists: true });
+    }
     // The pages agents are told to read are listed too.
     expect(urls).toEqual(expect.arrayContaining([`${SITE}/agents.md`, `${SITE}/llms.txt`]));
   });

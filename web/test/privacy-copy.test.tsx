@@ -14,10 +14,10 @@ describe('customer-facing privacy copy', () => {
     expect(lede).toHaveTextContent(/Cloudflare decrypts it at its edge/i);
     expect(lede).toHaveTextContent(/finch is not end-to-end encrypted/i);
     expect(screen.getByRole('link', { name: 'The full privacy boundary' })).toHaveAttribute('href', '/docs/privacy');
-    // Every logged call shows its body as not kept.
-    const rows = screen.getAllByRole('row').slice(1); // minus the header row
-    expect(rows.length).toBeGreaterThan(0);
-    for (const row of rows) expect(row).toHaveTextContent(/not kept$/);
+    // The log itself says bodies are not among what finch keeps (in the note
+    // beside the output, since finch logs has no body column to strike out).
+    expect(screen.getAllByRole('row').length).toBeGreaterThan(1);
+    expect(screen.getByText(/fields per call, and that is all of it/)).toHaveTextContent(/no request or response bodies/);
     expect(screen.queryByText(/never sees/i)).toBeNull();
   });
 

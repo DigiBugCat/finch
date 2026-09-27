@@ -55,7 +55,7 @@
 
 /* ---------- Plate II: the band ---------- */
 .fg-band-fig{margin:0; display:flex; flex-direction:column; gap:14px}
-.fg-band{--band-font:clamp(11px, 2.5vw, 34px);
+.fg-band{--band-font:clamp(13px, 2.5vw, 34px);
   display:flex; align-items:center; justify-content:space-between; gap:12px;
   height:clamp(56px, 8.8vw, 104px); border-radius:52px; background:var(--ochre); box-shadow:var(--shadow-cutout);
   padding-inline:clamp(16px, 2.9vw, 34px)}
@@ -64,7 +64,7 @@
    (/NOTES/mcp is a different service from /notes/mcp), so no text-transform. */
 .fg-band-addr{font-family:var(--mono); font-size:var(--band-font); font-weight:500; letter-spacing:.06em;
   white-space:nowrap; color:#3a2a10}
-.fg-band-anatomy{--band-font:clamp(11px, 2.5vw, 34px);
+.fg-band-anatomy{--band-font:clamp(13px, 2.5vw, 34px);
   display:flex; justify-content:space-between; gap:12px; padding-inline:clamp(16px, 2.9vw, 34px);
   height:calc(var(--band-font) * 1.5)}
 .fg-rivet-space{flex:none; width:clamp(12px, 1.5vw, 18px)}
@@ -136,19 +136,25 @@
 .fg-by-hand-h{font-weight:700}
 .fg-by-hand pre{margin:0; font-size:12.5px; line-height:22px; color:var(--ink); white-space:pre-wrap; overflow-wrap:anywhere}
 
-/* The terminal is as tall as its transcript (every line is laid out from the
-   start, untyped ones hidden), so it never grows while the session types
-   itself out and never leaves an empty tail below the last line. The phone
-   hangs off its right edge. */
+/* The terminal has a fixed height, level with the phone's bottom edge, so it
+   never grows while the session types itself out. Only typed lines are laid
+   out: they fill the window from the top, and once it is full the window
+   keeps its bottom edge on the newest line, so the oldest slide off the top
+   like a real terminal's scrollback. (.fg-term-lines is at least as tall as
+   the window, so a short session sits at the top; a taller one overflows
+   upward, clipped, because the window aligns its end.) Reduced motion never
+   types anything, so there the finished session gets its natural height.
+   The phone hangs off the terminal's right edge. */
 .fg-session{position:relative; width:100%; max-width:690px; min-height:420px}
-.fg-term{position:relative; width:min(520px, 100% - 150px); background:var(--surface-raised);
+.fg-term{position:relative; width:min(520px, 100% - 150px); height:400px; background:var(--surface-raised);
   border-radius:var(--radius-md); box-shadow:var(--shadow-cutout); padding:20px 22px; display:flex; flex-direction:column;
   font-family:var(--mono); font-size:12.5px; line-height:21px; overflow:hidden}
 .fg-term-bar{flex:none; padding-bottom:12px; margin-bottom:8px; border-bottom:1px solid var(--line);
   font:700 12px/16px var(--sans); letter-spacing:.04em; color:var(--ink-muted)}
-.fg-term-lines{display:flex; flex-direction:column}
+.fg-term-window{flex:1 1 0; min-height:0; overflow:hidden; display:flex; flex-direction:column; justify-content:flex-end}
+.fg-term-lines{flex:none; min-height:100%; display:flex; flex-direction:column}
 .fg-term-lines > span{overflow-wrap:anywhere}
-.fg-term-pending{visibility:hidden}
+@media (prefers-reduced-motion:reduce){ .fg-term{height:auto} }
 .fg-term-cmd{color:var(--ink)}
 .fg-term-out{color:var(--ink-muted)}
 .fg-term-ok{color:var(--leaf)}
@@ -177,13 +183,12 @@
 .fg-log-cmd{font-family:var(--mono); font-size:13.5px; line-height:20px; color:var(--ink)}
 .fg-log-scroll{overflow-x:auto; border-radius:var(--radius-sm)}
 .fg-log table{width:100%; min-width:720px; border-collapse:collapse; table-layout:fixed}
-.fg-c-time{width:100px} .fg-c-route{width:130px} .fg-c-caller{width:220px}
-.fg-c-status{width:76px} .fg-c-took{width:96px}
+/* finch logs' column order; Route takes what is left. */
+.fg-c-time{width:172px} .fg-c-status{width:76px} .fg-c-took{width:90px} .fg-c-caller{width:220px}
 .fg-log th{text-align:left; padding:10px 12px 8px 0; border-bottom:1px solid var(--line);
   font:700 11px/16px var(--sans); letter-spacing:.08em; text-transform:uppercase; color:var(--ink-muted)}
 .fg-log td{padding:9px 12px 9px 0; border-bottom:1px solid var(--line); font-family:var(--mono); font-size:13.5px;
   line-height:20px; font-variant-numeric:tabular-nums; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
-.fg-log td.fg-not-kept{color:var(--ink-muted); text-decoration:line-through}
 .fg-log-note{font-family:var(--hand); font-size:17px; color:var(--indigo); padding-top:6px}
 .fg-log-swipe{display:none; align-self:flex-end; font-family:var(--hand); font-size:16px; line-height:20px; color:var(--indigo)}
 /* The table needs about 776px with the card's padding (a viewport of about
@@ -280,6 +285,17 @@
   .fg-tiers{grid-template-columns:minmax(0,1fr)}
   .fg-tier{padding:24px 20px}
   .fg-oss{padding:18px 16px}
+}
+
+/* With its rivets and letter-spacing, the 36-character address at 13px needs
+   a viewport of about 425px. Below 460px the rivets and the letter-spacing go,
+   and the type is sized from the viewport (about 60px of gutters and padding,
+   36 characters at ~0.6em): 13px down to about 346px, 11.8px at 320px, so the
+   band always fits inside the 16px gutters. */
+@media (max-width:460px){
+  .fg-band{--band-font:clamp(11px, calc((100vw - 60px) / 22), 13px); justify-content:center; padding-inline:12px}
+  .fg-band .fg-rivet{display:none}
+  .fg-band .fg-band-addr{letter-spacing:0}
 }
 
 @media (max-width:420px){

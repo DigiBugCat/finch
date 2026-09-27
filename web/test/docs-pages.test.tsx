@@ -102,7 +102,7 @@ describe('the docs code block', () => {
 });
 
 describe('docs page titles', () => {
-  it('gives every docs page its own title under the "· finch docs" template', () => {
+  it('gives every docs page its own "<Title> · finch docs" title, the same in the tab and a shared link', () => {
     expect(docsLayoutMeta.title).toEqual({ default: 'finch docs', template: '%s · finch docs' });
     // Every page file on disk is covered here (a new page needs a title too).
     const known = Object.keys(PAGES).map((p) => (p === '/docs' ? 'page.tsx' : `${p.slice('/docs/'.length)}/page.tsx`));
@@ -110,13 +110,17 @@ describe('docs page titles', () => {
       expect({ file, covered: known.includes(file) || OWNED_ELSEWHERE.includes(file) }).toEqual({ file, covered: true });
     }
     const titles = Object.entries(PAGES).map(([path, page]) => {
-      const title = page.metadata?.title;
-      expect({ path, type: typeof title }).toEqual({ path, type: 'string' });
-      expect(title as string).not.toMatch(/finch|\|/i); // the template adds the brand
+      // Absolute, not a bare string: the layout's template skips the page in
+      // its own segment (the Quickstart), which then read "Quickstart · finch".
+      const full = (page.metadata?.title as { absolute?: string } | undefined)?.absolute;
+      expect({ path, type: typeof full }).toEqual({ path, type: 'string' });
+      const title = full!.replace(/ · finch docs$/, '');
+      expect(`${title} · finch docs`).toBe(full);
+      expect(title).not.toMatch(/finch|\|/i);
       expect(typeof page.metadata?.description).toBe('string');
       // A shared link previews as this page, not as the landing.
-      expect(page.metadata?.openGraph).toMatchObject({ title: `${title} · finch docs`, description: page.metadata?.description });
-      expect(page.metadata?.twitter).toMatchObject({ title: `${title} · finch docs` });
+      expect(page.metadata?.openGraph).toMatchObject({ title: full, description: page.metadata?.description });
+      expect(page.metadata?.twitter).toMatchObject({ title: full });
       // Overriding openGraph drops the file-based share image, so it must be
       // named again, and it must be a file that exists.
       expect(page.metadata?.openGraph).toMatchObject({ images: [{ url: '/opengraph-image.png', width: 1200, height: 630 }] });
@@ -124,8 +128,9 @@ describe('docs page titles', () => {
       return title;
     });
     expect(new Set(titles).size).toBe(titles.length);
-    expect(PAGES['/docs/auth'].metadata?.title).toBe('Keys & auth');
-    expect(PAGES['/docs/aviarymcp'].metadata?.title).toBe('AviaryMCP');
+    expect(PAGES['/docs'].metadata?.title).toEqual({ absolute: 'Quickstart · finch docs' });
+    expect(PAGES['/docs/auth'].metadata?.title).toEqual({ absolute: 'Keys & auth · finch docs' });
+    expect(PAGES['/docs/aviarymcp'].metadata?.title).toEqual({ absolute: 'AviaryMCP · finch docs' });
   });
 });
 

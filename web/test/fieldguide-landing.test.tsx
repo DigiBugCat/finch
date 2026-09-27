@@ -14,8 +14,9 @@ vi.mock('@clerk/nextjs', () => ({
 import Home from '@/app/page';
 import SiteNav from '@/components/fieldguide/SiteNav';
 import AgentSession, { FIRST_STEP, SESSION } from '@/components/fieldguide/AgentSession';
-import { LOG_COMMAND, logRows } from '@/components/fieldguide/SightingLog';
+import { LOG_COLUMNS, LOG_COMMAND, logRows } from '@/components/fieldguide/SightingLog';
 import { breakableParts } from '@/components/fieldguide/GateDial';
+import { SITEMAP_PATHS } from '@/app/site-paths';
 
 // The one paste for humans, verbatim from the shared CLI contract. Pinned here
 // as a literal (not imported) so a drift in the component fails this test.
@@ -64,6 +65,29 @@ function topLevelKeys(line: string): string[] {
   return keys;
 }
 
+/** The keys of every object nested below the top level of a JSON line (in
+ *  the order written), one array per object. Throws on an unbalanced line. */
+function nestedObjectKeys(line: string): string[][] {
+  topLevelKeys(line); // same shape checks
+  const out: string[][] = [];
+  const stack: (string[] | null)[] = []; // null for an array
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      const end = line.indexOf('"', i + 1);
+      const top = stack[stack.length - 1];
+      if (top && line[end + 1] === ':') top.push(line.slice(i + 1, end));
+      i = end;
+    } else if (ch === '{') stack.push([]);
+    else if (ch === '[') stack.push(null);
+    else if (ch === '}' || ch === ']') {
+      const done = stack.pop();
+      if (done && stack.length > 0) out.push(done);
+    }
+  }
+  return out;
+}
+
 function assertContractCommand(cmd: string) {
   if (!FINCH_COMMANDS.some((re) => re.test(cmd))) {
     throw new Error(`not a contract command: ${JSON.stringify(cmd)}`);
@@ -85,6 +109,13 @@ describe('the contract-command checker itself', () => {
     expect(topLevelKeys('{"schema_version":1,"ok":true,"tools":[{"name":"a",…},…]}')).toEqual(['schema_version', 'ok', 'tools']);
     expect(() => topLevelKeys('{"schema_version":1,"tools":[')).toThrow();
     expect(() => topLevelKeys('not json')).toThrow();
+  });
+
+  it('reads the keys of nested objects, so an unsorted tool object is caught', () => {
+    expect(nestedObjectKeys('{"schema_version":1,"tools":[{"name":"a",…},…]}')).toEqual([['name']]);
+    expect(nestedObjectKeys('{"a":{"z":1,"b":{"c":2}},"d":[{"y":1},{"x":2}]}')).toEqual([['c'], ['z', 'b'], ['y'], ['x']]);
+    expect(nestedObjectKeys('{"schema_version":1,"ok":true}')).toEqual([]);
+    expect(() => nestedObjectKeys('{"tools":[{"name":"a"}')).toThrow();
   });
 });
 
@@ -158,7 +189,12 @@ describe('field-guide landing', () => {
       const keys = topLevelKeys(l.text);
       expect(keys[0]).toBe('schema_version');
       expect(keys.slice(1)).toEqual([...keys.slice(1)].sort());
+      // Objects nested inside (each tool finch test lists) are Go maps too,
+      // so their keys come out fully alphabetical: "description" before "name".
+      for (const inner of nestedObjectKeys(l.text)) expect({ line: l.text, keys: inner }).toEqual({ line: l.text, keys: [...inner].sort() });
     }
+    const test = json.find((l) => l.text.includes('"tools"'))!;
+    expect(nestedObjectKeys(test.text)).toEqual([['description', 'name']]);
     // An untrimmed line parses in full; the poll result is exactly the CLI's.
     const poll = json.find((l) => l.text.includes('"status"'))!;
     expect(JSON.parse(poll.text)).toEqual({ schema_version: 1, account: 'you@example.com', status: 'approved' });
@@ -297,6 +333,10 @@ describe('field-guide landing', () => {
     // Sign-up lands on the fleet page, and the card says so.
     expect(screen.getByRole('link', { name: 'Create a free account' }).closest('article')).toHaveTextContent(/fleet page/);
     expect(screen.getByRole('link', { name: 'Email us' })).toHaveAttribute('href', 'mailto:hello@aviary.run');
+    // The one contact address is on another brand's domain, so the card says whose it is.
+    expect(screen.getByRole('link', { name: 'Email us' }).closest('article')).toHaveTextContent(
+      'Email Aviary, the maker of finch, at hello@aviary.run',
+    );
   });
 
   it('says finch is open source: hero, pricing and footer', () => {
@@ -305,7 +345,18 @@ describe('field-guide landing', () => {
     const oss = screen.getByRole('complementary', { name: 'Open source · MIT' });
     expect(oss).toHaveTextContent('Free and open source.');
     expect(within(oss).getByRole('link', { name: 'Source on GitHub' })).toHaveAttribute('href', 'https://github.com/DigiBugCat/finch');
-    expect(within(oss).getByRole('link', { name: 'Host it yourself' })).toHaveAttribute('href', '/docs/self-host');
+    // "Host it yourself" appears exactly when the self-host guide is a listed
+    // (and so, per site-basics.test, existing) page; never a link to a 404.
+    const selfHost = within(oss).queryByRole('link', { name: 'Host it yourself' });
+    if ((SITEMAP_PATHS as readonly string[]).includes('/docs/self-host')) {
+      expect(selfHost).toHaveAttribute('href', '/docs/self-host');
+    } else {
+      expect(selfHost).toBeNull();
+    }
+    for (const a of container.querySelectorAll('a[href^="/docs/"]')) {
+      const path = a.getAttribute('href')!.split('#')[0];
+      expect({ path, listed: (SITEMAP_PATHS as readonly string[]).includes(path) }).toEqual({ path, listed: true });
+    }
     const footer = container.querySelector('footer')!;
     expect(footer).toHaveTextContent(/free and open source, under the MIT license/);
     // The footer no longer name-drops a second brand without explaining it.
@@ -380,56 +431,79 @@ describe('agent session motion', () => {
     window.IntersectionObserver = realIO;
   });
 
-  const typed = (c: HTMLElement) =>
-    c.querySelectorAll('.fg-term-lines > span:not(.fg-term-cursor):not(.fg-term-pending)').length;
-  // The terminal's rows, in order: every session line plus exactly one cursor.
-  // Untyped lines stay in the layout (hidden), so the box is always sized by
-  // the whole transcript and the finished frame never clips its first line.
+  // The terminal's rows, in order: only the lines typed so far, then exactly
+  // one cursor. Untyped lines are not laid out at all (the old hidden
+  // placeholders made the box as tall as the whole transcript, and it opened
+  // mostly empty on every loop).
   const rows = (c: HTMLElement) =>
     [...c.querySelectorAll('.fg-term-lines > span')].map((s) =>
-      s.classList.contains('fg-term-cursor') ? 'CURSOR' : s.classList.contains('fg-term-pending') ? `(${s.textContent})` : s.textContent,
+      s.classList.contains('fg-term-cursor') ? 'CURSOR' : s.textContent,
     );
+  const typed = (c: HTMLElement) => rows(c).filter((r) => r !== 'CURSOR').length;
+  const expectFrame = (c: HTMLElement, n: number) =>
+    expect(rows(c)).toEqual([...SESSION.slice(0, n).map((l) => l.text), 'CURSOR']);
 
   it('holds the finished session, phone approved, for reduced motion', () => {
     reduced = true;
     const { container } = render(<AgentSession />);
-    expect(typed(container)).toBe(SESSION.length);
+    expectFrame(container, SESSION.length);
     act(() => { vi.advanceTimersByTime(5000); });
-    expect(typed(container)).toBe(SESSION.length);
+    expectFrame(container, SESSION.length);
     expect(container.querySelector('.fg-phone')).toHaveClass('is-shown');
     expect(screen.getByText('Approved ✓')).toBeInTheDocument();
-    // The still frame starts at the install step and ends on the cursor.
-    expect(rows(container)).toEqual([...SESSION.map((l) => l.text), 'CURSOR']);
   });
 
-  it('types the session out line by line when motion is allowed, never from an empty terminal', () => {
+  it('opens each loop mid-session, at the approval, and types the rest line by line', () => {
     reduced = false;
     const { container } = render(<AgentSession />);
-    // It starts with the install step already on screen, not a blank box.
-    expect(FIRST_STEP).toBeGreaterThan(0);
-    expect(typed(container)).toBe(FIRST_STEP);
-    expect(rows(container)[0]).toBe(SESSION[0].text);
-    act(() => { vi.advanceTimersByTime(650); });
-    expect(typed(container)).toBe(FIRST_STEP + 1);
-    // Typed lines first, then the cursor, then the rest held in place, hidden.
-    expect(rows(container)).toEqual([
-      ...SESSION.slice(0, FIRST_STEP + 1).map((l) => l.text),
-      'CURSOR',
-      ...SESSION.slice(FIRST_STEP + 1).map((l) => `(${l.text})`),
-    ]);
-    expect(container.querySelector('.fg-phone')).not.toHaveClass('is-shown');
-    // The phone slides in once the agent has asked you to approve the code...
+    // The loop opens with the install and `finch login --start` already typed;
+    // the next line is the agent asking you to approve.
     const ask = SESSION.findIndex((l) => l.kind === 'hand');
-    act(() => { vi.advanceTimersByTime(650 * (ask + 1 - (FIRST_STEP + 1))); });
+    expect(FIRST_STEP).toBe(ask);
+    expect(SESSION.slice(0, FIRST_STEP).map((l) => l.text)).toEqual(
+      expect.arrayContaining(['$ curl -fsSL https://finchmcp.com/install | sh', '$ finch login --start --json']),
+    );
+    expectFrame(container, FIRST_STEP);
+    expect(container.querySelector('.fg-phone')).not.toHaveClass('is-shown');
+    // One beat later the agent asks, and the phone slides in...
+    act(() => { vi.advanceTimersByTime(650); });
+    expectFrame(container, FIRST_STEP + 1);
     expect(container.querySelector('.fg-phone')).toHaveClass('is-shown');
     expect(screen.getByText('Approve')).toBeInTheDocument();
     // ...and turns green once the poll comes back approved.
-    act(() => { vi.advanceTimersByTime(650 * 2); });
+    const approvedAt = SESSION.findIndex((l) => l.text.includes('"status":"approved"')) + 1;
+    act(() => { vi.advanceTimersByTime(650 * (approvedAt - (FIRST_STEP + 1))); });
+    expectFrame(container, approvedAt);
     expect(screen.getByText('Approved ✓')).toBeInTheDocument();
-    // After a rest on the finished session it loops back to the start frame.
-    act(() => { vi.advanceTimersByTime(650 * (SESSION.length + 4)); });
-    expect(typed(container)).toBeGreaterThanOrEqual(FIRST_STEP);
-    expect(typed(container)).toBeLessThan(SESSION.length);
+    // It finishes, rests three beats on the finished session, then starts over
+    // at the same opening frame (phone hidden again).
+    act(() => { vi.advanceTimersByTime(650 * (SESSION.length - approvedAt)); });
+    expectFrame(container, SESSION.length);
+    act(() => { vi.advanceTimersByTime(650 * 3); });
+    expectFrame(container, SESSION.length);
+    act(() => { vi.advanceTimersByTime(650); });
+    expectFrame(container, FIRST_STEP);
+    expect(typed(container)).toBe(FIRST_STEP);
+    expect(container.querySelector('.fg-phone')).not.toHaveClass('is-shown');
+  });
+
+  it('keeps the terminal a fixed height while it types, and natural height for reduced motion', () => {
+    // jsdom has no layout, so this pins the stylesheet rules the typing relies
+    // on (checked in a browser at 1200px and 390px).
+    const css = readFileSync(resolve(import.meta.dirname, '../components/fieldguide/landing.css'), 'utf8');
+    const rule = (sel: string, from = css) => {
+      const m = from.match(new RegExp(`(?:^|[}\\s])${sel.replace(/[.]/g, '\\.')}\\{([^}]*)\\}`));
+      if (!m) throw new Error(`no rule for ${sel}`);
+      return m[1];
+    };
+    expect(rule('.fg-term')).toMatch(/(?:^|;\s*)height:\d+px/);
+    // The window clips from the top once the lines outgrow it, keeping the
+    // newest line in view; the lines fill it from the top until then.
+    expect(rule('.fg-term-window')).toMatch(/overflow:hidden/);
+    expect(rule('.fg-term-window')).toMatch(/justify-content:flex-end/);
+    expect(rule('.fg-term-lines')).toMatch(/min-height:100%/);
+    expect(css).toMatch(/@media \(prefers-reduced-motion:reduce\)\{\s*\.fg-term\{height:auto\}\s*\}/);
+    expect(css).not.toMatch(/fg-term-pending/);
   });
 });
 
@@ -463,8 +537,11 @@ describe('sighting log', () => {
   it('shows the rows finch logs lists: one service, newest first, every row under that service', () => {
     const rows = logRows();
     expect(rows).toHaveLength(7);
-    expect(rows[0].time).toBe('14:02:05');
-    const secs = rows.map((r) => r.time.split(':').map(Number)).map(([h, m, x]) => h * 3600 + m * 60 + x);
+    // Local time, date first, the way finch logs prints it (2006-01-02 15:04:05).
+    expect(rows[0].time).toBe('2026-09-27 14:02:05');
+    for (const r of rows) expect(r.time).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
+    for (const r of rows) expect(r.took).toMatch(/^\d+ms$/);
+    const secs = rows.map((r) => r.time.slice(11).split(':').map(Number)).map(([h, m, x]) => h * 3600 + m * 60 + x);
     for (let k = 1; k < secs.length; k++) expect(secs[k]).toBeLessThan(secs[k - 1]);
     for (const r of rows) {
       expect(r.route.startsWith('/notes/')).toBe(true);
@@ -488,20 +565,30 @@ describe('sighting log', () => {
     expect(log.querySelector('.iw-blink')).toBeNull();
   });
 
-  it('counts its columns right: five recorded fields, and the body struck out', () => {
-    render(<Home />);
+  it('shows exactly the columns finch logs prints, in its order, and no others', () => {
+    const { container } = render(<Home />);
     const table = screen.getByRole('table');
-    const headers = within(table).getAllByRole('columnheader').map((h) => h.textContent);
-    expect(headers).toEqual(['Time', 'Route', 'Caller', 'Status', 'Took', 'Body']);
-    const first = within(table).getAllByRole('row')[1];
-    const cells = within(first).getAllByRole('cell').map((c) => c.textContent);
-    const [row] = logRows();
-    expect(cells).toEqual([row.time, row.route, row.caller, '200', row.took, 'not kept']);
+    const headers = within(table).getAllByRole('columnheader').map((h) => h.textContent!.toUpperCase());
+    // finch logs' header line, verbatim (agent/core cli_lifecycle.go runLogs):
+    // TIME, STATUS, TOOK, CALLER, ROUTE. No Body column: the CLI has none.
+    expect(headers).toEqual(['TIME', 'STATUS', 'TOOK', 'CALLER', 'ROUTE']);
+    expect(LOG_COLUMNS.map((c) => c.key)).toEqual(['time', 'status', 'took', 'caller', 'route']);
+    const body = within(table).getAllByRole('row').slice(1);
+    const all = logRows();
+    expect(body).toHaveLength(all.length);
+    body.forEach((tr, k) => {
+      const r = all[k];
+      expect(within(tr).getAllByRole('cell').map((c) => c.textContent)).toEqual([r.time, r.status, r.took, r.caller, r.route]);
+    });
+    expect(container.querySelector('.fg-log')).not.toHaveTextContent(/not kept|body$/i);
     expect(screen.queryByText(/401|unknown key/)).toBeNull();
-    // The note's count matches the recorded columns (every header but Body).
+    // That bodies are not kept is a handwritten note outside the table, and
+    // its count matches the columns.
     const note = screen.getByText(/fields per call, and that is all of it/);
+    expect(table.contains(note)).toBe(false);
     expect(note).toHaveTextContent(/^Five fields per call/);
-    expect(headers.filter((h) => h !== 'Body')).toHaveLength(5);
+    expect(note).toHaveTextContent(/no request or response bodies/);
+    expect(headers).toHaveLength(5);
     expect(note).toHaveTextContent('Calls refused for a missing or wrong key are not logged.');
   });
 });

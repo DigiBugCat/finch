@@ -14,7 +14,8 @@ export type SessionLine = { text: string; kind: Kind };
 // What an agent following agents.md really types and reads back. Every command
 // must match the shared CLI contract (see prompt.ts); every JSON line is the
 // CLI's real output, trimmed with … where fields are left out, in the order
-// the CLI prints them ("schema_version" first, then alphabetical). 'hand'
+// the CLI prints them ("schema_version" first, then alphabetical; objects
+// nested inside, like each tool, are Go maps, so fully alphabetical). 'hand'
 // lines are the agent talking to you, not CLI output.
 export const SESSION: SessionLine[] = [
   { text: `$ ${INSTALL_ONE_LINER}`, kind: 'cmd' },
@@ -29,16 +30,17 @@ export const SESSION: SessionLine[] = [
   { text: '$ finch service install --json', kind: 'cmd' },
   { text: '{"schema_version":1,…,"installed":true,…,"running":true,…}', kind: 'out' },
   { text: '$ finch test notes --json', kind: 'cmd' },
-  { text: '{"schema_version":1,"ok":true,"service":"notes","tools":[{"name":"search_notes",…},…]}', kind: 'out' },
+  { text: '{"schema_version":1,"ok":true,"service":"notes","tools":[{"description":"…","name":"search_notes"},…]}', kind: 'out' },
   { text: '$ finch connect notes --client claude-code --json', kind: 'cmd' },
   { text: `{"schema_version":1,"client":"claude-code",…,"name":"notes",…,"url":"${EXAMPLE_URL}"}`, kind: 'out' },
   { text: 'notes is live and connected. Reload MCP servers to use it.', kind: 'hand' },
 ];
 
-// The loop starts with the install step already typed, so the terminal never
-// sits empty while the viewer looks at it, and rests a few beats on the
-// finished session before it starts over.
-export const FIRST_STEP = 2;
+// The loop opens with the install and `finch login --start` already typed, so
+// the terminal is never a mostly empty box; the next beat is the agent asking
+// you to approve, which is when the phone slides in. It rests a few beats on
+// the finished session before it starts over.
+export const FIRST_STEP = SESSION.findIndex((l) => l.kind === 'hand');
 const LAST_STEP = SESSION.length + 3;
 const STEP_MS = 650;
 // The phone slides in while the agent waits on the login and stays until the
@@ -63,21 +65,17 @@ export default function AgentSession() {
   const phoneShown = at >= PHONE_FROM;
   const approved = at >= APPROVED_AT;
 
-  // Every line is always laid out; lines not typed yet are only hidden. That
-  // way the terminal is sized by the whole transcript (it grows to fit it, so
-  // the finished frame never clips the first command), and typing it out
-  // never shifts the page. The cursor sits on the line after the last one
-  // typed, so the total line count never changes either.
-  const cursor = <span key="cursor" className="iw-blink fg-term-cursor">▍</span>;
-  const lines = SESSION.map((l, i) => (
-    <span
-      key={i}
-      className={`fg-term-${l.kind}${i >= typedCount ? ' fg-term-pending' : animate ? ' fg-rowin' : ''}`}
-    >
+  // Only the lines typed so far are laid out, then the cursor. The terminal
+  // window has a fixed height (landing.css), so typing never shifts the page:
+  // lines fill it from the top and, once it is full, the oldest slide off the
+  // top the way a real terminal scrolls. Viewers who prefer reduced motion
+  // get the whole finished session at its natural height instead.
+  const lines = SESSION.slice(0, typedCount).map((l, i) => (
+    <span key={i} className={`fg-term-${l.kind}${animate ? ' fg-rowin' : ''}`}>
       {l.text}
     </span>
   ));
-  lines.splice(typedCount, 0, cursor);
+  lines.push(<span key="cursor" className="iw-blink fg-term-cursor">▍</span>);
 
   return (
     <div className="fg-session" ref={ref}>
@@ -85,7 +83,9 @@ export default function AgentSession() {
         <div className="fg-term-bar">agent session · ~/notes-server</div>
         {/* The whole transcript for assistive tech; the typed copy is decoration. */}
         <pre className="sr-only">{SESSION.map((l) => l.text).join('\n')}</pre>
-        <div className="fg-term-lines" aria-hidden="true">{lines}</div>
+        <div className="fg-term-window" aria-hidden="true">
+          <div className="fg-term-lines">{lines}</div>
+        </div>
       </div>
       {/* Decorative: the approval step is already in the transcript above. */}
       <div className={`fg-phone${phoneShown ? ' is-shown' : ''}`} aria-hidden="true">

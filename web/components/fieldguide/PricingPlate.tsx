@@ -3,6 +3,7 @@
 import Link from 'next/link';
 import { Bird } from './Bird';
 import PlateHead from './PlateHead';
+import { SITEMAP_PATHS } from '@/app/site-paths';
 
 function PerchedFinch() {
   return (
@@ -33,6 +34,9 @@ function Flock() {
 
 export const GITHUB_URL = 'https://github.com/DigiBugCat/finch';
 export const SELF_HOST_PATH = '/docs/self-host';
+// The self-hosting guide ships separately; link to it only once the sitemap
+// lists it (site-basics.test ties that list to the pages that exist).
+const HAS_SELF_HOST_PAGE = (SITEMAP_PATHS as readonly string[]).includes(SELF_HOST_PATH);
 
 export default function PricingPlate() {
   return (
@@ -64,7 +68,7 @@ export default function PricingPlate() {
           </div>
           <p>
             For companies running finch across many machines that need an SLA, priority support or a security
-            review. Email <b>hello@aviary.run</b> and a person will reply.
+            review. Email Aviary, the maker of finch, at <b>hello@aviary.run</b> and a person will reply.
           </p>
           <a href="mailto:hello@aviary.run" className="iw-btn iw-btn-quiet fg-tier-cta">Email us</a>
         </article>
@@ -79,7 +83,7 @@ export default function PricingPlate() {
         </div>
         <div className="fg-oss-links">
           <a href={GITHUB_URL} className="iw-btn iw-btn-quiet">Source on GitHub</a>
-          <Link href={SELF_HOST_PATH} className="fg-strong-link">Host it yourself</Link>
+          {HAS_SELF_HOST_PAGE && <Link href={SELF_HOST_PATH} className="fg-strong-link">Host it yourself</Link>}
         </div>
       </aside>
     </section>
