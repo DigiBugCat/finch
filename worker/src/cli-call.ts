@@ -46,6 +46,8 @@ const CLIENT_INFO = { name: "finch-cli", version: "1.0.0" };
 /** Overall budget for the whole exchange. The CLI's HTTP client gives up at
  *  30 s, so the hub answers with a clear 504 before that. */
 export const CLI_CALL_DEADLINE_MS = 25_000;
+// Bound on tools/list pages walked while resolving a tool's header annotations.
+const MAX_TOOL_LIST_PAGES = 10;
 /** Cap on the bytes read from any single upstream response (JSON or SSE).
  *  Same ceiling as the relay's request-body cap (MAX_RELAY_BODY_BYTES). */
 export const CLI_CALL_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
@@ -207,17 +209,33 @@ class Client {
       res.rpc?.error?.code === -32020 &&
       typeof params.name === "string"
     ) {
-      const list = await this.statelessRequest("tools/list", {}, {});
-      const tools = list.rpc?.result?.tools;
-      const tool = Array.isArray(tools)
-        ? tools.find((t: any) => isObject(t) && t.name === params.name)
-        : undefined;
+      const tool = await this.findStatelessTool(params.name);
       const extra = tool ? paramHeaders(tool.inputSchema, params.arguments) : {};
       if (Object.keys(extra).length > 0) {
         return this.statelessRequest(rpcMethod, params, extra);
       }
     }
     return res;
+  }
+
+  /** Find a tool by name, following tools/list nextCursor pagination for at
+   *  most MAX_TOOL_LIST_PAGES pages so a server with many tools still yields
+   *  the header annotations of a tool past the first page. */
+  private async findStatelessTool(name: string): Promise<any> {
+    let cursor: string | undefined;
+    for (let page = 0; page < MAX_TOOL_LIST_PAGES; page++) {
+      const list = await this.statelessRequest("tools/list", cursor ? { cursor } : {}, {});
+      const result = list.rpc?.result;
+      const tools = result?.tools;
+      if (Array.isArray(tools)) {
+        const hit = tools.find((t: any) => isObject(t) && t.name === name);
+        if (hit) return hit;
+      }
+      const next = result?.nextCursor;
+      if (typeof next !== "string" || next === "" || next === cursor) return undefined;
+      cursor = next;
+    }
+    return undefined;
   }
 
   private statelessRequest(rpcMethod: string, params: Json, extra: Record<string, string>) {

@@ -238,7 +238,7 @@ function decodeHeader(v: string | undefined): string | undefined {
 
 /** A 2026-07-28-only stateless server. `initialize405` makes it answer the
  *  handshake POST with a bare 405 instead of -32022. */
-function modernServer(opts: { initialize405?: boolean } = {}) {
+function modernServer(opts: { initialize405?: boolean; paginate?: boolean } = {}) {
   const seen: Seen[] = [];
   const err = (status: number, id: unknown, code: number, message: string, data?: unknown) =>
     jsonRes(status, { jsonrpc: "2.0", id: id ?? null, error: { code, message, ...(data ? { data } : {}) } });
@@ -270,6 +270,14 @@ function modernServer(opts: { initialize405?: boolean } = {}) {
       return err(400, body.id, -32602, "missing _meta");
     }
     if (body.method === "tools/list") {
+      if (opts.paginate) {
+        // Page 1 omits the annotated tool; it only appears behind nextCursor.
+        const onSecond = body.params?.cursor === "page-2";
+        const tools = TOOLS.filter((t: any) => (t.name === "execute_sql") === onSecond);
+        const result: Json = { resultType: "complete", tools };
+        if (!onSecond) result.nextCursor = "page-2";
+        return jsonRes(200, { jsonrpc: "2.0", id: body.id, result });
+      }
       return jsonRes(200, { jsonrpc: "2.0", id: body.id, result: { resultType: "complete", tools: TOOLS } });
     }
     if (body.method === "tools/call") {
@@ -566,6 +574,19 @@ describe("cli call: 2026-07-28 stateless fallback", () => {
     expect(p.map((s) => s.body!.method)).toEqual(["initialize", "tools/call", "tools/list", "tools/call"]);
     expect(p[3].headers["mcp-param-region"]).toBe("us-west1");
     expect(p[3].headers["mcp-name"]).toBe("execute_sql");
+  });
+
+  it("follows tools/list nextCursor to find the annotated tool on a later page", async () => {
+    const m = modernServer({ paginate: true });
+    const { status } = await run(m.handle, "tools/call", {
+      name: "execute_sql",
+      arguments: { region: "us-west1", query: "select 1" },
+    });
+    expect(status).toBe(200);
+    const p = posts(m.seen);
+    expect(p.map((s) => s.body!.method)).toEqual(["initialize", "tools/call", "tools/list", "tools/list", "tools/call"]);
+    expect(p[3].body!.params.cursor).toBe("page-2");
+    expect(p[4].headers["mcp-param-region"]).toBe("us-west1");
   });
 
   it("base64-encodes a non-ASCII tool name in Mcp-Name", async () => {
