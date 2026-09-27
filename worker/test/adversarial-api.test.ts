@@ -116,8 +116,8 @@ describe("public credential endpoints fail closed on hostile bodies", () => {
   });
 });
 
-describe("user-scoped routes require a user-scoped assertion", () => {
-  it("does not accept a tenant assertion on /api/user/sync", async () => {
+describe("tenant resolution is the tenant assertion alone", () => {
+  it("no longer serves the user-scoped owner lookup", async () => {
     const assertion = await signAssertion({
       tenant: env.DEFAULT_TENANT!, kind: "assertion", exp: now() + 60,
     }, env.FINCH_SERVICE_SECRET);
@@ -125,8 +125,18 @@ describe("user-scoped routes require a user-scoped assertion", () => {
       "X-Finch-Service": env.FINCH_SERVICE_SECRET,
       "X-Finch-Auth": assertion,
     });
+    expect(res.status).toBe(404);
+  });
+
+  it("does not accept a user-scoped assertion as a tenant credential", async () => {
+    const assertion = await signAssertion({
+      tenant: env.DEFAULT_TENANT!, kind: "user", exp: now() + 60,
+    }, env.FINCH_SERVICE_SECRET);
+    const res = await call("/api/member-context", JSON.stringify({ clerkUserId: env.DEFAULT_TENANT }), {
+      "X-Finch-Service": env.FINCH_SERVICE_SECRET,
+      "X-Finch-Auth": assertion,
+    });
     expect(res.status).toBe(401);
-    expect(await res.json()).toEqual({ error: "invalid user assertion" });
   });
 });
 

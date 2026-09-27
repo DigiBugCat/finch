@@ -25,6 +25,7 @@ import { checkPrivacyInvariants } from "./check-privacy-invariants.mjs";
 // Shared with check-privacy-invariants so the two gates cannot drift, and so
 // both agree with wrangler on where a line comment ends (CR as well as LF).
 import { readJsonc } from "./jsonc.mjs";
+import { checkDurableObjectMigrations } from "./do-migrations.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..");
@@ -84,38 +85,12 @@ const prodRoutes = Array.isArray(prod?.routes) ? prod.routes : [];
 if (!prodRoutes.some((r) => r?.pattern === canonicalRoute)) {
   fail(`[env.production].routes must include the canonical JWKS route ${canonicalRoute}.`);
 }
-// The retired AviaryEnrollmentDO has no binding any more, but its migration
-// must stay: dropping it (or adding a deleted_classes step) would delete the
-// class's stored data. That is a deliberate, separate cleanup — never a side
-// effect of a routine deploy. Wrangler does not inherit migrations from the
-// top-level config, so every named environment is checked.
-const aviaryMigration = (envCfg.migrations ?? []).some(
-  (migration) =>
-    migration?.tag === "v5" &&
-    Array.isArray(migration?.new_sqlite_classes) &&
-    migration.new_sqlite_classes.includes("AviaryEnrollmentDO"),
-);
-if (!aviaryMigration) {
-  fail(`[env.${env}] must keep migration v5 for the retired AviaryEnrollmentDO.`);
-}
-if ((envCfg.migrations ?? []).some((migration) => migration?.deleted_classes)) {
-  fail(`[env.${env}] carries a deleted_classes migration — deleting Durable Object data needs an explicit, reviewed change.`);
-}
-const directoryBinding = (envCfg.durable_objects?.bindings ?? []).find(
-  (binding) => binding?.name === "DIRECTORY",
-);
-if (directoryBinding?.class_name !== "DirectoryDO") {
-  fail(`[env.${env}] must bind DIRECTORY to DirectoryDO.`);
-}
-const directoryMigration = (envCfg.migrations ?? []).some(
-  (migration) =>
-    migration?.tag === "v6" &&
-    Array.isArray(migration?.new_sqlite_classes) &&
-    migration.new_sqlite_classes.includes("DirectoryDO"),
-);
-if (!directoryMigration) {
-  fail(`[env.${env}] must include migration v6 for DirectoryDO.`);
-}
+// Durable Object migrations: append-only history, and no deleted_classes step
+// except the one approved v7 deletion of AviaryEnrollmentDO + DirectoryDO
+// (see scripts/do-migrations.mjs). Checked for the env being deployed, since
+// wrangler does not inherit migrations into named environments.
+const migrationProblems = checkDurableObjectMigrations(env, envCfg);
+if (migrationProblems.length) fail(migrationProblems.join("\n  "));
 
 const isProd = env === "production";
 

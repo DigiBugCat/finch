@@ -447,7 +447,14 @@ describe("Clerk userinfo verification boundaries", () => {
     expect(results.every((value) => value?.sub === "user_singleflight")).toBe(true);
   });
 
-  it.each([null, [], { sub: "u", email: 7 }, { email: "missing-sub@example.test" }])(
+  it.each([
+    null,
+    [],
+    { sub: 7 },
+    { sub: "u", user_id: 7 },
+    { user_id: ["u"] },
+    { email: "missing-sub@example.test" },
+  ])(
     "rejects malformed successful identity payload %#",
     async (payload) => {
       const fetcher = { fetch: async () => Response.json(payload) };
@@ -456,6 +463,21 @@ describe("Clerk userinfo verification boundaries", () => {
       )).toBeNull();
     },
   );
+
+  it("keeps only the Clerk user id: organization and profile claims are dropped", async () => {
+    const fetcher = {
+      fetch: async () =>
+        Response.json({
+          sub: "user_1",
+          org_id: "org_1",
+          org_role: "org:admin",
+          email: "u@example.test",
+        }),
+    };
+    expect(
+      await verifyClerkOAuthToken(`opaque-${crypto.randomUUID()}`, "https://clerk.test", fetcher as any),
+    ).toEqual({ sub: "user_1" });
+  });
 
   it("does not cache transient 5xx failures", async () => {
     let calls = 0;

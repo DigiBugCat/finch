@@ -11,10 +11,10 @@
 //   - /join is the ONE exception — it's TICKET-authed (the box presents the
 //     stateless join ticket it was handed at enroll). No service secret.
 //
-// Tenancy is single-user: a tenant has exactly one owner. A signed-in Clerk
-// user acts on the tenant they OWN (see /api/user/sync), else their personal
-// tenant (their Clerk user id). There are no shared members, invitations,
-// workspace switching, or per-user app grants.
+// Tenancy is single-user: a tenant IS one Clerk user — its id is their Clerk
+// user id and they are its only member (the owner). The web signs assertions
+// for exactly that id. There are no shared members, invitations, workspaces,
+// ACL rules, or per-user app grants.
 
 import { rateLimitOk, clientIp, json, tenantOp, boxStub, type Env } from "./index";
 import {
@@ -26,7 +26,7 @@ import {
 } from "./auth";
 import {
   routerLookup,
-  routerRegister,
+  routerRegisterWakingHolder,
   routerUnregister,
   routerListForTenant,
   isValidHostKey,
@@ -41,53 +41,7 @@ async function tenantOpRaw(env: Env, tenant: string, op: string, args: Record<st
   const id = env.TENANT.idFromName(tenant);
   return env.TENANT.get(id).fetch("https://tenant.internal/", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ op, ...args }) });
 }
-async function directoryOp<T=any>(env: Env, op: string, args: Record<string, unknown> = {}): Promise<T> {
-  const id=env.DIRECTORY.idFromName("global"); const res=await env.DIRECTORY.get(id).fetch("https://directory.internal/",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({op,...args})});
-  if(!res.ok) throw new Error(`directory ${op} failed: ${res.status}`); return res.json<T>();
-}
 function cloneResponse(res: Response): Promise<Response> { return res.text().then(text=>new Response(text,{status:res.status,headers:{"content-type":res.headers.get("content-type")??"application/json"}})); }
-
-/** The tenants a Clerk user OWNS — the directory's rows for them, plus any
- *  `extra` candidates (the legacy Clerk-org tenants the web says they admin)
- *  — each one re-verified against the TenantDO itself (the directory is an
- *  index, never the authority). The personal tenant (the user's own Clerk id)
- *  is excluded: it is the fallback, not a match. Legacy Clerk-org tenants
- *  carry an owner row once claimed, so they resolve like any other owned
- *  tenant. The row's own role is not trusted either way: every candidate is
- *  asked, so a directory row that lags an ownership change can neither grant
- *  nor hide ownership. An owned tenant the directory does not list yet (one
- *  claimed just now) is indexed, so it keeps resolving if the web stops
- *  naming it. */
-async function ownedTenants(env: Env, clerkUserId: string, extra: string[] = []): Promise<string[]> {
-  const listed = await directoryOp<{ memberships?: { tenantId: string }[] }>(
-    env,
-    "listForUser",
-    { clerkUserId },
-  );
-  const indexed = (listed.memberships ?? []).map((row) => String(row.tenantId || ""));
-  const out: string[] = [];
-  for (const tenantId of [...indexed, ...extra]) {
-    if (!tenantId || tenantId === clerkUserId || out.includes(tenantId)) continue;
-    const res = await tenantOpRaw(env, tenantId, "memberContext", { clerkUserId });
-    if (!res.ok) continue;
-    const ctx: any = await res.json();
-    if (ctx?.member?.role !== "owner" || ctx.member.state !== "active") continue;
-    out.push(tenantId);
-    if (!indexed.includes(tenantId)) {
-      await directoryOp(env, "upsertMembership", {
-        clerkUserId,
-        tenantId,
-        memberId: ctx.member.id,
-        role: "owner",
-        state: "active",
-      });
-    }
-  }
-  return out;
-}
-
-// Mirrors the web's cap on the admin org ids it reads from Clerk.
-const MAX_ADMIN_ORG_IDS = 1_000;
 
 // A CLI token is a long-lived tenant assertion, distinguished from a per-call
 // assertion by kind:"cli" + an epoch the tenant can bump to revoke. 30 days.
@@ -337,15 +291,6 @@ async function handleApiInner(
   const path = url.pathname;
   const method = req.method;
 
-  // Aviary service-device enrollment was removed. Answer its old public and
-  // CLI routes with a plain 410 so an old agent or `finch aviary` gets a clear
-  // reason instead of a generic 404/401.
-  if (path.startsWith("/api/aviary/") || path.startsWith("/api/cli/aviary/")) {
-    return json(410, {
-      error: "Aviary device enrollment has been removed — register services with `finch add` instead",
-    });
-  }
-
   // ---- /join — ticket-authed (NOT service-authed) ----
   if (path === "/join") {
     if (method !== "POST") return json(405, { error: "POST only" });
@@ -481,16 +426,17 @@ async function handleApiInner(
     //      credential, same as the dashboard) — so an agent can manage and
     //      REVOKE access without the dashboard. ----
 
-    // GET /api/cli/state — full tenant state (fleet, keys, ACL) for finch fleet/keys.
+    // GET /api/cli/state — full tenant state (fleet, keys) for finch fleet/keys.
     if (path === "/api/cli/state" && method === "GET") {
       return json(200, await tenantOp(env, cliTenant, "getState"));
     }
-    // POST /api/cli/keys {label,scope,owner} — mint a client finch_ key (once).
+    // POST /api/cli/keys {label,scope} — mint a client finch_ key (once). The
+    // key's owner is always the tenant owner.
     if (path === "/api/cli/keys" && method === "POST") {
       const b = await readJson(req);
       if (!b.label) return json(400, { error: "label required" });
       const out = await tenantOp<{ plaintext: string; key: PublicKey } | { error: string }>(
-        env, cliTenant, "mintKey", { label: b.label, scope: b.scope, owner: b.owner },
+        env, cliTenant, "mintKey", { label: b.label, scope: b.scope },
       );
       if ("error" in out) return json(400, { error: out.error });
       return json(200, { key: out.plaintext, ...out.key });
@@ -557,88 +503,6 @@ async function handleApiInner(
   }
   const assertion = req.headers.get("X-Finch-Auth") || "";
 
-  // POST /api/user/sync — the one USER-scoped route (the assertion names a Clerk
-  // user, kind:"user"). It resolves which tenants that user OWNS and returns
-  // them in the same {tenants, claimable} shape the web has always read:
-  //   - the tenants they own beyond their personal one (team workspaces and
-  //     Clerk-org tenants claimed before the cut), and
-  //   - their personal tenant (their Clerk user id), bootstrapped from the
-  //     verified primaryEmail when the web supplies one.
-  // Legacy Clerk-org tenants: for each org the web says (from Clerk) the user
-  // administers — `adminOrgIds` — a tenant that holds state from before native
-  // tenancy and was never claimed is claimed for this user here, as its single
-  // owner (it needs the verified primaryEmail for the owner row; without one
-  // it is reported in `claimable` instead). This is the retired claim UI's
-  // replacement, so such a tenant never becomes unreachable.
-  // `tenant` is the one tenant to act on, by the same rule as the web's
-  // chooseTenant: the only one of personal + owned that holds a fleet
-  // (services or finch_ keys); the personal tenant when none does; and null
-  // when more than one does, so a caller is never switched away from a
-  // populated tenant silently.
-  if (path === "/api/user/sync") {
-    const clerkUserId = await verifyAssertion(assertion, env.FINCH_SERVICE_SECRET, "user");
-    if (!clerkUserId) return json(401, { error: "invalid user assertion" });
-    if (method !== "POST") return json(405, { error: "POST only" });
-    const body = await readJson(req);
-    const emails = Array.isArray(body.emails)
-      ? body.emails.map((x: any) => String(x).trim().toLowerCase())
-      : [];
-    const primaryEmail = body.primaryEmail ? String(body.primaryEmail).trim().toLowerCase() : "";
-    if (primaryEmail && !emails.includes(primaryEmail)) {
-      return json(400, { error: "primaryEmail must be verified" });
-    }
-    if (primaryEmail) {
-      const r = await tenantOpRaw(env, clerkUserId, "memberContext", { clerkUserId, email: primaryEmail });
-      if (!r.ok) return cloneResponse(r);
-    }
-    const rawOrgIds: unknown[] = Array.isArray(body.adminOrgIds) ? body.adminOrgIds : [];
-    if (rawOrgIds.length > MAX_ADMIN_ORG_IDS) return json(400, { error: "too many adminOrgIds" });
-    const adminOrgIds = [...new Set(
-      rawOrgIds.filter((x): x is string => typeof x === "string" && x.startsWith("org_") && x.length <= 128),
-    )];
-    const claimable: { clerkOrgId: string }[] = [];
-    for (const clerkOrgId of adminOrgIds) {
-      const held = await tenantOp<{ migrated: boolean; hasState: boolean }>(env, clerkOrgId, "holdings");
-      if (held.migrated || !held.hasState) continue; // claimed already, or nothing to claim
-      if (!primaryEmail) {
-        claimable.push({ clerkOrgId });
-        continue;
-      }
-      // A 409 here means another admin claimed it first; it then resolves for
-      // them, not for this user.
-      await tenantOpRaw(env, clerkOrgId, "claimLegacyOrg", { clerkOrgId, clerkUserId, email: primaryEmail });
-    }
-    const owned = await ownedTenants(env, clerkUserId, adminOrgIds);
-    const tenants: Record<string, unknown>[] = [];
-    for (const tenantId of [...owned, clerkUserId]) {
-      const contextRes = await tenantOpRaw(env, tenantId, "memberContext", { clerkUserId });
-      if (!contextRes.ok) continue;
-      const context: any = await contextRes.json();
-      const personalPending = tenantId === clerkUserId && context.needsBootstrap === true;
-      if (context.member?.state !== "active" && !personalPending) continue;
-      tenants.push({
-        tenantId,
-        role: "owner",
-        ...(context.member ? { memberId: context.member.id } : {}),
-        ...(context.member ?? {}),
-        name: context.tenantMeta?.displayName ?? tenantId,
-        kind: context.tenantMeta?.kind ?? (tenantId === clerkUserId ? "personal" : "team"),
-        state: personalPending ? "invited" : context.member.state,
-      });
-    }
-    // Almost everyone owns only their personal tenant: nothing to probe.
-    let chosen: string | null = clerkUserId;
-    if (owned.length > 0) {
-      const populated: string[] = [];
-      for (const tenantId of [clerkUserId, ...owned]) {
-        const held = await tenantOp<{ holdsFleet: boolean }>(env, tenantId, "holdings");
-        if (held.holdsFleet) populated.push(tenantId);
-      }
-      chosen = populated.length === 0 ? clerkUserId : populated.length === 1 ? populated[0] : null;
-    }
-    return json(200, { tenant: chosen, tenants, claimable });
-  }
-
   const tenant = await verifyAssertion(assertion, env.FINCH_SERVICE_SECRET);
   if (!tenant) {
     return json(401, {
@@ -655,10 +519,10 @@ async function handleApiInner(
 
 
   // POST /api/member-context {clerkUserId, email?} — who this Clerk user is in
-  // THIS tenant. Only the tenant's OWNER is a member now: anyone else gets
-  // {member:null} and the web refuses them. For the user's personal tenant an
-  // `email` bootstraps the owner row on first use ({needsBootstrap:true}
-  // until then). Response shape unchanged.
+  // THIS tenant. Only the Clerk user whose tenant it is (tenant id === their
+  // user id) is a member, as its owner; anyone else gets {member:null} and the
+  // web refuses them. An `email` bootstraps the owner row on first use
+  // ({needsBootstrap:true} until then).
   if (method === "POST" && seg.length === 1 && seg[0] === "member-context") {
     const body = await readJson(req);
     return cloneResponse(await tenantOpRaw(env, tenant, "memberContext", {
@@ -804,7 +668,7 @@ async function handleApiInner(
     return json(out?.ok === false ? 404 : 200, out);
   }
 
-  // POST /api/keys {label,scope,owner}. scope is the STRUCTURED KeyScope
+  // POST /api/keys {label,scope}. scope is the STRUCTURED KeyScope
   // ({all:true} | {services:[...]}); TenantDO.mintKey validates every listed
   // service id exists and 400s on an unknown id. We pass it through and
   // surface the DO's error verbatim (no validation duplicated here).
@@ -816,7 +680,6 @@ async function handleApiInner(
     >(env, tenant, "mintKey", {
       label: body.label,
       scope: body.scope,
-      owner: body.owner,
     });
     if ("error" in out) return json(400, { error: out.error });
     const resp: MintKeyResp = {
@@ -909,13 +772,20 @@ async function handleHostnames(
   }
 
   if (method === "POST") {
-    const reg = await routerRegister(env, hostname, tenant);
+    // Already this tenant's (registered before, or handed over from the
+    // user's former team tenant by the single-user purge): Cloudflare already
+    // has it, and provisioning again would fail as a duplicate, whose failure
+    // path would then unregister the hostname the tenant owns.
+    const alreadyOwned = (await routerLookup(env, hostname)) === tenant;
+    const reg = alreadyOwned
+      ? { ok: true, handedOff: false }
+      : await routerRegisterWakingHolder(env, hostname, tenant);
     if (!reg.ok) {
       if (reg.reason === "collision") return json(409, { error: "hostname already registered" });
       return json(400, { error: "invalid hostname" });
     }
     let ssl: unknown = undefined;
-    if (!vanity) {
+    if (!vanity && !alreadyOwned && !reg.handedOff) {
       const cf = await provisionCfHostname(env, hostname);
       if (!cf.ok) {
         await routerUnregister(env, hostname, tenant);
@@ -1166,20 +1036,6 @@ async function handleRefresh(
   });
   if (!reg.exists) {
     return json(403, { error: "box no longer registered" });
-  }
-  // Refresh credentials issued by the retired Aviary device flow carry a
-  // per-box epoch; boxes enrolled that way still refresh here, so keep
-  // honoring it. Tokens minted by /join carry no epoch and skip this check.
-  if (typeof payload.epoch === "number") {
-    const current = await tenantOp<{ exists: boolean; epoch?: number }>(
-      env,
-      tenant,
-      "boxCredentialEpoch",
-      { service, box },
-    );
-    if (!current.exists || current.epoch !== payload.epoch) {
-      return json(403, { error: "refresh credential superseded" });
-    }
   }
 
   // Re-stamp the agent version when the box reports one (it re-execs onto a

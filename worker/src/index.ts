@@ -6,9 +6,10 @@
 //   - relays MCP / agent traffic to the per-BOX BoxDO, gated by a
 //     finch_ key check against the tenant's TenantDO.
 //
-// Tenancy: every request belongs to a tenant (a Clerk org id, or user id).
-//   - Control-plane requests (from the web app) carry X-Finch-Tenant explicitly
-//     — that IS the real tenant id, so control-plane TenantDOs are keyed by it.
+// Tenancy: every request belongs to a tenant, and a tenant is one Clerk user
+// (its id is their Clerk user id).
+//   - Control-plane requests (from the web app) carry a signed assertion naming
+//     the tenant id, so control-plane TenantDOs are keyed by it.
 //   - MCP / relay traffic carries only a vanity HOST slug (<slug>.finchmcp.com),
 //     which is NOT the tenant id. The relay resolves the slug to the tenant id
 //     via the singleton RouterDO (slug→tenantId index) and keys TenantDO +
@@ -18,8 +19,6 @@
 import { BoxDO, readBoundedBody } from "./box-do";
 import { TenantDO } from "./tenant-do";
 import { RouterDO, routerLookup } from "./router-do";
-import { AviaryEnrollmentDO } from "./aviary-enrollment-do";
-import { DirectoryDO } from "./directory-do";
 import { handleApi, isApiPath } from "./api";
 import { installScript } from "./install-script";
 import {
@@ -35,20 +34,15 @@ import {
 } from "./auth";
 import type { CallerAssertionClaims, CallerAuthMethod } from "./auth";
 
-// AviaryEnrollmentDO is a retired stub (it answers 410). It stays exported
-// because wrangler migration v5 declared the class: dropping the export would
-// fail the deploy, and deleting the class would delete its stored data. Remove
-// it only with an explicit, deliberate deleted_classes migration.
-export { BoxDO, TenantDO, RouterDO, AviaryEnrollmentDO, DirectoryDO };
+// AviaryEnrollmentDO and DirectoryDO are gone: wrangler migration v7 deletes
+// both classes and their stored data (see wrangler.jsonc).
+export { BoxDO, TenantDO, RouterDO };
 
 export interface Env {
   // Durable Object namespaces.
   BOX: DurableObjectNamespace; // per-box WS relay (BoxDO)
   TENANT: DurableObjectNamespace; // per-tenant control-plane state (TenantDO)
   ROUTER: DurableObjectNamespace; // singleton slug→tenantId index (RouterDO)
-  // Global clerkUserId → tenant index (DirectoryDO). Read-only now: consulted
-  // only to resolve which tenant a signed-in Clerk user OWNS.
-  DIRECTORY: DurableObjectNamespace;
 
   // Secrets / vars (wrangler vars in dev via .dev.vars; secrets in prod).
   FINCH_SERVICE_SECRET: string; // web-app -> control API shared secret
@@ -155,13 +149,6 @@ const MAX_RELAY_BODY_BYTES = 4 * 1024 * 1024; // 4 MiB
 // tenant resolution and RELAY_LIMIT, so it is the cheapest unauthenticated path
 // into this Worker; RFC 7591 client metadata is a handful of fields.
 const MAX_DCR_BODY_BYTES = 64 * 1024; // 64 KiB
-
-// The retired browser login wall's cookie names. The hub no longer mints or
-// reads them, but a browser may still carry one (they lived up to 12h) and a
-// signed session envelope names its Clerk user — so the relay keeps scrubbing
-// both names out of the Cookie header it forwards to the box. Safe to delete
-// once every pre-cut cookie has expired.
-const STALE_SESSION_COOKIES = new Set(["__Host-finch_session", "finch_session"]);
 
 // Caller-controlled copies are removed before any relay authentication runs;
 // only the Worker may inject this header after a successful auth decision.
@@ -287,25 +274,6 @@ async function injectCallerAssertion(
   );
 }
 
-/** Strip ONLY the stale login-wall cookies out of a Cookie header, preserving
- *  the hosted app's OWN cookies (e.g. app_sid). Parses the header into
- *  name=value pairs, drops the STALE_SESSION_COOKIES pairs, and re-serializes
- *  the rest. Returns "" if nothing remains (caller then deletes the header). A
- *  blanket "contains finch_" strip would delete the whole Cookie header and
- *  break every cookie-based hosted site. (#1) */
-function stripSessionCookie(cookieHeader: string): string {
-  const kept: string[] = [];
-  for (const part of cookieHeader.split(";")) {
-    const eq = part.indexOf("=");
-    const name = (eq < 0 ? part : part.slice(0, eq)).trim();
-    // drop only the stale login-wall cookie pairs
-    if (STALE_SESSION_COOKIES.has(name)) continue;
-    const pair = part.trim();
-    if (pair) kept.push(pair);
-  }
-  return kept.join("; ");
-}
-
 // Default target for GET /releases/<asset>: the project's GitHub Releases
 // "latest" download URL. Overridable via env.RELEASES_BASE.
 const DEFAULT_RELEASES_BASE =
@@ -318,7 +286,7 @@ const RELEASE_ASSET_RE =
   /^(?:checksums\.txt|finch-(darwin|linux)-(amd64|arm64|armv6|armv7))$/;
 
 // The OAuth scopes the MCP resource actually needs — identity only.
-// verifyClerkOAuthToken reads sub/user_id/org_id from Clerk's userinfo, so
+// verifyClerkOAuthToken reads only sub/user_id from Clerk's userinfo, so
 // `openid` covers verification; `offline_access` keeps connectors connected via
 // refresh tokens. Advertised in BOTH the 401 WWW-Authenticate scope hint and
 // the RFC 9728 scopes_supported (single const so the two can't drift). Without
@@ -596,7 +564,7 @@ export default {
         // (claude.ai) request the scopes advertised here (or in the 401
         // challenge's scope hint) instead of everything the AS supports, so
         // the consent screen stops asking for profile/metadata that the hub
-        // never reads (verifyClerkOAuthToken consumes only sub/org_id/email).
+        // never reads (verifyClerkOAuthToken consumes only sub/user_id).
         scopes_supported: MCP_SCOPES,
       });
       return new Response(body, {
@@ -759,13 +727,6 @@ export default {
         // Specific box: upstream = everything after <service>/<box>.
         const upstream = parts.slice(2).join("/");
         if (isReservedUpstream(upstream)) return json(404, { error: "not found" });
-        const allowed = await tenantOp<{ exists: boolean; allowed: boolean }>(
-          env,
-          tenant,
-          "routeAllowed",
-          { service, path: upstream ? `/${upstream}` : "/" },
-        );
-        if (!allowed.allowed) return json(404, { error: "route not exposed by service manifest" });
         return relayMcp(req, env, ctx, tenant, service, pinned, path, upstream);
       }
 
@@ -776,14 +737,9 @@ export default {
       // stale-pick "service offline" 503. (code-review #12)
       const upstream = parts.slice(1).join("/");
       if (isReservedUpstream(upstream)) return json(404, { error: "not found" });
-      const allowed = await tenantOp<{ exists: boolean; allowed: boolean }>(
-        env,
-        tenant,
-        "routeAllowed",
-        { service, path: upstream ? `/${upstream}` : "/" },
-      );
-      if (!allowed.allowed) return json(404, { error: "route not exposed by service manifest" });
       const pool = await pickHealthyPool(env, tenant, service);
+      // No such service: a plain 404, before any credential is looked at.
+      if (!pool) return json(404, { error: "no such service", service });
       if (!pool.length) {
         // No healthy box at all. Record this 503 too, so a load-balanced
         // offline call is just as visible in the dashboard (logs / recentCalls /
@@ -810,15 +766,16 @@ export default {
 
 /** The shuffled pool of online box names for a service (load-balance +
  *  failover). Uses the UNIFIED liveness rule (connected AND not pending) so the
- *  picker and the dashboard agree. Reads TenantDO getState. Empty if none. */
+ *  picker and the dashboard agree. Reads TenantDO getState. Empty if none is
+ *  online; null if the tenant has no such service. */
 async function pickHealthyPool(
   env: Env,
   tenant: string,
   service: string,
-): Promise<string[]> {
+): Promise<string[] | null> {
   const state = await tenantOp(env, tenant, "getState");
   const ap = (state?.services ?? []).find((a: any) => a.id === service);
-  if (!ap) return [];
+  if (!ap) return null;
   const boxes: any[] = ap.boxes ?? [];
   // online = holds a live socket AND approved (matches tenant-do boxOnline).
   const healthy = boxes.filter(
@@ -924,9 +881,10 @@ async function relayMcp(
     : null;
   // OAUTH PLANE: a non-finch_ bearer with CLERK_ISSUER configured is tried as a
   // Clerk OAuth access token (claude.ai custom connectors — they can't send
-  // finch_ keys). A verified token whose Clerk user OWNS this tenant
-  // authorizes the relay; any other verified identity is a hard 403 (Finch is
-  // single-user: there are no shared members or per-user app grants). An
+  // finch_ keys). A verified token whose Clerk user IS this tenant (tenant id
+  // === their user id) authorizes the relay; any other verified identity is a
+  // hard 403 (Finch is single-user: there are no shared members, org grants
+  // or per-user app grants). An
   // unverifiable token falls through to the key gate, whose 401 carries the
   // resource_metadata challenge pointing back at Clerk.
   let oauthAuthed = false;
@@ -945,9 +903,6 @@ async function relayMcp(
         const gate = await tenantOp<{ allowed: boolean }>(env, tenant, "gateOauth", {
           clerkUserId: id,
           service,
-          // Only consulted for a legacy Clerk-org tenant nobody has claimed.
-          orgIdClaim: who.org_id,
-          orgRole: who.org_role,
         });
         if (!gate.allowed) {
           return json(403, { error: "token identity does not own this tenant" });
@@ -967,6 +922,8 @@ async function relayMcp(
     //   public service        → allowed regardless of key (check.public)
     //   key service, no key    → not allowed, no bearer presented → 401
     //   key service, bad key   → not allowed, reason-mapped       → 403
+    // A key is allowed iff it exists (not revoked), has not expired, and its
+    // scope is {all:true} or names the service — there are no ACL rules.
     // So key-gated services behave EXACTLY as before; only public ones open up.
     const auth = req.headers.get("authorization") || "";
     const m = auth.match(/^Bearer\s+(finch_[A-Za-z0-9_-]+)$/);
@@ -977,12 +934,12 @@ async function relayMcp(
       keyId?: string;
       keyOwner?: string;
       public?: boolean;
-      reason?: "no-key" | "scope" | "acl" | "expired";
+      reason?: "no-key" | "expired" | "no-service" | "scope";
     }>(env, tenant, "checkKey", { hash, service });
     if (!check.allowed) {
       // No bearer at all on a key-gated service → the shape-level 401 (same as
       // before). A present-but-rejected key → 403 with the cause distinguished
-      // ("unknown key" vs "known key, not granted by the tenant's ACL").
+      // (unknown key, expired key, or a scope that does not cover the service).
       if (!m) {
         // The 401 challenge is what OAuth-capable clients key on: it points at
         // our RFC 9728 metadata, which points at Clerk (discovery → DCR → code
@@ -1002,13 +959,11 @@ async function relayMcp(
         );
       }
       const error =
-        check.reason === "acl"
-          ? "no ACL rule grants this key access to this service"
-          : check.reason === "scope"
-            ? "key scope does not include this service"
-            : check.reason === "expired"
-              ? "key has expired"
-              : "key not allowed for this service";
+        check.reason === "scope"
+          ? "key scope does not include this service"
+          : check.reason === "expired"
+            ? "key has expired"
+            : "key not allowed for this service";
       return json(403, { error });
     }
     caller = check.public ? "public" : check.keyLabel || "finch_key";
@@ -1035,7 +990,7 @@ async function relayMcp(
   // The scrub is BY NAME, not by value. The hub reads a finch_ key or OAuth
   // token only from `Authorization: Bearer`, and the first-party service
   // secret + tenant assertion only from X-Finch-Service / X-Finch-Auth — so
-  // those are what go (plus any stale login-wall cookie, below).
+  // those are what go.
   // Every other header is forwarded byte-for-byte. This used to also delete ANY
   // header whose value merely contained "finch_", which dropped MCP
   // 2026-07-28's Mcp-Name / Mcp-Param-* mirrors for a tool or argument named
@@ -1061,14 +1016,6 @@ async function relayMcp(
     for (const [name, value] of [...relayHeaders.entries()]) {
       if (value.includes(presented)) relayHeaders.delete(name);
     }
-  }
-  // Surgically remove ONLY a stale finch_session login-wall cookie from the
-  // Cookie header, leaving the hosted app's own cookies (e.g. app_sid) intact. (#1)
-  const cookieHeader = relayHeaders.get("cookie");
-  if (cookieHeader) {
-    const remaining = stripSessionCookie(cookieHeader);
-    if (remaining) relayHeaders.set("cookie", remaining);
-    else relayHeaders.delete("cookie");
   }
   // Buffer the body ONCE so we can replay it across failover candidates (a
   // streaming body can't be re-sent). Enforce the real size cap here too, since

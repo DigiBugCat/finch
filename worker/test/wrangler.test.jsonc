@@ -33,12 +33,7 @@
     "bindings": [
       { "name": "BOX", "class_name": "BoxDO" },
       { "name": "TENANT", "class_name": "TenantDO" },
-      { "name": "ROUTER", "class_name": "RouterDO" },
-      { "name": "DIRECTORY", "class_name": "DirectoryDO" },
-      // Test-only: the retired AviaryEnrollmentDO has no binding in
-      // ../wrangler.jsonc (nothing routes to it). This one lets the tests
-      // reach an instance to check that it scrubs its stored secrets.
-      { "name": "AVIARY_ENROLLMENT", "class_name": "AviaryEnrollmentDO" }
+      { "name": "ROUTER", "class_name": "RouterDO" }
     ]
   },
   "migrations": [
@@ -47,6 +42,7 @@
     { "tag": "v3", "new_sqlite_classes": ["RouterDO"] },
     { "tag": "v4", "renamed_classes": [{ "from": "ApplianceDO", "to": "BoxDO" }] },
     { "tag": "v5", "new_sqlite_classes": ["AviaryEnrollmentDO"] },
-    { "tag": "v6", "new_sqlite_classes": ["DirectoryDO"] }
+    { "tag": "v6", "new_sqlite_classes": ["DirectoryDO"] },
+    { "tag": "v7", "deleted_classes": ["AviaryEnrollmentDO", "DirectoryDO"] }
   ]
 }

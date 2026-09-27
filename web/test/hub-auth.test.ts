@@ -10,19 +10,7 @@ vi.mock("@clerk/nextjs/server", () => ({
 }));
 
 import { verifyAssertion } from "@worker-auth";
-import {
-  hubFetchAs,
-  HttpError,
-  requireAdmin,
-  resolveTenant,
-  userFetch,
-} from "@/lib/hub";
-
-const verifyWithKind = verifyAssertion as unknown as (
-  token: string,
-  secret: string,
-  expectedKind: string,
-) => Promise<string | null>;
+import { hubFetchAs, HttpError, resolveTenant } from "@/lib/hub";
 
 const originalHubUrl = process.env.HUB_URL;
 const originalServiceSecret = process.env.FINCH_SERVICE_SECRET;
@@ -36,56 +24,39 @@ afterAll(() => {
 });
 
 function memberResponse(overrides: Record<string, unknown> = {}) {
-  return new Response(
-    JSON.stringify({
-      member: {
-        id: "mem_1",
-        email: "member@example.com",
-        role: "member",
-        state: "active",
-        ...overrides,
-      },
-    }),
-    { headers: { "content-type": "application/json" } },
-  );
+  return Response.json({
+    member: {
+      id: "mem_1",
+      email: "owner@example.com",
+      role: "owner",
+      state: "active",
+      ...overrides,
+    },
+    tenantMeta: { id: "user_1", kind: "personal" },
+  });
 }
 
-// The hub is asked /api/user/sync (which tenants this user owns), then, only
-// when they own more than their personal tenant, /api/state of each candidate
-// (does it hold services or keys?), and finally /api/member-context (their
-// membership in the chosen tenant). Route by path.
-let syncResponse: () => Response;
-let memberContext: () => Response;
-// What each tenant's /api/state holds; a tenant not listed is empty.
-let fleets: Record<string, { services?: unknown[]; keys?: unknown[] }>;
-let stateResponse: (tenant: string) => Response;
+// A fake hub that only answers what the web may ask during tenant
+// resolution: POST /api/member-context, authenticated with the service secret
+// and an assertion for the signed-in user's OWN tenant, about that same user.
+// Anything else — another path, another tenant, another user, a missing or
+// wrong secret — is a test failure, not a silent 200.
+let memberContext: (body: Record<string, unknown>) => Response;
 
-function owns(...tenantIds: string[]): () => Response {
-  return () =>
-    Response.json({
-      tenants: [
-        { tenantId: "user_1", role: "owner", state: "active", name: "user_1", kind: "personal" },
-        ...tenantIds.map((tenantId) => ({
-          tenantId,
-          role: "owner",
-          state: "active",
-          name: `Team ${tenantId}`,
-          kind: "team",
-        })),
-      ],
-      claimable: [],
-    });
-}
-
-function callsTo(path: string): [string, RequestInit][] {
-  return (fetchMock.mock.calls as [string, RequestInit][]).filter(([url]) =>
-    String(url).endsWith(path),
-  );
-}
-
-async function signedAs(init: RequestInit, kind?: "user"): Promise<string | null> {
-  const token = new Headers(init.headers).get("x-finch-auth")!;
-  return kind ? verifyWithKind(token, "service-secret", kind) : verifyAssertion(token, "service-secret");
+async function fakeHub(url: string, init: RequestInit = {}): Promise<Response> {
+  const headers = new Headers(init.headers);
+  if (headers.get("x-finch-service") !== "service-secret") throw new Error(`bad service secret for ${url}`);
+  const tenant = await verifyAssertion(headers.get("x-finch-auth") ?? "", "service-secret");
+  if (tenant !== "user_1") throw new Error(`assertion for ${tenant} on ${url}`);
+  if (url !== "https://hub.example.test/api/member-context" || init.method !== "POST") {
+    throw new Error(`unexpected hub call ${init.method} ${url}`);
+  }
+  if (init.redirect !== "manual") throw new Error("redirects must not be followed");
+  const body = JSON.parse(String(init.body));
+  if (body.clerkUserId !== "user_1") throw new Error(`member-context for ${body.clerkUserId}`);
+  const extra = Object.keys(body).filter((k) => k !== "clerkUserId" && k !== "email");
+  if (extra.length) throw new Error(`unexpected member-context fields ${extra}`);
+  return memberContext(body);
 }
 
 describe("single-user tenant resolution", () => {
@@ -94,16 +65,8 @@ describe("single-user tenant resolution", () => {
     process.env.HUB_URL = "https://hub.example.test";
     process.env.FINCH_SERVICE_SECRET = "service-secret";
     authMock.mockResolvedValue({ userId: "user_1" });
-    syncResponse = () => Response.json({ tenants: [], claimable: [] });
     memberContext = () => memberResponse();
-    fleets = {};
-    stateResponse = (tenant) =>
-      Response.json({ services: [], keys: [], ...fleets[tenant] });
-    fetchMock.mockImplementation(async (url: string, init: RequestInit) => {
-      if (String(url).endsWith("/api/user/sync")) return syncResponse();
-      if (String(url).endsWith("/api/state")) return stateResponse((await signedAs(init))!);
-      return memberContext();
-    });
+    fetchMock.mockImplementation(fakeHub);
     vi.stubGlobal("fetch", fetchMock);
   });
 
@@ -114,182 +77,34 @@ describe("single-user tenant resolution", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("looks the owner up as the user, then checks membership as the personal tenant", async () => {
-    await resolveTenant();
-
-    const [[, sync]] = callsTo("/api/user/sync");
-    expect(sync.method).toBe("POST");
-    expect(JSON.parse(String(sync.body))).toEqual({ emails: [] });
-    expect(await signedAs(sync, "user")).toBe("user_1");
-    // A user-scoped assertion is never a tenant credential.
-    expect(await signedAs(sync)).toBeNull();
-
-    const [[url, member]] = callsTo("/api/member-context");
-    expect(url).toBe("https://hub.example.test/api/member-context");
-    expect(member.method).toBe("POST");
-    expect(JSON.parse(String(member.body))).toEqual({ clerkUserId: "user_1" });
-    expect(await signedAs(member)).toBe("user_1");
-  });
-
-  it("resolves a valid active member without granting ordinary members admin access", async () => {
-    const context = await resolveTenant();
-
-    expect(context).toMatchObject({
+  it("acts as the user's own tenant — their Clerk user id — with one hub call", async () => {
+    await expect(resolveTenant()).resolves.toEqual({
       tenant: "user_1",
       userId: "user_1",
       memberId: "mem_1",
-      email: "member@example.com",
-      role: "member",
-      isAdmin: false,
+      email: "owner@example.com",
     });
-    await expect(requireAdmin()).rejects.toMatchObject({ status: 403 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(String(init.body))).toEqual({ clerkUserId: "user_1" });
   });
 
-  it("stays on the personal tenant, without probing, when the user owns nothing else", async () => {
-    syncResponse = () =>
-      Response.json({
-        tenants: [
-          { tenantId: "ft_team", role: "member", state: "active" },
-          { tenantId: "ft_admin_only", role: "admin", state: "active" },
-          { tenantId: "ft_disabled", role: "owner", state: "disabled" },
-          { tenantId: "../../attacker", role: "owner", state: "active" },
-        ],
-        claimable: [],
-      });
-    memberContext = () => memberResponse({ role: "owner", email: "owner@example.com" });
-
-    await expect(resolveTenant()).resolves.toMatchObject({
-      tenant: "user_1",
-      role: "owner",
-      account: { name: "owner@example.com", kind: "personal" },
-    });
-    expect(callsTo("/api/state")).toHaveLength(0);
-  });
-
-  it("keeps the personal tenant that holds the fleet over an empty owned team", async () => {
-    // The user made an empty team during the beta, or co-owns someone's team.
-    syncResponse = owns("ft_empty_team");
-    fleets = { user_1: { services: [{ id: "printer" }] } };
-    memberContext = () => memberResponse({ role: "owner" });
-
-    await expect(resolveTenant()).resolves.toMatchObject({ tenant: "user_1" });
-    const probed = await Promise.all(callsTo("/api/state").map(([, init]) => signedAs(init)));
-    expect(probed).toEqual(["user_1", "ft_empty_team"]);
-    const [[, member]] = callsTo("/api/member-context");
-    expect(await signedAs(member)).toBe("user_1");
-  });
-
-  it("acts as an owned team that holds the fleet when the personal tenant is empty", async () => {
-    syncResponse = owns("ft_empty", "ft_fleet");
-    fleets = { ft_fleet: { services: [{ id: "printer" }] } };
-    memberContext = () => memberResponse({ role: "owner" });
-
-    await expect(requireAdmin()).resolves.toMatchObject({
-      tenant: "ft_fleet",
-      userId: "user_1",
-      role: "owner",
-      isAdmin: true,
-      account: { name: "Team ft_fleet", kind: "team" },
-    });
-    const [[, member]] = callsTo("/api/member-context");
-    expect(await signedAs(member)).toBe("ft_fleet");
-  });
-
-  it("counts finch_ keys as holding a fleet", async () => {
-    syncResponse = owns("ft_keys");
-    fleets = { ft_keys: { keys: [{ id: "k_1" }] } };
-    memberContext = () => memberResponse({ role: "owner" });
-
-    await expect(resolveTenant()).resolves.toMatchObject({ tenant: "ft_keys" });
-  });
-
-  it("stays on the personal tenant when no candidate holds anything", async () => {
-    syncResponse = owns("ft_a", "ft_b");
-    memberContext = () => memberResponse({ role: "owner" });
+  it("ignores an active Clerk organization: the tenant is still the user", async () => {
+    authMock.mockResolvedValue({ userId: "user_1", orgId: "org_1", orgRole: "org:admin" });
 
     await expect(resolveTenant()).resolves.toMatchObject({ tenant: "user_1" });
   });
 
-  it("refuses to choose between two tenants that both hold a fleet", async () => {
-    syncResponse = owns("ft_team");
-    fleets = {
-      user_1: { services: [{ id: "printer" }] },
-      ft_team: { services: [{ id: "scanner" }] },
-    };
-
-    await expect(resolveTenant()).rejects.toMatchObject({
-      status: 409,
-      message: expect.stringContaining('your personal account, "Team ft_team"'),
-    });
-    expect(callsTo("/api/member-context")).toHaveLength(0);
-  });
-
-  it("ignores a hub's own `tenant` pick and chooses from what the tenants hold", async () => {
-    // The shape a hub that has cut workspaces answers with: owned first.
-    syncResponse = () =>
-      Response.json({
-        tenant: "ft_empty",
-        tenants: [
-          { tenantId: "ft_empty", role: "owner", state: "active", name: "Empty", kind: "team" },
-          { tenantId: "user_1", role: "owner", state: "invited", name: "user_1", kind: "personal" },
-        ],
-        claimable: [],
-      });
-    fleets = { user_1: { services: [{ id: "printer" }] } };
-    memberContext = () => memberResponse({ role: "owner" });
-
-    await expect(resolveTenant()).resolves.toMatchObject({ tenant: "user_1" });
-  });
-
-  it("fails closed on a failed or malformed state probe", async () => {
-    syncResponse = owns("ft_team");
-    for (const [response, status] of [
-      [() => Response.json({ error: "down" }, { status: 503 }), 503],
-      [() => Response.json({ services: "none", keys: [] }), 502],
-      [() => new Response("<html>"), 502],
-    ] as const) {
-      stateResponse = response;
-      await expect(resolveTenant()).rejects.toMatchObject({ status });
-    }
-    expect(callsTo("/api/member-context")).toHaveLength(0);
-  });
-
-  it("refuses another tenant when member-context does not report the user as its owner", async () => {
-    syncResponse = owns("ft_someone_else");
-    fleets = { ft_someone_else: { services: [{ id: "printer" }] } };
-    for (const role of ["admin", "member"]) {
-      memberContext = () => memberResponse({ role });
-      await expect(resolveTenant()).rejects.toMatchObject({ status: 403 });
-    }
-  });
-
-  it("fails closed on a malformed owner lookup", async () => {
-    for (const body of [
-      { tenant: "user_1" },
-      { tenants: "user_1" },
-      {},
-      [],
-      null,
-    ]) {
-      syncResponse = () => Response.json(body);
-      await expect(resolveTenant()).rejects.toMatchObject({ status: 502 });
-    }
-    expect(callsTo("/api/member-context")).toHaveLength(0);
-  });
-
-  it("passes an owner-lookup rejection through without guessing a tenant", async () => {
-    syncResponse = () => Response.json({ error: "directory unavailable" }, { status: 503 });
-
-    await expect(resolveTenant()).rejects.toMatchObject({ status: 503 });
-    expect(callsTo("/api/member-context")).toHaveLength(0);
-  });
-
-  it("bootstraps a new personal tenant with the verified primary email", async () => {
+  it("bootstraps a new tenant with the verified primary email", async () => {
     const contexts = [
       Response.json({ member: null, tenantMeta: null, needsBootstrap: true }),
-      memberResponse({ role: "owner", email: "owner@example.com" }),
+      memberResponse(),
     ];
-    memberContext = () => contexts.shift()!;
+    const bodies: Record<string, unknown>[] = [];
+    memberContext = (body) => {
+      bodies.push(body);
+      return contexts.shift()!;
+    };
     getUserMock.mockResolvedValue({
       primaryEmailAddressId: "em_2",
       emailAddresses: [
@@ -298,14 +113,12 @@ describe("single-user tenant resolution", () => {
       ],
     });
 
-    await expect(resolveTenant()).resolves.toMatchObject({ tenant: "user_1", role: "owner" });
-    const calls = callsTo("/api/member-context");
-    expect(calls).toHaveLength(2);
-    expect(JSON.parse(String(calls[1][1].body))).toEqual({
-      clerkUserId: "user_1",
-      email: "owner@example.com",
-    });
-    expect(await signedAs(calls[1][1])).toBe("user_1");
+    await expect(resolveTenant()).resolves.toMatchObject({ tenant: "user_1", memberId: "mem_1" });
+    expect(bodies).toEqual([
+      { clerkUserId: "user_1" },
+      { clerkUserId: "user_1", email: "owner@example.com" },
+    ]);
+    expect(getUserMock).toHaveBeenCalledWith("user_1");
   });
 
   it("refuses to bootstrap without a verified email", async () => {
@@ -318,33 +131,31 @@ describe("single-user tenant resolution", () => {
     });
 
     await expect(resolveTenant()).rejects.toMatchObject({ status: 403 });
-    expect(callsTo("/api/member-context")).toHaveLength(1);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("never bootstraps a tenant other than the personal one", async () => {
-    syncResponse = owns("ft_owned");
-    fleets = { ft_owned: { services: [{ id: "printer" }] } };
-    memberContext = () => Response.json({ member: null, tenantMeta: null, needsBootstrap: true });
+  it("refuses when the hub does not report the user as the owner", async () => {
+    memberContext = () => Response.json({ member: null, tenantMeta: null });
 
     await expect(resolveTenant()).rejects.toMatchObject({ status: 403 });
-    expect(getUserMock).not.toHaveBeenCalled();
-    expect(callsTo("/api/member-context")).toHaveLength(1);
   });
 
-  it("refuses a membership that is not active", async () => {
-    for (const state of ["invited", "disabled"]) {
-      memberContext = () => memberResponse({ role: "owner", state });
-      await expect(resolveTenant()).rejects.toMatchObject({ status: 403 });
+  it("fails closed on any member that is not the active owner", async () => {
+    for (const overrides of [
+      { role: "admin" },
+      { role: "member" },
+      { role: "super-admin" },
+      { state: "invited" },
+      { state: "disabled" },
+      { id: "" },
+      { email: 7 },
+    ]) {
+      memberContext = () => memberResponse(overrides);
+      await expect(resolveTenant(), JSON.stringify(overrides)).rejects.toMatchObject({
+        status: 502,
+        message: "invalid response from hub",
+      });
     }
-    memberContext = () => Response.json({ member: null, tenantMeta: { id: "user_1" } });
-    await expect(resolveTenant()).rejects.toMatchObject({ status: 403 });
-  });
-
-  it("fails closed when an active hub member carries an unknown role", async () => {
-    memberContext = () => memberResponse({ role: "super-admin" });
-
-    await expect(resolveTenant()).rejects.toMatchObject({ status: 502 });
-    await expect(requireAdmin()).rejects.toMatchObject({ status: 502 });
   });
 
   it("maps a null hub authorization payload to a controlled bad-gateway response", async () => {
@@ -358,13 +169,14 @@ describe("single-user tenant resolution", () => {
     });
   });
 
-  it("distinguishes a malformed member shape from a well-formed membership denial", async () => {
-    memberContext = () => Response.json({ member: "owner" });
-
-    await expect(resolveTenant()).rejects.toMatchObject({
-      status: 502,
-      message: "invalid response from hub",
-    });
+  it("distinguishes a malformed member shape from a well-formed denial", async () => {
+    for (const body of [{ member: "owner" }, { member: [] }, {}]) {
+      memberContext = () => Response.json(body);
+      await expect(resolveTenant()).rejects.toMatchObject({
+        status: 502,
+        message: "invalid response from hub",
+      });
+    }
   });
 
   it("passes a hub rejection status through", async () => {
@@ -372,6 +184,13 @@ describe("single-user tenant resolution", () => {
 
     await expect(resolveTenant()).rejects.toBeInstanceOf(HttpError);
     await expect(resolveTenant()).rejects.toMatchObject({ status: 401 });
+  });
+
+  it("refuses a Clerk user id the hub could not accept as a tenant, before any call", async () => {
+    authMock.mockResolvedValue({ userId: "user.with.dots" });
+
+    await expect(resolveTenant()).rejects.toMatchObject({ status: 500 });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });
 
@@ -414,16 +233,6 @@ describe("outbound hub authentication boundary", () => {
 
     await expect(hubFetchAs("org_1", "/api/state")).rejects.toMatchObject({ status: 502 });
     expect(fetchMock).toHaveBeenCalledTimes(1);
-  });
-
-  it("mints user-scoped assertions that cannot authorize tenant-scoped calls", async () => {
-    await userFetch("user_1", "/api/user/sync");
-
-    const [, init] = fetchMock.mock.calls[0] as [URL, RequestInit];
-    const token = new Headers(init.headers).get("x-finch-auth")!;
-    expect(await verifyAssertion(token, "service-secret")).toBeNull();
-    expect(await verifyWithKind(token, "service-secret", "user")).toBe("user_1");
-    expect(init.redirect).toBe("manual");
   });
 
   it("rejects non-origin and cleartext remote hub configuration", async () => {
