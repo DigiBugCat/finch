@@ -61,8 +61,15 @@ wildcard DNS.
    on your domain, and see the Clerk note under
    [Known limitations](#known-limitations).
 2. Restrict who can sign up (in Clerk: **Configure → Restrictions**, allowlist
-   your email or turn sign-ups off). Anyone who can sign in can log a CLI in,
-   and in single-account mode their services would never be reachable anyway.
+   your email or turn sign-ups off). This is required, not a nicety. Clerk
+   development instances accept open sign-ups by default, and anyone who can
+   sign in can log a CLI in to your hub. A logged-in stranger can then run
+   `finch domain add finch.example.dev` to register your hub's own hostname
+   to their account. Registered hostnames are checked before the
+   single-account fallback, so from then on every call on your hub, tool
+   arguments included, goes to *their* services and your machines are
+   refused. The `VANITY_SUFFIXES` and `VANITY_TENANT` settings in step 2 close
+   that hole in the hub; restricting sign-ups closes it in Clerk. Do both.
 3. Create your user (**Users → Create user**) and copy its ID (`user_…`). This
    is your finch account ID.
 4. For MCP clients that sign in with OAuth instead of a key (such as claude.ai
@@ -95,6 +102,10 @@ repeated) and replace the example values.
     "DEFAULT_TENANT": "user_REPLACE_WITH_YOUR_CLERK_USER_ID",
     "WEB_URL": "https://example.dev",
     "CLERK_ISSUER": "https://REPLACE.clerk.accounts.dev",
+    // Reserve the hub's own hostname for your account, so no other signed-in
+    // account can register it with `finch domain add` and take over the hub.
+    "VANITY_SUFFIXES": "finch.example.dev",
+    "VANITY_TENANT": "user_REPLACE_WITH_YOUR_CLERK_USER_ID",
     // Caller assertions (optional; remove both lines to turn them off).
     "FINCH_ASSERTION_ACTIVE_KID": "selfhost-2026-09",
     "FINCH_ASSERTION_ISSUER": "https://finch.example.dev",
@@ -129,7 +140,9 @@ repeated) and replace the example values.
 
 No domain? Remove `routes` and set `workers_dev` to `true`. The hub is then
 `https://finch-selfhost.<your-subdomain>.workers.dev`; use that wherever this
-guide says `https://finch.example.dev`. The website works the same way.
+guide says `https://finch.example.dev`. The website works the same way. The hub
+already refuses to register any `workers.dev` name, so `VANITY_SUFFIXES` is not
+needed there (leaving it set is harmless).
 
 Keep the migrations exactly as they are: they are append-only history, and
 `deploy-preflight` refuses any other list. (v5 and v6 created two classes that
@@ -158,7 +171,8 @@ public hub.
 | `RELEASES_BASE` | var | optional | Where `/releases/<asset>` redirects when there is no bucket. Defaults to this repository's latest GitHub release. |
 | `SELF` | service binding | yes | The hub bound to itself, used by `finch test` and `finch call`. |
 | `RELAY_LIMIT`, `JOIN_LIMIT` | rate limit | recommended | Per-IP limits on the relay and on `/join`. `namespace_id` must be unique in your Cloudflare account. |
-| `VANITY_SUFFIXES`, `VANITY_TENANT`, `CF_SAAS_ZONE_ID`, `CF_API_TOKEN`, `BYO_CNAME_TARGET` | vars and secret | no | Custom hostnames (`finch domain add`). Not needed in single-account mode. |
+| `VANITY_SUFFIXES`, `VANITY_TENANT` | vars | yes, on your own domain | Set `VANITY_SUFFIXES` to the hub hostname and `VANITY_TENANT` to your Clerk user ID. Only that account can then register the hub hostname, or any name under it, with `finch domain add`. Without them, any signed-in account can claim the hub hostname and receive every call made to it. |
+| `CF_SAAS_ZONE_ID`, `CF_API_TOKEN`, `BYO_CNAME_TARGET` | vars and secret | no | Custom hostnames on other domains (`finch domain add`). Not needed in single-account mode. |
 
 Set the secrets. Generate fresh values; never reuse the ones in `.dev.vars`.
 
@@ -277,8 +291,9 @@ finch login --hub https://finch.example.dev
 `finch login` opens your website's `/cli` page; sign in and approve the code.
 The CLI saves the hub in `~/.finch/cli.json`, and `finch add` writes it into
 `finch.yml`, so later commands use it without `--hub`. Setting
-`FINCH_HUB=https://finch.example.dev` works too. From here the normal flow
-applies:
+`FINCH_HUB=https://finch.example.dev` works for most commands too, but not
+for `finch update` or `finch enroll`: on a machine with no saved login, pass
+them `--hub`. From here the normal flow applies:
 
 ```sh
 finch add notes --service http://127.0.0.1:8000
@@ -313,7 +328,8 @@ git fetch --tags && git checkout v1.9.0
 ```
 
 Update `RELEASES_BASE` (or your R2 bucket) to the new tag first, then run
-`finch update` on each machine. Read [`CHANGELOG.md`](../CHANGELOG.md) before
+`finch update` on each machine (with `--hub https://finch.example.dev` on a
+machine that has no saved login). Read [`CHANGELOG.md`](../CHANGELOG.md) before
 upgrading.
 
 ## Known limitations
@@ -342,7 +358,11 @@ These come from an audit of every `finchmcp.com` reference in `worker/`,
   Pass `--hub` yourself.
 - **The CLI defaults to finchmcp.com** whenever it has no saved login, no
   `hub:` in `finch.yml`, no `FINCH_HUB` and no `--hub`. `finch enroll` ignores
-  `FINCH_HUB` and needs `--hub`.
+  `FINCH_HUB` and needs `--hub`. `finch update` reads only `--hub` and the
+  saved login: on a machine enrolled without `finch login` (a container, say)
+  it asks finchmcp.com for the latest version and downloads that binary,
+  moving past the release your hub pins. Run `finch update --hub
+  https://finch.example.dev` there.
 - **Binaries come from this repository** unless you build and publish your
   own (GoReleaser config in `.goreleaser.yaml`); a build from a fork keeps
   finchmcp.com as its default hub.
@@ -353,7 +373,9 @@ These come from an audit of every `finchmcp.com` reference in `worker/`,
   name (as above) and your own pipeline.
 - **Custom hostnames** (`finch domain add`) need Cloudflare for SaaS on your
   zone, `CF_API_TOKEN`, `CF_SAAS_ZONE_ID` and a catch-all Worker route. They are
-  first-come and not ownership-checked.
+  first-come and not ownership-checked. Without Cloudflare for SaaS, the hub
+  records a registration without checking anything, which is why the hub
+  hostname must be reserved with `VANITY_SUFFIXES` and `VANITY_TENANT`.
 - **`finch test` borrows an internal name.** Each account is given a slug when
   it is created, and `finch test` routes through it as `<slug>.finchmcp.com`
   over the `SELF` binding, which needs no DNS. It works, but the name can show

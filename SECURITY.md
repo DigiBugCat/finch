@@ -7,11 +7,14 @@ reports as the most urgent kind of issue.
 
 Please report it privately, not in a public issue:
 
-1. Open the repository's **Security** tab and choose **Report a
-   vulnerability** (GitHub private vulnerability reporting).
-2. If that option is not available, open a public issue that says only that
-   you have a security report and asks for a private contact. Leave out every
-   detail.
+1. Use GitHub private vulnerability reporting: open
+   <https://github.com/DigiBugCat/finch/security/advisories/new>, or the
+   repository's **Security** tab and choose **Report a vulnerability**. Only
+   the maintainers can see what you send.
+2. If that form is not available, open an issue titled "Private contact
+   request" and leave the body empty. Do not say what it is about, which part
+   of finch it concerns, or that it is a security report. A maintainer will
+   reply with a private way to reach them.
 
 Include what you found, the steps or request that show it, what an attacker
 gains, and the finch version (`finch version`) or the URL involved. Do not

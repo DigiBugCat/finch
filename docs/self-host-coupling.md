@@ -19,6 +19,17 @@ account host, a build-time default hub for the CLI (stamped with `-ldflags -X`
 like `agentVersion`), and a site origin for the web read from
 `NEXT_PUBLIC_APP_ORIGIN`.
 
+## Hub (`worker/`): single-account mode today
+
+- [ ] `src/api.ts` `handleHostnames`: refuse to register the hub's own
+  hostnames (the request host, the host of each route, and the
+  `FINCH_ASSERTION_ISSUER` host) as custom hostnames, or refuse hostname
+  writes from any account other than `DEFAULT_TENANT` when `DEV=1`.
+  `resolveTenant` consults RouterDO before the `DEFAULT_TENANT` fallback, and
+  without `CF_API_TOKEN` a registration is recorded unchecked, so today a
+  self-hosted hub is safe only because the guide reserves its hostname with
+  `VANITY_SUFFIXES`/`VANITY_TENANT` (pinned by `test/self-host.test.ts`).
+
 ## Hub (`worker/`): required for a second domain
 
 - [ ] `src/index.ts` `hostKeyFromHost`: treats only `finchmcp.com` and
@@ -70,7 +81,7 @@ like `agentVersion`), and a site origin for the web read from
 
 ## CLI (`agent/`)
 
-The CLI already honours `--hub`, `FINCH_HUB`, the hub saved by `finch login`
+Most CLI commands already honour `--hub`, `FINCH_HUB`, the hub saved by `finch login`
 in `~/.finch/cli.json`, and `hub:` in `finch.yml`. What remains:
 
 - [ ] One default hub literal instead of seven: `core/agent.go`
@@ -81,6 +92,11 @@ in `~/.finch/cli.json`, and `hub:` in `finch.yml`. What remains:
   time so a fork's binaries default to its own hub.
 - [ ] `core/cli.go` `runEnroll`: its `--hub` default is the literal and ignores
   `FINCH_HUB`; use `agentDefaultHub()`.
+- [ ] `core/cli_update.go` `runUpdate`: reads only `--hub` and the saved
+  login, then falls back to the literal. It ignores `FINCH_HUB` and `hub:` in
+  `finch.yml`, so a machine enrolled without `finch login` updates from
+  finchmcp.com past the release its hub pins. Fall back to `finch.yml`'s hub,
+  then `agentDefaultHub()`.
 - [ ] Install hints in errors: `core/cli_update.go` and `core/cli_service.go`
   print `curl -fsSL https://finchmcp.com/install | sh`. Use the current hub.
 - [ ] Help and guide text: `core/cli.go` (`guideText`, the `finch add` usage

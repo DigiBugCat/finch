@@ -92,8 +92,8 @@ client ─ POST /notes/mcp (Bearer finch_…) ─▶ Worker
 - **Callers to your service.** A service needs a `finch_` key (hashed at rest,
   scoped to services) or a Clerk OAuth sign-in by you, unless you made it
   public. finch removes the credential before relaying, so your server never
-  sees it; for signed-in callers it adds a signed `X-Finch-Assertion` your
-  server can verify ([`worker/CALLER_ASSERTIONS.md`](worker/CALLER_ASSERTIONS.md)).
+  sees it; for every authenticated caller (key or OAuth) it adds a signed
+  `X-Finch-Assertion` your server can verify ([`worker/CALLER_ASSERTIONS.md`](worker/CALLER_ASSERTIONS.md)).
 - **The relay does not parse MCP.** It moves HTTP bytes, so unmodified
   Streamable-HTTP servers (FastMCP, the MCP SDKs) work, including SSE, progress
   notifications and long-running tools. By default only `/<service>/mcp` is

@@ -89,7 +89,14 @@ git checkout v1.8.0`}</Code>
           it works on any origin. A production instance needs DNS on your domain; see the
           Clerk note under <a href="#limitations">Known limitations</a>.
         </li>
-        <li>Restrict sign-ups to your email, or turn them off once your user exists.</li>
+        <li>
+          <b>Restrict sign-ups</b> to your email, or turn them off once your user exists. This
+          step is required: development instances accept anyone by default, and a stranger who
+          can sign in can log a CLI in to your hub, register your hub&apos;s own hostname to
+          their account with <code>finch domain add</code>, and receive every call made to it.
+          The <code>VANITY_SUFFIXES</code> and <code>VANITY_TENANT</code> settings below close
+          the same hole in the hub. Do both.
+        </li>
         <li>Create your user and copy its ID (<code>user_…</code>). It becomes your finch account ID.</li>
         <li>
           For MCP clients that sign in with OAuth (such as claude.ai custom connectors), open
@@ -116,6 +123,8 @@ git checkout v1.8.0`}</Code>
             <tr><td><code>DEFAULT_TENANT</code></td><td>Your Clerk user ID. Every call on the hub host belongs to this account.</td></tr>
             <tr><td><code>WEB_URL</code></td><td>Your website origin. <code>finch login</code> sends you to <code>&lt;WEB_URL&gt;/cli</code>.</td></tr>
             <tr><td><code>CLERK_ISSUER</code></td><td>Clerk&apos;s Frontend API URL. Turns on OAuth sign-in for MCP clients.</td></tr>
+            <tr><td><code>VANITY_SUFFIXES</code></td><td>Your hub hostname (<code>finch.example.dev</code>). Required on your own domain: with <code>VANITY_TENANT</code>, only your account can register it, so no one else can take over the hub. Not needed on <code>workers.dev</code>.</td></tr>
+            <tr><td><code>VANITY_TENANT</code></td><td>Your Clerk user ID, the same value as <code>DEFAULT_TENANT</code>.</td></tr>
             <tr><td><code>FINCH_SERVICE_SECRET</code> (secret)</td><td>Shared with the website; authenticates its calls and signs CLI tokens.</td></tr>
             <tr><td><code>TICKET_SECRET</code> (secret)</td><td>Signs the tokens your machines use to connect.</td></tr>
             <tr><td><code>FINCH_ASSERTION_PRIVATE_JWKS</code> (secret, optional)</td><td>Signs <code>X-Finch-Assertion</code>, the caller identity your services can verify. Goes with <code>FINCH_ASSERTION_ACTIVE_KID</code> and <code>FINCH_ASSERTION_ISSUER</code>.</td></tr>
@@ -185,13 +194,13 @@ finch connect notes --client claude-code`}</Code>
         <li><b>One account per hub.</b> Per-account subdomains on your own domain need code changes in the hub.</li>
         <li><b>The website&apos;s content names finchmcp.com.</b> The landing page, these docs, <code>/agents.md</code> and <code>/llms.txt</code> send visitors and agents to finchmcp.com until you edit them.</li>
         <li><b>Clerk production keys pin sign-in redirects to finchmcp.com</b> (<code>web/app/layout.tsx</code>). Use a development instance, or change that line in your copy.</li>
-        <li><b>The installer&apos;s closing hints assume finchmcp.com</b>, and the CLI falls back to it when it has no saved hub. Pass <code>--hub</code> or set <code>FINCH_HUB</code>.</li>
+        <li><b>The installer&apos;s closing hints assume finchmcp.com</b>, and the CLI falls back to it when it has no saved hub. Pass <code>--hub</code> or set <code>FINCH_HUB</code>. <code>finch update</code> and <code>finch enroll</code> ignore <code>FINCH_HUB</code>: on a machine with no saved login, pass them <code>--hub</code>.</li>
         <li><b>Binaries come from this repository</b> unless you build and publish your own.</li>
         <li><b>The deploy tooling is written for finchmcp.com.</b> Use your own environment name, as above, rather than editing <code>production</code>.</li>
       </ul>
       <p>
         Updating is the same steps from a newer tag: deploy the hub, then the website, then
-        run <code>finch update</code> on each machine. The full guide, with every configuration
+        run <code>finch update</code> on each machine (with <code>--hub</code> where there is no saved login). The full guide, with every configuration
         block, is <a href={GUIDE}>docs/self-host.md</a>.
       </p>
 

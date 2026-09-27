@@ -43,6 +43,20 @@ describe('/docs/self-host', () => {
     expect(screen.getAllByText('openid email profile').length).toBeGreaterThan(0);
   });
 
+  it('makes restricting sign-ups mandatory and names the hub hostname reservation', () => {
+    const { container } = render(<SelfHost />);
+    expect(container).toHaveTextContent(/This step is required/);
+    expect(container).toHaveTextContent(/finch domain add/);
+    const named = [...container.querySelectorAll('td:first-child code')].map((el) => el.textContent);
+    expect(named).toContain('VANITY_SUFFIXES');
+    expect(named).toContain('VANITY_TENANT');
+  });
+
+  it('tells readers finch update needs --hub without a saved login', () => {
+    const { container } = render(<SelfHost />);
+    expect(container).toHaveTextContent(/finch update and finch enroll ignore FINCH_HUB/);
+  });
+
   it('is linked from the docs sidebar and marked as the current page', () => {
     render(<DocsSidebar />);
     const link = screen.getByRole('link', { name: 'Run your own finch' });
@@ -79,6 +93,22 @@ describe('docs/self-host.md configuration blocks', () => {
     expect(hub.services[0].service).toBe(hub.name);
     expect(hub.logpush).toBe(false);
     expect(hub.observability.enabled).toBe(false);
+  });
+
+  it('reserve the hub hostname for the owner so no other account can claim it', () => {
+    const { hub } = guideBlocks();
+    const suffixes = String(hub.vars.VANITY_SUFFIXES ?? '')
+      .split(',')
+      .map((s: string) => s.trim().toLowerCase())
+      .filter(Boolean);
+    const hosts = hub.routes.map((r: { pattern: string }) => r.pattern.split('/')[0].toLowerCase());
+    expect(hosts.length).toBeGreaterThan(0);
+    for (const host of hosts) {
+      expect(suffixes.some((s: string) => host === s || host.endsWith(`.${s}`))).toBe(true);
+    }
+    expect(hub.vars.VANITY_TENANT).toBe(hub.vars.DEFAULT_TENANT);
+    // Required, not optional: the guide must not tell readers to skip it.
+    expect(guide).toMatch(/This is required, not a nicety/);
   });
 
   it('bind the website to the hub it deploys and pin an exact https origin', () => {
