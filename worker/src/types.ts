@@ -248,4 +248,4 @@ export interface MintKeyResp {
   scope: KeyScope;
 }
 
-export const LATEST_AGENT = "1.7.0";
+export const LATEST_AGENT = "1.7.1";
