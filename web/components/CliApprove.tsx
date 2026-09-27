@@ -11,8 +11,7 @@ import { useSearchParams } from 'next/navigation';
 import { UserButton, useUser } from '@clerk/nextjs';
 import { BirdMark } from './fieldguide/Bird';
 
-type Account = { name: string; kind: 'personal' | 'team' };
-type Origin = { found: boolean; reqIp?: string; reqUa?: string; ageSeconds?: number; account?: Account; error?: string } | null;
+type Origin = { found: boolean; reqIp?: string; reqUa?: string; ageSeconds?: number; error?: string } | null;
 
 export default function CliApprove() {
   const { user } = useUser();
@@ -26,13 +25,9 @@ export default function CliApprove() {
   const [origin, setOrigin] = useState<Origin>(null);   // initiator context for the typed code
   const seq = useRef(0);
 
-  // The account the minted token will act as, as the server resolved it: the
-  // user's personal account, or a team they own that holds their services.
-  // Until the code is looked up, fall back to the signed-in user's email.
-  const resolved = origin?.account;
-  const account = resolved
-    ? `${resolved.name} (${resolved.kind === 'team' ? 'team account' : 'personal account'})`
-    : user?.primaryEmailAddress?.emailAddress || user?.username || 'your account';
+  // Every account is one person's, so the minted token acts as the signed-in
+  // user's own account; name it by their email.
+  const account = user?.primaryEmailAddress?.emailAddress || user?.username || 'your account';
 
   // When a full code is typed, look up WHERE it was started so the user can tell
   // it's their own box (not an attacker-initiated code they were sent).
@@ -48,8 +43,8 @@ export default function CliApprove() {
           body: JSON.stringify({ userCode: c }),
         });
         const j = await r.json();
-        // A refusal (e.g. no single account to log in to) is shown as-is
-        // rather than as "no active login".
+        // A refusal (e.g. rate limited) is shown as-is rather than as
+        // "no active login".
         if (mine === seq.current) setOrigin(r.ok ? j : { found: false, error: j.error || 'could not look up that code' });
       } catch { /* ignore */ }
     }, 300);
@@ -59,10 +54,9 @@ export default function CliApprove() {
   async function approve() {
     setState('busy'); setMsg('');
     try {
-      // Send the email we already resolved client-side (useUser). On staging the
-      // server can't look it up — ctx.userId is the forced DEFAULT_TENANT id, not
-      // the real Clerk user — so the client value is what makes the box's account
-      // label work. It's a cosmetic label shown only on the approver's own box.
+      // Send the email we already resolved client-side (useUser). The server
+      // prefers its own Clerk lookup and uses this only if that lookup fails.
+      // It's a cosmetic label shown only on the approver's own box.
       const email = user?.primaryEmailAddress?.emailAddress || user?.username || '';
       const r = await fetch('/api/finch/cli-approve', {
         method: 'POST',

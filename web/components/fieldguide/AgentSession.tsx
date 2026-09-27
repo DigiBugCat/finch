@@ -14,9 +14,9 @@ export type SessionLine = { text: string; kind: Kind };
 // Every command here must match the shared CLI contract (see prompt.ts).
 export const SESSION: SessionLine[] = [
   { text: `$ ${INSTALL_ONE_LINER}`, kind: 'cmd' },
-  { text: 'installed finch 1.4.0 to ~/.local/bin', kind: 'out' },
+  { text: 'installed finch 1.7.0 to ~/.local/bin', kind: 'out' },
   { text: '$ finch login --start --json', kind: 'cmd' },
-  { text: '{"schema_version":1,"user_code":"QKTM-8FWD","expires_in":900,…}', kind: 'out' },
+  { text: '{"schema_version":1,"user_code":"QKTM-8FWD","expires_in":600,…}', kind: 'out' },
   { text: 'Open finchmcp.com/cli and approve QKTM-8FWD', kind: 'hand' },
   { text: '$ finch login --poll --json', kind: 'cmd' },
   { text: '{"schema_version":1,"status":"approved","account":"maray"}', kind: 'out' },

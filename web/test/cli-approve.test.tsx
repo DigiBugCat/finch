@@ -34,7 +34,9 @@ function hub(known: Record<string, { reqIp: string; reqUa: string }>) {
       if (Object.keys(body).join() !== 'userCode') return bad('fields');
       const origin = known[code];
       return Response.json(origin
-        ? { found: true, ...origin, ageSeconds: 12, account: { name: 'maray', kind: 'personal' } }
+        // Exactly the fields cleanDescribeResponse forwards: every account is
+        // one person's since #47, so the hub names no account here.
+        ? { found: true, ...origin, ageSeconds: 12 }
         : { found: false });
     }
     if (url === '/api/finch/cli-approve') {
@@ -59,7 +61,9 @@ describe('/cli approval page', () => {
 
     expect(screen.getByRole('textbox', { name: 'Login code' })).toHaveValue('QKTM-8FWD');
     await screen.findByText(/203\.0\.113\.7 · finch\/1\.4\.0 \(darwin\)/);
-    expect(screen.getByText(/This grants a CLI token/)).toHaveTextContent('maray (personal account)');
+    // The token acts as the signed-in user's own account, named by their email.
+    expect(screen.getByText(/This grants a CLI token/)).toHaveTextContent('acting as owner@example.com.');
+    expect(screen.queryByText(/team account|personal account/)).toBeNull();
     // Looking the code up never approves it.
     expect(calls.map((c) => c.url)).toEqual(['/api/finch/cli-describe']);
 

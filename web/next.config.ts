@@ -75,8 +75,9 @@ function contentSecurityPolicy(): string {
       "https://img.clerk.com",
     )}`,
     "img-src 'self' data: blob: https://img.clerk.com",
-    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
-    "font-src 'self' data: https://fonts.gstatic.com",
+    // next/font self-hosts every face (app/layout.tsx), so no font host.
+    "style-src 'self' 'unsafe-inline'",
+    "font-src 'self' data:",
     "frame-src 'self' https://challenges.cloudflare.com",
     "worker-src 'self' blob:",
     "manifest-src 'self'",

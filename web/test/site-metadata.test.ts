@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 
@@ -60,9 +60,23 @@ describe('fonts', () => {
     }
   });
 
-  it('self-hosts them: no runtime Google Fonts request for the CSP to allow', () => {
-    for (const file of ['app/layout.tsx', 'app/globals.css', 'components/fieldguide/landing.css', 'app/docs/docs.css']) {
+  it('self-hosts them: no runtime Google Fonts request, and the CSP allows none', () => {
+    for (const file of ['app/layout.tsx', 'app/globals.css', 'components/fieldguide/landing.css', 'app/docs/docs.css', 'next.config.ts']) {
       expect(read(file)).not.toMatch(/fonts\.(googleapis|gstatic)\.com/);
     }
+    const csp = read('next.config.ts');
+    expect(csp).toContain(`"style-src 'self' 'unsafe-inline'"`);
+    expect(csp).toContain(`"font-src 'self' data:"`);
+  });
+});
+
+describe('site icon', () => {
+  it('declares /icon.svg as the only icon, with no file-convention icon beside it', () => {
+    expect(metadata.icons).toEqual({ icon: [{ url: '/icon.svg', type: 'image/svg+xml' }] });
+    expect(read('public/icon.svg')).toMatch(/<svg[\s>]/);
+    // Next serves app/favicon.ico, app/icon.* and app/apple-icon.* on its own,
+    // adding a second icon to every page's <head>.
+    const conventional = readdirSync(resolve(root, 'app')).filter((f) => /^(favicon|icon|apple-icon)\./.test(f));
+    expect(conventional).toEqual([]);
   });
 });
