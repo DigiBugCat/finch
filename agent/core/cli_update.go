@@ -7,6 +7,7 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -63,7 +64,7 @@ func runUpdate(c *cli, args []string) error {
 
 	self, updated, err := performUpdate(hub, *force)
 	if err != nil {
-		return newCLIError(codeUpstream, "", "update failed: %v", err)
+		return updateFailure(err)
 	}
 	if !updated {
 		if c.json {
@@ -99,6 +100,42 @@ func runUpdate(c *cli, args []string) error {
 		return c.emit(map[string]any{"updated": true, "binary": self, "restart": mode})
 	}
 	return nil
+}
+
+// localUpdateError is an update that failed on this machine (locating the
+// binary, or writing and renaming the new one next to it) rather than in the
+// download from the hub.
+type localUpdateError struct{ err error }
+
+func (e *localUpdateError) Error() string { return e.err.Error() }
+func (e *localUpdateError) Unwrap() error { return e.err }
+
+func localUpdateErr(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &localUpdateError{err}
+}
+
+// localWriter tags the temp file's write errors as local, so io.Copy's error
+// says which side failed.
+type localWriter struct{ f *os.File }
+
+func (w localWriter) Write(p []byte) (int, error) {
+	n, err := w.f.Write(p)
+	return n, localUpdateErr(err)
+}
+
+// updateFailure classifies a failed update for the contract: a local failure
+// (an install directory this user cannot write, say one a root-run installer
+// left behind) is INTERNAL, and reinstalling puts finch in a writable
+// directory; anything from the hub side is UPSTREAM.
+func updateFailure(err error) error {
+	var le *localUpdateError
+	if errors.As(err, &le) {
+		return newCLIError(codeInternal, "curl -fsSL https://finchmcp.com/install | sh", "update failed on this machine: %v", err)
+	}
+	return newCLIError(codeUpstream, "", "update failed: %v", err)
 }
 
 func resolveUpdateRestartMode(requested string, tunnelActive, currentProcessServes bool) (string, error) {
@@ -144,7 +181,7 @@ func performUpdate(hub string, force bool) (self string, updated bool, err error
 	// symlink so we replace the actual file, not a symlink into it.
 	self, err = os.Executable()
 	if err != nil {
-		return "", false, fmt.Errorf("cannot locate own binary: %w", err)
+		return "", false, localUpdateErr(fmt.Errorf("cannot locate own binary: %w", err))
 	}
 	if resolved, rerr := filepath.EvalSymlinks(self); rerr == nil {
 		self = resolved
@@ -280,11 +317,11 @@ func downloadAndSwapWithLimit(ctx context.Context, url, dst string, limit int64)
 	dir := filepath.Dir(dst)
 	tmp, err := os.CreateTemp(dir, ".finch-update-*")
 	if err != nil {
-		return fmt.Errorf("temp file in %s: %w (need write access to install dir)", dir, err)
+		return localUpdateErr(fmt.Errorf("temp file in %s: %w (need write access to install dir)", dir, err))
 	}
 	tmpName := tmp.Name()
 	defer os.Remove(tmpName) // no-op after a successful rename
-	written, err := io.Copy(tmp, io.LimitReader(res.Body, limit+1))
+	written, err := io.Copy(localWriter{tmp}, io.LimitReader(res.Body, limit+1))
 	if err != nil {
 		tmp.Close()
 		return err
@@ -298,13 +335,13 @@ func downloadAndSwapWithLimit(ctx context.Context, url, dst string, limit int64)
 		return fmt.Errorf("download %s exceeds %d bytes", url, limit)
 	}
 	if err := tmp.Close(); err != nil {
-		return err
+		return localUpdateErr(err)
 	}
 	if err := os.Chmod(tmpName, 0o755); err != nil {
-		return err
+		return localUpdateErr(err)
 	}
 	if err := os.Rename(tmpName, dst); err != nil {
-		return fmt.Errorf("installing over %s: %w", dst, err)
+		return localUpdateErr(fmt.Errorf("installing over %s: %w", dst, err))
 	}
 	return nil
 }

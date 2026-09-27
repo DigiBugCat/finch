@@ -2,6 +2,7 @@ package core
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -87,6 +88,44 @@ func TestDownloadAndSwap(t *testing.T) {
 	}
 	if fi, _ := os.Stat(dst); fi.Mode()&0o111 == 0 {
 		t.Fatalf("dst not executable: %v", fi.Mode())
+	}
+}
+
+// A failure writing the new binary next to the old one is this machine's
+// problem (INTERNAL, reinstall), not the hub's (UPSTREAM): the contract tells
+// an agent to retry the network for UPSTREAM.
+func TestUpdateFailuresAreClassifiedBySide(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, "NEW")
+	}))
+	defer srv.Close()
+	srv404 := httptest.NewServer(http.NotFoundHandler())
+	defer srv404.Close()
+
+	locked := t.TempDir()
+	dst := filepath.Join(locked, "finch")
+	if err := os.WriteFile(dst, []byte("OLD"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(locked, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o755) })
+	if os.Getuid() == 0 {
+		t.Skip("root can write a 0555 directory")
+	}
+
+	var ce *cliError
+	err := updateFailure(downloadAndSwap(srv.URL+"/releases/x", dst))
+	if !errors.As(err, &ce) || ce.Code != codeInternal || ce.Next != "curl -fsSL https://finchmcp.com/install | sh" {
+		t.Fatalf("unwritable install dir: %#v", err)
+	}
+	err = updateFailure(downloadAndSwap(srv404.URL+"/releases/x", dst))
+	if !errors.As(err, &ce) || ce.Code != codeUpstream {
+		t.Fatalf("hub 404: %#v", err)
+	}
+	if b, _ := os.ReadFile(dst); string(b) != "OLD" {
+		t.Fatalf("dst clobbered: %q", b)
 	}
 }
 
