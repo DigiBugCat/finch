@@ -120,6 +120,8 @@ export class RouterDO extends DurableObject<Env> {
           return ok(this.unregister(a.slug, a.tenant));
         case "listForTenant":
           return ok({ keys: this.listForTenant(a.tenant) });
+        case "transfer":
+          return ok(this.transfer(a.slug, a.from, a.to));
         case "deviceStart":
           return ok(this.deviceStart(a.deviceCode, a.userCode, a.now, a.reqIp, a.reqUa));
         case "deviceDescribe":
@@ -182,6 +184,28 @@ export class RouterDO extends DurableObject<Env> {
     if (!cur) return { ok: true };
     if (cur !== t) return { ok: false, reason: "not-owner", owner: cur };
     this.ctx.storage.sql.exec("DELETE FROM slugs WHERE slug = ?", s);
+    return { ok: true };
+  }
+
+  /** Re-point a slug/host key from one tenant to another in one step, so it
+   *  is never unowned (and claimable by anyone) in between. Only the current
+   *  owner's key moves: a key owned by a third tenant, or by nobody, fails
+   *  closed ("not-owner"). Already owned by `to` is idempotent success. Used by
+   *  the single-user purge to hand an ownerless tenant's hosts to its one
+   *  former owner (TenantDO.handOffRoutes). */
+  transfer(
+    slug: unknown,
+    from: unknown,
+    to: unknown,
+  ): { ok: boolean; reason?: string; owner?: string } {
+    const s = this.norm(slug);
+    const f = typeof from === "string" ? from : "";
+    const t = typeof to === "string" ? to : "";
+    if (!s || !f || !t || !isValidHostKey(s)) return { ok: false, reason: "bad-input" };
+    const cur = this.lookup(s);
+    if (cur === t) return { ok: true };
+    if (cur !== f) return { ok: false, reason: "not-owner", owner: cur };
+    this.ctx.storage.sql.exec("UPDATE slugs SET tenant = ? WHERE slug = ?", t, s);
     return { ok: true };
   }
 
@@ -444,6 +468,53 @@ export async function routerUnregister(
     reason?: string;
     owner?: string;
   };
+}
+
+/** routerRegister, but a collision first wakes the holding tenant and retries
+ *  once. The holder may be an ownerless team/org tenant whose single-user
+ *  purge has not run yet (nothing reached it since the deploy); waking it runs
+ *  the purge, which hands its hosts to its one former owner
+ *  (TenantDO.handOffRoutes). If that owner is `tenant`, the retry succeeds and
+ *  `handedOff` is true: the host was already registered (and, for a custom
+ *  hostname, provisioned) by the old tenant, so the caller must not provision
+ *  it again. Any other holder keeps the host, and the collision stands. */
+export async function routerRegisterWakingHolder(
+  env: Env,
+  slug: string,
+  tenant: string,
+): Promise<{ ok: boolean; reason?: string; owner?: string; handedOff?: boolean }> {
+  const first = await routerRegister(env, slug, tenant);
+  if (first.ok || first.reason !== "collision" || !first.owner || first.owner === tenant) {
+    return first;
+  }
+  try {
+    const stub = env.TENANT.get(env.TENANT.idFromName(first.owner));
+    // Any op runs the pending purge first; cliEpoch is a pure read.
+    await stub.fetch("https://tenant/op", {
+      method: "POST",
+      body: JSON.stringify({ op: "cliEpoch" }),
+    });
+  } catch {
+    return first;
+  }
+  if ((await routerLookup(env, slug)) !== tenant) return first;
+  return { ok: true, handedOff: true };
+}
+
+/** Move a slug/host-key from tenant `from` to tenant `to` (see RouterDO.transfer). */
+export async function routerTransfer(
+  env: Env,
+  slug: string,
+  from: string,
+  to: string,
+): Promise<{ ok: boolean; reason?: string; owner?: string }> {
+  const res = await routerStub(env).fetch("https://router/op", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ op: "transfer", slug, from, to }),
+  });
+  if (!res.ok) throw new Error(`router transfer failed: HTTP ${res.status}`);
+  return (await res.json()) as { ok: boolean; reason?: string; owner?: string };
 }
 
 /** List every slug/host-key owned by a tenant. */

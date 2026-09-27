@@ -26,7 +26,7 @@ import {
 } from "./auth";
 import {
   routerLookup,
-  routerRegister,
+  routerRegisterWakingHolder,
   routerUnregister,
   routerListForTenant,
   isValidHostKey,
@@ -772,13 +772,20 @@ async function handleHostnames(
   }
 
   if (method === "POST") {
-    const reg = await routerRegister(env, hostname, tenant);
+    // Already this tenant's (registered before, or handed over from the
+    // user's former team tenant by the single-user purge): Cloudflare already
+    // has it, and provisioning again would fail as a duplicate, whose failure
+    // path would then unregister the hostname the tenant owns.
+    const alreadyOwned = (await routerLookup(env, hostname)) === tenant;
+    const reg = alreadyOwned
+      ? { ok: true, handedOff: false }
+      : await routerRegisterWakingHolder(env, hostname, tenant);
     if (!reg.ok) {
       if (reg.reason === "collision") return json(409, { error: "hostname already registered" });
       return json(400, { error: "invalid hostname" });
     }
     let ssl: unknown = undefined;
-    if (!vanity) {
+    if (!vanity && !alreadyOwned && !reg.handedOff) {
       const cf = await provisionCfHostname(env, hostname);
       if (!cf.ok) {
         await routerUnregister(env, hostname, tenant);
