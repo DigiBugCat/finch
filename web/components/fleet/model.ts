@@ -138,7 +138,8 @@ export function timeAgo(ts: number, now: number): string {
 export function callerLabel(raw: string): string {
   if (raw.startsWith('oauth:')) return 'you, signed in (OAuth)';
   if (raw === 'public' || raw === 'anonymous') return 'no key (public)';
-  if (raw === 'dashboard') return 'finch test or call';
+  // "finch-cli" from the 1.8 hub on; "dashboard" on calls recorded before it.
+  if (raw === 'finch-cli' || raw === 'dashboard') return 'finch test or call';
   if (!raw) return 'unknown';
   return `key: ${raw}`;
 }

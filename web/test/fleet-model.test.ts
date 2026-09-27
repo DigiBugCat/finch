@@ -162,6 +162,8 @@ describe('fleet helpers', () => {
     expect(callerLabel('oauth:user_2mXf8Q')).toBe('you, signed in (OAuth)');
     expect(callerLabel('anonymous')).toBe('no key (public)');
     expect(callerLabel('public')).toBe('no key (public)');
+    expect(callerLabel('finch-cli')).toBe('finch test or call');
+    expect(callerLabel('dashboard')).toBe('finch test or call');
     expect(callerLabel('dashboard')).toBe('finch test or call');
     expect(callerLabel('')).toBe('unknown');
   });
