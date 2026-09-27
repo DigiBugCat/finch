@@ -162,6 +162,24 @@ func currentServiceStatus() serviceStatus {
 	}
 }
 
+// serviceStillUp reports whether the service manager still has the finch unit
+// loaded or running, after a stop that reported an error. On macOS a loaded job
+// counts even between KeepAlive restarts, since launchd would start it again.
+func serviceStillUp() bool {
+	switch serviceGOOS {
+	case "darwin":
+		_, err := runServiceCommand("launchctl", "print", launchdTarget())
+		return err == nil
+	case "linux":
+		out, _ := runServiceCommand("systemctl", "--user", "is-active", systemdUnitName)
+		switch strings.TrimSpace(out) {
+		case "active", "activating", "reloading", "deactivating":
+			return true
+		}
+	}
+	return false
+}
+
 // managedServeRunning reports whether a service manager runs the serve — the
 // `finch service` unit, or the legacy finch-tunnel unit — for `finch update`.
 func managedServeRunning() bool {
@@ -372,6 +390,17 @@ func serviceInstall(c *cli, configPath string) error {
 		serviceSleep(300 * time.Millisecond)
 		s = currentServiceStatus()
 	}
+	if !s.Running {
+		// The manager accepted the unit but `finch run` never came up (a
+		// missing credential, a foreground serve holding the lock, a crash on
+		// start). The unit stays installed, since the manager keeps retrying
+		// it, but install did not deliver a running endpoint, so it fails.
+		msg := fmt.Sprintf("installed %s, but 'finch run' is not running; check the log (%s)", s.Unit, s.logHint())
+		if len(notes) > 0 {
+			msg += "; " + strings.Join(notes, "; ")
+		}
+		return newCLIError(codeInternal, "finch service status", "%s", msg)
+	}
 	if c.json {
 		p := s.payload()
 		p["config"] = manifest
@@ -394,14 +423,22 @@ func serviceInstall(c *cli, configPath string) error {
 }
 
 func serviceUninstall(c *cli) error {
-	var unitPath string
+	var unitPath, stop string
+	var out string
+	var err error
 	switch serviceGOOS {
 	case "darwin":
-		unitPath = launchdPlistPath()
-		_, _ = runServiceCommand("launchctl", "bootout", launchdTarget())
+		unitPath, stop = launchdPlistPath(), "launchctl bootout"
+		out, err = runServiceCommand("launchctl", "bootout", launchdTarget())
 	default:
-		unitPath = systemdUnitPath()
-		_, _ = runServiceCommand("systemctl", "--user", "disable", "--now", systemdUnitName)
+		unitPath, stop = systemdUnitPath(), "systemctl --user disable --now"
+		out, err = runServiceCommand("systemctl", "--user", "disable", "--now", systemdUnitName)
+	}
+	// Stopping fails harmlessly when nothing is loaded. Any other failure
+	// leaves the serve up, and the unit is what stops it, so keep the unit and
+	// fail unless the manager confirms the serve is gone.
+	if err != nil && serviceStillUp() {
+		return newCLIError(codeInternal, "finch service uninstall", "%s failed (%v: %s); finch is still running, so %s was kept", stop, err, strings.TrimSpace(out), unitPath)
 	}
 	removed := false
 	if err := os.Remove(unitPath); err == nil {

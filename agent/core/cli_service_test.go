@@ -21,6 +21,9 @@ type fakeServiceManager struct {
 	// bootstrapFailures makes the next N launchctl bootstraps fail the way
 	// launchd does while a booted-out job is still being torn down.
 	bootstrapFailures int
+	// neverStarts makes bootstrap/restart succeed without the serve ever
+	// reaching running (finch run crashing on start).
+	neverStarts bool
 }
 
 func (m *fakeServiceManager) install(t *testing.T, goos string) {
@@ -51,7 +54,7 @@ func (m *fakeServiceManager) install(t *testing.T, goos string) {
 				m.bootstrapFailures--
 				return "Bootstrap failed: 5: Input/output error", fmt.Errorf("exit status 5")
 			}
-			m.running = true
+			m.running = !m.neverStarts
 			return "", nil
 		case "systemctl --user is-active finch.service":
 			if m.running {
@@ -64,7 +67,7 @@ func (m *fakeServiceManager) install(t *testing.T, goos string) {
 			if _, err := os.Stat(systemdUnitPath()); err != nil {
 				t.Errorf("restart before the unit was written")
 			}
-			m.running = true
+			m.running = !m.neverStarts
 			return "", nil
 		case "systemctl --user disable --now finch.service":
 			m.running = false
@@ -282,6 +285,80 @@ func TestServiceInstallFailures(t *testing.T) {
 			t.Fatalf("exit=%d stderr=%q", code, stderr)
 		}
 	})
+}
+
+// install must not report success for an endpoint that is not serving: the
+// unit stays (the manager keeps retrying it) but the command fails.
+func TestServiceInstallFailsWhenTheServeNeverRuns(t *testing.T) {
+	for _, goos := range []string{"darwin", "linux"} {
+		t.Run(goos, func(t *testing.T) {
+			home := isolate(t)
+			writeManifest(t, filepath.Join(home, ".finch", "finch.yml"))
+			m := &fakeServiceManager{t: t, neverStarts: true, linger: "yes"}
+			m.install(t, goos)
+			stdout, stderr, code := finch(t, "service", "install", "--json")
+			env := decodeJSONError(t, stderr)
+			if code != 1 || stdout != "" || env.Error.Code != "INTERNAL" || env.Error.Next != "finch service status" || !strings.Contains(env.Error.Message, "not running") {
+				t.Fatalf("exit=%d stdout=%q env=%+v", code, stdout, env)
+			}
+			unit := launchdPlistPath()
+			if goos == "linux" {
+				unit = systemdUnitPath()
+			}
+			if !fileExists(unit) {
+				t.Fatal("the unit was removed; the manager should keep retrying it")
+			}
+			_, perr, pcode := finch(t, "service", "install")
+			if pcode != 1 || !strings.Contains(perr, "not running") {
+				t.Fatalf("plain mode: exit=%d stderr=%q", pcode, perr)
+			}
+		})
+	}
+}
+
+// uninstall must not delete the unit (the only handle that stops the serve)
+// and report success while the serve is still up. A stop that fails only
+// because nothing was loaded is fine.
+func TestServiceUninstallKeepsTheUnitWhenStopFails(t *testing.T) {
+	uid := strconv.Itoa(os.Getuid())
+	for _, tc := range []struct{ goos, stop string }{
+		{"darwin", "launchctl bootout gui/" + uid + "/" + launchdLabel},
+		{"linux", "systemctl --user disable --now finch.service"},
+	} {
+		t.Run(tc.goos, func(t *testing.T) {
+			home := isolate(t)
+			writeManifest(t, filepath.Join(home, ".finch", "finch.yml"))
+			m := &fakeServiceManager{t: t, linger: "yes"}
+			m.install(t, tc.goos)
+			if _, stderr, code := finch(t, "service", "install", "--json"); code != 0 {
+				t.Fatalf("install: exit=%d stderr=%q", code, stderr)
+			}
+			unit := launchdPlistPath()
+			if tc.goos == "linux" {
+				unit = systemdUnitPath()
+			}
+
+			m.failOn = tc.stop // fails and leaves the serve running
+			stdout, stderr, code := finch(t, "service", "uninstall", "--json")
+			env := decodeJSONError(t, stderr)
+			if code != 1 || stdout != "" || env.Error.Code != "INTERNAL" || !strings.Contains(env.Error.Message, "still running") {
+				t.Fatalf("exit=%d stdout=%q env=%+v", code, stdout, env)
+			}
+			if !fileExists(unit) {
+				t.Fatal("the unit was removed while finch was still running")
+			}
+
+			// Not loaded at all: the stop error is the harmless kind.
+			m.running = false
+			stdout, stderr, code = finch(t, "service", "uninstall", "--json")
+			if got := decodeJSONOut(t, stdout); code != 0 || got["removed"] != true {
+				t.Fatalf("exit=%d stdout=%q stderr=%q", code, stdout, stderr)
+			}
+			if fileExists(unit) {
+				t.Fatal("unit survived an uninstall of a stopped service")
+			}
+		})
+	}
 }
 
 func TestRotateServiceLog(t *testing.T) {
