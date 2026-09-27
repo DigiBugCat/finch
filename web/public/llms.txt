@@ -6,7 +6,7 @@
 
 Finch is operated from a CLI on macOS and Linux. Every command accepts --json: success payloads carry "schema_version":1, and errors go to stderr as {"schema_version":1,"error":{"code","message","next"}}. Exit codes: 0 ok, 1 error, 2 usage, 10 waiting for approval, 11 expired, 12 not logged in. The installed binary prints the agent manual with `finch guide`.
 
-Agent flow: `finch status --json` (no "schema_version":1 in its output means an older finch: reinstall first) →`finch login --start --json` (show the human the link and code) → `finch login --poll --json` every `interval` seconds until exit 0 → `finch add <name> --service http://127.0.0.1:<port> --json` (prints the public URL) → `finch service install --json` (runs `finch run` as a launchd or systemd user service) → `finch test <name> --json` → `finch connect <name> --client claude-code|cursor|codex|json`. `finch connect` mints a finch_ key for that client and writes it into the client's config without printing it.
+Agent flow: `finch status --json` (no "schema_version":1 in its output means an older finch: reinstall first) → `finch login --start --json` (show the human the link and code) → `finch login --poll --json` every `interval` seconds until exit 0 → `finch add <name> --service http://127.0.0.1:<port> --json` (prints the public URL) → `finch service install --json` (runs `finch run` as a launchd or systemd user service) → `finch test <name> --json` → `finch connect <name> --client claude-code|cursor|codex|json`. `finch connect` mints a finch_ key for that client and writes it into the client's config without printing it.
 
 The one paste for humans: "Read https://finchmcp.com/agents.md and use finch to publish my MCP server on http://127.0.0.1:8000 as notes. Show me the sign-in link when you get it. Run it as a background service, check it with finch test, then connect it to this agent."
 
@@ -39,6 +39,8 @@ finch test hello                                     # lists the greet tool; non
 finch call hello greet --args '{"name": "world"}'    # -> Hello, world!
 finch connect hello --client claude-code             # wires it into Claude Code with a fresh finch_ key
 ```
+
+Known limitation: `finch test` and `finch call` send one stateless JSON-RPC request through the hub. A Streamable-HTTP server that requires an MCP session or an SSE-capable client (FastMCP's default above, and the Python MCP SDK's) rejects that with HTTP 406 or 400 "Missing session ID". finch then exits 1 with UPSTREAM and a message saying the service is reachable; that does not mean the service is down, and MCP clients connected with `finch connect` still work through the public URL.
 
 ## Docs
 

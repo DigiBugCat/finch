@@ -146,6 +146,16 @@ Any other exit code means it did not; read `error.message` and `error.next`.
 Right after `finch service install`, the relay can take a few seconds to
 connect. If you get `UPSTREAM`, wait 5 seconds and try again, up to 3 times.
 
+A failed `finch test` is not always proof that the service is down.
+`finch test` sends one stateless `tools/list` through the hub, without an MCP
+session. Many Streamable-HTTP servers, including FastMCP and the Python MCP
+SDK in their default mode, reject that with HTTP 406 or 400
+`Missing session ID`. In that case `error.message` says the service is
+reachable through finch. Do not retry. Go on to step 6, and tell your human
+that `finch test` could not check this server, so they should confirm it from
+the connected client. For other `UPSTREAM` failures, show your human the
+message. A 401 or 404 in it came from their MCP server, not from finch.
+
 ## 6. Connect it to an MCP client
 
 ```sh
@@ -184,7 +194,7 @@ When `next` is present, it is the command to run next. Exit codes are
 | `APPROVAL_PENDING` | 10 | A login was started but not approved yet. | `finch login --poll --json` every `interval` seconds. |
 | `EXPIRED` | 11 | The login code expired before approval. | `finch login --start --json` and show the new link. |
 | `NOT_FOUND` | 1 | The service, pending login, or client does not exist here. | The `next` field: `finch add …`, `finch login --start`, or `finch connect … --client json`. |
-| `UPSTREAM` | 1 | The hub or your MCP server failed: unreachable, offline, or it returned an MCP error. | Check the local server is running, then `finch service status --json`; retry `finch test <name> --json`. |
+| `UPSTREAM` | 1 | The hub or your MCP server failed: unreachable, offline, an HTTP error from the server itself, or an MCP error. | Check the local server is running, then `finch service status --json`; retry `finch test <name> --json`. If the message says the service is reachable but needs an MCP session, go on to `finch connect` (step 6). |
 | `USAGE` | 2 | The command line was wrong. | Fix the arguments; `finch help` lists every command. |
 | `INTERNAL` | 1 | A local problem, such as an unwritable file or a service manager error. | Read `message`; tell your human if you cannot fix it. |
 

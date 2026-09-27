@@ -80,6 +80,12 @@ The same manual is hosted at https://finchmcp.com/agents.md.
 
 ## 4. Check it
   finch test notes --json         exit 0 = the MCP server answered tools/list
+  UPSTREAM: retry up to 3 times, 5s apart (the relay may still be connecting).
+  If the message says the service is reachable but rejected finch's one-shot
+  request (HTTP 406, or 400 Missing session ID), the server needs a full MCP
+  session that 'finch test' does not do yet: do not retry, go on to step 5 and
+  ask the human to confirm it from the client. A 401/404 in the message came
+  from their MCP server, not from finch.
 
 ## 5. Connect it to an MCP client
   finch connect notes --client claude-code     (or cursor | codex)
