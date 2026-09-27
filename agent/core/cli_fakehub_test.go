@@ -148,6 +148,8 @@ type fakeHub struct {
 	call     func(method string) (int, string, string)
 	down     bool // every authed route answers 503
 	authDown bool // POST /api/cli/auth answers 503
+	// revokeDown makes POST /api/cli/keys/revoke answer 503.
+	revokeDown bool
 	// relayDown makes the relay socket (/connect/<id>) answer 502, as a hub
 	// that accepts the credential but cannot take the relay would.
 	relayDown bool
@@ -385,6 +387,10 @@ func (h *fakeHub) serve(w http.ResponseWriter, r *http.Request) {
 			ID string `json:"id"`
 		}
 		if !h.body(w, r, &b) {
+			return
+		}
+		if h.revokeDown {
+			writeJSON(w, 503, map[string]string{"error": "hub unavailable"})
 			return
 		}
 		if _, ok := h.keys[b.ID]; !ok {

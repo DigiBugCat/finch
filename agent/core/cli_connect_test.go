@@ -181,6 +181,36 @@ func TestConnectRevokesTheKeyItReplaces(t *testing.T) {
 	}
 }
 
+// A rotation whose revoke fails is reported, not swallowed: the new entry is in
+// place, but the replaced key is still live and nothing references it any more,
+// so connect exits 1 INTERNAL and names the key to revoke.
+func TestConnectReportsAKeyItCouldNotRevoke(t *testing.T) {
+	home, h := connectFixture(t)
+	if err := os.MkdirAll(filepath.Join(home, ".cursor"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, stderr, code := finch(t, "connect", "notes", "--client", "cursor", "--json"); code != 0 { // k_1
+		t.Fatalf("connect: exit=%d stderr=%q", code, stderr)
+	}
+	h.set(func(h *fakeHub) { h.revokeDown = true })
+	stdout, stderr, code := finch(t, "connect", "notes", "--client", "cursor", "--json") // k_2
+	env := decodeJSONError(t, stderr)
+	if code != 1 || stdout != "" || env.Error.Code != "INTERNAL" || env.Error.Next != "finch keys revoke k_1" ||
+		!strings.Contains(env.Error.Message, "k_1 is still active") || !strings.Contains(env.Error.Message, "finch keys list") {
+		t.Fatalf("exit=%d stdout=%q env=%+v", code, stdout, env)
+	}
+	if strings.Contains(stderr, "finch_secret") {
+		t.Fatalf("a key leaked: %q", stderr)
+	}
+	if _, ok := h.keys["k_1"]; !ok || len(h.revoked) != 0 {
+		t.Fatalf("keys=%v revoked=%v", h.keys, h.revoked)
+	}
+	// The client already uses the new key.
+	if cfg := mustRead(t, filepath.Join(home, ".cursor", "mcp.json")); !strings.Contains(cfg, "finch_secret2") {
+		t.Fatalf("cursor config=%q", cfg)
+	}
+}
+
 // A dotfile manager's symlinked mcp.json must stay a symlink, with the new
 // entry written into its target.
 func TestConnectCursorWritesThroughSymlink(t *testing.T) {
@@ -593,7 +623,9 @@ func TestConnectClaudeCodeResolvesCat(t *testing.T) {
 }
 
 // A service made public after it was connected: the re-connect writes an entry
-// with no headersHelper, so the helper file's key is revoked and the file goes.
+// with no headersHelper and revokes the helper file's key. The file itself is
+// machine-wide — entries for this service in OTHER project directories still
+// run it — so it stays, emptied to no headers, and those entries keep working.
 func TestConnectClaudeCodePublicReconnectRevokesTheHelperKey(t *testing.T) {
 	home, h := connectFixture(t)
 	fc := writeFakeClaude(t, "0")
@@ -604,7 +636,21 @@ func TestConnectClaudeCodePublicReconnectRevokesTheHelperKey(t *testing.T) {
 	if !fileExists(helperFile) {
 		t.Fatal("no headers file after a key-gated connect")
 	}
-	h.set(func(h *fakeHub) { h.services["notes"] = "public" })
+	// What another project's entry for this service runs.
+	otherProjectHelper := fc.entry(t, "notes")["headersHelper"].(string)
+
+	// The first public reconnect cannot reach the hub to revoke: it fails
+	// and leaves the helper holding the (still live) key.
+	h.set(func(h *fakeHub) { h.services["notes"] = "public"; h.revokeDown = true })
+	_, stderr, code := finch(t, "connect", "notes", "--client", "claude-code", "--json")
+	env := decodeJSONError(t, stderr)
+	if code != 1 || env.Error.Code != "INTERNAL" || env.Error.Next != "finch keys revoke k_1" || !strings.Contains(env.Error.Message, "k_1 is still active") {
+		t.Fatalf("exit=%d env=%+v", code, env)
+	}
+	if hdr := runHelper(t, otherProjectHelper); hdr["Authorization"] != "Bearer finch_secret1" {
+		t.Fatalf("the helper lost its unrevoked key: %v", hdr)
+	}
+	h.set(func(h *fakeHub) { h.revokeDown = false })
 	stdout, stderr, code := finch(t, "connect", "notes", "--client", "claude-code", "--json")
 	if code != 0 {
 		t.Fatalf("public reconnect: exit=%d stderr=%q", code, stderr)
@@ -616,8 +662,11 @@ func TestConnectClaudeCodePublicReconnectRevokesTheHelperKey(t *testing.T) {
 	if !reflect.DeepEqual(h.revoked, []string{"k_1"}) || h.nextKey != 1 {
 		t.Fatalf("revoked=%v minted=%d", h.revoked, h.nextKey)
 	}
-	if fileExists(helperFile) {
-		t.Fatal("the stale headers file was left behind")
+	if got := mustRead(t, helperFile); got != "{}\n" {
+		t.Fatalf("headers file=%q, want it kept with no headers", got)
+	}
+	if hdr := runHelper(t, otherProjectHelper); len(hdr) != 0 {
+		t.Fatalf("another project's helper still sends headers: %v", hdr)
 	}
 	if entry := fc.entry(t, "notes"); entry["headersHelper"] != nil || entry["url"] != h.url()+"/notes/mcp" {
 		t.Fatalf("claude entry=%v", entry)

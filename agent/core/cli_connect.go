@@ -392,12 +392,14 @@ func runConnect(c *cli, args []string) error {
 	// service), so the key it replaced is referenced nowhere: revoke it. For
 	// claude-code that is the key inline in the project entry it removed, and
 	// the key the headers file held before this run overwrote it (or, for a
-	// service now public, removed it).
+	// service now public, before it is emptied below).
 	prevKeys := []string{target.prevKey}
 	if *client == "claude-code" {
 		prevKeys = append(prevKeys, target.helperPrevKey)
 	}
 	revoked := []string{}
+	var unrevoked []string
+	var revokeErr error
 	seen := map[string]bool{}
 	for _, prev := range prevKeys {
 		for _, id := range replacedKeyIDs(st, name, label, keyID, prev) {
@@ -405,9 +407,35 @@ func runConnect(c *cli, args []string) error {
 				continue
 			}
 			seen[id] = true
-			if _, err := cliRequest("POST", cred.Hub, "/api/cli/keys/revoke", cred.Token, map[string]string{"id": id}); err == nil {
-				revoked = append(revoked, id)
+			if _, err := cliRequest("POST", cred.Hub, "/api/cli/keys/revoke", cred.Token, map[string]string{"id": id}); err != nil {
+				unrevoked = append(unrevoked, id)
+				if revokeErr == nil {
+					revokeErr = err
+				}
+				continue
 			}
+			revoked = append(revoked, id)
+		}
+	}
+	// A rotation that leaves the superseded key live is not a success: the
+	// client no longer references it, so no later connect would find it again.
+	// (Reconnecting is how a suspected-exposed key gets rotated.)
+	if len(unrevoked) > 0 {
+		next := "finch keys list"
+		if len(unrevoked) == 1 {
+			next = "finch keys revoke " + unrevoked[0]
+		}
+		return newCLIError(codeInternal, next,
+			"connected %s, but revoking the key it replaced failed (%v); %s is still active — revoke it with 'finch keys revoke <id>' (see 'finch keys list')",
+			name, revokeErr, strings.Join(unrevoked, ", "))
+	}
+	// A public entry has no headersHelper, but Claude Code entries for this
+	// service in OTHER project directories still run the same machine-wide
+	// helper file. Keep it, now that its key is revoked, with no headers, so
+	// those entries still reach the (public) service.
+	if *client == "claude-code" && key == "" && target.helperBefore != nil {
+		if err := writeCredentialFile(target.helperPath, []byte("{}\n")); err != nil {
+			return newCLIError(codeInternal, "", "connected %s, but emptying the stale headers file %s failed: %v", name, target.helperPath, err)
 		}
 	}
 
@@ -475,13 +503,8 @@ func connectClaudeCode(t *connectTarget, name, endpoint, key string) error {
 		}
 		return newCLIError(codeUpstream, next, "%s", msg)
 	}
-	// A public entry has no headersHelper, so a headers file left from when the
-	// service was key-gated is stale; its key is revoked by the caller.
-	if key == "" && t.helperBefore != nil {
-		if err := os.Remove(t.helperPath); err != nil && !os.IsNotExist(err) {
-			return newCLIError(codeInternal, "", "removing the stale headers file %s: %v", t.helperPath, err)
-		}
-	}
+	// A public entry has no headersHelper. The headers file left from when the
+	// service was key-gated is emptied by the caller once its key is revoked.
 	return nil
 }
 
