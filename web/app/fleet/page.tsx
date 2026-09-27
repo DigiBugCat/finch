@@ -12,7 +12,7 @@ import '@/components/fleet/fleet.css';
 export const dynamic = 'force-dynamic';
 
 export const metadata: Metadata = {
-  title: 'Your fleet — finch',
+  title: 'Your fleet',
   robots: { index: false, follow: false },
 };
 

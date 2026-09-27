@@ -132,12 +132,16 @@ export function timeAgo(ts: number, now: number): string {
  * Who made a call, as a person reads it. The relay records a key's label, or
  * oauth:<Clerk user id> for a signed-in connector (on a single-user account
  * that is always the owner), "public" for a public service called without a
- * key ("anonymous" when that call found the machine offline), and "dashboard"
+ * key, "anonymous" when a call arrived while no machine was connected (it was
+ * turned away before any key check), and "dashboard"
  * for the hub's own first-party calls (finch test / call).
  */
 export function callerLabel(raw: string): string {
   if (raw.startsWith('oauth:')) return 'you, signed in (OAuth)';
-  if (raw === 'public' || raw === 'anonymous') return 'no key (public)';
+  if (raw === 'public') return 'no key (public)';
+  // Recorded when a call arrived while no machine was connected; the caller
+  // was turned away before any key check, whatever the service's access mode.
+  if (raw === 'anonymous') return 'turned away (machine offline)';
   // "finch-cli" from the 1.8 hub on; "dashboard" on calls recorded before it.
   if (raw === 'finch-cli' || raw === 'dashboard') return 'finch test or call';
   if (!raw) return 'unknown';
@@ -275,6 +279,21 @@ function shellArg(value: string): string {
 }
 
 /** The exact finch commands the page offers; every change is made from a terminal. */
+/** One outdated machine with every older version and service it serves. */
+export interface OldMachineGroup { machine: string; versions: string[]; services: string[] }
+
+/** Group the per-service outdated entries by machine: one row per machine. */
+export function groupOldMachines(old: { machine: string; service: string; version: string }[]): OldMachineGroup[] {
+  const byName = new Map<string, OldMachineGroup>();
+  for (const o of old) {
+    const g = byName.get(o.machine) ?? { machine: o.machine, versions: [], services: [] };
+    if (o.version && !g.versions.includes(o.version)) g.versions.push(o.version);
+    if (o.service && !g.services.includes(o.service)) g.services.push(o.service);
+    byName.set(o.machine, g);
+  }
+  return [...byName.values()];
+}
+
 export const cmd = {
   logs: (id: string) => `finch logs ${shellArg(id)}`,
   test: (id: string) => `finch test ${shellArg(id)}`,

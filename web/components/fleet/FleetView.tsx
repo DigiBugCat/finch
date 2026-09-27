@@ -8,6 +8,7 @@ import CopyButton from './CopyButton';
 import FleetClock from './FleetClock';
 import {
   cmd,
+  groupOldMachines,
   type FleetCall,
   type FleetKey,
   type FleetMachine,
@@ -64,6 +65,9 @@ function Machine({ m, latest }: { m: FleetMachine; latest: string }) {
   );
 }
 
+/** Rows shown per service; the rest are one `finch logs` away. */
+export const CALLS_SHOWN = 8;
+
 function Calls({ calls, id }: { calls: FleetCall[]; id: string }) {
   if (!calls.length) {
     return (
@@ -85,7 +89,7 @@ function Calls({ calls, id }: { calls: FleetCall[]; id: string }) {
         </tr>
       </thead>
       <tbody>
-        {calls.map((c, i) => (
+        {calls.slice(0, CALLS_SHOWN).map((c, i) => (
           <tr key={`${c.ts}-${i}`}>
             <td data-label="Time"><time dateTime={c.ts ? new Date(c.ts).toISOString() : undefined} title={c.ago}>{c.time}</time></td>
             <td data-label="Route" className="fl-route">{c.route}</td>
@@ -95,6 +99,15 @@ function Calls({ calls, id }: { calls: FleetCall[]; id: string }) {
           </tr>
         ))}
       </tbody>
+      {calls.length > CALLS_SHOWN && (
+        <tfoot>
+          <tr>
+            <td colSpan={5} className="fl-calls-more">
+              The {CALLS_SHOWN} most recent of {calls.length}. <code>{cmd.logs(id)}</code> shows them all.
+            </td>
+          </tr>
+        </tfoot>
+      )}
     </table>
   );
 }
@@ -298,22 +311,24 @@ function Address({ view }: { view: View }) {
 }
 
 function UpdateHint({ view }: { view: View }) {
-  const n = view.oldMachines.length;
+  const groups = groupOldMachines(view.oldMachines);
+  const n = groups.length;
   if (!n) return null;
   return (
     <section className="fl-update" aria-labelledby="fl-update">
       <h2 id="fl-update" className="iw-label">Update available</h2>
       <p>
         {view.latestAgent ? `finch ${view.latestAgent} is out. ` : ''}
-        {plural(n, 'machine')} still {n === 1 ? 'runs' : 'run'} an older version:{' '}
-        {view.oldMachines.map((m, i) => (
-          <span key={`${m.service}-${m.machine}-${i}`}>
-            {i ? ', ' : ''}
-            <b>{m.machine}</b> ({m.service}, {m.version})
-          </span>
-        ))}
-        . On each one, run:
+        {plural(n, 'machine')} still {n === 1 ? 'runs' : 'run'} an older version:
       </p>
+      <ul className="fl-update-list">
+        {groups.map((g) => (
+          <li key={g.machine}>
+            <b>{g.machine}</b> · finch {g.versions.join(', ')} · {plural(g.services.length, 'service')}
+          </li>
+        ))}
+      </ul>
+      <p>On each one, run:</p>
       <Command command={cmd.update()} />
     </section>
   );
