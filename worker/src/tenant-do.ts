@@ -25,7 +25,7 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./index";
 import { genFinchKey, hashKey, last4 } from "./auth";
-import { routerRegister } from "./router-do";
+import { routerRegister, routerRegisterWakingHolder, routerStub, routerTransfer } from "./router-do";
 import {
   type TenantState,
   type Service,
@@ -73,6 +73,13 @@ interface StoredState {
   // The version of the single-user purge this record has been through (see
   // purgeLegacyTenancy). Born current on a tenant created after it shipped.
   singleUserPurge?: number;
+  // Set by the purge on an ownerless (team/org) tenant that had exactly one
+  // active owner: that user's Clerk id. handOffRoutes moves this tenant's
+  // RouterDO hosts to their tenant, then deletes the field.
+  routeHeir?: string;
+  // Services whose boxes the purge removed: the next `finch add` of each
+  // re-enrolls it in place instead of de-duping to "<id>-2" (see enroll).
+  reenroll?: string[];
   tenantMeta?: TenantMeta;
   // At most one row: the owner, whose clerkUserId is the tenant id.
   members: TenantMember[];
@@ -228,6 +235,7 @@ export class TenantDO extends DurableObject<Env> {
     if (req.method !== "POST") return bad(405, "POST only");
     if (!this.purgeChecked) {
       await this.purgeLegacyTenancy();
+      await this.handOffRoutes();
       this.purgeChecked = true;
     }
     let msg: { op?: string; [k: string]: unknown };
@@ -727,7 +735,19 @@ export class TenantDO extends DurableObject<Env> {
    *  The owner is the member row whose clerkUserId is this tenant's id — the
    *  Clerk user whose tenant this is. A team workspace or a Clerk-org tenant
    *  (kind "team", or an `org_` id) is nobody's tenant any more, so it has no
-   *  owner. The purge:
+   *  owner.
+   *
+   *  The tenant was EXPOSED if anyone besides the owner could have signed in
+   *  to it: it is a team/org tenant, or another member row is not a
+   *  never-accepted invitation (state "invited" with no Clerk binding). A
+   *  removed member who had signed in was kept as a "disabled" row, so the
+   *  rows are a complete record of who could have. Nothing records who minted
+   *  a key or enrolled a box — a key's `owner` is who it was labelled for
+   *  (the Keys view defaulted it to the tenant owner, and a CLI mint always
+   *  used the owner's email), and a box records no enroller — so in an exposed
+   *  tenant every key and every box is treated as possibly someone else's.
+   *
+   *  The purge:
    *    - deletes every other member row (co-owners, admins, members,
    *      invitations) and normalizes the owner's row to an active owner. With
    *      no owner row it also deletes `tenantMeta`, so the tenant's own user
@@ -739,10 +759,17 @@ export class TenantDO extends DurableObject<Env> {
    *      cleared with them);
    *    - deletes the audit rows of the retired sharing features (category
    *      "access"), and every other row that names a non-owner member;
-   *    - revokes every finch_ key the owner did not mint (see ownedByOwner);
-   *    - bumps cliTokenEpoch once if anyone besides the owner could have held
-   *      a CLI token for this tenant (another member row, or a team/org
-   *      tenant), since a CLI token names a tenant, not a person. */
+   *    - exposed: revokes every finch_ key, removes every box (so /refresh
+   *      refuses its long-lived credential and the relay stops routing to it;
+   *      the owner re-adds their own with `finch add`, which reuses the
+   *      now-empty service), and bumps cliTokenEpoch once, since a CLI token
+   *      names a tenant, not a person. An ownerless tenant's services are also
+   *      set back to key-gated, so nothing on it answers without a key, and
+   *      if exactly one active owner row existed its hosts are handed to that
+   *      user (routeHeir, see handOffRoutes);
+   *    - otherwise: revokes only keys labelled for someone other than the
+   *      owner (an email other than theirs); the owner's keys, boxes and CLI
+   *      logins are untouched. */
   private async purgeLegacyTenancy(): Promise<void> {
     const raw = await this.ctx.storage.get<any>("state");
     if (!raw || typeof raw !== "object") return;
@@ -756,6 +783,25 @@ export class TenantDO extends DurableObject<Env> {
     const shared = tenant.startsWith("org_") || raw.tenantMeta?.kind === "team";
     const owner = shared ? undefined : members.find((m) => m.clerkUserId === tenant);
     const others = members.filter((m) => m !== owner);
+    const couldHaveSignedIn = (m: any): boolean =>
+      m.state !== "invited" ||
+      (typeof m.clerkUserId === "string" && m.clerkUserId !== "") ||
+      typeof m.boundAt === "number";
+    const exposed = shared || others.some(couldHaveSignedIn);
+    // An ownerless tenant's hosts go to its one former owner, if it had
+    // exactly one active owner who had signed in; otherwise they stay with the
+    // (now inert) tenant — slugs are never recycled to whoever asks first.
+    const formerOwners = shared
+      ? members.filter(
+          (m) =>
+            m.role === "owner" &&
+            m.state === "active" &&
+            typeof m.clerkUserId === "string" &&
+            m.clerkUserId !== "" &&
+            m.clerkUserId !== tenant,
+        )
+      : [];
+    const heir: string | undefined = formerOwners.length === 1 ? formerOwners[0].clerkUserId : undefined;
     const now = Date.now();
 
     // Members: the owner alone, as an active owner.
@@ -789,33 +835,54 @@ export class TenantDO extends DurableObject<Env> {
       delete raw.tenantMeta;
     }
 
-    // Keys: revoke every key the owner did not mint, and detach it from the
-    // services and boxes it was listed on. The owner minted a key labelled
-    // with their email, or one labelled "you" (the placeholder a key gets
-    // before the tenant has an identity) when no one else was ever a member.
+    // Keys: in an exposed tenant, all of them (no key records its minter).
+    // Otherwise only the owner could have minted, so keep every key labelled
+    // for the owner — their email, or the "you" placeholder a key got before
+    // the tenant had an identity — and revoke the ones labelled for someone
+    // else. Revoked ids are detached from services and boxes below.
     const keys: any[] = Array.isArray(raw.keys) ? raw.keys : [];
     const ownerEmail = owner ? normalizeEmail(String(owner.email ?? "")) : "";
-    const ownedByOwner = (k: any): boolean => {
-      if (shared) return false;
+    const keep = (k: any): boolean => {
+      if (exposed) return false;
       const keyOwner = typeof k?.owner === "string" ? normalizeEmail(k.owner) : "";
-      if (!keyOwner || keyOwner === "you") return others.length === 0;
+      if (!keyOwner || keyOwner === "you") return true;
       return !!ownerEmail && keyOwner === ownerEmail;
     };
-    raw.keys = keys.filter((k) => ownedByOwner(k));
+    raw.keys = keys.filter(keep);
     const revokedCount = keys.length - raw.keys.length;
-    const kept = new Set<unknown>(raw.keys.map((k: any) => k?.id));
+    const keptIds = new Set<unknown>(raw.keys.map((k: any) => k?.id));
     const keepKeyIds = (ids: unknown) =>
-      Array.isArray(ids) ? ids.filter((id: unknown) => kept.has(id)) : ids;
+      Array.isArray(ids) ? ids.filter((id: unknown) => keptIds.has(id)) : ids;
 
     // Services and boxes: drop the Aviary fields and the ids of keys that no
-    // longer exist.
+    // longer exist. In an exposed tenant, remove every box: none records who
+    // enrolled it, and its /join refresh token carries no epoch, so removal is
+    // the only thing that stops a box someone else runs from refreshing and
+    // from receiving this tenant's traffic (a "pending" box would still be
+    // reachable by a box-pinned path, and `finch approve` clears a whole
+    // service at once).
     const services: any[] = Array.isArray(raw.services) ? raw.services : [];
+    let removedBoxes = 0;
+    const reenroll: string[] = [];
     for (const svc of services) {
       if (!svc || typeof svc !== "object") continue;
       if (svc.aviaryManaged) svc.routes = [];
       for (const f of LEGACY_SERVICE_FIELDS) delete svc[f];
       svc.keys = keepKeyIds(svc.keys);
-      for (const box of Array.isArray(svc.boxes) ? svc.boxes : []) {
+      const boxes: any[] = Array.isArray(svc.boxes) ? svc.boxes : [];
+      if (exposed) {
+        removedBoxes += boxes.length;
+        svc.boxes = [];
+        svc.boxCount = 0;
+        svc.box = "—";
+        // Boxless, like a freshly enrolled service: the next box to join
+        // promotes it (registerBox), and getState reports this state as is.
+        svc.state = "invited";
+        if (shared) svc.auth = "key";
+        else if (typeof svc.id === "string") reenroll.push(svc.id);
+        continue;
+      }
+      for (const box of boxes) {
         if (!box || typeof box !== "object") continue;
         for (const f of LEGACY_BOX_FIELDS) delete box[f];
         box.keys = keepKeyIds(box.keys);
@@ -845,17 +912,20 @@ export class TenantDO extends DurableObject<Env> {
     const logs: any[] = Array.isArray(raw.logs) ? raw.logs : [];
     raw.logs = logs.filter((l) => l?.cat !== "access" && !namesOther(l));
 
-    const bump = shared || others.length > 0;
-    if (bump) {
+    if (exposed) {
       raw.cliTokenEpoch = (typeof raw.cliTokenEpoch === "number" ? raw.cliTokenEpoch : 0) + 1;
     }
-    if (bump || revokedCount > 0) {
+    if (heir) raw.routeHeir = heir;
+    if (reenroll.length) raw.reenroll = reenroll;
+    if (exposed || revokedCount > 0) {
       const ev: StoredLogEvent = {
         cat: "key",
         actor: "finch",
-        action:
-          `single-user migration: revoked ${revokedCount} key(s) not minted by the owner` +
-          (bump ? " and every CLI token" : ""),
+        action: exposed
+          ? `single-user migration: others could sign in (${shared ? "shared tenant" : "other members"}), ` +
+            `so no key or box has a known owner; revoked all ${revokedCount} key(s), ` +
+            `removed ${removedBoxes} box(es) and revoked every CLI token`
+          : `single-user migration: revoked ${revokedCount} key(s) labelled for someone other than the owner`,
         target: "legacy sharing data",
         ip: "",
         svc: "",
@@ -866,6 +936,56 @@ export class TenantDO extends DurableObject<Env> {
       if (raw.logs.length > MAX_LOGS) raw.logs.length = MAX_LOGS;
     }
     raw.singleUserPurge = SINGLE_USER_PURGE_VERSION;
+    await this.ctx.storage.put("state", raw);
+  }
+
+  /** Hand an ownerless tenant's RouterDO hosts (its finchmcp.com slugs and
+   *  custom hostnames) to its one former owner, recorded by the purge as
+   *  `routeHeir`. Before single-user tenancy that user's commands resolved to
+   *  this tenant; now they act on their own, so without this the hosts would
+   *  stay registered to a tenant no one can manage and could never be
+   *  re-pointed. Each host moves atomically (RouterDO.transfer), so it is
+   *  never claimable in between, and a Cloudflare custom hostname needs no
+   *  change (it is keyed by hostname, not tenant). The marker is deleted only
+   *  once every host moved; any failure leaves it for the next instance. */
+  private async handOffRoutes(): Promise<void> {
+    const raw = await this.ctx.storage.get<any>("state");
+    const heir = raw && typeof raw === "object" ? raw.routeHeir : undefined;
+    if (typeof heir !== "string" || !heir) return;
+    const tenant = this.tenantId();
+    let hosts: string[];
+    try {
+      const res = await routerStub(this.env).fetch("https://router/op", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ op: "listForTenant", tenant }),
+      });
+      if (!res.ok) return;
+      const out = (await res.json()) as { keys?: unknown };
+      if (!Array.isArray(out.keys)) return;
+      hosts = out.keys.filter((k): k is string => typeof k === "string");
+      for (const host of hosts) {
+        const moved = await routerTransfer(this.env, host, tenant, heir);
+        // "not-owner": someone else holds it now, so it is not ours to move.
+        if (!moved.ok && moved.reason !== "not-owner") return;
+      }
+    } catch {
+      return; // router unavailable: retry on the next instance
+    }
+    delete raw.routeHeir;
+    const ev: StoredLogEvent = {
+      cat: "admin",
+      actor: "finch",
+      action: `single-user migration: moved ${hosts.length} host(s) to the tenant's former owner`,
+      target: hosts.join(", ").slice(0, 200) || "none",
+      ip: "",
+      svc: "",
+      ts: Date.now(),
+      ago: "",
+    };
+    raw.logs = Array.isArray(raw.logs) ? raw.logs : [];
+    raw.logs.unshift(ev);
+    if (raw.logs.length > MAX_LOGS) raw.logs.length = MAX_LOGS;
     await this.ctx.storage.put("state", raw);
   }
 
@@ -885,8 +1005,22 @@ export class TenantDO extends DurableObject<Env> {
   ): Promise<{ id: string }> {
     const s = await this.load();
     let id = this.slugify(name, "service");
+    const existing = this.findService(s, id);
+    const reenroll = Array.isArray(s.reenroll) ? s.reenroll : [];
+    if (existing && existing.boxes.length === 0 && reenroll.includes(id)) {
+      // A service whose boxes the single-user purge removed is re-enrolled in
+      // place, once: the new ticket joins THIS service, so `finch add <name>`
+      // (the command a revoked box's agent prints) restores it at the same URL
+      // with its auth mode, instead of minting "<name>-2" beside a dead one.
+      s.reenroll = reenroll.filter((x) => x !== id);
+      if (!s.reenroll.length) delete s.reenroll;
+      await this.ensureDefaultSlug(s);
+      this.log(s, { cat: "device", actor: "you", action: "re-enrolled", target: id, ip: "", svc: id });
+      await this.save(s);
+      return { id };
+    }
     // de-dupe id within the tenant
-    if (this.findService(s, id)) {
+    if (existing) {
       let n = 2;
       let candidate = id;
       do {
@@ -1298,7 +1432,9 @@ export class TenantDO extends DurableObject<Env> {
       if (slug) {
         let res: { ok: boolean; reason?: string; owner?: string };
         try {
-          res = await routerRegister(this.env, slug, this.tenantId());
+          // Waking the holder lets a user reclaim a slug their former team
+          // tenant held before its purge has run (routerRegisterWakingHolder).
+          res = await routerRegisterWakingHolder(this.env, slug, this.tenantId());
         } catch {
           res = { ok: false, reason: "router-unavailable" };
         }
