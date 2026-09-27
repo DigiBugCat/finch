@@ -27,14 +27,19 @@ caller ── HTTPS ──▶ hub Worker ──▶ BoxDO ══ WSS ══ finch
   hibernate, so extra services cost nothing at rest.
 - **Many requests per socket.** Each relayed request has its own string `id`;
   frames for different ids interleave.
-- **Request bodies are buffered** (up to 4 MiB); **response bodies stream.**
+- **Request bodies are buffered** (up to 4 MiB, valid UTF-8 only);
+  **response bodies stream** and may be binary.
 - **No session affinity.** A service served by several machines gets
   best-effort failover, not `Mcp-Session-Id` stickiness.
 
 ## Frames
 
 One WebSocket text message is one frame: a UTF-8 JSON object with `id` and
-`type`. Body bytes travel as standard, padded base64.
+`type`. Response body bytes travel in `chunk` frames as standard, padded
+base64, so responses may be any bytes. The request body travels in `req` as a
+JSON string, so it must be valid UTF-8: `BoxDO` answers a request whose body
+is not (a binary upload, `application/octet-stream`) with 400 `relay request
+body must be valid UTF-8` before the agent sees it.
 
 | Frame | Direction | Fields | Meaning |
 |---|---|---|---|
@@ -80,8 +85,12 @@ alive.
 
 The agent only forwards paths under the service's base path: the path in the
 `service` URL when it has one (`http://127.0.0.1:8000/mcp` → `/mcp`), otherwise
-`/mcp`. With `forward_all: true` in `finch.yml` it forwards everything under
-`/<service>/`. It collapses `.` and `..` before checking, refuses scheme or host
+`/mcp`. `forward_all: true` in `finch.yml` (`finch add --forward-all`) removes
+the `/mcp` default, so a service whose URL has no path
+(`http://127.0.0.1:3000`) forwards everything under `/<service>/`. It does not
+widen a path in the URL: `http://127.0.0.1:8000/api` stays confined to
+`/<service>/api/…` with or without it. The path is not rewritten, so
+`/<service>/api/x` reaches the local server as `/api/x`. It collapses `.` and `..` before checking, refuses scheme or host
 injection, and takes scheme and host only from its configuration.
 
 ## Headers

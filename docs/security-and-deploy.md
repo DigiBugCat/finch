@@ -95,7 +95,8 @@ who called, not that they were allowed to. Treat an assertion as
 authorization only on a key-gated service.
 
 On your machine, the agent confines relayed paths to the service's base path
-(`/mcp` by default, or the whole service with `forward_all`), collapses `.` and
+(the path in the service URL; `/mcp` when it has none, or the whole service
+with `forward_all` and a pathless URL), collapses `.` and
 `..` segments first, and builds the upstream URL from its own configuration,
 never from the request.
 

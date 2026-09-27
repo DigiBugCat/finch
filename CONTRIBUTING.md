@@ -54,7 +54,14 @@ go build -o finch .
 python3 ../examples/hello-mcp/server.py &          # an MCP server on :8000
 ./finch login --hub http://localhost:8787
 ./finch add hello --service http://127.0.0.1:8000
-./finch run                                         # serve in the foreground
+./finch run                                         # serves in the foreground; leave it running
+```
+
+`finch run` does not return while it serves, so check it from a second
+terminal:
+
+```sh
+cd agent
 ./finch test hello
 ```
 

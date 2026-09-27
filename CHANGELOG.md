@@ -29,7 +29,9 @@ The CLI and hub changes below are #58. `/agents.md`, `/llms.txt` and
   instead of creating `<name>-2`. A name another machine publishes is refused
   with a clear message.
 - `finch add --forward-all` forwards every path of the service, for web apps
-  and REST APIs. Without it only `/<name>/mcp` is forwarded, as before.
+  and REST APIs, when the `--service` URL has no path. Without it only
+  `/<name>/mcp` is forwarded, as before; a URL with a path stays confined to
+  that path either way.
 - `finch rm <name>` also removes the service from `finch.yml`, deletes its
   saved credential on this machine, and restarts a running background
   service. It refuses a service enrolled under a different account than the

@@ -2,8 +2,9 @@
 
 finch gives the MCP server on your Mac or Linux machine a stable `https://`
 address, with keys or OAuth sign-in at the door. Your machine dials out to
-finch, so no port is opened and nothing on it listens to the internet. It works
-for any local HTTP app, not just MCP. The hosted version at
+finch, so no port is opened and nothing on it listens to the internet. It also
+works for local web apps and HTTP APIs, as long as request bodies are text
+(JSON, forms): binary uploads are refused for now. The hosted version at
 [finchmcp.com](https://finchmcp.com) is free, and everything here is MIT
 licensed so you can [run your own](docs/self-host.md).
 
@@ -100,7 +101,10 @@ client ─ POST /notes/mcp (Bearer finch_…) ─▶ Worker
 - **The relay does not parse MCP.** It moves HTTP bytes, so unmodified
   Streamable-HTTP servers (FastMCP, the MCP SDKs) work, including SSE, progress
   notifications and long-running tools. By default only `/<service>/mcp` is
-  forwarded; `--forward-all` forwards the whole service.
+  forwarded; `--forward-all` forwards the whole service when its `--service`
+  URL has no path. A URL with a path (`http://127.0.0.1:8000/api`) is always
+  confined to that path. Request bodies must be valid UTF-8 (4 MiB at most);
+  responses can be any bytes.
 
 The wire format is in [`docs/relay-protocol.md`](docs/relay-protocol.md), and
 the full security model in
