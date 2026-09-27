@@ -1,0 +1,10 @@
+{
+  "args": [
+    "service",
+    "install",
+    "--json"
+  ],
+  "exit": 1,
+  "stdout": "",
+  "stderr": "{\"schema_version\":1,\"error\":{\"code\":\"NOT_FOUND\",\"message\":\"nothing to serve yet \\u2014 no finch.yml (./finch.yml, ~/.finch/finch.yml, ~/.config/finch/finch.yml)\",\"next\":\"finch add <name> --service <url>\"}}\n"
+}

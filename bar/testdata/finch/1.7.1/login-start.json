@@ -1,0 +1,10 @@
+{
+  "args": [
+    "login",
+    "--start",
+    "--json"
+  ],
+  "exit": 0,
+  "stdout": "{\"schema_version\":1,\"expires_in\":600,\"interval\":3,\"user_code\":\"WXYZ-2345\",\"verification_uri_complete\":\"https://finchmcp.com/cli?code=WXYZ-2345\"}\n",
+  "stderr": ""
+}

@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-27 -32 47 47" width="47" height="47">
+  <!--
+    The finch-bar menu bar glyph: the Indigo Wash finch from
+    web/components/fieldguide/Bird.tsx (same body path, head and beak), set in a
+    square box with room for a status badge at the lower right.
+
+    tools/genicons rasterizes this file into the tray icons in
+    internal/icons/*.png. It reads the shapes by id, so keep the ids:
+      body, head, beak  the bird (the macOS template draws all three in black)
+      badge             the status dot; hidden unless a state shows it
+    Edit this file, then run:  go generate ./internal/icons
+  -->
+  <path id="body" fill="#23456b" d="M-12 -8 C -10 -20, 8 -22, 12 -12 C 14 -6, 8 0, 0 0 L -8 0 C -14 0, -20 -2, -26 2 C -22 -4, -16 -6, -12 -8 Z"/>
+  <circle id="head" fill="#23456b" cx="9" cy="-19" r="6"/>
+  <path id="beak" fill="#e0a84a" d="M14 -20 L20 -18 L14 -16 Z"/>
+  <circle id="badge" fill="#b4462f" cx="13.5" cy="7" r="6" visibility="hidden"/>
+</svg>

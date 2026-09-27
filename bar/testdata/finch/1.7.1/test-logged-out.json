@@ -1,0 +1,10 @@
+{
+  "args": [
+    "test",
+    "notes",
+    "--json"
+  ],
+  "exit": 12,
+  "stdout": "",
+  "stderr": "{\"schema_version\":1,\"error\":{\"code\":\"NOT_LOGGED_IN\",\"message\":\"not logged in\",\"next\":\"finch login --start\"}}\n"
+}

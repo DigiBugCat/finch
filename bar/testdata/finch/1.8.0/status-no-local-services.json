@@ -1,0 +1,9 @@
+{
+  "args": [
+    "status",
+    "--json"
+  ],
+  "exit": 0,
+  "stdout": "{\"schema_version\":1,\"logged_in\":true,\"loggedIn\":true,\"login_pending\":false,\"ingress\":[],\"service\":{\"installed\":false,\"manager\":\"launchd\",\"running\":false,\"unit\":\"/Users/you/Library/LaunchAgents/com.finchmcp.finch.plist\"},\"version\":\"1.8.0\",\"account\":\"you@example.com\",\"hub\":\"https://finchmcp.com\",\"hub_reachable\":true,\"config\":\"/Users/you/.finch/finch.yml\"}\n",
+  "stderr": ""
+}

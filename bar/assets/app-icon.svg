@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!--
+    The finch-bar application icon (the macOS .app icon and the Linux
+    .desktop icon): the Indigo Wash finch on a sheet of washi paper, the same
+    mark as web/public/icon.svg. The bird is the Bird.tsx silhouette scaled by
+    16 and centred on the tile (x' = 512 + 16(x + 3), y' = 512 + 16(y + 11.5)).
+    tools/genicons renders it at build time with -app.
+  -->
+  <rect id="tile" fill="#f1ebdd" x="80" y="80" width="864" height="864" rx="190"/>
+  <path id="body" fill="#23456b" d="M 368 568 C 400 376, 688 344, 752 504 C 784 600, 688 696, 560 696 L 432 696 C 336 696, 240 664, 144 728 C 208 632, 304 600, 368 568 Z"/>
+  <circle id="head" fill="#23456b" cx="704" cy="392" r="96"/>
+  <path id="beak" fill="#e0a84a" d="M 784 376 L 880 408 L 784 440 Z"/>
+</svg>

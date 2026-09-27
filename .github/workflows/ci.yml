@@ -121,6 +121,48 @@ jobs:
         working-directory: .
         run: test "$(docker run --rm --entrypoint id finch-agent:test -u)" = "10001"
 
+  bar:
+    # finch-bar, the optional menu bar companion (its own Go module in bar/).
+    # Linux builds it without cgo; macOS builds the cgo (Cocoa) side and the
+    # universal .app bundle the release job signs.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: bar
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.4"
+          cache-dependency-path: bar/go.sum
+      - run: go build ./...
+      - run: go vet ./...
+      # Includes TestCommittedIconsMatchSVG: the tray PNGs must match
+      # assets/finch.svg (regenerate with `go generate ./internal/icons`).
+      - run: go test -race ./...
+      - name: go.mod and go.sum are tidy
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+      - name: gofmt
+        run: test -z "$(gofmt -l .)"
+      - run: sh -n scripts/build-macos.sh && sh -n scripts/sign-macos.sh && sh -n scripts/package-linux.sh
+      - name: Build the Linux package
+        if: runner.os == 'Linux'
+        run: |
+          scripts/package-linux.sh 0.0.0-ci amd64 "$RUNNER_TEMP/bar"
+          tar -tzf "$RUNNER_TEMP/bar/finch-bar-linux-amd64.tar.gz"
+      - name: Build the macOS app bundle
+        if: runner.os == 'macOS'
+        run: |
+          scripts/build-macos.sh 0.0.0-ci "$RUNNER_TEMP/bar"
+          lipo -info "$RUNNER_TEMP/bar/finch-bar.app/Contents/MacOS/finch-bar"
+          "$RUNNER_TEMP/bar/finch-bar.app/Contents/MacOS/finch-bar" --version
+
   release-candidate:
     # This small immutable hand-off makes a successful *whole* CI run, rather
     # than an independently racing push event, the input to deployment.

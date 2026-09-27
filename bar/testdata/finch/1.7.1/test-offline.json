@@ -1,0 +1,10 @@
+{
+  "args": [
+    "test",
+    "kanban",
+    "--json"
+  ],
+  "exit": 1,
+  "stdout": "",
+  "stderr": "{\"schema_version\":1,\"error\":{\"code\":\"UPSTREAM\",\"message\":\"kanban did not answer through the hub: hub 502: service offline (is 'finch run' serving it?)\",\"next\":\"finch service status\"}}\n"
+}

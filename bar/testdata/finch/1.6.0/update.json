@@ -1,0 +1,8 @@
+{
+  "args": [
+    "update"
+  ],
+  "exit": 0,
+  "stdout": "finch: installed new binary at /Users/you/.local/bin/finch\n",
+  "stderr": ""
+}

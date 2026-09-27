@@ -1,0 +1,3 @@
+# Local builds (scripts/*.sh write to the directory you name; dist/ by habit)
+/finch-bar
+/dist/

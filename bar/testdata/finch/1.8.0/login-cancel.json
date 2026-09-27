@@ -1,0 +1,10 @@
+{
+  "args": [
+    "login",
+    "--cancel",
+    "--json"
+  ],
+  "exit": 0,
+  "stdout": "{\"schema_version\":1,\"cancelled\":true}\n",
+  "stderr": ""
+}
