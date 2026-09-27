@@ -21,6 +21,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
+	"strings"
 )
 
 const (
@@ -277,11 +279,48 @@ func lookupCommand(name string) commandFunc {
 			return nil
 		}
 	case "guide":
-		return func(c *cli, args []string) error { _, err := io.WriteString(c.stdout, guideText); return err }
+		return func(c *cli, args []string) error {
+			if c.json {
+				return c.emit(map[string]any{"text": guideText})
+			}
+			_, err := io.WriteString(c.stdout, guideText)
+			return err
+		}
 	case "help", "-h", "--help":
-		return func(c *cli, args []string) error { _, err := io.WriteString(c.stdout, usageText); return err }
+		return func(c *cli, args []string) error {
+			if c.json {
+				return c.emit(map[string]any{"text": usageText, "commands": helpCommands(usageText)})
+			}
+			_, err := io.WriteString(c.stdout, usageText)
+			return err
+		}
 	}
 	return nil
+}
+
+var helpCommandLine = regexp.MustCompile(`^  (\S.*?)\s{2,}(\S.*)$`)
+
+// helpCommands is the "Commands:" table of `finch help` as structured rows,
+// for `finch help --json`: each command's usage and one-line summary.
+func helpCommands(text string) []map[string]string {
+	rows := []map[string]string{}
+	in := false
+	for _, line := range strings.Split(text, "\n") {
+		if line == "Commands:" {
+			in = true
+			continue
+		}
+		if !in {
+			continue
+		}
+		if strings.TrimSpace(line) == "" {
+			break
+		}
+		if m := helpCommandLine.FindStringSubmatch(line); m != nil {
+			rows = append(rows, map[string]string{"usage": m[1], "summary": m[2]})
+		}
+	}
+	return rows
 }
 
 // hubError is a non-200 answer (or a transport failure, Status 0) from the hub.

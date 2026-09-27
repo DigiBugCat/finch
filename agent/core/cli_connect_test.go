@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 func connectFixture(t *testing.T) (string, *fakeHub) {
@@ -546,8 +547,101 @@ func TestShellQuoteSurvivesTheShell(t *testing.T) {
 	if err := os.WriteFile(f, []byte(`{"Authorization":"Bearer x"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if got := runHelper(t, claudeHelperCommand(f)); got["Authorization"] != "Bearer x" {
+	cat, err := lookPathAbs("cat")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := runHelper(t, claudeHelperCommand(cat, f)); got["Authorization"] != "Bearer x" {
 		t.Fatalf("helper=%v", got)
+	}
+}
+
+// The headersHelper names the cat preflight found on PATH, by absolute path,
+// and a machine with no cat on PATH fails preflight before a key is minted.
+func TestConnectClaudeCodeResolvesCat(t *testing.T) {
+	_, h := connectFixture(t)
+	fc := writeFakeClaude(t, "0")
+	catDir := t.TempDir()
+	cat := filepath.Join(catDir, "cat")
+	if err := os.Symlink("/bin/cat", cat); err != nil {
+		t.Fatal(err)
+	}
+	// Only the fake claude and this cat: no /bin, /usr/bin on PATH.
+	t.Setenv("PATH", fc.dir+":"+catDir)
+	if _, stderr, code := finch(t, "connect", "notes", "--client", "claude-code", "--json"); code != 0 {
+		t.Fatalf("exit=%d stderr=%q", code, stderr)
+	}
+	helper, _ := fc.entry(t, "notes")["headersHelper"].(string)
+	if !strings.HasPrefix(helper, shellQuote(cat)+" ") {
+		t.Fatalf("headersHelper=%q, want it to start with %s", helper, shellQuote(cat))
+	}
+	if hdr := runHelper(t, helper); hdr["Authorization"] != "Bearer finch_secret1" {
+		t.Fatalf("headersHelper printed %v", hdr)
+	}
+
+	_, h2 := connectFixture(t)
+	fc2 := writeFakeClaude(t, "0")
+	t.Setenv("PATH", fc2.dir)
+	_, stderr, code := finch(t, "connect", "notes", "--client", "claude-code", "--json")
+	env := decodeJSONError(t, stderr)
+	if code != 1 || env.Error.Code != "NOT_FOUND" || !strings.Contains(env.Error.Message, "cat") || env.Error.Next != "finch connect notes --client json" {
+		t.Fatalf("exit=%d env=%+v", code, env)
+	}
+	if h2.nextKey != 0 || h.nextKey != 1 {
+		t.Fatalf("minted: %d, %d", h.nextKey, h2.nextKey)
+	}
+}
+
+// A service made public after it was connected: the re-connect writes an entry
+// with no headersHelper, so the helper file's key is revoked and the file goes.
+func TestConnectClaudeCodePublicReconnectRevokesTheHelperKey(t *testing.T) {
+	home, h := connectFixture(t)
+	fc := writeFakeClaude(t, "0")
+	helperFile := filepath.Join(home, ".finch", "connect", "notes.claude-code.json")
+	if _, stderr, code := finch(t, "connect", "notes", "--client", "claude-code", "--json"); code != 0 {
+		t.Fatalf("exit=%d stderr=%q", code, stderr)
+	}
+	if !fileExists(helperFile) {
+		t.Fatal("no headers file after a key-gated connect")
+	}
+	h.set(func(h *fakeHub) { h.services["notes"] = "public" })
+	stdout, stderr, code := finch(t, "connect", "notes", "--client", "claude-code", "--json")
+	if code != 0 {
+		t.Fatalf("public reconnect: exit=%d stderr=%q", code, stderr)
+	}
+	got := decodeJSONOut(t, stdout)
+	if got["key_id"] != "" || !reflect.DeepEqual(got["revoked_key_ids"], []any{"k_1"}) || got["headers_file"] != nil {
+		t.Fatalf("payload=%v", got)
+	}
+	if !reflect.DeepEqual(h.revoked, []string{"k_1"}) || h.nextKey != 1 {
+		t.Fatalf("revoked=%v minted=%d", h.revoked, h.nextKey)
+	}
+	if fileExists(helperFile) {
+		t.Fatal("the stale headers file was left behind")
+	}
+	if entry := fc.entry(t, "notes"); entry["headersHelper"] != nil || entry["url"] != h.url()+"/notes/mcp" {
+		t.Fatalf("claude entry=%v", entry)
+	}
+}
+
+// Credential state is checked before the client: while a login awaits approval
+// (or there is none) a missing client is not what the agent should chase.
+func TestConnectChecksLoginBeforeClient(t *testing.T) {
+	isolate(t)
+	h := newFakeHub(t)
+	t.Setenv("PATH", t.TempDir()) // no claude
+	_, stderr, code := finch(t, "connect", "notes", "--client", "claude-code", "--json")
+	if env := decodeJSONError(t, stderr); code != 12 || env.Error.Code != "NOT_LOGGED_IN" {
+		t.Fatalf("not logged in: exit=%d env=%+v", code, env)
+	}
+	if err := savePendingLogin(&pendingLogin{Hub: h.url(), DeviceCode: "d", UserCode: "AB-CD", VerificationURIComplete: "https://x/cli", Interval: 3, ExpiresAt: time.Now().Add(time.Minute).Unix()}); err != nil {
+		t.Fatal(err)
+	}
+	for _, client := range []string{"claude-code", "cursor", "codex"} {
+		_, stderr, code := finch(t, "connect", "notes", "--client", client, "--json")
+		if env := decodeJSONError(t, stderr); code != 10 || env.Error.Code != "APPROVAL_PENDING" || env.Error.Next != "finch login --poll" {
+			t.Fatalf("%s while a login is pending: exit=%d env=%+v", client, code, env)
+		}
 	}
 }
 

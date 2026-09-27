@@ -8,6 +8,7 @@ package core
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -20,6 +21,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/coder/websocket"
 )
 
 const fakeCLIToken = "cli_test_token"
@@ -145,6 +148,9 @@ type fakeHub struct {
 	call     func(method string) (int, string, string)
 	down     bool // every authed route answers 503
 	authDown bool // POST /api/cli/auth answers 503
+	// relayDown makes the relay socket (/connect/<id>) answer 502, as a hub
+	// that accepts the credential but cannot take the relay would.
+	relayDown bool
 }
 
 func newFakeHub(t *testing.T) *fakeHub {
@@ -197,6 +203,12 @@ func (h *fakeHub) body(w http.ResponseWriter, r *http.Request, into any) bool {
 }
 
 func (h *fakeHub) serve(w http.ResponseWriter, r *http.Request) {
+	// The relay socket is held open for the relay's lifetime, so it is served
+	// outside the lock.
+	if id, ok := strings.CutPrefix(r.URL.Path, "/connect/"); ok {
+		h.acceptRelay(w, r, id)
+		return
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	route := r.Method + " " + r.URL.Path
@@ -242,6 +254,28 @@ func (h *fakeHub) serve(w http.ResponseWriter, r *http.Request) {
 		default:
 			writeJSON(w, 200, map[string]string{"status": h.deviceState})
 		}
+		return
+	case "POST /refresh":
+		// A box's refresh token (what /join hands out: rt_<service>) buys a
+		// connect token and the relay socket to dial; anything else is 403.
+		var b struct {
+			RefreshToken string `json:"refreshToken"`
+			Version      string `json:"version"`
+		}
+		if !h.body(w, r, &b) {
+			return
+		}
+		id, ok := strings.CutPrefix(b.RefreshToken, "rt_")
+		if _, known := h.services[id]; !ok || !known {
+			writeJSON(w, 403, map[string]string{"error": "invalid refresh token"})
+			return
+		}
+		exp, _ := json.Marshal(map[string]int64{"exp": time.Now().Add(10 * time.Minute).Unix()})
+		writeJSON(w, 200, joinResp{
+			OK: true, Tenant: "user_1", Service: id, Box: "testbox", URL: h.srv.URL + "/" + id + "/mcp",
+			ConnectURL:   "ws" + strings.TrimPrefix(h.srv.URL, "http") + "/connect/" + id,
+			ConnectToken: base64.RawURLEncoding.EncodeToString(exp) + ".sig",
+		})
 		return
 	case "POST /join":
 		var b struct{ Ticket, Box, OS, Version string }
@@ -385,6 +419,32 @@ func (h *fakeHub) serve(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, body)
 	default:
 		writeJSON(w, 404, map[string]string{"error": "unknown CLI route", "path": r.URL.Path})
+	}
+}
+
+// acceptRelay takes a relay socket and holds it until the box closes it.
+func (h *fakeHub) acceptRelay(w http.ResponseWriter, r *http.Request, id string) {
+	h.mu.Lock()
+	_, known := h.services[id]
+	down := h.relayDown
+	h.mu.Unlock()
+	if !known || r.URL.Query().Get("ct") == "" {
+		writeJSON(w, 403, map[string]string{"error": "bad connect token"})
+		return
+	}
+	if down {
+		writeJSON(w, 502, map[string]string{"error": "relay unavailable"})
+		return
+	}
+	conn, err := websocket.Accept(w, r, nil)
+	if err != nil {
+		return
+	}
+	defer conn.CloseNow()
+	for {
+		if _, _, err := conn.Read(r.Context()); err != nil {
+			return
+		}
 	}
 }
 

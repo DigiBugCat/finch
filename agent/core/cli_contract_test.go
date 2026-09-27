@@ -635,3 +635,53 @@ func TestListCommandsWrapArraysWithSchemaVersion(t *testing.T) {
 		}
 	}
 }
+
+// help and guide keep the --json contract: one schema-versioned object on
+// stdout carrying the prose (and, for help, the command table as rows).
+func TestHelpAndGuideJSON(t *testing.T) {
+	isolate(t)
+	for _, tc := range []struct {
+		args []string
+		text string
+	}{
+		{[]string{"help", "--json"}, usageText},
+		{[]string{"--help", "--json"}, usageText},
+		{[]string{"guide", "--json"}, guideText},
+	} {
+		stdout, stderr, code := finch(t, tc.args...)
+		if code != 0 || stderr != "" {
+			t.Fatalf("%v: exit=%d stderr=%q", tc.args, code, stderr)
+		}
+		got := decodeJSONOut(t, stdout)
+		if got["text"] != tc.text {
+			t.Fatalf("%v: text=%q", tc.args, got["text"])
+		}
+		if tc.text == guideText {
+			if _, ok := got["commands"]; ok {
+				t.Fatalf("guide payload has commands: %v", got)
+			}
+			continue
+		}
+		rows, _ := got["commands"].([]any)
+		if len(rows) < 20 {
+			t.Fatalf("help commands=%v", got["commands"])
+		}
+		first, _ := rows[0].(map[string]any)
+		if first["usage"] != "login [--hub URL]" || !strings.HasPrefix(first["summary"].(string), "Log in and wait") {
+			t.Fatalf("first row=%v", first)
+		}
+		for _, r := range rows {
+			m := r.(map[string]any)
+			if len(m) != 2 || m["usage"] == "" || m["summary"] == "" {
+				t.Fatalf("bad row %v", m)
+			}
+		}
+	}
+	// Without --json they stay prose.
+	if stdout, _, code := finch(t, "help"); code != 0 || stdout != usageText {
+		t.Fatalf("plain help: exit=%d", code)
+	}
+	if stdout, _, code := finch(t, "guide"); code != 0 || stdout != guideText {
+		t.Fatalf("plain guide: exit=%d", code)
+	}
+}

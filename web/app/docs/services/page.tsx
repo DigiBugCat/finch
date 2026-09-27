@@ -67,7 +67,8 @@ finch service uninstall    <span class="c"># stop and remove it</span>`}</Code>
         <code>install</code> again is safe, for example after moving the binary. Stop any{' '}
         <code>finch run</code> you started in a terminal first, since only one serve per
         machine can hold the relay; <code>install</code> exits with an error when{' '}
-        <code>finch run</code> does not come up, and says why when it knows.
+        <code>finch run</code> does not come up or a service&apos;s relay has not connected
+        within about 20 seconds, and says why when it knows.
       </p>
       <div className="docs-note">
         <b>Headless Linux box?</b> A systemd user service stops when you log out unless

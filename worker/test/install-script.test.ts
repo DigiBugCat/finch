@@ -36,6 +36,9 @@ describe("GET /install", () => {
   it("uses plain http only for a loopback hub", async () => {
     expect(await (await get("localhost:8787")).text()).toContain('HUB="http://localhost:8787"');
     expect(await (await get("hub.test")).text()).toContain('HUB="https://hub.test"');
+    expect(await (await get("[::1]:8787")).text()).toContain('HUB="http://[::1]:8787"');
+    expect(await (await get("localhost.example.com")).text()).toContain('HUB="https://localhost.example.com"');
+    expect(await (await get("127.0.0.1.nip.io")).text()).toContain('HUB="https://127.0.0.1.nip.io"');
   });
 
   it("never escalates privileges and honours FINCH_INSTALL_DIR", () => {
@@ -45,5 +48,12 @@ describe("GET /install", () => {
     expect(script).toContain("FINCH_INSTALL_DIR");
     expect(script).toContain('BIN_DIR="$HOME/.local/bin"');
     expect(script.startsWith("#!/bin/sh\n")).toBe(true);
+  });
+
+  it("creates its temporary files with mktemp in the install dir, never at PID-derived paths", () => {
+    const script = installScript("https://finchmcp.com");
+    expect(script).toContain('mktemp "$BIN_DIR/.finch-$1.XXXXXXXX"');
+    expect(script).toContain('trap \'rm -f ${tmp:+"$tmp"} ${sums:+"$sums"}\' EXIT');
+    expect(script).not.toContain("$$");
   });
 });

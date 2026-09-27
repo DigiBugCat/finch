@@ -696,11 +696,11 @@ describe("retired hub surfaces", () => {
 // names the origin that actually reaches the tenant's services: the inbound hub
 // in dev/staging (DEV=1, no per-slug routing), the claimed slug host in prod.
 describe("GET /api/cli/state serviceBase", () => {
-  async function cliState(tenant: string, e: Record<string, unknown>): Promise<any> {
+  async function cliState(tenant: string, e: Record<string, unknown>, host = HOST): Promise<any> {
     const token = await signAssertion({ tenant, exp: nowSec() + 300, kind: "cli", epoch: 0 }, SERVICE);
     const ctx = createExecutionContext();
     const res = await worker.fetch(
-      new Request(`https://${HOST}/api/cli/state`, { headers: { host: HOST, Authorization: `Bearer ${token}` } }),
+      new Request(`https://${HOST}/api/cli/state`, { headers: { host, Authorization: `Bearer ${token}` } }),
       e as any,
       ctx,
     );
@@ -716,6 +716,30 @@ describe("GET /api/cli/state serviceBase", () => {
     expect(dev.serviceBase).toBe(`https://${HOST}`);
 
     const prod = await cliState(tenant, { ...env, DEV: undefined });
+    expect(prod.serviceBase).toBe(`https://${prod.host}`);
+  });
+
+  // Plain http only for a hub reached on this machine: the hostname must be
+  // exactly a loopback name, never merely start with one, or `finch connect`
+  // would write a bearer key into a client config pointed at plaintext http.
+  it("is http only for an exact loopback host", async () => {
+    const tenant = `user_state_loopback_${++seq}`;
+    for (const [host, want] of [
+      ["localhost:8787", "http://localhost:8787"],
+      ["localhost", "http://localhost"],
+      ["LOCALHOST:8787", "http://LOCALHOST:8787"],
+      ["127.0.0.1:8787", "http://127.0.0.1:8787"],
+      ["[::1]:8787", "http://[::1]:8787"],
+      ["localhost.example.com", "https://localhost.example.com"],
+      ["localhost-hub.example.com:8443", "https://localhost-hub.example.com:8443"],
+      ["127.0.0.1.nip.io", "https://127.0.0.1.nip.io"],
+      ["127.example.com", "https://127.example.com"],
+    ]) {
+      const st = await cliState(tenant, env, host);
+      expect(st.serviceBase, host).toBe(want);
+    }
+    // In prod a look-alike host is not local either: it gets the slug host.
+    const prod = await cliState(tenant, { ...env, DEV: undefined }, "localhost.example.com");
     expect(prod.serviceBase).toBe(`https://${prod.host}`);
   });
 });

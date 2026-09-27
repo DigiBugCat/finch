@@ -351,6 +351,9 @@ func serviceInstall(c *cli, configPath string) error {
 		return newCLIError(codeInternal, "", "writing %s: %v", unitPath, err)
 	}
 
+	// The serve the manager starts below writes its relay status after this
+	// instant; an older status file (a previous run's) is ignored.
+	installStart := time.Now()
 	linger := true
 	switch serviceGOOS {
 	case "darwin":
@@ -404,8 +407,20 @@ func serviceInstall(c *cli, configPath string) error {
 		}
 		return newCLIError(codeInternal, "finch service status", "%s", msg)
 	}
+	// A live process is not a live endpoint: a relay whose credential is
+	// missing or rejected keeps `finch run` up while it waits for `finch add`.
+	// Wait for the serve's own report that every relay is connected.
+	relays, problem := waitForRelays(manifest, installStart)
+	if problem != nil {
+		problem.Message = fmt.Sprintf("installed %s and 'finch run' is running, but %s; check the log (%s)", s.Unit, problem.Message, s.logHint())
+		if len(notes) > 0 {
+			problem.Message += "; " + strings.Join(notes, "; ")
+		}
+		return problem
+	}
 	if c.json {
 		p := s.payload()
+		p["relays"] = relays
 		p["config"] = manifest
 		p["binary"] = bin
 		p["log"] = s.logHint()
@@ -423,6 +438,70 @@ func serviceInstall(c *cli, configPath string) error {
 		c.printf("       note: %s\n", n)
 	}
 	return nil
+}
+
+// relayReadyPolls × relayReadyInterval bounds how long install waits for the
+// new serve's relays to connect (about 20s).
+const (
+	relayReadyPolls    = 40
+	relayReadyInterval = 500 * time.Millisecond
+)
+
+// waitForRelays waits until the `finch run` started after since reports every
+// ingress rule of manifest connected (run_status.go), and returns their
+// states. A credential error fails at once, naming the `finch add` that fixes
+// it; otherwise it gives up after about 20s, naming what is not connected.
+func waitForRelays(manifest string, since time.Time) (map[string]relayStatus, *cliError) {
+	hostName, _ := os.Hostname()
+	cfg, err := loadConfig(manifest, hostName)
+	if err != nil {
+		return nil, newCLIError(codeInternal, "finch service status", "%s no longer loads: %v", manifest, err)
+	}
+	path := runStatusPath(cfg.CredentialsDir)
+	var st *serveReport
+	for i := 0; ; i++ {
+		if st = readRunStatus(path); st != nil && st.Started < since.UnixNano() {
+			st = nil // an earlier run's report
+		}
+		if st != nil {
+			up := true
+			for _, ing := range cfg.Ingress {
+				r := st.Relays[ing.AppPath]
+				if r.State == relayCredentialError {
+					return nil, newCLIError(codeInternal, "finch add "+ing.AppPath+" --service "+ing.Service,
+						"%s is not connected: %s", ing.AppPath, r.Error)
+				}
+				up = up && r.State == relayConnected
+			}
+			if up {
+				return st.Relays, nil
+			}
+		}
+		if i >= relayReadyPolls {
+			break
+		}
+		serviceSleep(relayReadyInterval)
+	}
+	wait := (relayReadyPolls * relayReadyInterval).String()
+	if st == nil {
+		return nil, newCLIError(codeInternal, "finch service status", "it has not reported its relays within %s (%s)", wait, path)
+	}
+	var down []string
+	for _, ing := range cfg.Ingress {
+		r := st.Relays[ing.AppPath]
+		if r.State == relayConnected {
+			continue
+		}
+		d := ing.AppPath + " (" + r.State
+		if r.State == "" {
+			d = ing.AppPath + " (not reported"
+		}
+		if r.Error != "" {
+			d += ": " + r.Error
+		}
+		down = append(down, d+")")
+	}
+	return nil, newCLIError(codeInternal, "finch service status", "not connected after %s: %s", wait, strings.Join(down, ", "))
 }
 
 func serviceUninstall(c *cli) error {

@@ -135,11 +135,15 @@ Running it again is safe, and it is required after publishing another service
 with `finch add`: the service reads `finch.yml` only when it starts, and
 `install` restarts it. Check it at any time with `finch service status --json`.
 
-Exit `0` means `finch run` is running. If it does not come up, `install` exits
-`1` with `INTERNAL`; the unit stays installed, and `error.message` names the
-log to read and any reason finch already knows. A common one is a `finch run`
-already serving in a terminal: ask your human to stop it (Ctrl-C), then run
-`finch service install --json` again.
+Exit `0` means `finch run` is running and every service's relay has connected
+to the hub (the payload's `relays` lists each one). If `finch run` does not come
+up, or a relay has not connected within about 20 seconds, `install` exits `1`
+with `INTERNAL`; the unit stays installed, and `error.message` names the log to
+read and any reason finch already knows. A common one is a `finch run` already
+serving in a terminal: ask your human to stop it (Ctrl-C), then run
+`finch service install --json` again. Another is a rejected or missing
+credential: `error.next` is then the `finch add <name> --service <url>` that
+replaces it.
 
 On Linux, when the output has `"linger": false`, tell your human that
 `sudo loginctl enable-linger <user>` keeps finch running after they log out

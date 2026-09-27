@@ -60,8 +60,7 @@ async function mintCliToken(
     { tenant, exp, kind: "cli", epoch: epoch ?? 0 },
     env.FINCH_SERVICE_SECRET,
   );
-  const scheme =
-    host.startsWith("localhost") || host.startsWith("127.") ? "http" : "https";
+  const scheme = isLoopbackHost(host) ? "http" : "https";
   return { token, expiresAt: exp, hub: `${scheme}://${host}` };
 }
 
@@ -475,7 +474,7 @@ async function handleApiInner(
       if (!service || !rpcMethod) return json(400, { error: "service and method required" });
       const exp = Math.floor(Date.now() / 1000) + 120;
       const assertion = await signAssertion({ tenant: cliTenant, exp }, env.FINCH_SERVICE_SECRET);
-      const scheme = host.startsWith("localhost") || host.startsWith("127.") ? "http" : "https";
+      const scheme = isLoopbackHost(host) ? "http" : "https";
       const res = await env.SELF.fetch(`${scheme}://${host}/${encodeURIComponent(service)}/mcp`, {
         method: "POST",
         headers: {
@@ -840,12 +839,22 @@ async function tenantHostBase(
 // tenant's stored <slug>.finchmcp.com resolves only in prod (wildcard DNS +
 // slug routing), so using it there hands operators an unresolvable install/URL.
 // Prod (DEV unset) routes by slug subdomain, so there we must use it.
-function isLocalHost(inboundHost: string): boolean {
-  return inboundHost.startsWith("localhost") || inboundHost.startsWith("127.");
+/** Whether a Host header (with or without a port) names this machine: the
+ *  parsed hostname is exactly localhost, 127.0.0.1 or ::1. Never a prefix
+ *  test: localhost.example.com or 127.0.0.1.nip.io is a routed public host,
+ *  and plain http there would carry client credentials in the clear. */
+export function isLoopbackHost(hostHeader: string): boolean {
+  let hostname: string;
+  try {
+    hostname = new URL(`http://${hostHeader}`).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]" || hostname === "::1";
 }
 
 function usesInboundHost(env: Env, inboundHost: string): boolean {
-  return isLocalHost(inboundHost) || env.DEV === "1";
+  return isLoopbackHost(inboundHost) || env.DEV === "1";
 }
 
 /** tenantHostBase for a caller that already holds the tenant's stored host. */
@@ -855,7 +864,7 @@ function hostBase(
   stateHost: string | undefined,
 ): { http: string; ws: string; host: string } {
   const host = !usesInboundHost(env, inboundHost) && stateHost ? stateHost : inboundHost;
-  const s = isLocalHost(inboundHost) ? "" : "s";
+  const s = isLoopbackHost(inboundHost) ? "" : "s";
   return { http: `http${s}://${host}`, ws: `ws${s}://${host}`, host };
 }
 

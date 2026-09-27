@@ -68,7 +68,7 @@ finch connect notes --client claude-code              <span class="c"># wire it 
             </tr>
             <tr>
               <td><code>finch service install</code></td>
-              <td>Run <code>finch run</code> as a login service that starts at login and restarts if it exits: a launchd LaunchAgent (<code>~/Library/LaunchAgents/com.finchmcp.finch.plist</code>) on macOS, a systemd user unit (<code>finch.service</code>) on Linux. Safe to run again. It exits <code>1</code> if <code>finch run</code> does not come up (the unit stays installed; the message names the log). On a headless Linux box, <code>sudo loginctl enable-linger $USER</code> keeps it running after you log out.</td>
+              <td>Run <code>finch run</code> as a login service that starts at login and restarts if it exits: a launchd LaunchAgent (<code>~/Library/LaunchAgents/com.finchmcp.finch.plist</code>) on macOS, a systemd user unit (<code>finch.service</code>) on Linux. Safe to run again. It waits for every service's relay to connect, and exits <code>1</code> if <code>finch run</code> does not come up or a relay has not connected within about 20 seconds (the unit stays installed; the message names the reason, such as a rejected credential, and the log). On a headless Linux box, <code>sudo loginctl enable-linger $USER</code> keeps it running after you log out.</td>
             </tr>
             <tr>
               <td><code>finch service status</code> / <code>uninstall</code></td>

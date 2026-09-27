@@ -25,7 +25,10 @@ package core
 // that file, which Claude Code runs each time it connects. claude's argv then
 // carries only the URL and the file's path. The same file serves every project
 // connected to that service on this machine, so a re-connect rotates the key
-// for all of them.
+// for all of them. The helper names cat by the absolute path preflight found on
+// PATH (not a hard-coded /bin/cat, which NixOS and some minimal systems lack).
+// Re-connecting a service that has since been made public writes an entry with
+// no helper, so the file's key is revoked and the file removed.
 
 import (
 	"context"
@@ -55,6 +58,7 @@ func codexConfigDir() string {
 type connectTarget struct {
 	client string
 	claude string         // claude-code: the claude binary
+	cat    string         // claude-code: absolute path of cat, for the headersHelper
 	config string         // cursor/codex: the config file to merge into
 	cursor map[string]any // cursor: the parsed existing config
 	codex  string         // codex: the existing config text
@@ -94,8 +98,19 @@ func shellQuote(s string) string {
 }
 
 // claudeHelperCommand is the headersHelper: print the headers file, which is
-// already the JSON object of headers Claude Code expects.
-func claudeHelperCommand(path string) string { return "/bin/cat " + shellQuote(path) }
+// already the JSON object of headers Claude Code expects. cat is the absolute
+// path preflight resolved, so the helper does not depend on the PATH Claude
+// Code happens to run it with.
+func claudeHelperCommand(cat, path string) string { return shellQuote(cat) + " " + shellQuote(path) }
+
+// lookPathAbs resolves an executable on PATH to an absolute path.
+func lookPathAbs(name string) (string, error) {
+	p, err := exec.LookPath(name)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Abs(p)
+}
 
 var claudeLocalScope = regexp.MustCompile(`(?m)^\s*Scope:\s*Local config`)
 
@@ -183,6 +198,11 @@ func preflightClient(client, name string) (*connectTarget, error) {
 			return nil, newCLIError(codeNotFound, jsonNext, "the 'claude' CLI (Claude Code) is not on PATH")
 		}
 		t.claude = bin
+		cat, err := lookPathAbs("cat")
+		if err != nil {
+			return nil, newCLIError(codeNotFound, jsonNext, "no 'cat' on PATH; Claude Code's headersHelper needs it to read the key file")
+		}
+		t.cat = cat
 		t.helperPath = claudeHelperPath(name)
 		before, err := readCredentialFile(t.helperPath, credentialStateLimit)
 		if err != nil {
@@ -275,11 +295,13 @@ func runConnect(c *cli, args []string) error {
 	if !valid {
 		return usageError("--client must be one of: %s", strings.Join(connectClients, ", "))
 	}
-	target, err := preflightClient(*client, name)
+	// Credential state first: while a login awaits approval (or there is none)
+	// the answer is to finish logging in, not to troubleshoot the client.
+	cred, err := requireCred()
 	if err != nil {
 		return err
 	}
-	cred, err := requireCred()
+	target, err := preflightClient(*client, name)
 	if err != nil {
 		return err
 	}
@@ -369,9 +391,10 @@ func runConnect(c *cli, args []string) error {
 	// The client's entry now carries the new key (or none, for a public
 	// service), so the key it replaced is referenced nowhere: revoke it. For
 	// claude-code that is the key inline in the project entry it removed, and
-	// the key the headers file held before this run overwrote it.
+	// the key the headers file held before this run overwrote it (or, for a
+	// service now public, removed it).
 	prevKeys := []string{target.prevKey}
-	if *client == "claude-code" && key != "" {
+	if *client == "claude-code" {
 		prevKeys = append(prevKeys, target.helperPrevKey)
 	}
 	revoked := []string{}
@@ -434,7 +457,7 @@ func connectClaudeCode(t *connectTarget, name, endpoint, key string) error {
 				_ = os.Remove(t.helperPath)
 			}
 		}
-		entry["headersHelper"] = claudeHelperCommand(t.helperPath)
+		entry["headersHelper"] = claudeHelperCommand(t.cat, t.helperPath)
 	}
 	next := "finch connect " + name + " --client claude-code"
 	if t.claudeLocal {
@@ -451,6 +474,13 @@ func connectClaudeCode(t *connectTarget, name, endpoint, key string) error {
 			msg += "; this project's previous " + name + " entry was already removed, so run connect again"
 		}
 		return newCLIError(codeUpstream, next, "%s", msg)
+	}
+	// A public entry has no headersHelper, so a headers file left from when the
+	// service was key-gated is stale; its key is revoked by the caller.
+	if key == "" && t.helperBefore != nil {
+		if err := os.Remove(t.helperPath); err != nil && !os.IsNotExist(err) {
+			return newCLIError(codeInternal, "", "removing the stale headers file %s: %v", t.helperPath, err)
+		}
 	}
 	return nil
 }

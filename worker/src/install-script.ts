@@ -10,7 +10,9 @@
  *  binary from the hub-relative /releases path, verifies it against
  *  checksums.txt when a SHA-256 tool is available (failing closed when the
  *  manifest is missing or lacks exactly one entry for the asset), and swaps it
- *  into place with an atomic rename in the target directory.
+ *  into place with an atomic rename in the target directory. Its temporary
+ *  files come from mktemp in that directory (exclusive, unpredictable names)
+ *  and are removed on every exit.
  *
  *  POSIX sh only: it runs under `sh` on macOS and Linux. Kept free of Workers
  *  APIs so tests can execute it under a real shell. */
@@ -70,12 +72,28 @@ fetch() {
 asset="finch-\${os}-\${arch}"
 url="$HUB/releases/$asset"
 # Download next to the destination so the final rename is atomic (and never
-# crosses filesystems); clean up on any failure.
-tmp="$BIN_DIR/.finch-install.$$"
-sums="$BIN_DIR/.finch-checksums.$$"
-trap 'rm -f "$tmp" "$sums"' EXIT
+# crosses filesystems). mktemp creates each file exclusively under an
+# unpredictable name, so nothing another user pre-created in a shared
+# FINCH_INSTALL_DIR (a symlink to one of your files) is ever written through;
+# the trap removes both files on any exit.
+tmp=""
+sums=""
+trap 'rm -f \${tmp:+"$tmp"} \${sums:+"$sums"}' EXIT
+newtemp() {
+  mktemp "$BIN_DIR/.finch-$1.XXXXXXXX" 2>/dev/null || {
+    echo "finch: cannot create a temporary file in $BIN_DIR (is mktemp installed?)" >&2
+    return 1
+  }
+}
+tmp="$(newtemp install)"
+sums="$(newtemp checksums)"
 echo "finch: downloading $url"
 fetch "$url" "$tmp"
+# The file must still be the regular file mktemp made, not something swapped in.
+if [ -L "$tmp" ] || [ ! -f "$tmp" ]; then
+  echo "finch: $tmp was replaced while downloading; not installing" >&2
+  exit 1
+fi
 if [ ! -s "$tmp" ]; then
   echo "finch: download was empty" >&2
   exit 1
@@ -90,7 +108,7 @@ fi
 if [ -n "$sha" ]; then
   # Fail closed: with a hash tool present, the binary installs only against
   # exactly one checksums.txt entry for this asset.
-  if ! fetch "$HUB/releases/checksums.txt" "$sums" 2>/dev/null || [ ! -s "$sums" ]; then
+  if ! fetch "$HUB/releases/checksums.txt" "$sums" 2>/dev/null || [ -L "$sums" ] || [ ! -s "$sums" ]; then
     echo "finch: could not fetch $HUB/releases/checksums.txt to verify $asset; not installing" >&2
     exit 1
   fi

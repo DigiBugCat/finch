@@ -19,7 +19,7 @@
 import { BoxDO, readBoundedBody } from "./box-do";
 import { TenantDO } from "./tenant-do";
 import { RouterDO, routerLookup } from "./router-do";
-import { handleApi, isApiPath } from "./api";
+import { handleApi, isApiPath, isLoopbackHost } from "./api";
 import { installScript } from "./install-script";
 import {
   hashKey,
@@ -481,10 +481,7 @@ export default {
     //      installs the `finch` binary onto PATH; the operator then runs the
     //      `finch join --ticket …` half that the install string appends. ----
     if (path === "/install" && req.method === "GET") {
-      const scheme =
-        host.startsWith("localhost") || host.startsWith("127.0.0.1")
-          ? "http"
-          : "https";
+      const scheme = isLoopbackHost(host) ? "http" : "https";
       return new Response(installScript(`${scheme}://${host}`), {
         status: 200,
         headers: {

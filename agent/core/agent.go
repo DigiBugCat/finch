@@ -784,6 +784,12 @@ func (o *outStream) setPaused(p bool) {
 // to confine to /mcp (default) or forward the whole host. hub is the box's own
 // hub base URL — the pinned source a hub-pushed "update" frame downloads from.
 func serve(parent context.Context, wsURL string, upstream *url.URL, forwardAll bool, hub string) error {
+	return serveLink(parent, wsURL, upstream, forwardAll, hub, nil)
+}
+
+// serveLink is serve with onOpen, called once the hub has accepted the relay
+// socket (the connect token checked out), before any frame is served.
+func serveLink(parent context.Context, wsURL string, upstream *url.URL, forwardAll bool, hub string, onOpen func()) error {
 	if err := validateRelayTransportURL(wsURL); err != nil {
 		return err
 	}
@@ -802,6 +808,9 @@ func serve(parent context.Context, wsURL string, upstream *url.URL, forwardAll b
 	defer c.Close(websocket.StatusNormalClosure, "bye")
 	c.SetReadLimit(maxRelayFrameBytes)
 	log.Printf("finch: relay open -> %s", upstream)
+	if onOpen != nil {
+		onOpen()
+	}
 
 	// One writer at a time: coder/websocket forbids concurrent writes. write
 	// returns an error so a streaming forward() can ABORT mid-stream when the DO

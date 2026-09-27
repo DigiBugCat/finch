@@ -80,8 +80,10 @@ The same manual is hosted at https://finchmcp.com/agents.md.
   finch service status --json     -> {"installed":true,"running":true,...}
   Run install again after every later 'finch add': the service reads finch.yml
   only when it starts, and install restarts it. install exits 1 if 'finch run'
-  does not come up; the message says why (for example a 'finch run' already
-  serving in a terminal, which must be stopped). On Linux, "linger": false
+  does not come up, or if a service's relay has not connected within ~20s; the
+  message says why (for example a 'finch run' already serving in a terminal,
+  which must be stopped, or a rejected credential, whose 'next' is the
+  'finch add' that replaces it). On Linux, "linger": false
   means the human should run 'sudo loginctl enable-linger <user>' (never run
   sudo yourself). ('finch run' serves in the foreground instead.)
 

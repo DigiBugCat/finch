@@ -223,7 +223,7 @@ test("without a SHA-256 tool it warns and installs", () => {
   const fx = fixture({ manifest: null });
   const tools = join(fx.root, "tools");
   mkdirSync(tools);
-  for (const tool of ["sh", "uname", "tr", "mkdir", "awk", "chmod", "mv", "rm", "cp", "dirname", "basename", "cat"]) {
+  for (const tool of ["sh", "uname", "tr", "mkdir", "mktemp", "awk", "chmod", "mv", "rm", "cp", "dirname", "basename", "cat"]) {
     const found = spawnSync("sh", ["-c", `command -v ${tool}`], { encoding: "utf8" }).stdout.trim();
     assert.ok(found.startsWith("/"), `${tool} not found`);
     symlinkSync(found, join(tools, tool));
@@ -233,4 +233,45 @@ test("without a SHA-256 tool it warns and installs", () => {
   assert.equal(res.status, 0, res.stderr);
   assert.match(res.stderr, /without verifying its checksum/);
   assertInstalled(join(custom, "finch"));
+});
+
+// The download and checksum files are created with mktemp in the install
+// directory (exclusive, unpredictable names; never a PID-derived path another
+// user could pre-create as a symlink) and removed on success and failure.
+test("temporary files come from mktemp in the install dir and are cleaned up", () => {
+  const script = installScript(HUB);
+  assert.doesNotMatch(script, /\$\$/, "a PID-derived temp path is predictable");
+  for (const [name, opts, status] of [
+    ["success", {}, 0],
+    ["checksum mismatch", { badChecksum: true }, 1],
+  ]) {
+    const fx = fixture(opts);
+    const log = join(fx.root, "mktemp.log");
+    const realMktemp = spawnSync("sh", ["-c", "command -v mktemp"], { encoding: "utf8" }).stdout.trim();
+    writeFileSync(
+      join(fx.bin, "mktemp"),
+      `#!/bin/sh\nout="$("${realMktemp}" "$@")" || exit $?\nprintf '%s\\n' "$out" >> "${log}"\nprintf '%s\\n' "$out"\n`,
+    );
+    chmodSync(join(fx.bin, "mktemp"), 0o755);
+    const custom = join(fx.root, "custom");
+    mkdirSync(custom);
+    // A symlink planted where a PID-derived name would have been is never used.
+    const victim = join(fx.root, "victim");
+    writeFileSync(victim, "precious\n");
+    chmodSync(victim, 0o600);
+    for (let pid = 1; pid < 64; pid++) symlinkSync(victim, join(custom, `.finch-install.${pid}`));
+    const res = run(fx, { FINCH_INSTALL_DIR: custom });
+    assert.equal(res.status, status, `${name}: ${res.stderr}`);
+    const made = readFileSync(log, "utf8").trim().split("\n");
+    assert.equal(made.length, 2, `${name}: mktemp calls ${made}`);
+    for (const p of made) {
+      assert.equal(join(p, ".."), custom, `${name}: ${p} is not in the install dir`);
+      assert.match(p.slice(custom.length + 1), /^\.finch-(install|checksums)\.[A-Za-z0-9]{8}$/);
+      assert.ok(!existsSync(p), `${name}: ${p} was left behind`);
+    }
+    assert.equal(readFileSync(victim, "utf8"), "precious\n");
+    assert.equal(statSync(victim).mode & 0o777, 0o600);
+    const left = readdirSync(custom).filter((f) => !f.startsWith(".finch-install."));
+    assert.deepEqual(left, status === 0 ? ["finch"] : [], name);
+  }
 });

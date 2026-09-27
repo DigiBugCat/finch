@@ -1,6 +1,8 @@
 package core
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -8,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // fakeServiceManager answers exactly the service-manager commands a platform
@@ -24,6 +27,28 @@ type fakeServiceManager struct {
 	// neverStarts makes bootstrap/restart succeed without the serve ever
 	// reaching running (finch run crashing on start).
 	neverStarts bool
+	// onStart is what the started `finch run` does; nil stands in for a serve
+	// whose relays all connect (it reports "notes" connected).
+	onStart func()
+}
+
+// start is the service manager starting `finch run`.
+func (m *fakeServiceManager) start(t *testing.T) {
+	m.running = !m.neverStarts
+	if !m.running {
+		return
+	}
+	if m.onStart != nil {
+		m.onStart()
+		return
+	}
+	home, _ := os.UserHomeDir()
+	b, _ := json.Marshal(serveReport{PID: 42, Started: time.Now().UnixNano(), Relays: map[string]relayStatus{
+		"notes": {State: relayConnected, Upstream: "http://127.0.0.1:8000"},
+	}})
+	if err := writeCredentialFile(runStatusPath(filepath.Join(home, ".finch")), b); err != nil {
+		t.Error(err)
+	}
 }
 
 func (m *fakeServiceManager) install(t *testing.T, goos string) {
@@ -54,7 +79,7 @@ func (m *fakeServiceManager) install(t *testing.T, goos string) {
 				m.bootstrapFailures--
 				return "Bootstrap failed: 5: Input/output error", fmt.Errorf("exit status 5")
 			}
-			m.running = !m.neverStarts
+			m.start(t)
 			return "", nil
 		case "systemctl --user is-active finch.service":
 			if m.running {
@@ -67,7 +92,7 @@ func (m *fakeServiceManager) install(t *testing.T, goos string) {
 			if _, err := os.Stat(systemdUnitPath()); err != nil {
 				t.Errorf("restart before the unit was written")
 			}
-			m.running = !m.neverStarts
+			m.start(t)
 			return "", nil
 		case "systemctl --user disable --now finch.service":
 			m.running = false
@@ -458,5 +483,163 @@ func TestResolveUpdateRestartModeUsesManagedService(t *testing.T) {
 	}
 	if mode, _ := resolveUpdateRestartMode("auto", managedServeRunning(), false); mode != "service" {
 		t.Fatalf("mode=%s, want service", mode)
+	}
+}
+
+// serveAgainst makes the fake service manager start a real config serve (the
+// relays `finch run` runs) against the fake hub, and waits for real between
+// readiness checks (40 × 50ms), so install sees the serve's own report.
+func serveAgainst(t *testing.T, m *fakeServiceManager, manifest string) {
+	t.Helper()
+	serviceSleep = func(time.Duration) { time.Sleep(50 * time.Millisecond) }
+	ctx, cancel := context.WithCancel(context.Background())
+	var done chan struct{}
+	m.onStart = func() {
+		hostName, _ := os.Hostname()
+		cfg, err := loadConfig(manifest, hostName)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		done = make(chan struct{})
+		go func() {
+			defer close(done)
+			_ = serveConfig(ctx, cfg)
+		}()
+	}
+	t.Cleanup(func() {
+		cancel()
+		if done != nil {
+			<-done
+		}
+	})
+}
+
+func writeHubManifest(t *testing.T, path, hub string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("hub: "+hub+"\nbox: testbox\ningress:\n  - app_path: notes\n    service: http://127.0.0.1:8000\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A live `finch run` is not a live endpoint: install waits for the serve to
+// report every relay connected, and fails (keeping the unit) when a relay's
+// credential is rejected or the relay never connects.
+func TestServiceInstallWaitsForTheRelays(t *testing.T) {
+	setup := func(t *testing.T, refreshToken string) (*fakeHub, *fakeServiceManager, string) {
+		home := isolate(t)
+		h := newFakeHub(t)
+		h.set(func(h *fakeHub) { h.services["notes"] = "key" })
+		manifest := filepath.Join(home, ".finch", "finch.yml")
+		writeHubManifest(t, manifest, h.url())
+		if err := saveState(filepath.Join(home, ".finch", "notes.json"), &agentState{Hub: h.url(), RefreshToken: refreshToken}); err != nil {
+			t.Fatal(err)
+		}
+		m := &fakeServiceManager{t: t, linger: "yes"}
+		m.install(t, "darwin")
+		serveAgainst(t, m, manifest)
+		return h, m, home
+	}
+
+	t.Run("connected", func(t *testing.T) {
+		setup(t, "rt_notes")
+		stdout, stderr, code := finch(t, "service", "install", "--json")
+		if code != 0 {
+			t.Fatalf("exit=%d stderr=%q", code, stderr)
+		}
+		got := decodeJSONOut(t, stdout)
+		relays, _ := got["relays"].(map[string]any)
+		notes, _ := relays["notes"].(map[string]any)
+		if got["running"] != true || notes["state"] != "connected" || len(relays) != 1 {
+			t.Fatalf("payload=%v", got)
+		}
+	})
+
+	t.Run("credential rejected", func(t *testing.T) {
+		_, _, home := setup(t, "rt_revoked")
+		stdout, stderr, code := finch(t, "service", "install", "--json")
+		env := decodeJSONError(t, stderr)
+		if code != 1 || stdout != "" || env.Error.Code != "INTERNAL" || env.Error.Next != "finch add notes --service http://127.0.0.1:8000" ||
+			!strings.Contains(env.Error.Message, "notes is not connected: saved credential rejected: hub returned HTTP 403") {
+			t.Fatalf("exit=%d env=%+v", code, env)
+		}
+		if !fileExists(launchdPlistPath()) {
+			t.Fatal("the unit was removed; it should stay installed")
+		}
+		if !fileExists(runStatusPath(filepath.Join(home, ".finch"))) {
+			t.Fatal("the serve's status file is missing")
+		}
+	})
+
+	t.Run("relay never connects", func(t *testing.T) {
+		h, _, _ := setup(t, "rt_notes")
+		h.set(func(h *fakeHub) { h.relayDown = true })
+		_, stderr, code := finch(t, "service", "install", "--json")
+		env := decodeJSONError(t, stderr)
+		if code != 1 || env.Error.Code != "INTERNAL" || env.Error.Next != "finch service status" ||
+			!strings.Contains(env.Error.Message, "not connected after 20s: notes (reconnecting: Finch relay dial failed (HTTP 502))") {
+			t.Fatalf("exit=%d env=%+v", code, env)
+		}
+		if !fileExists(launchdPlistPath()) {
+			t.Fatal("the unit was removed; it should stay installed")
+		}
+	})
+
+	t.Run("an earlier run's report is ignored", func(t *testing.T) {
+		home := isolate(t)
+		writeManifest(t, filepath.Join(home, ".finch", "finch.yml"))
+		b, _ := json.Marshal(serveReport{PID: 7, Started: time.Now().Add(-time.Hour).UnixNano(), Relays: map[string]relayStatus{"notes": {State: relayConnected}}})
+		if err := writeCredentialFile(runStatusPath(filepath.Join(home, ".finch")), b); err != nil {
+			t.Fatal(err)
+		}
+		m := &fakeServiceManager{t: t}
+		m.install(t, "darwin")
+		m.onStart = func() {} // running, but never reports
+		_, stderr, code := finch(t, "service", "install", "--json")
+		if env := decodeJSONError(t, stderr); code != 1 || !strings.Contains(env.Error.Message, "has not reported its relays") {
+			t.Fatalf("exit=%d env=%+v", code, env)
+		}
+	})
+}
+
+// The serve removes its status file on a clean shutdown.
+func TestServeConfigRemovesItsStatusOnShutdown(t *testing.T) {
+	isolate(t)
+	h := newFakeHub(t)
+	h.set(func(h *fakeHub) { h.services["notes"] = "key" })
+	dir := t.TempDir()
+	cfg := &config{Hub: h.url(), Box: "testbox", CredentialsDir: dir, Ingress: []ingress{{AppPath: "notes", Service: "http://127.0.0.1:8000"}}}
+	if err := saveState(cfg.statePathFor("notes"), &agentState{Hub: h.url(), RefreshToken: "rt_notes"}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- serveConfig(ctx, cfg) }()
+	path := runStatusPath(dir)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if st := readRunStatus(path); st != nil && st.Relays["notes"].State == relayConnected {
+			if st.PID != os.Getpid() || st.Relays["notes"].Upstream != "http://127.0.0.1:8000" {
+				t.Fatalf("status=%+v", st)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the relay never reported connected: %+v", readRunStatus(path))
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if m := fileMode(t, path); m != 0o600 {
+		t.Fatalf("status file mode=%04o", m)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if fileExists(path) {
+		t.Fatal("the status file outlived the serve")
 	}
 }
