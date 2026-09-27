@@ -70,8 +70,8 @@ esac
 
 // run executes the installer with /usr/local/bin redirected to a test-owned
 // directory, stdin closed, and a minimal PATH.
-function run(fx, env = {}, { systemWritable = false } = {}) {
-  chmodSync(fx.system, systemWritable ? 0o755 : 0o555);
+function run(fx, env = {}, { systemWritable = false, systemMode } = {}) {
+  chmodSync(fx.system, systemMode ?? (systemWritable ? 0o755 : 0o555));
   const script = installScript(HUB).replaceAll("/usr/local/bin", fx.system);
   const res = spawnSync("sh", ["-c", script], {
     env: { HOME: fx.home, PATH: `${fx.bin}:/usr/bin:/bin`, ...env },
@@ -154,6 +154,66 @@ test("FINCH_INSTALL_DIR wins over both defaults", () => {
   assert.ok(!existsSync(join(fx.system, "finch")));
 });
 
+// Another account that can write the install dir can swap the verified binary
+// after its checksum check (or later), so such a directory is refused unless
+// its sticky bit stops others from unlinking or renaming our files.
+function sharedDir(fx, name, mode) {
+  const dir = join(fx.root, name);
+  mkdirSync(dir);
+  chmodSync(dir, mode); // mkdirSync's mode is masked by the umask
+  return dir;
+}
+
+function assertRefusedShared(res, dir) {
+  assert.equal(res.status, 1, res.stdout);
+  assert.ok(res.stderr.includes(`refusing to install into ${dir}: other users can write to it`), res.stderr);
+  assert.match(res.stderr, /chmod go-w/);
+  assert.ok(!existsSync(join(dir, "finch")));
+  assert.deepEqual(readdirSync(dir), [], "temporary files were left behind");
+}
+
+test("a world-writable FINCH_INSTALL_DIR is refused before anything is downloaded", () => {
+  const fx = fixture();
+  const shared = sharedDir(fx, "shared", 0o777);
+  const res = run(fx, { FINCH_INSTALL_DIR: shared });
+  assertRefusedShared(res, shared);
+  assert.doesNotMatch(res.stdout, /downloading/);
+  assert.ok(!existsSync(join(fx.root, "sudo-called")));
+});
+
+test("a world-writable directory with the sticky bit is accepted", () => {
+  const fx = fixture();
+  const sticky = sharedDir(fx, "sticky", 0o1777);
+  const res = run(fx, { FINCH_INSTALL_DIR: sticky });
+  assert.equal(res.status, 0, res.stderr);
+  assertInstalled(join(sticky, "finch"));
+  assert.deepEqual(readdirSync(sticky), ["finch"]);
+});
+
+test("a group-writable directory is accepted only for your own user-private group", () => {
+  const fx = fixture();
+  const grp = sharedDir(fx, "group", 0o775);
+  const [, , owner, group] = spawnSync("ls", ["-ld", `${grp}/.`], { encoding: "utf8", env: { LC_ALL: "C", PATH: "/usr/bin:/bin" } })
+    .stdout.trim()
+    .split(/\s+/);
+  const me = spawnSync("id", ["-un"], { encoding: "utf8" }).stdout.trim();
+  const res = run(fx, { FINCH_INSTALL_DIR: grp });
+  if (owner === me && group === me) {
+    assert.equal(res.status, 0, res.stderr);
+    assertInstalled(join(grp, "finch"));
+  } else {
+    assertRefusedShared(res, grp);
+  }
+});
+
+test("a system dir other users can write is skipped for ~/.local/bin", { skip: isRoot && "root can write anywhere" }, () => {
+  const fx = fixture();
+  const res = run(fx, {}, { systemMode: 0o777 });
+  assert.equal(res.status, 0, res.stderr);
+  assertInstalled(join(fx.home, ".local", "bin", "finch"));
+  assert.ok(!existsSync(join(fx.system, "finch")));
+});
+
 test("an unwritable FINCH_INSTALL_DIR fails fast instead of escalating", { skip: isRoot && "root can write anywhere" }, () => {
   const fx = fixture();
   const locked = join(fx.root, "locked");
@@ -223,7 +283,7 @@ test("without a SHA-256 tool it warns and installs", () => {
   const fx = fixture({ manifest: null });
   const tools = join(fx.root, "tools");
   mkdirSync(tools);
-  for (const tool of ["sh", "uname", "tr", "mkdir", "mktemp", "awk", "chmod", "mv", "rm", "cp", "dirname", "basename", "cat"]) {
+  for (const tool of ["sh", "uname", "tr", "mkdir", "mktemp", "awk", "chmod", "mv", "rm", "cp", "dirname", "basename", "cat", "ls", "id"]) {
     const found = spawnSync("sh", ["-c", `command -v ${tool}`], { encoding: "utf8" }).stdout.trim();
     assert.ok(found.startsWith("/"), `${tool} not found`);
     symlinkSync(found, join(tools, tool));

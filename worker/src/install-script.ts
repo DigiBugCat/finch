@@ -4,9 +4,12 @@
  *
  *  An AI agent runs this line unattended (see /agents.md), so the script must
  *  never block on input: it never calls sudo. It installs to /usr/local/bin
- *  when that directory is writable, otherwise to ~/.local/bin (printing a PATH
- *  hint), and FINCH_INSTALL_DIR overrides both (FINCH_BIN_DIR is the older
- *  name, still honoured). It detects OS/arch, downloads the matching release
+ *  when that directory is writable by you and no other account, otherwise to
+ *  ~/.local/bin (printing a PATH hint), and FINCH_INSTALL_DIR overrides both
+ *  (FINCH_BIN_DIR is the older name, still honoured). Whatever the directory,
+ *  it refuses one that other users can write (group- or world-writable
+ *  without the sticky bit), since they could swap the verified binary before
+ *  or after the final rename. It detects OS/arch, downloads the matching release
  *  binary from the hub-relative /releases path, verifies it against
  *  checksums.txt when a SHA-256 tool is available (failing closed when the
  *  manifest is missing or lacks exactly one entry for the asset), and swaps it
@@ -40,11 +43,34 @@ case "$os" in
   *) echo "finch: unsupported OS: $os (finch runs on macOS and Linux)" >&2; exit 1 ;;
 esac
 
+# private_dir DIR succeeds when no OTHER account can unlink, rename or replace
+# files in DIR: only its owner may write it, or it has the sticky bit (like
+# /tmp), or its group write goes to your own user-private group (the umask-002
+# default on Debian, Ubuntu and Fedora: group "you" holds only you). Anything
+# else would let another user swap the binary between the checksum check and
+# the final rename, or replace it at any time afterwards.
+private_dir() {
+  info="$(LC_ALL=C ls -ld "$1/." 2>/dev/null)" || return 1
+  mode="$(echo "$info" | awk '{print $1}')"
+  owner="$(echo "$info" | awk '{print $3}')"
+  group="$(echo "$info" | awk '{print $4}')"
+  case "$mode" in
+    d????????[tT]*) return 0 ;;
+    d???????w*) return 1 ;;
+    d????w*)
+      me="$(id -un 2>/dev/null || true)"
+      [ -n "$me" ] && [ "$owner" = "$me" ] && [ "$group" = "$me" ]
+      ;;
+    d*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 if [ -n "\${FINCH_INSTALL_DIR:-}" ]; then
   BIN_DIR="$FINCH_INSTALL_DIR"
 elif [ -n "\${FINCH_BIN_DIR:-}" ]; then
   BIN_DIR="$FINCH_BIN_DIR"
-elif [ -d /usr/local/bin ] && [ -w /usr/local/bin ]; then
+elif [ -d /usr/local/bin ] && [ -w /usr/local/bin ] && private_dir /usr/local/bin; then
   BIN_DIR="/usr/local/bin"
 elif [ -n "\${HOME:-}" ]; then
   BIN_DIR="$HOME/.local/bin"
@@ -55,6 +81,10 @@ fi
 mkdir -p "$BIN_DIR" 2>/dev/null || true
 if [ ! -d "$BIN_DIR" ] || [ ! -w "$BIN_DIR" ]; then
   echo "finch: cannot write to $BIN_DIR; set FINCH_INSTALL_DIR to a directory you own" >&2
+  exit 1
+fi
+if ! private_dir "$BIN_DIR"; then
+  echo "finch: refusing to install into $BIN_DIR: other users can write to it (group- or world-writable without the sticky bit), so one could swap the binary after it is verified. Run 'chmod go-w $BIN_DIR', or set FINCH_INSTALL_DIR to a directory only you can write" >&2
   exit 1
 fi
 
