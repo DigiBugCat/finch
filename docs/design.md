@@ -103,7 +103,7 @@ services intentionally receive no assertion.
 3. ✅ Clerk auth + `finch_` key check at the edge; signed caller assertions for assertion-aware services.
 4. ✅ `finch` CLI: `login` (browser approval) / `add` / `run` / `approve`; CLI tokens; one-paste install.
 5. ✅ Manifest runtime (`finch.toml` — one process fronts many local servers as separate services, cloudflared-style ingress).
-6. ✅ Dashboard (fleet, keys, settings, audit log, "test in chat").
+6. ✅ Single-user CLI slice: the `finch` CLI drives the whole lifecycle (fleet, keys, auth, hostnames, status); the web keeps sign-in, `finch login` approval, docs and the landing page. The dashboard, team workspaces, browser login wall, Aviary device enrollment and "test in chat" were cut.
 7. Bind `finchmcp.com` zone + production deploy.
 
 **Optional / later (not blocking):** a stdio↔Streamable-HTTP bridge (host

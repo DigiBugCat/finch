@@ -1,38 +1,100 @@
 import {ClerkProvider} from "@clerk/nextjs";
 import type { Metadata } from "next";
+import { IBM_Plex_Mono, Kalam, Manrope, Newsreader } from "next/font/google";
+import PaintDefs from "@/components/fieldguide/PaintDefs";
 import "./globals.css";
 
-// Clerk components themed to the Finch palette (globals.css / dashboard.css
-// tokens — warm dark bg, amber accent, Nunito). Values are duplicated here
-// because Clerk renders some surfaces (modals, portals) outside our CSS scope.
+// Indigo Wash type, self-hosted by next/font (downloaded at build time and
+// served from this origin, so the CSP needs no font or stylesheet host). Each
+// exposes a CSS variable that globals.css folds into --serif/--sans/--hand/
+// --mono with the design system's fallbacks; next/font's metric-matched
+// fallback faces keep the swap from shifting layout.
+const newsreader = Newsreader({
+  subsets: ["latin"],
+  axes: ["opsz"],
+  style: ["normal", "italic"],
+  display: "swap",
+  variable: "--font-newsreader",
+});
+const manrope = Manrope({
+  subsets: ["latin"],
+  display: "swap",
+  variable: "--font-manrope",
+});
+const kalam = Kalam({
+  subsets: ["latin"],
+  weight: "400",
+  display: "swap",
+  variable: "--font-kalam",
+  preload: false,
+});
+const plexMono = IBM_Plex_Mono({
+  subsets: ["latin"],
+  weight: ["400", "500"],
+  display: "swap",
+  variable: "--font-plex-mono",
+  preload: false,
+});
+
+const SANS = 'var(--font-manrope), Manrope, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif';
+
+// Clerk's <SignIn>/<SignUp>/<UserButton> in Indigo Wash Paper. Colours are the
+// token hex values rather than var(--…) because Clerk derives tints and alpha
+// scales from them and renders some surfaces (popovers, modals) in portals.
 const clerkAppearance = {
   variables: {
-    colorBackground: "#2d271c", // --card
-    colorInput: "#1c1711", // --input-bg
-    colorForeground: "#f1e9d8", // --ink
-    colorMutedForeground: "#a89d85", // --dim
-    colorInputForeground: "#f1e9d8",
-    colorPrimary: "#f2b443", // --amber
-    colorPrimaryForeground: "#2a200c", // matches .btn-amber ink
-    colorBorder: "#3f3725",
-    colorDanger: "#e8848f", // --red
-    colorSuccess: "#79d995", // --green
-    colorNeutral: "#f1e9d8",
-    borderRadius: "12px",
-    fontFamily: '"Nunito", system-ui, sans-serif',
+    colorBackground: "#f9f5ec", // surface-raised
+    colorInput: "#f1ebdd", // surface
+    colorInputForeground: "#1f2a44", // ink
+    colorForeground: "#1f2a44", // ink
+    colorMutedForeground: "#5a5f6e", // ink-muted
+    colorMuted: "#f1ebdd", // surface
+    colorPrimary: "#23456b", // indigo
+    colorPrimaryForeground: "#f9f5ec", // on-indigo
+    colorDanger: "#b4462f", // vermilion
+    colorSuccess: "#3e6b4f", // leaf
+    colorWarning: "#e0a84a", // ochre
+    colorNeutral: "#1f2a44", // ink
+    colorBorder: "#cfc3ab", // line
+    colorRing: "#b4462f", // focus
+    colorShadow: "#1f2a44",
+    colorModalBackdrop: "rgba(31,42,68,0.35)",
+    borderRadius: "6px", // radius-md
+    fontFamily: SANS,
+    fontFamilyButtons: SANS,
+    fontFamilyMono: 'var(--font-plex-mono), "IBM Plex Mono", ui-monospace, Menlo, monospace',
   },
   elements: {
-    card: { border: "1px solid #3f3725", boxShadow: "0 20px 60px -20px rgba(0,0,0,.6)" },
-    formButtonPrimary: { fontWeight: 800, textTransform: "none" as const },
-    socialButtonsBlockButton: { border: "1px solid #3f3725" },
-    footerActionLink: { color: "#f2b443", fontWeight: 700 },
+    card: { boxShadow: "1px 2px 0 rgba(31,42,68,.07), 2px 4px 8px rgba(31,42,68,.14)" },
+    headerTitle: {
+      fontFamily: 'var(--font-newsreader), Newsreader, "Iowan Old Style", Georgia, serif',
+      fontWeight: 500,
+      fontSize: "1.75rem",
+      letterSpacing: "-0.01em",
+    },
+    formButtonPrimary: { fontWeight: 600, textTransform: "none" as const },
+    formFieldInput: { borderColor: "#23456b" },
+    footerActionLink: { color: "#23456b", fontWeight: 700 },
   },
 };
 
+const TITLE = "finch — localhost, with a front door";
+const DESCRIPTION =
+  "finch gives the MCP server on your Mac or Linux machine a stable https address, with keys or OAuth at the door. Your machine calls out to finch, so nothing on it is left open. Free.";
+
 export const metadata: Metadata = {
-  title: "Finch — your AI, meet the real world",
-  description:
-    "Finch turns any spare computer — a Mac mini, a Raspberry Pi, that laptop in the closet — into a safe, always-on helper your AI can actually use. No servers. No wiring. No open ports.",
+  metadataBase: new URL("https://finchmcp.com"),
+  title: TITLE,
+  description: DESCRIPTION,
+  icons: { icon: [{ url: "/icon.svg", type: "image/svg+xml" }] },
+  openGraph: {
+    title: TITLE,
+    description: DESCRIPTION,
+    url: "https://finchmcp.com",
+    siteName: "finch",
+    type: "website",
+  },
+  twitter: { card: "summary", title: TITLE, description: DESCRIPTION },
 };
 
 /**
@@ -51,10 +113,9 @@ export const metadata: Metadata = {
  * Returning undefined elsewhere keeps Clerk's default, which includes the
  * current origin and so keeps local dev and the workers.dev previews working.
  *
- * Safe to narrow: middleware only ever sets redirect_url to request.url (always
- * this origin), and the portal login-wall hop to a tenant host does not use
- * Clerk's redirect machinery — app/portal/start/route.ts issues its own
- * Response.redirect after auth().
+ * Safe to narrow: nothing in this app sends a signed-in user to another origin
+ * — sign-in only ever returns to pages on this one (the /cli approval page, the
+ * docs).
  */
 function allowedRedirectOrigins(): string[] | undefined {
   const key = process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY ?? "";
@@ -67,22 +128,12 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en">
-      <head>
-        {/* Nunito, loaded exactly as the design handoff does, so the verbatim
-            `font-family:"Nunito"` in globals.css resolves correctly. */}
-        <link rel="preconnect" href="https://fonts.googleapis.com" />
-        <link
-          rel="preconnect"
-          href="https://fonts.gstatic.com"
-          crossOrigin=""
-        />
-        <link
-          href="https://fonts.googleapis.com/css2?family=Nunito:ital,wght@0,400;0,500;0,600;0,700;0,800;0,900;1,400&display=swap"
-          rel="stylesheet"
-        />
-      </head>
+    <html
+      lang="en"
+      className={`${newsreader.variable} ${manrope.variable} ${kalam.variable} ${plexMono.variable}`}
+    >
       <body>
+        <PaintDefs />
         <ClerkProvider
           appearance={clerkAppearance}
           allowedRedirectOrigins={allowedRedirectOrigins()}

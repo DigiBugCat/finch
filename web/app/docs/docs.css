@@ -1,74 +1,82 @@
-/* Finch docs — Tailscale-style layout on the Dusk theme.
-   Grouped left sidebar, single content column, quiet type-first pages. */
+/* finch docs: Indigo Wash, Paper. A quiet book page: grouped sidebar on the
+   left, one reading column (60-70 characters), Newsreader headings over
+   Manrope text. Class names are the ones the docs pages already use. */
 
-.docs-shell{display:grid; grid-template-columns:250px 1fr; gap:0; max-width:1160px;
-  margin:0 auto; padding:0 28px; min-height:calc(100vh - 68px)}
+.docs-shell{display:grid; grid-template-columns:220px minmax(0,1fr); gap:0; min-height:calc(100vh - 92px)}
 
 /* ---- sidebar ---- */
-.docs-side{border-right:1px solid var(--line); padding:36px 24px 60px 0;
-  position:sticky; top:68px; align-self:start; max-height:calc(100vh - 68px); overflow-y:auto}
+.docs-side{border-right:1px solid var(--line); padding:32px 24px 60px 0;
+  position:sticky; top:0; align-self:start; max-height:100vh; overflow-y:auto}
 .docs-group{margin-bottom:26px}
-.docs-group-h{font-size:11.5px; font-weight:800; text-transform:uppercase; letter-spacing:.08em;
-  color:var(--dim2); margin-bottom:8px}
-.docs-side a{display:block; color:var(--dim); font-weight:600; font-size:14.5px;
-  padding:6px 10px; border-radius:8px; transition:.12s}
-.docs-side a:hover{color:var(--ink); background:var(--card2)}
-.docs-side a.on{color:var(--amber); background:var(--amber-soft); font-weight:700}
+.docs-group-h{font:700 11px/16px var(--sans); letter-spacing:.1em; text-transform:uppercase;
+  color:var(--ink-muted); margin:0 0 8px}
+.docs-side ul{list-style:none; margin:0; padding:0}
+.docs-side a{display:block; color:var(--ink); font-weight:600; font-size:14.5px; line-height:20px;
+  padding:8px 10px; border-radius:var(--radius-sm); text-decoration:none}
+.docs-side a:hover{color:var(--indigo); background:var(--surface-raised)}
+.docs-side a.on{color:var(--indigo); background:var(--surface-raised); box-shadow:var(--shadow-cutout); font-weight:700}
 
 /* ---- content ---- */
-.docs-main{padding:44px 0 90px 44px; min-width:0}
-.docs-main h1{font-size:34px; font-weight:900; margin-bottom:10px}
-.docs-lede{color:var(--dim); font-size:17.5px; margin-bottom:34px; max-width:62ch; text-wrap:pretty}
-.docs-main h2{font-size:22px; font-weight:800; margin:40px 0 12px; padding-top:8px}
-.docs-main h3{font-size:17px; font-weight:800; margin:26px 0 8px}
-.docs-main p{color:var(--ink); font-size:15.5px; line-height:1.65; margin:0 0 14px; max-width:68ch}
-.docs-main p.dim, .docs-main li.dim{color:var(--dim)}
+.docs-main{padding:40px 0 48px 48px; min-width:0}
+.docs-main h1{font-family:var(--serif); font-weight:500; font-size:44px; line-height:50px; letter-spacing:-.01em; margin-bottom:12px}
+.docs-lede{color:var(--ink-muted); font-size:17px; line-height:28px; margin-bottom:32px; max-width:62ch; text-wrap:pretty}
+.docs-main h2{font-family:var(--serif); font-weight:500; font-size:28px; line-height:34px; margin:44px 0 12px}
+.docs-main h3{font-family:var(--serif); font-weight:600; font-size:21px; line-height:28px; margin:28px 0 8px}
+.docs-main p{color:var(--ink); font-size:16px; line-height:26px; margin:0 0 14px; max-width:68ch}
+.docs-main .dim{color:var(--ink-muted)}
 .docs-main ul, .docs-main ol{margin:0 0 16px; padding-left:22px; max-width:68ch}
-.docs-main li{font-size:15.5px; line-height:1.65; margin-bottom:6px}
-.docs-main a{color:var(--amber); font-weight:600}
-.docs-main a:hover{text-decoration:underline}
-.docs-main code{font-family:var(--mono); font-size:.86em; background:var(--card2);
-  border:1px solid var(--line); border-radius:6px; padding:1.5px 6px}
+.docs-main li{font-size:16px; line-height:26px; margin-bottom:6px}
+.docs-main a{color:var(--link); font-weight:600; text-decoration:underline; text-decoration-thickness:1px;
+  text-decoration-color:var(--line); text-underline-offset:3px}
+.docs-main a:hover{color:var(--ink); text-decoration-color:currentColor}
+.docs-main code{font-family:var(--mono); font-size:.86em; background:var(--surface-raised);
+  border-radius:var(--radius-sm); padding:1.5px 5px; overflow-wrap:anywhere}
+.docs-main strong, .docs-main b{font-weight:700}
 
-/* code blocks */
-.docs-code{background:var(--input-bg); border:1px solid var(--line); border-radius:12px;
-  padding:16px 18px; margin:0 0 18px; overflow-x:auto; max-width:760px}
-.docs-code code{background:none; border:none; padding:0; font-size:13px; line-height:1.7;
-  white-space:pre; display:block; color:var(--ink)}
-.docs-code .c{color:var(--dim2)}   /* comment */
-.docs-code .o{color:var(--green)}  /* output */
+/* code blocks: a sheet of paper resting on the page */
+.docs-code{background:var(--surface-raised); border-radius:var(--radius-md); box-shadow:var(--shadow-cutout);
+  padding:16px 18px; margin:0 0 20px; overflow-x:auto; max-width:760px}
+.docs-code code{background:none; border:none; padding:0; font-size:13px; line-height:22px;
+  white-space:pre; display:block; color:var(--ink); overflow-wrap:normal}
+.docs-code .c{color:var(--ink-muted)}   /* comment */
+.docs-code .o{color:var(--leaf)}        /* output */
 
 /* callout */
-.docs-note{background:var(--card); border:1px solid var(--line2); border-left:3px solid var(--amber);
-  border-radius:10px; padding:13px 16px; margin:0 0 18px; font-size:14.5px; color:var(--dim); max-width:760px}
+.docs-note{background:var(--surface-raised); border-radius:var(--radius-md); box-shadow:var(--shadow-cutout);
+  padding:14px 18px; margin:0 0 20px; font-size:15px; line-height:24px; color:var(--ink); max-width:760px}
 .docs-note b{color:var(--ink)}
+.docs-note p:last-child{margin-bottom:0}
 
 /* tables */
-.docs-table-wrap{overflow-x:auto; margin:0 0 18px; max-width:760px}
-.docs-main table{border-collapse:collapse; font-size:14.5px; width:100%}
-.docs-main th{text-align:left; font-size:12px; text-transform:uppercase; letter-spacing:.06em;
-  color:var(--dim2); font-weight:800; padding:8px 14px 8px 0; border-bottom:1px solid var(--line2)}
-.docs-main td{padding:9px 14px 9px 0; border-bottom:1px solid var(--line); vertical-align:top}
+.docs-table-wrap{overflow-x:auto; margin:0 0 20px; max-width:760px}
+.docs-main table{border-collapse:collapse; font-size:14.5px; line-height:22px; width:100%; font-variant-numeric:tabular-nums}
+.docs-main th{text-align:left; font:700 11px/16px var(--sans); text-transform:uppercase; letter-spacing:.08em;
+  color:var(--ink-muted); padding:8px 14px 8px 0; border-bottom:1px solid var(--indigo)}
+.docs-main td{padding:10px 14px 10px 0; border-bottom:1px solid var(--line); vertical-align:top}
 .docs-main td:first-child{white-space:nowrap}
 
 /* docs home cards */
 .docs-cards{display:grid; grid-template-columns:1fr 1fr; gap:16px; margin:26px 0 10px; max-width:760px}
-.docs-card{display:block; background:var(--card); border:1px solid var(--line); border-radius:16px;
-  padding:20px 22px; transition:.15s}
-.docs-card:hover{border-color:var(--line2); background:var(--card-hi); transform:translateY(-2px); text-decoration:none !important}
-.docs-card h3{margin:0 0 6px; font-size:16.5px}
-.docs-card p{margin:0; color:var(--dim); font-size:14px}
+.docs-main a.docs-card{display:block; background:var(--surface-raised); border-radius:var(--radius-md);
+  box-shadow:var(--shadow-cutout); padding:20px 22px; color:var(--ink); text-decoration:none; font-weight:400}
+.docs-main a.docs-card:hover h3{color:var(--indigo); text-decoration:underline; text-underline-offset:3px}
+.docs-card h3{margin:0 0 6px; font-size:19px; line-height:26px}
+.docs-card p{margin:0; color:var(--ink-muted); font-size:14px; line-height:21px}
 
 /* prev/next footer */
-.docs-foot{display:flex; justify-content:space-between; gap:14px; margin-top:56px;
+.docs-foot{display:flex; justify-content:space-between; flex-wrap:wrap; gap:14px; margin-top:56px;
   padding-top:22px; border-top:1px solid var(--line); max-width:760px}
-.docs-foot a{font-weight:700; font-size:14.5px}
+.docs-foot a{font-weight:700; font-size:15px}
 
 @media (max-width:860px){
-  .docs-shell{grid-template-columns:1fr}
+  .docs-shell{grid-template-columns:minmax(0,1fr)}
   .docs-side{position:static; border-right:none; border-bottom:1px solid var(--line);
-    max-height:none; padding:22px 0 10px; display:flex; gap:20px; overflow-x:auto}
-  .docs-group{margin-bottom:12px; flex-shrink:0}
-  .docs-main{padding:30px 0 70px}
+    max-height:none; padding:8px 0 16px; display:flex; flex-wrap:wrap; gap:4px 28px; overflow:visible}
+  .docs-group{margin-bottom:8px}
+  .docs-side ul{display:flex; flex-wrap:wrap; gap:2px 4px}
+  .docs-side a{padding:10px}
+  .docs-main{padding:28px 0 40px}
+  .docs-main h1{font-size:36px; line-height:42px}
+  .docs-main h2{font-size:25px; line-height:31px}
   .docs-cards{grid-template-columns:1fr}
 }

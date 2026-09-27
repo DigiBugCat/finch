@@ -17,8 +17,8 @@ export default function Quickstart() {
       <div className="docs-note">
         <b>Starting a new Python service?</b>{' '}
         <Link href="/docs/aviarymcp">AviaryMCP</Link> defines each tool once and
-        generates MCP, REST, and OpenAPI while managing Finch registration and
-        first-run approval. Its public release candidate is available on PyPI.
+        generates MCP, REST, and OpenAPI from it; publish it with the steps
+        below. Its public release candidate is available on PyPI.
       </div>
 
       <h2>1. Write an MCP server</h2>
@@ -122,7 +122,7 @@ finch call hello greet --args '{"name": "world"}'
         </Link>
         <Link className="docs-card" href="/docs/aviarymcp">
           <h3>AviaryMCP</h3>
-          <p>Build one Python tool surface for MCP, REST, and OpenAPI with native Finch enrollment.</p>
+          <p>Build one Python tool surface for MCP, REST, and OpenAPI, then publish it with the CLI.</p>
         </Link>
         <Link className="docs-card" href="/docs/auth">
           <h3>Keys &amp; auth</h3>
@@ -130,7 +130,7 @@ finch call hello greet --args '{"name": "world"}'
         </Link>
         <Link className="docs-card" href="/docs/acls">
           <h3>Access control</h3>
-          <p>Grant different users and agents access to different services.</p>
+          <p>Keys, OAuth, and public services: who can reach what.</p>
         </Link>
         <Link className="docs-card" href="/docs/cli">
           <h3>CLI reference</h3>
@@ -138,7 +138,7 @@ finch call hello greet --args '{"name": "world"}'
         </Link>
         <Link className="docs-card" href="/docs/privacy">
           <h3>Privacy &amp; data handling</h3>
-          <p>Transport encryption, the relay non-retention guarantee, retained metadata, and Test Chat.</p>
+          <p>Transport encryption, the relay non-retention guarantee, and retained metadata.</p>
         </Link>
       </div>
     </>

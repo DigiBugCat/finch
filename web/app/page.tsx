@@ -1,32 +1,31 @@
-import Nav from '@/components/Nav';
-import Hero from '@/components/Hero';
-import ClientStrip from '@/components/ClientStrip';
-import ValuePillars from '@/components/ValuePillars';
-import HowItWorks from '@/components/HowItWorks';
-import Abilities from '@/components/Abilities';
-import FlockSplit from '@/components/FlockSplit';
-import Safety from '@/components/Safety';
-import Beta from '@/components/Beta';
-import Faq from '@/components/Faq';
-import FinalCta from '@/components/FinalCta';
-import Footer from '@/components/Footer';
+// The landing: finch as a field guide, seven plates in Indigo Wash.
+// Server-rendered; only the gate dial, the agent session, the sighting log and
+// the copy buttons hydrate.
+import SiteNav from '@/components/fieldguide/SiteNav';
+import SiteFooter from '@/components/fieldguide/SiteFooter';
+import HeroPlate from '@/components/fieldguide/HeroPlate';
+import BandPlate from '@/components/fieldguide/BandPlate';
+import FieldRecording from '@/components/fieldguide/FieldRecording';
+import GateDial from '@/components/fieldguide/GateDial';
+import AgentPlate from '@/components/fieldguide/AgentPlate';
+import SightingLog from '@/components/fieldguide/SightingLog';
+import PricingPlate from '@/components/fieldguide/PricingPlate';
+import '@/components/fieldguide/landing.css';
 
 export default function Home() {
   return (
     <>
-      <Nav />
-      <span id="top" />
-      <Hero />
-      <ClientStrip />
-      <ValuePillars />
-      <HowItWorks />
-      <Abilities />
-      <FlockSplit />
-      <Safety />
-      <Beta />
-      <Faq />
-      <FinalCta />
-      <Footer />
+      <SiteNav />
+      <main>
+        <HeroPlate />
+        <BandPlate />
+        <FieldRecording />
+        <GateDial />
+        <AgentPlate />
+        <SightingLog />
+        <PricingPlate />
+      </main>
+      <SiteFooter />
     </>
   );
 }

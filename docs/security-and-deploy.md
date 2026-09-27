@@ -163,8 +163,9 @@ What actually ships, with the exact secrets/vars/routes per worker.
 
 Relay routing uses a single **host key** namespace in RouterDO: `<slug>.finchmcp.com` stores the
 bare slug (`pelican`), while vanity and BYO domains store the full lowercase hostname
-(`pelican.aviary.run`, `mcp.acme.com`). Unknown host keys fail closed with 404, and the browser
-login-wall cookie remains host-scoped with no `Domain` attribute.
+(`pelican.aviary.run`, `mcp.acme.com`). Unknown host keys fail closed with 404. The hub sets no
+cookies on relay hosts (the browser login wall was removed), and a box's own `Set-Cookie` is
+stripped of any `Domain` attribute so it stays host-only.
 
 Vanity hostnames are gated by `VANITY_SUFFIXES` and `VANITY_TENANT`: production sets
 `VANITY_SUFFIXES="aviary.run"`, and `VANITY_TENANT` must be set to the only tenant allowed to
@@ -189,20 +190,20 @@ completed DCV, so operationally treat stale or disputed registrations as an admi
 
 ### 3.5 Clerk
 
-- A **production Clerk instance** (separate from dev). `pk_live`/`sk_live`. Organizations enabled (`resolveTenant` needs `orgId`). Authorized parties / allowed origins locked to `finchmcp.com`.
+- A **production Clerk instance** (separate from dev). `pk_live`/`sk_live`. Organizations are not used: a signed-in user's tenant is their Clerk user id (§5). No webhook endpoint is needed. Authorized parties / allowed origins locked to `finchmcp.com`.
 
 ### 3.6 Step-by-step deploy order
 
 1. **Plan**: confirm the Cloudflare account is on **Workers Paid** (DOs).
 2. **Zone**: add `finchmcp.com` to Cloudflare; verify DNS is active (orange-cloud).
-3. **Clerk prod**: create the production instance; enable Organizations; set authorized parties to `finchmcp.com`; note `pk_live`/`sk_live`.
+3. **Clerk prod**: create the production instance (Organizations stay off); set authorized parties to `finchmcp.com`; note `pk_live`/`sk_live`.
 4. **Apply all Critical + High fixes** from §2 (deploy is blocked otherwise) — especially the `/_connect` connect-token (A1-A5).
 5. **Hub secrets**: `wrangler secret put FINCH_SERVICE_SECRET --env production`, `... TICKET_SECRET --env production`, (connect-token secret if separate). Do NOT set `DEFAULT_TENANT` in prod.
 6. **Deploy hub**: `cd worker && wrangler deploy --env production`. Confirm DO migrations applied and `workers_dev:false` / routes bound.
 7. **Web build-time vars**: set `NEXT_PUBLIC_CLERK_*` (incl. `pk_live`) in the build env.
 8. **Web secrets**: `wrangler secret put CLERK_SECRET_KEY --env production` (`sk_live`), `... FINCH_SERVICE_SECRET --env production` (matching the hub).
 9. **Deploy web**: `cd web && opennextjs-cloudflare build && opennextjs-cloudflare deploy -- --env production`.
-10. **Smoke test**: dashboard sign-in (Organizations), enroll an appliance, agent `/join` + `/_connect` with the connect-token, a relayed MCP call with a `finch_` key, and confirm the apex + a tenant subdomain both route correctly. Verify `*.workers.dev` and the apex no longer resolve to `dev-tenant`.
+10. **Smoke test**: `finch login` approval at `/cli`, enroll an appliance, agent `/join` + `/_connect` with the connect-token, a relayed MCP call with a `finch_` key, and confirm the apex + a tenant subdomain both route correctly. Verify `*.workers.dev` and the apex no longer resolve to `dev-tenant`.
 
 ---
 
@@ -316,39 +317,118 @@ vars, and secrets), separate Clerk instances, and `DEFAULT_TENANT` confined to d
 
 ---
 
-## 5. Native Finch tenancy migration
+## 5. Single-user tenancy
 
-`TenantDO.tenantMeta` is the per-tenant migration marker. Its absence preserves
-the narrow legacy door behavior; its presence means `TenantDO.members` is the
-only membership and role authority. Existing tenant IDs and every dependent DO
-name remain unchanged. Personal workspaces migrate lazily when their authenticated
-Clerk subject supplies a server-verified email. Legacy organization-shaped
-workspaces migrate only through the explicit, server-verified org-admin claim
-flow. The one-time bootstrap rewrites the locked `user:you` owner principal,
-key owners, and group members atomically to the owner's normalized email.
+A tenant is one Clerk user: its id is that user's Clerk user id, and that user
+is its only member (the owner). Clerk Organizations are not used. The hub
+authorizes only three kinds of relay caller — a `finch_` key, a Clerk OAuth
+token whose user id IS the tenant id, or the first-party service assertion
+used by `POST /api/cli/call` — plus anyone at all on a service marked
+`public`. A browser without a key on a key-gated service gets a plain JSON
+401; there is no login-wall redirect, portal grant, or session cookie, and the
+relay forwards the Cookie header untouched.
 
-`DirectoryDO` (binding `DIRECTORY`, migration `v6`) is a disposable discovery
-index only. Every directory write follows a successful TenantDO commit;
-authorization never reads the directory. `reindexTenant` is the repair operation
-for missing workspace or invite pointers.
+- **Web.** `resolveTenant` (web/lib/hub.ts) uses the Clerk `userId` as the
+  tenant, signs every hub assertion for it, and confirms with
+  `POST /api/member-context` that the user is its active owner. A tenant that
+  has never been set up answers `{needsBootstrap:true}`; the web retries with
+  the user's verified primary email and the hub creates the owner row. There
+  is no tenant chooser, owner lookup, or account label.
+- **Hub.** `TenantDO.memberContext` reports a member only for the Clerk user
+  whose tenant it is; anyone else gets `{member:null, tenantMeta:null}`.
+  `gateOauth` admits an OAuth token iff its user id equals the tenant id (a
+  public service admits anyone); organization claims are not read, and
+  `verifyClerkOAuthToken` keeps only `sub`/`user_id`.
+- **Keys.** `checkKey` allows a key iff it exists (revocation deletes it), the
+  service exists, and its scope is `{all:true}` or lists the service — plus
+  expiry when a tenant enforces it. There are no ACL rules, groups, or
+  per-user grants, and every key's owner is the tenant owner (a caller cannot
+  name another).
+- **Boxes.** `/join` and `/refresh` are unchanged for ordinary boxes. Grants
+  carrying a per-box credential `epoch` were only issued by the retired
+  Aviary device flow; they no longer verify, so such a box must be re-added
+  with `finch add`. Aviary manifest route prefixes are no longer enforced.
 
-| Door | tenantMeta absent | tenantMeta present |
-| --- | --- | --- |
-| Dashboard | personal subject may bootstrap; org tenant must be claimed | active native member required |
-| Browser | subject==tenant, otherwise email ACL | active member; owners/admins bypass ACL, members require ACL |
-| OAuth | subject==tenant, or org-id equality plus email ACL | active member; owners/admins bypass ACL, members require ACL |
+### 5.1 The single-user migration (owner-approved, destructive)
 
-The active-workspace cookie is an unsigned pointer, not a capability, and is
-revalidated against live TenantDO membership on every privileged request. Clerk
-supplies identity and currently verified emails only. Clerk organization roles
-never authorize. `user.created`, `user.updated`, and
-`organizationMembership.created` are the configured webhook events; login-time
-identity sync remains the correctness path when webhooks are delayed or absent.
+Deploying this version permanently deletes legacy data:
 
-Rollback anchors must be recorded from `wrangler deployments list --env
-production` immediately before release. Deploy worker before web. Migration v6
-is additive; rolling back code leaves DirectoryDO dormant and old TenantDO code
-preserves unknown `tenantMeta`/`members` fields through its state spread. On
-roll-forward, reindex the affected tenant. The legacy portal-grant body is kept
-only for the worker-before-web deployment window and removed after live
-acceptance.
+- **Durable Object migration `v7`** (`deleted_classes`) deletes
+  `AviaryEnrollmentDO` (the retired device-enrollment records) and
+  `DirectoryDO` (the global Clerk-user → tenant index) with all their stored
+  data, in every environment. `deploy-preflight` (scripts/do-migrations.mjs)
+  allows exactly this deletion and refuses any other `deleted_classes` step,
+  and refuses any edit to the applied migration history.
+- **TenantDO purge.** On the first request each TenantDO serves after the
+  deploy, `purgeLegacyTenancy` runs once, recorded by the versioned
+  `singleUserPurge` flag in the stored state (tenants created afterwards are
+  born flagged; bump `SINGLE_USER_PURGE_VERSION` to run a new pass). The
+  owner is the member row whose `clerkUserId` is the tenant id; a team
+  workspace or Clerk-org tenant (`kind: "team"` or an `org_` id) has no owner.
+  The purge:
+  - deletes every other member row (co-owners, admins, members,
+    invitations) and normalizes the owner's row to an active owner; with no
+    owner it also deletes `tenantMeta`, so the tenant's own user bootstraps
+    it afresh;
+  - deletes `groups`, `acl`, `accessRequests`, `sessionEpoch`, the earlier
+    `cliSingleUserCut` flag, the Aviary fields on services
+    (`aviaryManaged`, `aviaryManifestSha256`, `aviaryApprovalNonce`, and the
+    manifest's `routes`) and boxes (`aviaryCredentialEpoch`,
+    `aviaryPendingCredentialEpoch`, `aviaryPendingApprovalNonce`);
+  - deletes `access` audit rows and any audit row naming a non-owner member;
+  - decides whether the tenant was **exposed**: anyone besides the owner
+    could have signed in to it. That is a team/org tenant, or any other
+    member row that is not a never-accepted invitation (`state: "invited"`
+    with no `clerkUserId`/`boundAt`). A removed member who had signed in was
+    kept as a `disabled` row, so the rows are a complete record.
+  - **exposed:** revokes every `finch_` key, removes every box, and bumps
+    `cliTokenEpoch` once. Stored state never records who minted a key or
+    enrolled a box. A key's `owner` is only who it was labelled for; the
+    Keys view defaulted it to the tenant owner, and a CLI mint always used
+    the owner's email, so an admin's key can carry the owner's label.
+    Removing a box is what makes `/refresh` refuse its long-lived `/join`
+    credential (those carry no epoch) and stops the relay routing to it,
+    pinned paths included. Marking boxes `pending` would not be enough: a
+    pinned path still reaches a pending box, and `finch approve` clears a
+    whole service at once. Services stay. Each one emptied here is listed in
+    `reenroll`, so the owner's next `finch add <name>` (the command a revoked
+    box's agent prints) re-enrolls it in place at the same URL, once,
+    instead of creating `<name>-2`.
+  - **not exposed:** revokes only keys labelled with an email other than
+    the owner's (a key labelled with the owner's email or the `"you"`
+    placeholder stays). Boxes and CLI logins are untouched, so never-accepted
+    invitations cost the owner nothing.
+  - removes revoked key ids from service and box key lists.
+  - **ownerless tenants** (team/Clerk-org) also get every service set to
+    `auth: "key"`, so with no key and no box nothing on them answers. If
+    exactly one active owner row with a Clerk id existed, that user is
+    recorded as `routeHeir`, and `handOffRoutes` moves every RouterDO host
+    key the tenant holds (its finchmcp.com slugs and custom hostnames) to
+    that user's tenant. Before this change, the tenant chooser sent that user
+    to the team tenant. Each key moves atomically (`RouterDO.transfer`), so
+    it is never claimable in between. Cloudflare custom hostnames are keyed
+    by hostname, so they need no change. The marker is cleared only when
+    every key has moved, and a router failure is retried by the next
+    instance. With no single former owner, the hosts stay with the inert
+    tenant, since slugs are never recycled.
+
+  Because the purge is lazy, a sleeping team tenant could still hold a slug
+  or hostname its former owner tries to claim. On a collision,
+  `routerRegisterWakingHolder` (used by the subdomain setting and
+  `POST /api/hostnames`) wakes the holder once, which runs its purge and
+  hand-off, and then re-checks. `POST /api/hostnames` never provisions a
+  hostname at Cloudflare again when the tenant already owns it (for
+  example, after a hand-off). A duplicate would fail, and its failure path
+  would unregister the hostname.
+
+  A tenant with only its owner changes nothing but the flag (plus dropping
+  the always-present `acl`/`groups` defaults). A tenant no request touches
+  keeps its legacy rows until one does. After `v7` there is no index of such
+  tenants. RouterDO's `slugs` table still lists every tenant that holds a hub
+  domain, which covers every tenant that ever loaded state or enrolled a
+  service, and that is the source a later sweep would use.
+
+`SESSION_SECRET` (hub) and `CLERK_WEBHOOK_SECRET` (web) are no longer read;
+either can be deleted as a separate step. The Clerk production webhook
+endpoint, whose web route was removed with the CLI cut, should be removed
+from the Clerk dashboard.

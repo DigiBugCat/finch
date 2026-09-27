@@ -25,6 +25,7 @@ import { checkPrivacyInvariants } from "./check-privacy-invariants.mjs";
 // Shared with check-privacy-invariants so the two gates cannot drift, and so
 // both agree with wrangler on where a line comment ends (CR as well as LF).
 import { readJsonc } from "./jsonc.mjs";
+import { checkDurableObjectMigrations } from "./do-migrations.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..");
@@ -84,42 +85,12 @@ const prodRoutes = Array.isArray(prod?.routes) ? prod.routes : [];
 if (!prodRoutes.some((r) => r?.pattern === canonicalRoute)) {
   fail(`[env.production].routes must include the canonical JWKS route ${canonicalRoute}.`);
 }
-const aviaryRoute = "finchmcp.com/api/aviary/*";
-if (!prodRoutes.some((r) => r?.pattern === aviaryRoute)) {
-  fail(`[env.production].routes must include the Aviary enrollment route ${aviaryRoute}.`);
-}
-
-// Every named environment must carry the enrollment DO binding and migration;
-// Wrangler does not inherit either from the top-level config.
-const aviaryBinding = (envCfg.durable_objects?.bindings ?? []).find(
-  (binding) => binding?.name === "AVIARY_ENROLLMENT",
-);
-if (aviaryBinding?.class_name !== "AviaryEnrollmentDO") {
-  fail(`[env.${env}] must bind AVIARY_ENROLLMENT to AviaryEnrollmentDO.`);
-}
-const aviaryMigration = (envCfg.migrations ?? []).some(
-  (migration) =>
-    Array.isArray(migration?.new_sqlite_classes) &&
-    migration.new_sqlite_classes.includes("AviaryEnrollmentDO"),
-);
-if (!aviaryMigration) {
-  fail(`[env.${env}] must include the AviaryEnrollmentDO SQLite migration.`);
-}
-const directoryBinding = (envCfg.durable_objects?.bindings ?? []).find(
-  (binding) => binding?.name === "DIRECTORY",
-);
-if (directoryBinding?.class_name !== "DirectoryDO") {
-  fail(`[env.${env}] must bind DIRECTORY to DirectoryDO.`);
-}
-const directoryMigration = (envCfg.migrations ?? []).some(
-  (migration) =>
-    migration?.tag === "v6" &&
-    Array.isArray(migration?.new_sqlite_classes) &&
-    migration.new_sqlite_classes.includes("DirectoryDO"),
-);
-if (!directoryMigration) {
-  fail(`[env.${env}] must include migration v6 for DirectoryDO.`);
-}
+// Durable Object migrations: append-only history, and no deleted_classes step
+// except the one approved v7 deletion of AviaryEnrollmentDO + DirectoryDO
+// (see scripts/do-migrations.mjs). Checked for the env being deployed, since
+// wrangler does not inherit migrations into named environments.
+const migrationProblems = checkDurableObjectMigrations(env, envCfg);
+if (migrationProblems.length) fail(migrationProblems.join("\n  "));
 
 const isProd = env === "production";
 
@@ -142,7 +113,6 @@ if (isProd) {
 const SECRET_KEYS = [
   "FINCH_SERVICE_SECRET",
   "TICKET_SECRET",
-  "SESSION_SECRET",
   "FINCH_ASSERTION_PRIVATE_JWKS",
 ];
 const devValues = new Set();

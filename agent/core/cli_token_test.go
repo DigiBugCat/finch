@@ -9,8 +9,7 @@ import (
 )
 
 // resolveCliToken must give the ~30-day TENANT-ADMIN CLI token the same argv-free
-// intake the strictly less privileged enrollment ticket already has (resolveTicket,
-// cli.go:1131): "-" reads stdin, FINCH_CLI_TOKEN is the env fallback. The argv form
+// intake the strictly less privileged enrollment ticket already has (resolveTicket): "-" reads stdin, FINCH_CLI_TOKEN is the env fallback. The argv form
 // still works — it only reports fromArgv=true so cmdLogin can warn that the token
 // landed in /proc/<pid>/cmdline and shell history.
 func TestResolveCliToken(t *testing.T) {
@@ -32,7 +31,10 @@ func TestResolveCliToken(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("FINCH_CLI_TOKEN", tc.env)
-			got, fromArgv := resolveCliToken(tc.arg, strings.NewReader(tc.stdin))
+			got, fromArgv, err := resolveCliToken(tc.arg, strings.NewReader(tc.stdin))
+			if err != nil {
+				t.Fatalf("resolveCliToken(%q): %v", tc.arg, err)
+			}
 			if got != tc.want || fromArgv != tc.wantFromArgv {
 				t.Fatalf("resolveCliToken(%q) = (%q, %v), want (%q, %v)", tc.arg, got, fromArgv, tc.want, tc.wantFromArgv)
 			}
@@ -40,9 +42,7 @@ func TestResolveCliToken(t *testing.T) {
 	}
 }
 
-// loginCommand (cli.go:994) is what BOTH copy-a-whole-command surfaces emit:
-// `finch token --login` and the dashboard's Settings → CLI access button. The
-// old form embedded the tenant-admin token as an argv word, and callers paste
+// loginCommand is what `finch token --login` emits. The old form embedded the tenant-admin token as an argv word, and callers paste
 // these straight into a shell — so the token landed in /proc/<pid>/cmdline and
 // in shell history. Assert the token is nowhere on the command line, and that
 // the heredoc body still round-trips through the intake resolveCliToken uses.
@@ -68,15 +68,15 @@ func TestLoginCommandKeepsTokenOffArgv(t *testing.T) {
 	}
 	// What the shell hands the login process on stdin is exactly the body line;
 	// resolveCliToken must recover the token verbatim, metacharacters intact.
-	got, fromArgv := resolveCliToken("-", strings.NewReader(lines[1]+"\n"))
-	if got != token || fromArgv {
-		t.Fatalf("round-trip = (%q, %v), want (%q, false)", got, fromArgv, token)
+	got, fromArgv, err := resolveCliToken("-", strings.NewReader(lines[1]+"\n"))
+	if err != nil || got != token || fromArgv {
+		t.Fatalf("round-trip = (%q, %v, %v), want (%q, false, nil)", got, fromArgv, err, token)
 	}
 }
 
-// The package header (cli.go:1) is the recipe a reader/agent follows on a FRESH
-// box. It must not be circular: `finch token` calls loadCliCred first (cli.go:1009
-// → cli.go:278), which exits "not logged in" when no credential exists yet, so
+// The cli.go package header is the recipe a reader/agent follows on a FRESH
+// box. It must not be circular: `finch token` calls loadCliCred first, which
+// exits "not logged in" when no credential exists yet, so
 // `finch token | finch login --token -` cannot bootstrap box #1. The pipe is
 // correct only where the text says the source box is already logged in.
 func TestPackageHeaderBootstrapsAFreshBox(t *testing.T) {

@@ -5,15 +5,16 @@
 //
 // Usage:
 //
-//	finch join --hub http://localhost:8787 --ticket <tkt> --upstream http://127.0.0.1:8000
+//	finch add printer --service http://127.0.0.1:8000   # enroll (CLI login)
+//	finch run                                            # serve finch.yml
 //
-// The ticket is minted in the dashboard ("Add device"). On join the hub tells
-// us which service/box we are AND hands us a short-lived per-box
-// connect-token; we present that token on the relay dial (?ct=<token>) — it is
-// the sole proof that authenticates this box-side channel. We then hold the
-// relay WebSocket open, reconnect with backoff, and send WS-protocol pings for
-// NAT keepalive (the hub auto-pongs them without waking the Durable Object, so
-// they're free).
+// Enrollment trades a one-shot ticket (minted by `finch add` via the CLI token)
+// at /join. The hub tells us which service/box we are AND hands us a
+// short-lived per-box connect-token; we present that token on the relay dial
+// (?ct=<token>) — it is the sole proof that authenticates this box-side channel.
+// We then hold the relay WebSocket open, reconnect with backoff, and send
+// WS-protocol pings for NAT keepalive (the hub auto-pongs them without waking
+// the Durable Object, so they're free).
 //
 // Reconnect model: the enrollment ticket is ONE-SHOT — the hub burns it on the
 // first /join and 409s any replay. So /join also hands us a long-lived (~30d)
@@ -21,10 +22,9 @@
 // reconnect with it; once it nears expiry we trade the refresh token at /refresh
 // for a fresh connect-token. The one-shot join ticket is never re-used.
 //
-// We persist that refresh token to --state (0600), so a restart/reboot resumes
-// straight from it without a new dashboard ticket — "authenticate once", like
-// ngrok. --ticket is only needed on first enroll (or if the credential was
-// revoked).
+// We persist that refresh token (0600) under the credentials dir, so a
+// restart/reboot resumes straight from it without a new ticket — "authenticate
+// once", like ngrok.
 package core
 
 import (
@@ -41,28 +41,24 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
-	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/coder/websocket"
 	"gopkg.in/yaml.v3"
 )
 
-// agentVersion is the canonical default. Release builds may stamp it via
-// `-ldflags "-X main.agentVersion=<v>"`; the literal here is the source of
-// truth that CI (scripts/check-versions.mjs) asserts matches the worker's
-// LATEST_AGENT and the web dashboard constant. Keep all three in sync.
-var agentVersion = "1.6.0"
-
-// The SDK-owned Aviary daemon never permits hub-triggered native-code updates.
-// Its Python parent selected and validated the absolute executable; silently
-// replacing that trust decision from a relay frame would be a downgrade.
-var remoteUpdatesDisabled atomic.Bool
+// agentVersion is the canonical default. Release builds stamp it via
+// `-ldflags "-X github.com/digibugcat/finch/agent/core.agentVersion=<v>"`; the
+// literal here is the source of truth that CI (scripts/check-versions.mjs)
+// asserts matches the worker's LATEST_AGENT and the web's copy. Keep them in sync.
+var agentVersion = "1.7.0"
 
 // connectSkew is how long before a connect-token's exp we treat it as already
 // expired and force a fresh /join, so we never dial with a token that lapses
@@ -80,6 +76,23 @@ var controlPlaneHTTPClient = &http.Client{
 		ExpectContinueTimeout: time.Second,
 	},
 	Timeout: 30 * time.Second,
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
+
+// relayCallHTTPClient is for /api/cli/call (finch test / finch call). The hub
+// answers only after it has run a whole MCP exchange with the service, which it
+// bounds at 25s, so the header timeout must outlast that budget or a slow but
+// successful call is reported as a transport failure.
+var relayCallHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 40 * time.Second,
+		ExpectContinueTimeout: time.Second,
+	},
+	Timeout: 45 * time.Second,
 	CheckRedirect: func(*http.Request, []*http.Request) error {
 		return http.ErrUseLastResponse
 	},
@@ -261,83 +274,23 @@ type joinResp struct {
 }
 
 func Main() {
-	// Setup subcommands (cloudflared-style): `finch login` saves a CLI token,
-	// `finch add` enrolls a service + appends an ingress rule. These run
-	// and exit; `join`/`run`/bare fall through to the relay agent below.
-	if len(os.Args) > 1 {
-		switch os.Args[1] {
-		case "login":
-			cmdLogin(os.Args[2:])
-			return
-		case "add":
-			cmdAdd(os.Args[2:])
-			return
-		case "enroll":
-			cmdEnroll(os.Args[2:])
-			return
-		case "approve":
-			cmdApprove(os.Args[2:])
-			return
-		case "aviary":
-			cmdAviary(os.Args[2:])
-			return
-		case "auth":
-			cmdAuth(os.Args[2:])
-			return
-		case "token":
-			cmdToken(os.Args[2:])
-			return
-		case "status":
-			cmdStatus(os.Args[2:])
-			return
-		case "keys":
-			cmdKeys(os.Args[2:])
-			return
-		case "domain":
-			cmdDomain(os.Args[2:])
-			return
-		case "fleet", "ls":
-			cmdFleet(os.Args[2:])
-			return
-		case "rm":
-			cmdRm(os.Args[2:])
-			return
-		case "revoke-tokens":
-			cmdRevokeTokens(os.Args[2:])
-			return
-		case "test":
-			cmdTest(os.Args[2:])
-			return
-		case "call":
-			cmdCall(os.Args[2:])
-			return
-		case "update":
-			cmdUpdate(os.Args[2:])
-			return
-		case "version", "--version", "-v":
-			cmdVersion(os.Args[2:])
-			return
-		case "guide":
-			printGuide()
-			return
-		case "help", "-h", "--help":
-			printUsage()
-			return
-		}
-		if err := validateRelayCommandArg(os.Args[1]); err != nil {
-			log.Fatalf("finch: %v", err)
-		}
-	}
+	// Setup and control subcommands (login, add, service, connect, …) run and
+	// exit through the agent-facing CLI contract (cli_contract.go); only
+	// `run`/`join`/bare flags fall through to the relay agent below.
+	cliMain(os.Args[1:])
+
+	// Under the LaunchAgent, keep ~/.finch/finch.log bounded (launchd never
+	// rotates it). A no-op anywhere else: only the plist sets FINCH_LOG_FILE.
+	rotateServiceLogAtStart()
 
 	hostName, _ := os.Hostname()
-	runCommand := len(os.Args) > 1 && os.Args[1] == "run"
 	defaultHub := agentDefaultHub()
 	defaultBox := agentDefaultBox(hostName)
 	hub := flag.String("hub", defaultHub, "finch hub base URL (http[s]://…)")
-	ticket := flag.String("ticket", "", "one-shot enrollment ticket from the dashboard (first run only; '-' reads it from stdin, or set FINCH_TICKET; later runs resume from --state)")
+	ticket := flag.String("ticket", "", "one-shot enrollment ticket (single-service mode, first run only; '-' reads it from stdin, or set FINCH_TICKET; later runs resume from --state)")
 	box := flag.String("box", defaultBox, "this box's name")
-	upstream := flag.String("upstream", "http://127.0.0.1:8000", "local MCP server base URL")
-	statePath := flag.String("state", defaultStatePath(), "file that persists the per-box refresh credential so a restart needs no new ticket")
+	upstream := flag.String("upstream", "http://127.0.0.1:8000", "single-service mode: local service base URL")
+	statePath := flag.String("state", defaultStatePath(), "single-service mode: file that persists the per-box refresh credential so a restart needs no new ticket")
 	configPath := flag.String("config", "", "path to a finch.yml manifest; serves every ingress rule (one local service per app_path) over one process")
 	forwardAll := flag.Bool("forward-all", false, "forward the WHOLE loopback host (every path), not just /mcp — for a website or any non-MCP HTTP app (single-service mode)")
 
@@ -352,31 +305,18 @@ func Main() {
 		log.Fatalf("finch: %v", err)
 	}
 
-	// Argv-free ticket intake (--ticket - from stdin, FINCH_TICKET from env),
-	// same as `finch enroll`: keep the refresh-token-minting ticket off the
-	// process table / shell history on the single-service `finch join` path.
+	// Argv-free ticket intake (--ticket - from stdin, FINCH_TICKET from env):
+	// keep the refresh-token-minting ticket off the process table / shell
+	// history on the single-service `finch join` path.
 	*ticket = resolveTicket(*ticket)
 
-	// finch.toml support (TOML parsing) was removed in favor of a cloudflared-style
-	// finch.yml. Fail loudly rather than silently dropping an upgraded
-	// multi-service box to single-service mode and serving nothing: both when
-	// --config points at a .toml and when a legacy finch.toml is the only manifest
-	// in the working dir.
-	if strings.HasSuffix(strings.ToLower(*configPath), ".toml") {
-		fatalLegacyTOML(*configPath, hostName)
-	}
-
 	// Config-driven (cloudflared-style) when --config is given, or a finch.yml is
-	// found in the search path and no single-service flags were overridden. The
-	// search prefers the working dir (project-local manifests keep working) then
-	// falls back to the dotfile home (~/.finch/finch.yml, ~/.config/finch/finch.yml)
-	// so a box with a home-dir manifest serves from anywhere, not just when cwd
-	// happens to be home. A legacy finch.toml in cwd still fails loudly.
+	// found in the search path and no ticket was given. The search prefers the
+	// working dir (project-local manifests keep working) then falls back to the
+	// dotfile home (~/.finch/finch.yml, ~/.config/finch/finch.yml) so a box with a
+	// home-dir manifest serves from anywhere, not just when cwd happens to be home.
 	cfgPath := *configPath
 	if cfgPath == "" && *ticket == "" {
-		if _, terr := os.Stat("finch.toml"); terr == nil {
-			fatalLegacyTOML("finch.toml", hostName)
-		}
 		cfgPath = findManifest()
 	}
 	if cfgPath != "" {
@@ -392,31 +332,25 @@ func Main() {
 		log.Fatalf("finch: %v", err)
 	}
 	*hub = normalizedHub
-	// `finch run` is also the zero-config AviaryMCP daemon mode. With no
-	// finch.yml it owns only the local control socket and starts relays as SDK
-	// leases arrive; bare `finch` retains the historical single-service path.
-	if runCommand {
-		credentialsDir := dynamicCredentialsDir()
-		runConfig(&config{Hub: *hub, Box: *box, CredentialsDir: credentialsDir})
-		return
-	}
 
-	// Single-service: confine forwarded requests to one upstream (SSRF guard in
-	// forward()). Parse it once.
-	upstreamURL, err := parseUpstreamTransportURL(*upstream)
-	if err != nil {
+	// Single-service mode (`finch join`, or `finch run` with no finch.yml): one
+	// upstream from flags, credential at --state. Kept so boxes enrolled with the
+	// original `finch join --ticket … --upstream …` one-liner keep serving (a
+	// hub-pushed update re-execs with that same argv).
+	if _, err := parseUpstreamTransportURL(*upstream); err != nil {
 		log.Fatalf("finch: --upstream %q is invalid: %v", *upstream, err)
 	}
-	// `finch join --ticket <t>` enrolls inline (first run), then resumes from the
-	// saved credential — the same enroll-then-resume split `finch enroll`/`finch
-	// run` use, collapsed into one command for the single-service path.
 	if *ticket != "" {
+		// First run: enroll inline, then resume from the saved credential.
 		if saved, _ := loadState(*statePath); saved == nil || saved.RefreshToken == "" || saved.Hub != *hub {
 			if _, _, eerr := enrollToState(*hub, *box, *ticket, *statePath); eerr != nil {
 				log.Fatalf("finch: enroll failed: %v", eerr)
 			}
 			log.Printf("finch: enrolled — credential saved to %s", *statePath)
 		}
+	} else if saved, _ := loadState(*statePath); saved == nil || saved.RefreshToken == "" || saved.Hub != *hub {
+		log.Fatalf("finch: nothing to serve — no finch.yml found (./finch.yml, ~/.finch/finch.yml, ~/.config/finch/finch.yml) "+
+			"and no credential for %s at %s.\nRun `finch login`, then `finch add <app_path> --service <url>`.", *hub, *statePath)
 	}
 	// Refuse to start if another finch run already holds this state — a second
 	// process would dial out for the same slugs and supersede the incumbent
@@ -428,14 +362,36 @@ func Main() {
 	}
 	defer release()
 
-	// Thread the ticket into the run path so a same-hub-but-revoked credential can
-	// still recover from a fresh ticket: runService re-enrolls if resume fails.
-	// superviseService restarts the relay on a panic/unexpected return, matching
-	// config mode's self-heal.
-	superviseService(serviceOpts{
-		hub: *hub, statePath: *statePath, upstream: upstreamURL,
-		ticket: *ticket, box: *box, forwardAll: *forwardAll,
+	// The ticket rides along so a same-hub-but-revoked credential can still
+	// recover from a fresh ticket. A revoked credential is otherwise recovered
+	// with `finch add`, which writes finch.yml — superviseRelay then hands back
+	// errManifestChanged and this process switches to serving the manifest.
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	err = superviseRelay(ctx, relayOptions{
+		Hub: *hub, Box: *box, Upstream: *upstream, CredentialPath: *statePath,
+		Ticket: *ticket, ForwardAll: *forwardAll, WatchManifest: true,
 	})
+	if errors.Is(err, errManifestChanged) {
+		if err := serveFoundManifest(ctx, hostName); err != nil {
+			log.Fatalf("finch: %v", err)
+		}
+	}
+}
+
+// serveFoundManifest serves the finch.yml findManifest discovers — the handoff
+// from a single-service relay whose credential was replaced via `finch add`.
+func serveFoundManifest(ctx context.Context, hostName string) error {
+	path := findManifest()
+	if path == "" {
+		return fmt.Errorf("finch.yml disappeared before it could be served")
+	}
+	cfg, err := loadConfig(path, hostName)
+	if err != nil {
+		return err
+	}
+	log.Printf("finch: %s was written — switching this box to serve it", path)
+	return serveConfig(ctx, cfg)
 }
 
 func validateRelayCommandArg(arg string) error {
@@ -466,30 +422,11 @@ func agentDefaultBox(hostName string) string {
 	return hostName
 }
 
-func dynamicCredentialsDir() string {
-	if configured := strings.TrimSpace(os.Getenv("FINCH_CREDENTIALS_DIR")); configured != "" {
-		return expandHome(configured)
-	}
-	return filepath.Dir(defaultStatePath())
-}
-
-// aviaryServeConfigFromEnv is the SDK-owned zero-config runtime definition.
-// It must stay independent of findManifest/loadConfig and carries no static
-// ingress rules: only live SDK leases can populate its desired state.
-func aviaryServeConfigFromEnv() *config {
-	hostName, _ := os.Hostname()
-	return &config{
-		Hub:            agentDefaultHub(),
-		Box:            agentDefaultBox(hostName),
-		CredentialsDir: dynamicCredentialsDir(),
-		Ingress:        nil,
-	}
-}
-
 // enrollToState trades a one-shot ticket for a long-lived refresh credential via
 // /join and persists it (0600) to statePath, returning the join response too so
 // callers can read the hub-slugified service id. Shared by the single-service
-// `finch join` path and `finch add` (both write a fixed state file).
+// `finch join` path and `finch add` (both write a fixed state file); `finch
+// enroll` names its file after the assignment, so it uses join + persistJoin.
 func enrollToState(hub, box, ticket, statePath string) (*agentState, *joinResp, error) {
 	validatedHub, err := validateHubTransportURL(hub)
 	if err != nil {
@@ -507,242 +444,33 @@ func enrollToState(hub, box, ticket, statePath string) (*agentState, *joinResp, 
 	return st, jr, nil
 }
 
-// persistJoin saves a /join result as the box-side refresh credential (0600).
-// Only /join returns the long-lived refresh token, so it must be present. Split
-// out of enrollToState so `finch enroll` can read the hub-slugified service id
-// from the join response BEFORE choosing the credential filename.
+// persistError is a LOCAL failure to save the credential a successful /join
+// returned (unwritable credentials-dir, full disk). The hub has already
+// consumed the one-shot ticket and registered the box, so it is not a hub
+// failure and retrying the join cannot fix it.
+type persistError struct {
+	Path    string
+	Service string
+	Err     error
+}
+
+func (e *persistError) Error() string {
+	return fmt.Sprintf("persisting credential to %s: %v", e.Path, e.Err)
+}
+
+func (e *persistError) Unwrap() error { return e.Err }
+
+// persistJoin writes the credential a successful /join returned to statePath
+// (0600). Only /join returns the long-lived refresh token, so it must be present.
 func persistJoin(hub string, jr *joinResp, statePath string) (*agentState, error) {
 	if jr.RefreshToken == "" {
 		return nil, fmt.Errorf("hub returned no refresh token")
 	}
 	st := &agentState{Hub: hub, Tenant: jr.Tenant, Service: jr.Service, Box: jr.Box, RefreshToken: jr.RefreshToken}
 	if err := saveState(statePath, st); err != nil {
-		return nil, fmt.Errorf("persisting credential to %s: %w", statePath, err)
+		return nil, &persistError{Path: statePath, Service: jr.Service, Err: err}
 	}
 	return st, nil
-}
-
-// runConfig serves every ingress rule from a finch.yml — one relay loop per
-// service, concurrently, over a single process (the cloudflared model). Each
-// rule maps a public path (<slug>.finchmcp.com/<app_path>/…) to a local service.
-// A rule with a bad service or a not-yet-enrolled service is logged and
-// skipped; its siblings keep running.
-func runLegacyConfig(cfg *config) {
-	if len(cfg.Ingress) == 0 {
-		log.Fatal("finch: finch.yml has no ingress rules — nothing to serve")
-	}
-	// One box-level lock for the whole config run: a second finch run against the
-	// same credentials dir would dial the same slugs and supersede these relays,
-	// flapping both. (The systemd unit is the intended owner.)
-	release, ok := lockState(filepath.Join(cfg.CredentialsDir, "finch-run"))
-	if !ok {
-		log.Fatalf("finch: another finch run already serves %s — refusing to start a second relay", cfg.CredentialsDir)
-	}
-	defer release()
-	// If this box is logged in (finch login), self-approve the services we
-	// serve — the CLI token holder is the tenant admin, so no dashboard hop.
-	autoApprove := loadCliCredQuiet() != nil
-
-	var wg sync.WaitGroup
-	started := 0
-	for _, ing := range cfg.Ingress {
-		up, err := parseUpstreamTransportURL(ing.Service)
-		if err != nil {
-			log.Printf("finch[%s]: service %q has invalid transport: %v — skipping", ing.AppPath, ing.Service, err)
-			continue
-		}
-		statePath := cfg.statePathFor(ing.AppPath)
-		started++
-		wg.Add(1)
-		go func(ing ingress, up *url.URL, sp string) {
-			defer wg.Done()
-			superviseService(serviceOpts{
-				hub: cfg.Hub, statePath: sp, upstream: up,
-				label: ing.AppPath, autoApprove: autoApprove, forwardAll: ing.ForwardAll,
-			})
-		}(ing, up, statePath)
-	}
-	if started == 0 {
-		log.Fatal("finch: no valid ingress rules to serve")
-	}
-	log.Printf("finch: serving %d ingress rule(s) from finch.yml as box %q", started, cfg.Box)
-	wg.Wait()
-}
-
-// serviceOpts bundles one relay loop's inputs: the hub + saved-credential path,
-// the local upstream, a log label, whether to auto-approve, the whole-host
-// forwarding opt-in, and the single-service ticket fallback (ticket+box, both
-// empty in config mode).
-type serviceOpts struct {
-	hub         string
-	statePath   string
-	upstream    *url.URL
-	label       string
-	autoApprove bool
-	forwardAll  bool
-	ticket      string // single-service `finch join --ticket` recovery; "" in config mode
-	box         string // box name the ticket fallback enrolls under
-}
-
-// superviseService keeps one app's relay alive for the whole process lifetime.
-// runService already reconnects forever on its own, so the only ways it hands
-// control back are (a) a panic somewhere in the serve/forward path, which would
-// otherwise silently kill just this goroutine and leave the app dark while
-// siblings keep running, or (b) an unexpected return of the reconnect loop. Both
-// are treated as transient: log and restart after a short delay. The one
-// non-transient outcome is "not enrolled" (runService returns enrolled=false),
-// which is an operator/config error no restart can fix — we stop and leave the
-// sibling apps running. This is the self-heal that makes a single wedged app
-// (see the woodpecker silent-relay incident) recover without a full restart.
-func superviseService(o serviceOpts) {
-	lp := "finch"
-	if o.label != "" {
-		lp = "finch[" + o.label + "]"
-	}
-	for {
-		enrolled := func() (enrolled bool) {
-			defer func() {
-				if r := recover(); r != nil {
-					// A panic left enrolled at its zero value (false); force true so
-					// the caller restarts rather than treating it as "not enrolled".
-					enrolled = true
-					log.Printf("%s: relay panic recovered: %v — restarting in 5s", lp, r)
-				}
-			}()
-			return runService(o)
-		}()
-		if !enrolled {
-			return // not enrolled — a restart can't help; let siblings run.
-		}
-		log.Printf("%s: relay exited unexpectedly — restarting in 5s", lp)
-		time.Sleep(5 * time.Second)
-	}
-}
-
-// runService resumes one already-enrolled service from its saved credential,
-// then holds its relay open and reconnects forever. `o.label` prefixes logs (the
-// ingress app_path in config mode, empty in single-service mode). Enrollment is
-// normally a separate one-time step (`finch enroll`); in single-service mode a
-// fresh `o.ticket` is a fallback that re-enrolls when the saved credential is
-// missing/revoked. It returns false only when no usable credential and no ticket
-// are found (logs how to enroll); the forever-reconnect loop otherwise never
-// returns, so a normal return is unexpected and reported as enrolled=true.
-func runService(o serviceOpts) (enrolled bool) {
-	hub, statePath, upstreamURL, label, autoApprove := o.hub, o.statePath, o.upstream, o.label, o.autoApprove
-	lp := "finch"
-	if label != "" {
-		lp = "finch[" + label + "]"
-	}
-
-	// Resume from a saved refresh credential for THIS hub. Enrollment (minting the
-	// credential from a one-shot ticket) happens out-of-band in `finch enroll`.
-	var jr *joinResp
-	refreshToken := ""
-	if saved, _ := loadState(statePath); saved != nil && saved.RefreshToken != "" && saved.Hub == hub {
-		if r, rerr := refresh(hub, saved.RefreshToken); rerr == nil {
-			jr = r
-			refreshToken = saved.RefreshToken
-			log.Printf("%s: resumed from saved credential (%s)", lp, statePath)
-		} else {
-			log.Printf("%s: saved credential at %s unusable (%v)", lp, statePath, rerr)
-		}
-	}
-	// Resume-then-ticket fallback (single-service `finch join --ticket`): if the
-	// saved credential is missing/revoked/expired and we hold an enrollment ticket,
-	// re-enroll with it (overwriting the stale state) and proceed — so a fresh valid
-	// ticket always recovers a box whose credential was revoked server-side. The
-	// join response already carries a connect-token, so no extra /refresh is needed.
-	// Config mode passes no ticket and falls through to the enroll hint below.
-	if jr == nil && o.ticket != "" {
-		if st, ejr, eerr := enrollToState(hub, o.box, o.ticket, statePath); eerr != nil {
-			log.Printf("%s: re-enroll from ticket failed: %v", lp, eerr)
-		} else {
-			jr = ejr
-			refreshToken = st.RefreshToken
-			log.Printf("%s: re-enrolled from ticket — credential saved to %s", lp, statePath)
-		}
-	}
-	if jr == nil {
-		enrollHint := label
-		if enrollHint == "" {
-			enrollHint = "<app_path>"
-		}
-		log.Printf("%s: not enrolled — run: finch enroll %s --ticket <t>", lp, enrollHint)
-		return false
-	}
-	// Describe the rule by its full name: the application, its public endpoint,
-	// and the local service it fronts.
-	name := label
-	if name == "" {
-		name = jr.Service
-	}
-	endpoint := jr.URL
-	if endpoint == "" { // older hub without host/url in the join response
-		endpoint = relayURL(hub, jr.Service, jr.Box)
-	}
-	log.Printf("%s: %q live at %s  →  %s  (box %q, tenant %s)",
-		lp, name, endpoint, upstreamURL, jr.Box, jr.Tenant)
-
-	// Self-approve via the saved CLI token (best-effort): the box just
-	// registered as `pending` if the tenant requires approval; clear that so it
-	// goes live once the relay connects — no dashboard hop.
-	if autoApprove {
-		if cred := loadCliCredQuiet(); cred != nil && cred.Hub == hub {
-			if err := cliApprove(cred, jr.Service); err != nil {
-				log.Printf("%s: auto-approve skipped (%v) — approve in the dashboard if it stays pending", lp, err)
-			} else {
-				log.Printf("%s: approved", lp)
-			}
-		}
-	}
-
-	wsBase := relayDialURL(jr, hub)
-	connectToken := jr.ConnectToken
-	connectExp := tokenExp(connectToken)
-
-	// Exponential backoff (capped at 30s) shared by refresh and reconnect.
-	backoff := time.Second
-	backoffSleep := func() {
-		time.Sleep(backoff)
-		if backoff < 30*time.Second {
-			backoff *= 2
-		}
-	}
-	for {
-		// Refresh the connect-token near expiry by trading the long-lived refresh
-		// token at /refresh — never the one-shot join ticket (the hub burned it).
-		if time.Now().Add(connectSkew).After(connectExp) {
-			fresh, err := refresh(hub, refreshToken)
-			if err != nil {
-				log.Printf("%s: connect-token refresh failed: %v (retrying in %s)", lp, err, backoff)
-				backoffSleep()
-				continue
-			}
-			connectToken = fresh.ConnectToken
-			connectExp = tokenExp(connectToken)
-			// Re-read each refresh so a host change is picked up, not pinned to the
-			// first value.
-			wsBase = relayDialURL(fresh, hub)
-			log.Printf("%s: refreshed connect-token (valid until %s)", lp, connectExp.Format(time.RFC3339))
-		}
-
-		wsURL, err := relayConnectURL(wsBase, connectToken)
-		if err != nil {
-			log.Printf("%s: invalid relay assignment: %v (refreshing after %s)", lp, err, backoff)
-			connectExp = time.Time{}
-			backoffSleep()
-			continue
-		}
-		start := time.Now()
-		if err := serve(context.Background(), wsURL, upstreamURL, o.forwardAll, hub); err != nil {
-			log.Printf("%s: link down: %v (reconnecting in %s)", lp, err, backoff)
-			backoffSleep()
-			continue
-		}
-		if time.Since(start) > time.Minute {
-			backoff = time.Second
-		}
-	}
 }
 
 // join claims a box slot with the ticket and returns the hub's assignment
@@ -810,14 +538,10 @@ func joinContext(ctx context.Context, hub, ticket, box string) (*joinResp, error
 	return &jr, nil
 }
 
-// refresh trades the long-lived per-box refresh token for a fresh
+// refreshContext trades the long-lived per-box refresh token for a fresh
 // connect-token, without re-using the one-shot enrollment ticket. The hub
-// rejects it (403) if the box was removed from the dashboard, which is how
+// rejects it (403) if the service or box was removed (`finch rm`), which is how
 // revocation propagates to the box within a connect-token TTL.
-func refresh(hub, refreshToken string) (*joinResp, error) {
-	return refreshContext(context.Background(), hub, refreshToken)
-}
-
 func refreshContext(ctx context.Context, hub, refreshToken string) (*joinResp, error) {
 	validatedHub, err := validateHubTransportURL(hub)
 	if err != nil {
@@ -951,8 +675,6 @@ func osLabel() string {
 		return "macOS"
 	case "linux":
 		return "Linux"
-	case "windows":
-		return "Windows"
 	default:
 		return runtime.GOOS
 	}
@@ -1046,10 +768,10 @@ func (r *relayRequestRegistry) remove(id string, expected *outStream) {
 	r.mu.Unlock()
 }
 
-func runForwardedRelayRequest(ctx context.Context, registry *relayRequestRegistry, upstream *url.URL, f frame, write func(frame) error, stream *outStream, forwardAll bool, routes []string) {
+func runForwardedRelayRequest(ctx context.Context, registry *relayRequestRegistry, upstream *url.URL, f frame, write func(frame) error, stream *outStream, forwardAll bool) {
 	defer stream.cancel() // detach the child context from the long-lived relay
 	defer registry.remove(f.ID, stream)
-	forwardWithRoutes(ctx, upstream, f, write, stream, forwardAll, routes)
+	forward(ctx, upstream, f, write, stream, forwardAll)
 }
 
 // isPaused reports the current pause state under the lock.
@@ -1078,17 +800,12 @@ func (o *outStream) setPaused(p bool) {
 // to confine to /mcp (default) or forward the whole host. hub is the box's own
 // hub base URL — the pinned source a hub-pushed "update" frame downloads from.
 func serve(parent context.Context, wsURL string, upstream *url.URL, forwardAll bool, hub string) error {
-	return serveWithRoutes(parent, wsURL, upstream, forwardAll, nil, hub)
+	return serveLink(parent, wsURL, upstream, forwardAll, hub, nil)
 }
 
-// serveWithRoutes is the dynamic-service form of serve. Legacy callers keep
-// the historical /mcp-or-forward_all behavior through serve above; AviaryMCP
-// supplies an explicit, segment-aware list such as /mcp, /api/v1, and /birdz.
-func serveWithRoutes(parent context.Context, wsURL string, upstream *url.URL, forwardAll bool, routes []string, hub string) error {
-	return serveWithRoutesStatus(parent, wsURL, upstream, forwardAll, routes, hub, nil)
-}
-
-func serveWithRoutesStatus(parent context.Context, wsURL string, upstream *url.URL, forwardAll bool, routes []string, hub string, onConnected func()) error {
+// serveLink is serve with onOpen, called once the hub has accepted the relay
+// socket (the connect token checked out), before any frame is served.
+func serveLink(parent context.Context, wsURL string, upstream *url.URL, forwardAll bool, hub string, onOpen func()) error {
 	if err := validateRelayTransportURL(wsURL); err != nil {
 		return err
 	}
@@ -1107,8 +824,8 @@ func serveWithRoutesStatus(parent context.Context, wsURL string, upstream *url.U
 	defer c.Close(websocket.StatusNormalClosure, "bye")
 	c.SetReadLimit(maxRelayFrameBytes)
 	log.Printf("finch: relay open -> %s", upstream)
-	if onConnected != nil {
-		onConnected()
+	if onOpen != nil {
+		onOpen()
 	}
 
 	// One writer at a time: coder/websocket forbids concurrent writes. write
@@ -1197,7 +914,7 @@ func serveWithRoutesStatus(parent context.Context, wsURL string, upstream *url.U
 				}
 				continue
 			}
-			go runForwardedRelayRequest(fctx, inFlight, upstream, f, write, os, forwardAll, routes)
+			go runForwardedRelayRequest(fctx, inFlight, upstream, f, write, os, forwardAll)
 		case "window":
 			if os := inFlight.lookup(f.ID); os != nil {
 				// credits===0 => PAUSE; credits>0 => RESUME. A missing credits
@@ -1216,13 +933,11 @@ func serveWithRoutesStatus(parent context.Context, wsURL string, upstream *url.U
 				inFlight.remove(f.ID, os)
 			}
 		case "update":
-			// Out-of-band hub push (dashboard "update now"): self-update from OUR
-			// hub's /releases and re-exec in place. Runs in a goroutine so the
-			// read loop (and in-flight forwards) are never blocked; singleflight
+			// Out-of-band hub push ("update now"): self-update from OUR hub's
+			// /releases and re-exec in place. Runs in a goroutine so the read
+			// loop (and in-flight forwards) are never blocked; singleflight
 			// inside drops repeats. Old agents ignore this frame (default case).
-			if !remoteUpdatesDisabled.Load() {
-				go selfUpdateFromHub(hub)
-			}
+			go selfUpdateFromHub(hub)
 		}
 	}
 }
@@ -1254,11 +969,7 @@ const relayChunkSize = 32 << 10
 // unbounded. The head is emitted before any wait — head is never paused. os may
 // be nil (no flow control / direct unit-test call): then it never pauses.
 func forward(ctx context.Context, upstream *url.URL, f frame, write func(frame) error, os *outStream, forwardAll bool) {
-	forwardWithRoutes(ctx, upstream, f, write, os, forwardAll, nil)
-}
-
-func forwardWithRoutes(ctx context.Context, upstream *url.URL, f frame, write func(frame) error, os *outStream, forwardAll bool, routes []string) {
-	target, err := resolveUpstreamWithRoutes(upstream, f.Path, forwardAll, routes)
+	target, err := resolveUpstream(upstream, f.Path, forwardAll)
 	if err != nil {
 		// SSRF reject — pre-head, so the DO turns this into a 403 response.
 		write(frame{ID: f.ID, Type: "err", Status: 403, Message: err.Error()})
@@ -1288,7 +999,7 @@ func forwardWithRoutes(ctx context.Context, upstream *url.URL, f frame, write fu
 		req.Header.Set("X-Finch-Assertion", f.Assertion)
 	}
 
-	resp, err := relayClientWithRoutes(upstream, forwardAll, routes).Do(req)
+	resp, err := relayClient(upstream, forwardAll).Do(req)
 	if err != nil {
 		// Dial / connect failure — pre-head, so the DO maps it to a 502 and may
 		// still fail over to another box.
@@ -1386,10 +1097,6 @@ func isReservedFinchIdentityHeader(lower string) bool {
 // trusted base + the redirect's path and refuse the hop if it doesn't match,
 // so a Location can never move host/scheme or climb out of the prefix.
 func relayClient(base *url.URL, forwardAll bool) *http.Client {
-	return relayClientWithRoutes(base, forwardAll, nil)
-}
-
-func relayClientWithRoutes(base *url.URL, forwardAll bool, routes []string) *http.Client {
 	return &http.Client{
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			if len(via) >= 10 {
@@ -1404,7 +1111,7 @@ func relayClientWithRoutes(base *url.URL, forwardAll bool, routes []string) *htt
 			if req.URL.Scheme != base.Scheme || req.URL.Host != base.Host {
 				return fmt.Errorf("redirect blocked (SSRF confinement): %q leaves %s://%s", req.URL.String(), base.Scheme, base.Host)
 			}
-			if _, err := resolveUpstreamWithRoutes(base, req.URL.Path, forwardAll, routes); err != nil {
+			if _, err := resolveUpstream(base, req.URL.Path, forwardAll); err != nil {
 				return fmt.Errorf("redirect blocked (SSRF confinement): %w", err)
 			}
 			return nil
@@ -1430,10 +1137,6 @@ func relayClientWithRoutes(base *url.URL, forwardAll bool, routes []string) *htt
 // forward the WHOLE /<app_path>/* subtree — for a website or any non-MCP HTTP
 // app. In every case host/scheme come only from the trusted base, never the frame.
 func resolveUpstream(base *url.URL, rawPath string, forwardAll bool) (string, error) {
-	return resolveUpstreamWithRoutes(base, rawPath, forwardAll, nil)
-}
-
-func resolveUpstreamWithRoutes(base *url.URL, rawPath string, forwardAll bool, routes []string) (string, error) {
 	if rawPath == "" {
 		rawPath = "/"
 	}
@@ -1458,31 +1161,13 @@ func resolveUpstreamWithRoutes(base *url.URL, rawPath string, forwardAll bool, r
 	// result that climbs above "/", so the cleaned path is always rooted.
 	clean := path.Clean(reqPath)
 
-	// Dynamic registrations declare one or more path-segment prefixes. Match a
-	// route itself or a child segment only: /api/v1 allows /api/v1/tools but not
-	// /api/v10. The paths were normalized at registration; repeat the strict
-	// boundary check here because this is the actual SSRF enforcement point.
-	if len(routes) > 0 {
-		allowed := false
-		for _, route := range routes {
-			route = strings.TrimRight(route, "/")
-			if route != "" && (clean == route || strings.HasPrefix(clean, route+"/")) {
-				allowed = true
-				break
-			}
-		}
-		if !allowed {
-			return "", fmt.Errorf("rejected path (outside route allowlist): %q", clean)
-		}
-	}
-
 	// Confine to the allowed prefix: the service's configured base path when one is
 	// set (e.g. service http://127.0.0.1:8000/mcp confines to /mcp), else /mcp by
 	// DEFAULT — UNLESS forwardAll is set, which opts out and forwards the whole
 	// /<app_path>/* subtree ("" prefix). When a prefix IS set the cleaned path must
 	// BE it or a child of it, so "/mcp/../admin" → "/admin" stays rejected.
 	prefix := strings.TrimRight(base.Path, "/")
-	if prefix == "" && !forwardAll && len(routes) == 0 {
+	if prefix == "" && !forwardAll {
 		prefix = "/mcp"
 	}
 	if prefix != "" && clean != prefix && !strings.HasPrefix(clean, prefix+"/") {
@@ -1498,18 +1183,13 @@ func resolveUpstreamWithRoutes(base *url.URL, rawPath string, forwardAll bool, r
 	return out.String(), nil
 }
 
-// agentState is the small credential the agent persists between runs so a
-// restart resumes without a fresh dashboard ticket. It holds the long-lived
-// per-box refresh token (and the assignment, for clarity).
 // ---- finch.yml manifest (cloudflared-style ingress) ------------------------
 
-// ingress is one rule: expose a local `service` as the service named `path`.
+// ingress is one rule: expose a local `service` as the service named `app_path`.
 //
-//	name    — human label for the application (e.g. "Label Printer"); logs only.
-//	path    — the public URL segment AND the service enrolled in the dashboard.
-//	          Full endpoint: https://<your-slug>.finchmcp.com/<path>/mcp
-//	service — the local server to forward to (e.g. http://127.0.0.1:8000).
-//	ticket  — one-shot enrollment ticket, first run only (then state resumes).
+//	app_path — the public URL segment AND the enrolled service id.
+//	           Full endpoint: https://<your-slug>.finchmcp.com/<app_path>/mcp
+//	service  — the local server to forward to (e.g. http://127.0.0.1:8000).
 type ingress struct {
 	AppPath string `yaml:"app_path"`
 	Service string `yaml:"service"`
@@ -1522,7 +1202,7 @@ type ingress struct {
 // config is a parsed finch.yml. `credentials-dir` is a DIRECTORY — each
 // service's refresh credential is persisted at <credentials-dir>/<app_path>.json,
 // so one box can front many services without their credentials colliding. The
-// credentials are written out-of-band by `finch enroll`, never by this manifest.
+// credentials are written out-of-band by `finch add`, never by this manifest.
 type config struct {
 	Hub            string    `yaml:"hub"`
 	Box            string    `yaml:"box"`
@@ -1530,27 +1210,6 @@ type config struct {
 	Ingress        []ingress `yaml:"ingress"`
 }
 
-// fatalLegacyTOML aborts with a migration message. finch.toml support (TOML
-// parsing) was removed in favor of a cloudflared-style finch.yml; an upgraded
-// multi-service box must migrate rather than silently fall through to
-// single-service mode and stop serving every service.
-func fatalLegacyTOML(path, hostName string) {
-	if hostName == "" {
-		hostName = "this-box"
-	}
-	log.Fatalf("finch: %s is no longer supported — finch now reads a finch.yml manifest.\n"+
-		"Migrate to finch.yml (one ingress rule per local service):\n\n"+
-		"  hub: https://finchmcp.com\n"+
-		"  box: %s\n"+
-		"  ingress:\n"+
-		"    - app_path: printer\n"+
-		"      service: http://127.0.0.1:8000\n\n"+
-		"Enroll each app once with `finch enroll <app_path> --ticket <t>`, then run `finch run`.",
-		path, hostName)
-}
-
-// loadConfig reads + validates a finch.yml, applying defaults (prod hub, this
-// box's hostname, ~/.finch credentials dir).
 // findManifest locates the finch.yml to serve when no --config was given. Search
 // order: the working dir first (project-local manifests, cloudflared-style), then
 // the dotfile home so a box with a home-dir manifest serves from any cwd. Returns
@@ -1585,6 +1244,8 @@ func defaultManifestPath() string {
 	return "finch.yml"
 }
 
+// loadConfig reads + validates a finch.yml, applying defaults (prod hub, this
+// box's hostname, ~/.finch credentials dir).
 func loadConfig(path, hostName string) (*config, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -1610,8 +1271,14 @@ func loadConfig(path, hostName string) (*config, error) {
 		} else {
 			c.CredentialsDir = ".finch"
 		}
+	} else if c.CredentialsDir = expandHome(c.CredentialsDir); !filepath.IsAbs(c.CredentialsDir) {
+		// A relative credentials-dir is relative to the manifest, not to the
+		// caller's cwd: `finch add --config dir/finch.yml` run from elsewhere
+		// and the service (which runs in the manifest's directory) must agree.
+		if abs, err := filepath.Abs(path); err == nil {
+			c.CredentialsDir = filepath.Join(filepath.Dir(abs), c.CredentialsDir)
+		}
 	}
-	c.CredentialsDir = expandHome(c.CredentialsDir)
 	seen := map[string]bool{}
 	for i, ing := range c.Ingress {
 		if ing.AppPath == "" || ing.Service == "" {
@@ -1632,11 +1299,30 @@ func loadConfig(path, hostName string) (*config, error) {
 	return &c, nil
 }
 
+// maxAppPathLength matches a DNS label, since an app_path is also a public URL
+// segment on the tenant host.
+const maxAppPathLength = 63
+
 func validateServiceID(id string) error {
 	if len(id) > maxAppPathLength || !validAppPath(id) {
 		return fmt.Errorf("service id %q must be a safe URL segment of at most %d characters", id, maxAppPathLength)
 	}
 	return nil
+}
+
+// validAppPath accepts ASCII letters and digits, with '-', '_' and '.' allowed
+// only between them — a single safe URL segment.
+func validAppPath(value string) bool {
+	for i, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			continue
+		}
+		if i > 0 && i < len(value)-1 && (r == '-' || r == '_' || r == '.') {
+			continue
+		}
+		return false
+	}
+	return value != ""
 }
 
 // statePathFor is where service `appPath`'s refresh credential lives: a per-rule
@@ -1656,19 +1342,15 @@ func expandHome(p string) string {
 	return p
 }
 
+// agentState is the small credential the agent persists between runs so a
+// restart resumes without a fresh ticket. It holds the long-lived per-box
+// refresh token (and the assignment, for clarity).
 type agentState struct {
 	Hub          string `json:"hub"`
 	Tenant       string `json:"tenant"`
 	Service      string `json:"service"`
 	Box          string `json:"box"`
 	RefreshToken string `json:"refreshToken"`
-	// ApprovedManifest* are present on scoped Aviary device-enrollment grants.
-	// They are optional only for backward compatibility with legacy finch.yml
-	// credentials, which do not use dynamic route manifests.
-	ApprovedRoutes         []string `json:"approved_routes,omitempty"`
-	ApprovedEdgeAuth       string   `json:"approved_edge_auth,omitempty"`
-	ApprovedTenant         string   `json:"approved_tenant,omitempty"`
-	ApprovedManifestSHA256 string   `json:"approved_manifest_sha256,omitempty"`
 }
 
 // defaultStatePath is ~/.finch/agent.json (falls back to the cwd if there's no
@@ -1680,8 +1362,6 @@ func defaultStatePath() string {
 	return ".finch-agent.json"
 }
 
-// loadState reads the persisted credential, returning (nil,nil) if the file
-// doesn't exist yet (first run).
 // readCredentialFile reads an on-disk credential with the checks a credential
 // deserves: refuse anything that is not a regular file (a symlink planted by
 // another local account would otherwise be followed), refuse group/world-
@@ -1811,6 +1491,8 @@ func writeCredentialFile(path string, b []byte) error {
 	return nil
 }
 
+// loadState reads the persisted credential, returning (nil,nil) if the file
+// doesn't exist yet (first run).
 func loadState(path string) (*agentState, error) {
 	b, err := readCredentialFile(path, credentialStateLimit)
 	if err != nil {

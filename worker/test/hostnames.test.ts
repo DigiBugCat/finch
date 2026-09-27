@@ -5,10 +5,9 @@ import {
   waitOnExecutionContext,
 } from "cloudflare:test";
 import worker, { hostKeyFromHost } from "../src/index";
-import { signAssertion, signSession } from "../src/auth";
+import { signAssertion } from "../src/auth";
 
 const SERVICE = env.FINCH_SERVICE_SECRET;
-const SESSION = env.SESSION_SECRET;
 
 const nowSec = () => Math.floor(Date.now() / 1000);
 let seq = 0;
@@ -55,6 +54,15 @@ async function router(body: Record<string, unknown>): Promise<any> {
   return res.json();
 }
 
+/** Flip a service's relay access mode (the op behind `finch auth`). */
+async function setAuth(tenant: string, service: string, mode: "key" | "public") {
+  const res = await env.TENANT.get(env.TENANT.idFromName(tenant)).fetch(
+    "https://tenant.internal/",
+    { method: "POST", body: JSON.stringify({ op: "setAuth", service, mode }) },
+  );
+  expect(((await res.json()) as any).ok).toBe(true);
+}
+
 async function freshServiceOnHost(host: string, tenant: string) {
   expect((await router({ op: "register", slug: host, tenant })).ok).toBe(true);
   const enroll = (await (
@@ -86,9 +94,7 @@ async function freshServiceOnHost(host: string, tenant: string) {
     "POST",
     `/api/services/${encodeURIComponent(enroll.id)}/approve`,
   );
-  await api(tenant, "PUT", `/api/services/${encodeURIComponent(enroll.id)}/auth`, {
-    mode: "public",
-  });
+  await setAuth(tenant, enroll.id, "public");
   await waitForBox(
     tenant,
     enroll.id,
@@ -159,6 +165,40 @@ describe("RouterDO host-key validation", () => {
     expect((await router({ op: "listForTenant", tenant })).keys).toContain("mcp.acme.com");
     expect((await router({ op: "unregister", slug: "mcp.acme.com", tenant })).ok).toBe(true);
   });
+
+  it("transfers a host key only from its current owner, in one step", async () => {
+    const from = `tenant_from_${Date.now()}_${seq++}`;
+    const to = `tenant_to_${Date.now()}_${seq++}`;
+    const host = `moving-${seq++}.acme.com`;
+    expect((await router({ op: "register", slug: host, tenant: from })).ok).toBe(true);
+    // A third tenant cannot move it, and neither can anyone move an unowned key.
+    expect(await router({ op: "transfer", slug: host, from: "intruder", to })).toEqual({
+      ok: false,
+      reason: "not-owner",
+      owner: from,
+    });
+    expect((await router({ op: "transfer", slug: `nobody-${seq++}`, from, to })).reason).toBe("not-owner");
+    for (const bad of [
+      { slug: "evil.finchmcp.com", from, to },
+      { slug: host, from: "", to },
+      { slug: host, from, to: "" },
+      { slug: host, from: 7, to },
+    ]) {
+      expect((await router({ op: "transfer", ...bad })).reason, JSON.stringify(bad)).toBe("bad-input");
+    }
+    expect((await router({ op: "lookup", slug: host })).tenant).toBe(from);
+
+    expect(await router({ op: "transfer", slug: host.toUpperCase(), from, to })).toEqual({ ok: true });
+    expect((await router({ op: "lookup", slug: host })).tenant).toBe(to);
+    expect((await router({ op: "listForTenant", tenant: from })).keys).not.toContain(host);
+    // Idempotent once it is `to`'s; the old owner can no longer move it.
+    expect(await router({ op: "transfer", slug: host, from, to })).toEqual({ ok: true });
+    expect(await router({ op: "transfer", slug: host, from, to: "x" })).toEqual({
+      ok: false,
+      reason: "not-owner",
+      owner: to,
+    });
+  });
 });
 
 describe("custom hostname API", () => {
@@ -209,7 +249,7 @@ describe("custom hostname API", () => {
   });
 });
 
-describe("relay and login wall on custom hostnames", () => {
+describe("relay on custom hostnames", () => {
   it("resolves a registered custom hostname end to end", async () => {
     const ctx = await freshServiceOnHost(
       `relay-${Date.now()}-${seq++}.acme.com`,
@@ -228,43 +268,31 @@ describe("relay and login wall on custom hostnames", () => {
     ctx.agent.close(1000, "done");
   });
 
-  it("binds login-wall sessions to the full custom-host host key", async () => {
-    const host = `wall-${Date.now()}-${seq++}.acme.com`;
-    const ctx = await freshServiceOnHost(host, `tenant_wall_custom_${Date.now()}_${seq++}`);
-    await api(ctx.tenant, "PUT", `/api/services/${encodeURIComponent(ctx.service)}/auth`, {
-      mode: "key",
-    });
-    await env.TENANT.get(env.TENANT.idFromName(ctx.tenant)).fetch("https://tenant.internal/", { method: "POST", body: JSON.stringify({ op: "bootstrapMembers", kind: "team", displayName: "Test", bootstrappedFrom: "fresh", claimantClerkUserId: "user_123", members: [{ clerkUserId: "user_123", email: "owner@example.com", role: "owner", state: "active" }] }) });
-    const cookie = await signSession(
-      {
-        kind: "session",
-        tenant: ctx.tenant,
-        slug: host,
-        userId: "user_123",
-        admin: true, // per-app enforcement: admin sessions pass every service
-        epoch: 0,
-        exp: nowSec() + 3600,
-      } as any,
-      SESSION,
+  it("gates a key service on a custom host: keyless 401 (no redirect), finch_ key relays", async () => {
+    const host = `keyed-${Date.now()}-${seq++}.acme.com`;
+    const ctx = await freshServiceOnHost(host, `tenant_keyed_custom_${Date.now()}_${seq++}`);
+    await setAuth(ctx.tenant, ctx.service, "key");
+
+    const keyless = await call(
+      new Request(`${ctx.base}/${ctx.service}/index.html`, {
+        headers: { host, accept: "text/html" },
+        redirect: "manual",
+      }),
     );
+    expect(keyless.status).toBe(401);
+    expect(keyless.headers.get("location")).toBeNull();
+
+    const minted = (await (
+      await api(ctx.tenant, "POST", "/api/keys", { label: "host-key", scope: { all: true } })
+    ).json()) as { key: string };
     const goodSeen = nextFrame(ctx.agent);
     const good = call(
       new Request(`${ctx.base}/${ctx.service}/index.html`, {
-        headers: { host, accept: "text/html", cookie: `finch_session=${cookie}` },
+        headers: { host, accept: "text/html", authorization: `Bearer ${minted.key}` },
       }),
     );
     reply200(ctx.agent, (await goodSeen).id);
     expect((await good).status).toBe(200);
-
-    const otherHost = `other-${Date.now()}-${seq++}.acme.com`;
-    expect((await router({ op: "register", slug: otherHost, tenant: ctx.tenant })).ok).toBe(true);
-    const bad = await call(
-      new Request(`https://${otherHost}/${ctx.service}/index.html`, {
-        headers: { host: otherHost, accept: "text/html", cookie: `finch_session=${cookie}` },
-        redirect: "manual",
-      }),
-    );
-    expect(bad.status).toBe(302);
     ctx.agent.close(1000, "done");
   });
 });

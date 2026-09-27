@@ -1,4 +1,4 @@
-# Finch web (dashboard) — local dev vars TEMPLATE.
+# Finch web — local dev vars TEMPLATE.
 #
 # Copy to `.dev.vars` (gitignored) and fill with THROWAWAY dev values.
 # `next dev` / `opennextjs-cloudflare preview` read `.dev.vars` locally.
@@ -10,8 +10,8 @@ NEXTJS_ENV=development
 # Clerk routing (non-secret).
 NEXT_PUBLIC_CLERK_SIGN_IN_URL=/sign-in
 NEXT_PUBLIC_CLERK_SIGN_UP_URL=/sign-up
-NEXT_PUBLIC_CLERK_SIGN_IN_FALLBACK_REDIRECT_URL=/
-NEXT_PUBLIC_CLERK_SIGN_UP_FALLBACK_REDIRECT_URL=/
+NEXT_PUBLIC_CLERK_SIGN_IN_FALLBACK_REDIRECT_URL=/docs
+NEXT_PUBLIC_CLERK_SIGN_UP_FALLBACK_REDIRECT_URL=/docs
 
 # Clerk DEV instance keys. Publishable is public; secret key is sensitive even
 # in dev — use your own dev instance's values, never commit real ones.

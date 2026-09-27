@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { setupTestEnv } from "./test-env";
 
 const authMock = vi.fn();
@@ -8,12 +8,13 @@ vi.mock("@clerk/nextjs/server", () => ({
   clerkClient: async () => ({ users: { getUser: getUserMock } }),
 }));
 
-setupTestEnv({ HUB_URL: "https://hub.example.com", FINCH_SERVICE_SECRET: "test-service-secret" });
+const HUB = "https://hub.example.com";
+const SECRET = "test-service-secret";
+setupTestEnv({ HUB_URL: HUB, FINCH_SERVICE_SECRET: SECRET });
 
+import { verifyAssertion } from "@worker-auth";
 import { POST as approve } from "@/app/api/finch/cli-approve/route";
 import { POST as describeCode } from "@/app/api/finch/cli-describe/route";
-import { POST as revoke } from "@/app/api/finch/cli-revoke/route";
-import { POST as mint } from "@/app/api/finch/cli-token/route";
 
 const userId = "user_cli_owner";
 
@@ -33,26 +34,64 @@ function rawRequest(path: string, body: string, headers?: HeadersInit): Request 
   });
 }
 
-function memberContext(role: "owner" | "admin" | "member" = "owner"): Response {
+function owner(overrides: Record<string, unknown> = {}): Response {
   return Response.json({
-    member: {
-      id: "member_cli",
-      role,
-      state: "active",
-      email: `${role}@example.com`,
-    },
-    tenantMeta: { id: userId },
+    member: { id: "member_cli", role: "owner", state: "active", email: "owner@example.com", ...overrides },
+    tenantMeta: { id: userId, kind: "personal" },
   });
 }
 
-const FUTURE_EXPIRY = Math.floor(Date.now() / 1000) + 24 * 60 * 60;
-const validToken = {
-  token: "eyJ0ZW5hbnQiOiJ1c2VyX2NsaV9vd25lciJ9.signature_-",
-  hub: "https://hub.example.com",
-  expiresAt: FUTURE_EXPIRY,
-};
+type Handler = (body: Record<string, unknown>) => Response | Promise<Response>;
+
+// Every malformed hub call the fake hub refused. A route may turn a thrown
+// fetch into a 502, so a refusal must also fail the test explicitly.
+let violations: string[] = [];
+afterEach(() => {
+  expect(violations).toEqual([]);
+});
+
+/**
+ * A fake hub that answers only the calls these routes may make, and only when
+ * they are made correctly: POST, the service secret, an assertion for the
+ * signed-in user's OWN tenant (their Clerk user id), no redirect following,
+ * and a JSON body. `/api/member-context` must ask about that same user.
+ * Anything else throws, so a wrong call fails the test instead of getting a
+ * canned 200. Returns the recorded calls.
+ */
+function hub(handlers: { memberContext?: Handler; describe?: Handler; approve?: Handler } = {}) {
+  const calls: { path: string; body: Record<string, unknown> }[] = [];
+  const routes: Record<string, Handler | undefined> = {
+    "/api/member-context": handlers.memberContext ?? (() => owner()),
+    "/api/cli-describe": handlers.describe,
+    "/api/device-approve": handlers.approve,
+  };
+  const refuse = (why: string): never => {
+    violations.push(why);
+    throw new Error(why);
+  };
+  const spy = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+    const url = String(input);
+    if (!url.startsWith(`${HUB}/api/`)) refuse(`unexpected hub URL ${url}`);
+    const path = url.slice(HUB.length);
+    const handler = routes[path] ?? refuse(`unexpected hub call ${path}`);
+    if (init?.method !== "POST") refuse(`${path} must be a POST`);
+    if (init?.redirect !== "manual") refuse(`${path} must not follow redirects`);
+    const headers = new Headers(init?.headers);
+    if (headers.get("x-finch-service") !== SECRET) refuse(`${path} without the service secret`);
+    const tenant = await verifyAssertion(headers.get("x-finch-auth") ?? "", SECRET);
+    if (tenant !== userId) refuse(`${path} signed for ${tenant}, not the user's own tenant`);
+    const body = JSON.parse(String(init?.body));
+    if (path === "/api/member-context" && body.clerkUserId !== userId) {
+      refuse(`member-context asked about ${body.clerkUserId}`);
+    }
+    calls.push({ path, body });
+    return handler(body);
+  });
+  return { spy, calls, paths: () => calls.map((c) => c.path) };
+}
 
 beforeEach(() => {
+  violations = [];
   authMock.mockReset();
   getUserMock.mockReset();
   vi.restoreAllMocks();
@@ -69,38 +108,32 @@ describe("CLI route authorization boundary", () => {
   it.each([
     ["approve", () => approve(request("/api/finch/cli-approve", { userCode: "ABCD-EFGH" }))],
     ["describe", () => describeCode(request("/api/finch/cli-describe", { userCode: "ABCD-EFGH" }))],
-    ["revoke", () => revoke()],
-    ["mint", () => mint()],
   ])("rejects an unauthenticated %s request before any hub action", async (_name, call) => {
     authMock.mockResolvedValue({ userId: null });
-    const fetchSpy = vi.spyOn(globalThis, "fetch");
+    const { spy } = hub();
 
     const response = await call();
 
     expect(response.status).toBe(401);
-    expect(fetchSpy).not.toHaveBeenCalled();
+    expect(spy).not.toHaveBeenCalled();
   });
 
   it.each([
     ["approve", () => approve(request("/api/finch/cli-approve", { userCode: "ABCD-EFGH" }))],
     ["describe", () => describeCode(request("/api/finch/cli-describe", { userCode: "ABCD-EFGH" }))],
-    ["revoke", () => revoke()],
-    ["mint", () => mint()],
-  ])("rejects a non-admin %s request before its privileged action", async (_name, call) => {
-    const fetchSpy = vi
-      .spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(memberContext("member"));
+  ])("refuses a %s request when the hub does not report the user as owner", async (_name, call) => {
+    const { paths } = hub({ memberContext: () => Response.json({ member: null, tenantMeta: null }) });
 
     const response = await call();
 
     expect(response.status).toBe(403);
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(paths()).toEqual(["/api/member-context"]);
   });
 
   it("fails closed when the hub returns malformed membership state", async () => {
-    vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(
-      Response.json({ member: { role: "owner", state: "active" } }),
-    );
+    const { paths } = hub({
+      memberContext: () => Response.json({ member: { role: "owner", state: "active" } }),
+    });
 
     const response = await describeCode(
       request("/api/finch/cli-describe", { userCode: "ABCD-EFGH" }),
@@ -108,6 +141,22 @@ describe("CLI route authorization boundary", () => {
 
     expect(response.status).toBe(502);
     expect(await response.json()).toEqual({ error: "invalid response from hub" });
+    // Refused at membership, before any action call.
+    expect(paths()).toEqual(["/api/member-context"]);
+  });
+
+  it("always acts as the user's own tenant, whatever Clerk organization is active", async () => {
+    authMock.mockResolvedValue({ userId, orgId: "org_acme", orgRole: "org:admin" });
+    const { paths } = hub({ describe: () => Response.json({ found: false }) });
+
+    const response = await describeCode(
+      request("/api/finch/cli-describe", { userCode: "ABCD-EFGH" }),
+    );
+
+    // The fake hub already refused any assertion not signed for userId.
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ found: false });
+    expect(paths()).toEqual(["/api/member-context", "/api/cli-describe"]);
   });
 });
 
@@ -119,38 +168,31 @@ describe("CLI code request validation", () => {
     ["a number", 42],
     ["a boolean", true],
   ])("rejects valid JSON whose top level is %s", async (_name, body) => {
-    const fetchSpy = vi
-      .spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(memberContext());
+    const { paths } = hub();
 
     const response = await describeCode(request("/api/finch/cli-describe", body));
 
     expect(response.status).toBe(400);
-    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(paths()).toEqual(["/api/member-context"]);
   });
 
   it.each([null, [], {}, 7, true])(
     "rejects a non-string userCode without coercing it (%j)",
     async (userCode) => {
-      const fetchSpy = vi
-        .spyOn(globalThis, "fetch")
-        .mockResolvedValueOnce(memberContext());
+      const { paths } = hub();
 
       const response = await approve(
         request("/api/finch/cli-approve", { userCode }),
       );
 
       expect(response.status).toBe(400);
-      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(paths()).toEqual(["/api/member-context"]);
       expect(getUserMock).not.toHaveBeenCalled();
     },
   );
 
   it("rejects malformed JSON and an over-limit body before the action call", async () => {
-    const fetchSpy = vi
-      .spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(memberContext())
-      .mockResolvedValueOnce(memberContext());
+    const { paths } = hub();
 
     const malformed = await describeCode(
       rawRequest("/api/finch/cli-describe", "{"),
@@ -164,32 +206,28 @@ describe("CLI code request validation", () => {
 
     expect(malformed.status).toBe(400);
     expect(oversized.status).toBe(413);
-    expect(fetchSpy).toHaveBeenCalledTimes(2);
+    expect(paths()).toEqual(["/api/member-context", "/api/member-context"]);
   });
 
   it.each(["", "ABC", "ABCI-1234", "ABCD--EFGH", "A".repeat(33)])(
     "rejects a code outside the generated CLI-code language (%s)",
     async (userCode) => {
-      const fetchSpy = vi
-        .spyOn(globalThis, "fetch")
-        .mockResolvedValueOnce(memberContext());
+      const { paths } = hub();
 
       const response = await describeCode(
         request("/api/finch/cli-describe", { userCode }),
       );
 
       expect(response.status).toBe(400);
-      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(paths()).toEqual(["/api/member-context"]);
     },
   );
 });
 
 describe("POST /api/finch/cli-describe", () => {
   it("normalizes a human-entered code, uses one auth snapshot, and strips unexpected fields", async () => {
-    const fetchSpy = vi
-      .spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(memberContext())
-      .mockResolvedValueOnce(
+    const { calls } = hub({
+      describe: () =>
         Response.json({
           found: true,
           reqIp: "203.0.113.1",
@@ -197,8 +235,9 @@ describe("POST /api/finch/cli-describe", () => {
           ageSeconds: 4,
           approved: false,
           token: "must-not-cross-the-bff",
+          account: { name: "a hub-chosen label", kind: "team" },
         }),
-      );
+    });
 
     const response = await describeCode(
       request("/api/finch/cli-describe", { userCode: " abcd efgh " }),
@@ -206,10 +245,12 @@ describe("POST /api/finch/cli-describe", () => {
 
     expect(response.status).toBe(200);
     expect(authMock).toHaveBeenCalledTimes(1);
-    expect(fetchSpy).toHaveBeenCalledTimes(2);
-    const [url, init] = fetchSpy.mock.calls[1] as [string, RequestInit];
-    expect(url).toBe("https://hub.example.com/api/cli-describe");
-    expect(JSON.parse(init.body as string)).toEqual({ userCode: "ABCD-EFGH" });
+    expect(calls).toEqual([
+      { path: "/api/member-context", body: { clerkUserId: userId } },
+      { path: "/api/cli-describe", body: { userCode: "ABCD-EFGH" } },
+    ]);
+    // No account label: the token always acts as the signed-in user's own
+    // account, which the page names from their Clerk profile.
     expect(await response.json()).toEqual({
       found: true,
       reqIp: "203.0.113.1",
@@ -220,13 +261,11 @@ describe("POST /api/finch/cli-describe", () => {
   });
 
   it.each([
-    ["non-JSON", new Response("<html>oops</html>")],
-    ["a primitive", Response.json(null)],
-    ["a fractional age", Response.json({ found: true, ageSeconds: 1.5 })],
-  ])("returns 502 for %s success data", async (_name, actionResponse) => {
-    vi.spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(memberContext())
-      .mockResolvedValueOnce(actionResponse);
+    ["non-JSON", () => new Response("<html>oops</html>")],
+    ["a primitive", () => Response.json(null)],
+    ["a fractional age", () => Response.json({ found: true, ageSeconds: 1.5 })],
+  ])("returns 502 for %s success data", async (_name, describe) => {
+    hub({ describe });
 
     const response = await describeCode(
       request("/api/finch/cli-describe", { userCode: "ABCD-EFGH" }),
@@ -237,9 +276,11 @@ describe("POST /api/finch/cli-describe", () => {
   });
 
   it("maps an action-plane network failure to an upstream 502", async () => {
-    vi.spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(memberContext())
-      .mockRejectedValueOnce(new TypeError("connection reset"));
+    hub({
+      describe: () => {
+        throw new TypeError("connection reset");
+      },
+    });
 
     const response = await describeCode(
       request("/api/finch/cli-describe", { userCode: "ABCD-EFGH" }),
@@ -257,10 +298,7 @@ describe("POST /api/finch/cli-approve", () => {
       primaryEmailAddressId: "primary",
       emailAddresses: [{ id: "primary", emailAddress: `  ${longServerEmail}  ` }],
     });
-    const fetchSpy = vi
-      .spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(memberContext())
-      .mockResolvedValueOnce(Response.json({ ok: true }));
+    const { calls } = hub({ approve: () => Response.json({ ok: true }) });
 
     const response = await approve(
       request("/api/finch/cli-approve", {
@@ -271,21 +309,14 @@ describe("POST /api/finch/cli-approve", () => {
 
     expect(response.status).toBe(200);
     expect(authMock).toHaveBeenCalledTimes(1);
-    expect(fetchSpy).toHaveBeenCalledTimes(2);
-    const [url, init] = fetchSpy.mock.calls[1] as [string, RequestInit];
-    expect(url).toBe("https://hub.example.com/api/device-approve");
-    const forwarded = JSON.parse(init.body as string);
-    expect(forwarded.userCode).toBe("ABCD-EFGH");
-    expect(forwarded.email).toBe("attacker@example.com");
+    expect(calls.map((c) => c.path)).toEqual(["/api/member-context", "/api/device-approve"]);
+    expect(calls[1].body).toEqual({ userCode: "ABCD-EFGH", email: "attacker@example.com" });
   });
 
   it("accepts a trimmed client label exactly at the limit when Clerk lookup fails", async () => {
     getUserMock.mockRejectedValue(new Error("synthetic staging user"));
     const clientEmail = `  ${"a".repeat(200)}  `;
-    const fetchSpy = vi
-      .spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(memberContext())
-      .mockResolvedValueOnce(Response.json({ ok: true }));
+    const { calls } = hub({ approve: () => Response.json({ ok: true }) });
 
     const response = await approve(
       request("/api/finch/cli-approve", {
@@ -295,21 +326,31 @@ describe("POST /api/finch/cli-approve", () => {
     );
 
     expect(response.status).toBe(200);
-    const [, init] = fetchSpy.mock.calls[1] as [string, RequestInit];
-    expect(JSON.parse(init.body as string).email).toBe("a".repeat(200));
+    expect(calls[1].body.email).toBe("a".repeat(200));
+  });
+
+  it("labels the token with the server-side Clerk email when it is valid", async () => {
+    const { calls } = hub({ approve: () => Response.json({ ok: true }) });
+
+    const response = await approve(
+      request("/api/finch/cli-approve", { userCode: "ABCD-EFGH", email: "someone@else.test" }),
+    );
+
+    expect(response.status).toBe(200);
+    expect(calls[1].body).toEqual({ userCode: "ABCD-EFGH", email: "owner@example.com" });
   });
 
   it.each([`${"a".repeat(201)}`, "owner@example.com\nforged"])(
     "rejects an invalid client label without approving (%j)",
     async (email) => {
-      const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValueOnce(memberContext());
+      const { paths } = hub({ approve: () => Response.json({ ok: true }) });
 
       const response = await approve(
         request("/api/finch/cli-approve", { userCode: "ABCD-EFGH", email }),
       );
 
       expect(response.status).toBe(400);
-      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(paths()).toEqual(["/api/member-context"]);
       expect(getUserMock).not.toHaveBeenCalled();
     },
   );
@@ -317,27 +358,24 @@ describe("POST /api/finch/cli-approve", () => {
   it.each([null, [], {}, 7, true])(
     "rejects a non-string client email instead of inventing a label (%j)",
     async (email) => {
-      const fetchSpy = vi
-        .spyOn(globalThis, "fetch")
-        .mockResolvedValueOnce(memberContext());
+      const { paths } = hub({ approve: () => Response.json({ ok: true }) });
 
       const response = await approve(
         request("/api/finch/cli-approve", { userCode: "ABCD-EFGH", email }),
       );
 
       expect(response.status).toBe(400);
-      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(paths()).toEqual(["/api/member-context"]);
       expect(getUserMock).not.toHaveBeenCalled();
     },
   );
 
   it("rejects malformed success data while preserving a real hub rejection", async () => {
-    const fetchSpy = vi
-      .spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(memberContext())
-      .mockResolvedValueOnce(Response.json({ ok: "true" }))
-      .mockResolvedValueOnce(memberContext())
-      .mockResolvedValueOnce(Response.json({ error: "code expired" }, { status: 409 }));
+    const answers = [
+      Response.json({ ok: "true" }),
+      Response.json({ error: "code expired" }, { status: 409 }),
+    ];
+    const { paths } = hub({ approve: () => answers.shift()! });
 
     const malformed = await approve(
       request("/api/finch/cli-approve", { userCode: "ABCD-EFGH" }),
@@ -349,103 +387,11 @@ describe("POST /api/finch/cli-approve", () => {
     expect(malformed.status).toBe(502);
     expect(rejected.status).toBe(409);
     expect(await rejected.json()).toEqual({ error: "code expired" });
-    expect(fetchSpy).toHaveBeenCalledTimes(4);
-  });
-});
-
-describe("POST /api/finch/cli-revoke", () => {
-  it("forwards one authorized epoch bump and validates its result", async () => {
-    const fetchSpy = vi
-      .spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(memberContext())
-      .mockResolvedValueOnce(Response.json({ ok: true, epoch: 3 }));
-
-    const response = await revoke();
-
-    expect(response.status).toBe(200);
-    expect(await response.json()).toEqual({ ok: true, epoch: 3 });
-    expect(fetchSpy).toHaveBeenCalledTimes(2);
-    const [url, init] = fetchSpy.mock.calls[1] as [string, RequestInit];
-    expect(url).toBe("https://hub.example.com/api/cli-revoke");
-    expect(init.method).toBe("POST");
-    expect(init.body).toBe("{}");
-  });
-
-  it.each([
-    ["non-JSON", new Response("bad gateway")],
-    ["false ok", Response.json({ ok: false, epoch: 1 })],
-    ["fractional epoch", Response.json({ ok: true, epoch: 1.5 })],
-  ])("returns 502 for %s success data", async (_name, actionResponse) => {
-    vi.spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(memberContext())
-      .mockResolvedValueOnce(actionResponse);
-
-    const response = await revoke();
-
-    expect(response.status).toBe(502);
-    expect(await response.json()).toEqual({ error: "invalid response from hub" });
-  });
-
-  it("maps a network failure to 502 without exposing its details", async () => {
-    vi.spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(memberContext())
-      .mockRejectedValueOnce(new Error("secret upstream detail"));
-
-    const response = await revoke();
-
-    expect(response.status).toBe(502);
-    expect(await response.json()).toEqual({ error: "hub unavailable" });
-  });
-});
-
-describe("POST /api/finch/cli-token", () => {
-  it("returns a validated token contract", async () => {
-    const fetchSpy = vi
-      .spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(memberContext())
-      .mockResolvedValueOnce(Response.json(validToken));
-
-    const response = await mint();
-
-    expect(response.status).toBe(200);
-    expect(await response.json()).toEqual(validToken);
-    expect(fetchSpy).toHaveBeenCalledTimes(2);
-  });
-
-  it.each([
-    ["non-JSON", new Response("bad gateway")],
-    ["a primitive", Response.json("token")],
-    ["a shell-shaped token", Response.json({ ...validToken, token: "good.bad; rm" })],
-    ["an expired token", Response.json({ ...validToken, expiresAt: 1 })],
-    ["a cleartext remote hub", Response.json({ ...validToken, hub: "http://evil.example.com" })],
-    ["a hub URL with a path", Response.json({ ...validToken, hub: "https://hub.example.com/evil" })],
-    ["a fractional expiry", Response.json({ ...validToken, expiresAt: 2.5 })],
-  ])("returns 502 for %s success data", async (_name, actionResponse) => {
-    vi.spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(memberContext())
-      .mockResolvedValueOnce(actionResponse);
-
-    const response = await mint();
-
-    expect(response.status).toBe(502);
-    expect(await response.json()).toEqual({ error: "invalid response from hub" });
-  });
-
-  it("preserves an authenticated upstream status and maps transport failure to 502", async () => {
-    const fetchSpy = vi
-      .spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(memberContext())
-      .mockResolvedValueOnce(Response.json({ error: "overloaded" }, { status: 503 }))
-      .mockResolvedValueOnce(memberContext())
-      .mockRejectedValueOnce(new TypeError("connection reset"));
-
-    const rejected = await mint();
-    const unavailable = await mint();
-
-    expect(rejected.status).toBe(503);
-    expect(await rejected.json()).toEqual({ error: "could not mint CLI token" });
-    expect(unavailable.status).toBe(502);
-    expect(await unavailable.json()).toEqual({ error: "invalid response from hub" });
-    expect(fetchSpy).toHaveBeenCalledTimes(4);
+    expect(paths()).toEqual([
+      "/api/member-context",
+      "/api/device-approve",
+      "/api/member-context",
+      "/api/device-approve",
+    ]);
   });
 });

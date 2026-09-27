@@ -41,7 +41,7 @@ func TestRunForwardedRelayRequest_CancelsAndUnregistersOnNormalReturn(t *testing
 		t.Fatal("register stream")
 	}
 	base, _ := url.Parse("http://127.0.0.1:8000")
-	runForwardedRelayRequest(ctx, r, base, frame{ID: "request", Method: "GET", Path: "/outside"}, func(frame) error { return nil }, stream, false, nil)
+	runForwardedRelayRequest(ctx, r, base, frame{ID: "request", Method: "GET", Path: "/outside"}, func(frame) error { return nil }, stream, false)
 	select {
 	case <-ctx.Done():
 	default:

@@ -30,8 +30,6 @@ function makeRepo(t, overrides = {}) {
   const files = {
     "agent/core/agent.go": 'var agentVersion = "1.2.3"\n',
     "worker/src/types.ts": 'export const LATEST_AGENT = "1.2.3";\n',
-    "web/components/dash/data.ts":
-      'export const LATEST_AGENT = "1.2.3";\n',
     ...overrides,
   };
   for (const [relativePath, contents] of Object.entries(files)) {
@@ -76,7 +74,7 @@ test("returns the one synchronized canonical version and reports real drift", (t
   assert.equal(checkVersions({ root }).version, "1.2.3");
 
   writeFileSync(
-    join(root, "web/components/dash/data.ts"),
+    join(root, "worker/src/types.ts"),
     'export const LATEST_AGENT = "1.2.4";\n',
   );
   assert.throws(
@@ -97,10 +95,8 @@ test("does not let stale comments or look-alike identifiers hide drift", (t) => 
       '// var agentVersion = "1.5.0"\nvar agentVersion = "1.6.0"\n',
     "worker/src/types.ts":
       'export const PREVIOUS_LATEST_AGENT = "1.5.0";\n' +
-      'export const LATEST_AGENT = "1.7.0";\n',
-    "web/components/dash/data.ts":
       '/*\nexport const LATEST_AGENT = "1.5.0";\n*/\n' +
-      'export const LATEST_AGENT = "1.8.0";\n',
+      'export const LATEST_AGENT = "1.7.0";\n',
   });
 
   assert.throws(
@@ -109,7 +105,6 @@ test("does not let stale comments or look-alike identifiers hide drift", (t) => 
       assert.equal(error.exitCode, 1);
       assert.match(error.message, /1\.6\.0/);
       assert.match(error.message, /1\.7\.0/);
-      assert.match(error.message, /1\.8\.0/);
       assert.doesNotMatch(error.message, /1\.5\.0/);
       return true;
     },
@@ -130,17 +125,14 @@ test("rejects ambiguous duplicate canonical declarations", (t) => {
 test("aggregates missing and malformed sources into one bounded diagnostic", (t) => {
   const root = makeRepo(t, {
     "agent/core/agent.go": null,
-    "worker/src/types.ts": 'export const NOT_LATEST_AGENT = "1.2.3";\n',
-    "web/components/dash/data.ts":
-      'export const LATEST_AGENT = "definitely-not-semver";\n',
+    "worker/src/types.ts": 'export const LATEST_AGENT = "definitely-not-semver";\n',
   });
   assert.throws(
     () => checkVersions({ root }),
     (error) => {
       assert.equal(error.exitCode, 2);
       assert.match(error.message, /agent\/core\/agent\.go.*ENOENT/);
-      assert.match(error.message, /worker\/src\/types\.ts.*found 0/);
-      assert.match(error.message, /web\/components\/dash\/data\.ts.*not valid SemVer/);
+      assert.match(error.message, /worker\/src\/types\.ts.*not valid SemVer/);
       assert.ok(error.message.length < 800);
       return true;
     },

@@ -15,7 +15,7 @@ test("accepts only the reviewed metadata-only console shapes", () => {
       }
       Promise.reject(new Error("offline")).catch((error) =>
         console.error(
-          "tenant directory index failed",
+          "caller assertion JWKS unavailable",
           error instanceof Error ? error.message : String(error),
         ),
       );

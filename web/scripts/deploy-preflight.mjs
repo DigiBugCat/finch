@@ -12,14 +12,16 @@
 //     pk_test_/sk_test_ in the build env (or shipped vars) is rejected.
 //   - .dev.vars.example must keep REPLACE_… stubs (never real dev secrets that
 //     someone might `secret put` verbatim into prod).
-//   - the sibling hub source implements the `viewerScoped` echo the member
-//     projection fails closed on (deploy-order guard, see below).
+//   - staging/production must ship every static file the landing points at
+//     (public/agents.md, public/llms.txt; see landing-files.mjs), so the
+//     copied agent prompt never starts on a 404.
 //
 // Usage: node scripts/deploy-preflight.mjs <env>   (env = production | dev)
 import { readFileSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { readJsonc } from "./jsonc.mjs";
+import { missingLandingFiles } from "./landing-files.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..");
@@ -84,6 +86,20 @@ if (envCfg.logpush !== false) {
   fail(`[env.${env}].logpush must be false.`);
 }
 
+// The landing's agent prompt says "Read https://finchmcp.com/agents.md" and
+// its footer links there. Deploying the landing without that file hands every
+// visitor's agent a 404 on its first step, so a real deploy waits for it.
+if (env === "staging" || env === "production") {
+  const missing = missingLandingFiles(join(root, "public"));
+  if (missing.length > 0) {
+    fail(
+      `the landing links to ${missing.map((f) => `/${f}`).join(", ")} but web/public has no ` +
+        `non-empty ${missing.join(", ")}. Land it (agents.md comes with the CLI track) ` +
+        `before deploying the landing.`,
+    );
+  }
+}
+
 if (isProd && envCfg.workers_dev === true) {
   fail("[env.production].workers_dev is true — prod must not expose a workers.dev origin.");
 }
@@ -128,42 +144,6 @@ if (isProd) {
   }
 }
 
-// Deploy-order guard: hub BEFORE web.
-//
-// app/api/finch/state/route.ts fails CLOSED for a member when the hub does not
-// echo `viewerScoped` — it hands back an empty fleet rather than an unnarrowed
-// one. That is the right security choice and stays; the cost is that shipping
-// web ahead of the hub blanks every member's dashboard.
-//
-// CI already orders the two (deploy.yml: the `web` job `needs: hub`). This
-// covers the case CI doesn't: a hand-run `npm run deploy` from a checkout whose
-// worker/ predates — or has reverted — the narrowing. It is a source check, not
-// a probe of the live hub: web and worker deploy from ONE tree, so a tree that
-// can't produce the echo can't have deployed a hub that emits it. A live probe
-// isn't available here either — /api/state needs tenant credentials this script
-// deliberately has no access to.
-const hubStatePath = join(root, "..", "worker", "src", "tenant-do.ts");
-if (existsSync(hubStatePath)) {
-  const hubSource = readFileSync(hubStatePath, "utf8");
-  // Match the ECHO itself (`viewerScoped: true`), not the bare identifier — a
-  // renamed/negated leftover mentioning the word would otherwise satisfy this.
-  if (!/\bviewerScoped\s*:\s*true\b/.test(hubSource)) {
-    fail(
-      "worker/src/tenant-do.ts does not emit the `viewerScoped` echo. The member " +
-        "state projection fails closed without it, so deploying this web build " +
-        "would blank every member's dashboard. Deploy the hub first (and from a " +
-        "tree that has the ACL narrowing).",
-    );
-  }
-} else {
-  // A standalone web checkout can't be checked; say so loudly rather than
-  // passing silently, since the fail-closed branch still applies at runtime.
-  console.warn(
-    "  finch-web deploy-preflight WARNING: worker/src/tenant-do.ts not found — " +
-      "cannot verify the hub emits `viewerScoped`. Confirm the hub is deployed FIRST.",
-  );
-}
-
 // Known dev secret values must never leak into shippable `vars`.
 const SECRET_KEYS = ["FINCH_SERVICE_SECRET", "CLERK_SECRET_KEY"];
 const devValues = new Set();
@@ -194,4 +174,4 @@ if (existsSync(examplePath)) {
   }
 }
 
-console.log(`finch-web deploy-preflight OK for --env ${env} (no dev-secret/vars leak, no dev Clerk key).`);
+console.log(`finch-web deploy-preflight OK for --env ${env} (no dev-secret/vars leak, no dev Clerk key${env === "staging" || env === "production" ? ", landing files present" : ""}).`);
