@@ -642,8 +642,8 @@ describe("retired hub surfaces", () => {
       const res = await call(
         new Request(`http://${HOST}${path}`, { method: "POST", headers: { host: HOST }, body: "{}" }),
       );
-      // Unauthenticated: the ordinary control-plane / CLI-token refusal.
-      expect(res.status, path).toBe(401);
+      // Unknown routes are a 404 before any credential is looked at.
+      expect(res.status, path).toBe(404);
     }
     const authed = await post("/api/aviary/device/start", `user_x_${++seq}`);
     expect(authed.status).toBe(404);

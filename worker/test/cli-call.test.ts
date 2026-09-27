@@ -1140,8 +1140,9 @@ describe("POST /api/cli/call in production (DEV and DEFAULT_TENANT unset)", () =
       prodEnv,
       createExecutionContext(),
     );
+    // The apex names no account: a plain 404, before any tenant lookup.
     expect(res.status).toBe(404);
-    expect(((await res.json()) as Json).error).toBe("tenant could not be resolved from host");
+    expect(((await res.json()) as Json).error).toBe("not found");
     agents.forEach((a) => a.close(1000, "done"));
   });
 

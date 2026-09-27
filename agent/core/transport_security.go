@@ -18,16 +18,16 @@ func validateHubTransportURL(raw string) (string, error) {
 	}
 	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" || u.Hostname() == "" || u.User != nil || u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
-		return "", fmt.Errorf("invalid Finch hub %q", raw)
+		return "", fmt.Errorf("invalid finch hub %q", raw)
 	}
 	switch strings.ToLower(u.Scheme) {
 	case "https":
 	case "http":
 		if !isLoopbackHost(u.Hostname()) {
-			return "", fmt.Errorf("insecure Finch hub %q: HTTPS is required for non-loopback hosts", raw)
+			return "", fmt.Errorf("insecure finch hub %q: HTTPS is required for non-loopback hosts", raw)
 		}
 	default:
-		return "", fmt.Errorf("invalid Finch hub %q: expected an http(s) URL", raw)
+		return "", fmt.Errorf("invalid finch hub %q: expected an http(s) URL", raw)
 	}
 	return raw, nil
 }
@@ -37,7 +37,7 @@ func validateHubTransportURL(raw string) (string, error) {
 func validateRelayTransportURL(raw string) error {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil || u.Host == "" || u.Hostname() == "" || u.User != nil || u.Fragment != "" {
-		return fmt.Errorf("invalid Finch relay URL")
+		return fmt.Errorf("invalid finch relay URL")
 	}
 	switch strings.ToLower(u.Scheme) {
 	case "wss":
@@ -46,9 +46,9 @@ func validateRelayTransportURL(raw string) error {
 		if isLoopbackHost(u.Hostname()) {
 			return nil
 		}
-		return fmt.Errorf("insecure Finch relay URL: WSS is required for non-loopback hosts")
+		return fmt.Errorf("insecure finch relay URL: WSS is required for non-loopback hosts")
 	default:
-		return fmt.Errorf("invalid Finch relay URL: expected a ws(s) URL")
+		return fmt.Errorf("invalid finch relay URL: expected a ws(s) URL")
 	}
 }
 
