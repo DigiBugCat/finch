@@ -110,6 +110,24 @@ case ":\${PATH:-}:" in
     ;;
 esac
 
+# An older finch earlier on PATH (a previous installer used a root-owned
+# /usr/local/bin) would keep answering to 'finch'. Compare real directories so
+# a symlinked PATH entry is not mistaken for another copy.
+found="$(command -v finch 2>/dev/null || true)"
+case "$found" in
+  /*)
+    found_dir="$(cd "$(dirname "$found")" 2>/dev/null && pwd -P || true)"
+    bin_real="$(cd "$BIN_DIR" && pwd -P)"
+    if [ "$found_dir/$(basename "$found")" != "$bin_real/finch" ]; then
+      finch_cmd="$BIN_DIR/finch"
+      echo ""
+      echo "finch: warning: 'finch' on your PATH is $found, not the copy just installed."
+      echo "  That older finch shadows the new one. Run $BIN_DIR/finch by its full path,"
+      echo "  or remove $found (it may be root-owned from an earlier install)."
+    fi
+    ;;
+esac
+
 echo ""
 echo "  Next:  $finch_cmd login --start      # prints a sign-in link + code"
 echo "         $finch_cmd login --poll       # repeat until approved"

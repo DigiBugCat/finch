@@ -47,9 +47,13 @@ The same manual is hosted at https://finchmcp.com/agents.md.
 
 ## Before you start
   finch status --json
-  "loggedIn": true   -> skip step 1
-  "service"          -> whether the background service is installed / running
-  "ingress"          -> what this machine already publishes
+  no "schema_version":1 -> an older finch answered. Reinstall:
+                           curl -fsSL https://finchmcp.com/install | sh
+                           If it warns that an older finch on PATH
+                           shadows the new one, run the full path it prints.
+  "loggedIn": true      -> skip step 1
+  "service"             -> whether the background service is installed / running
+  "ingress"             -> what this machine already publishes
 
 ## 1. Log in (the only human step)
   finch login --start --json

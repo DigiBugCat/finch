@@ -123,6 +123,35 @@ func TestAgentDocsOnlyUseRealCommandsAndFlags(t *testing.T) {
 	}
 }
 
+// A finch from before the contract also answers `finch status --json` (with no
+// schema_version), so the pre-check must tell an agent how to recognise it and
+// what to do about a shadowing copy; otherwise it skips the install and every
+// later command fails with a usage error from the old binary.
+func TestAgentDocsDetectAnOldFinch(t *testing.T) {
+	isolate(t)
+	docs := map[string]string{"finch guide": guideText}
+	if b, err := os.ReadFile(filepath.Join("..", "..", "web", "public", "agents.md")); err == nil {
+		docs["agents.md"] = string(b)
+	}
+	for name, doc := range docs {
+		start := strings.Index(doc, "finch status --json")
+		end := strings.Index(doc, "finch login --start --json")
+		if start < 0 || end < start {
+			t.Fatalf("%s: no pre-check before the login step", name)
+		}
+		if !strings.Contains(doc[start:end], `no "schema_version":1`) && !strings.Contains(doc[start:end], `has no `+"`"+`"schema_version":1`+"`") {
+			t.Fatalf("%s: the pre-check does not say how to recognise an old finch", name)
+		}
+		if !strings.Contains(doc[start:end], "shadows the new one") {
+			t.Fatalf("%s: the pre-check or install step does not cover a shadowing finch on PATH", name)
+		}
+	}
+	stdout, stderr, code := finch(t, "status", "--json")
+	if code != 0 || !strings.HasPrefix(stdout, `{"schema_version":1,`) {
+		t.Fatalf("status --json must lead with schema_version for that check: exit=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+}
+
 // The agent flow's commands must appear, in order, in agents.md and the guide.
 func TestAgentDocsFollowTheContractOrder(t *testing.T) {
 	flow := []string{

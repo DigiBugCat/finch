@@ -28,6 +28,10 @@ finch status --json
 ```
 
 - Exit code 127, or `command not found`: finch is not installed yet. Go to step 1.
+- The output has no `"schema_version":1`, or the command fails: this finch is
+  too old for these steps (older versions print `{"loggedIn":…}` without a
+  `schema_version`). Go to step 1 to install the current one, even though a
+  `finch` is already on `PATH`.
 - `"loggedIn": true`: skip step 2.
 - `"login_pending": true`: a login is waiting for approval. Go to step 2 and
   poll; do not start a new one.
@@ -49,6 +53,13 @@ that is writable and to `~/.local/bin` otherwise, and prints a `PATH` hint in
 the second case. Set `FINCH_INSTALL_DIR` to choose the directory. If `finch` is
 still not found afterwards, run it by its full path (for example
 `~/.local/bin/finch`) for the rest of this session.
+
+If the installer warns that another `finch` on `PATH` shadows the new one (an
+older copy in a root-owned `/usr/local/bin`, say), plain `finch` still runs the
+old binary. Use the full path the installer printed after `Next:` for every
+command in this session, and tell your human they can remove the old copy.
+Then run `finch status --json` again (by that path) and check that it has
+`"schema_version":1`.
 
 ## 2. Log in (the one human step)
 
