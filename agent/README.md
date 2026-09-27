@@ -79,7 +79,8 @@ change meaning.
 
 ```bash
 # 1. install (or `go build -o finch .` from this directory). Never uses sudo:
-#    /usr/local/bin when writable, else ~/.local/bin; FINCH_INSTALL_DIR overrides.
+#    /usr/local/bin when only you can write it, else ~/.local/bin;
+#    FINCH_INSTALL_DIR overrides (a dir other users can write is refused).
 curl -fsSL https://finchmcp.com/install | sh
 
 # 2. log in — two steps for an agent (a human can run plain `finch login`)

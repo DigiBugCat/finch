@@ -51,8 +51,10 @@ curl -fsSL https://finchmcp.com/install | sh
 ```
 
 The installer never asks for a password. It installs to `/usr/local/bin` when
-that is writable and to `~/.local/bin` otherwise, and prints a `PATH` hint in
-the second case. Set `FINCH_INSTALL_DIR` to choose the directory. If `finch` is
+you can write it and no other user can, and to `~/.local/bin` otherwise, and
+prints a `PATH` hint in the second case. Set `FINCH_INSTALL_DIR` to choose the
+directory; it refuses one that other users can write (group- or world-writable
+without the sticky bit) and says how to fix that. If `finch` is
 still not found afterwards, run it by its full path (for example
 `~/.local/bin/finch`) for the rest of this session.
 

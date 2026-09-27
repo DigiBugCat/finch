@@ -55,7 +55,7 @@ Known limitation: `finch test` and `finch call` send one stateless JSON-RPC requ
 
 ## Install
 
-- [Install script](https://finchmcp.com/install): `curl -fsSL https://finchmcp.com/install | sh` (macOS and Linux). It never prompts for sudo: it installs to /usr/local/bin when that is writable, otherwise to ~/.local/bin (and prints a PATH hint). Set FINCH_INSTALL_DIR to choose the directory.
+- [Install script](https://finchmcp.com/install): `curl -fsSL https://finchmcp.com/install | sh` (macOS and Linux). It never prompts for sudo: it installs to /usr/local/bin when you can write it and no other user can, otherwise to ~/.local/bin (and prints a PATH hint). Set FINCH_INSTALL_DIR to choose the directory; one that other users can write (group- or world-writable without the sticky bit) is refused.
 
 ## Optional
 
