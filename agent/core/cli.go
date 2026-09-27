@@ -518,6 +518,12 @@ func relayCallFailure(cred *cliCred, service, method string, err error) error {
 		return newCLIError(codeUpstream, "",
 			"%s answered %s with HTTP 404 (%s): the local server has no MCP endpoint at /mcp under its --service URL",
 			service, method, he.Msg)
+	case he.Status == 409 && strings.Contains(he.Msg, "no public hostname"):
+		// The hub relays through the account's own hostname (the relay picks
+		// the tenant by host), and this account has none registered.
+		return newCLIError(codeNotFound, "finch domain add <host>",
+			"cannot reach %s: this finch account has no public hostname for the hub to route through (%s); claim a hub subdomain in the dashboard or add one with 'finch domain add <host>'",
+			service, he.Msg)
 	case he.Status >= 500:
 		return newCLIError(codeUpstream, "finch service status", "%s did not answer through the hub: %v (is 'finch run' serving it?)", service, he)
 	case he.Status == 406 || (he.Status == 400 && strings.Contains(strings.ToLower(he.Msg), "session")):

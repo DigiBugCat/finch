@@ -6,6 +6,7 @@ import {
   runInDurableObject,
 } from "cloudflare:test";
 import worker from "../src/index";
+import { isLoopbackHost } from "../src/api";
 import { hashKey, signAssertion, signToken } from "../src/auth";
 import { SINGLE_USER_PURGE_VERSION } from "../src/tenant-do";
 
@@ -734,6 +735,12 @@ describe("GET /api/cli/state serviceBase", () => {
       ["localhost-hub.example.com:8443", "https://localhost-hub.example.com:8443"],
       ["127.0.0.1.nip.io", "https://127.0.0.1.nip.io"],
       ["127.example.com", "https://127.example.com"],
+      // The whole 127.0.0.0/8 block is loopback (net.IP.IsLoopback agrees).
+      ["127.0.0.2:8787", "http://127.0.0.2:8787"],
+      ["127.255.255.254", "http://127.255.255.254"],
+      ["[0:0:0:0:0:0:0:1]:8787", "http://[0:0:0:0:0:0:0:1]:8787"],
+      ["128.0.0.1:8787", "https://128.0.0.1:8787"],
+      ["[::2]:8787", "https://[::2]:8787"],
     ]) {
       const st = await cliState(tenant, env, host);
       expect(st.serviceBase, host).toBe(want);
@@ -741,5 +748,39 @@ describe("GET /api/cli/state serviceBase", () => {
     // In prod a look-alike host is not local either: it gets the slug host.
     const prod = await cliState(tenant, { ...env, DEV: undefined }, "localhost.example.com");
     expect(prod.serviceBase).toBe(`https://${prod.host}`);
+  });
+});
+
+describe("isLoopbackHost", () => {
+  it("accepts localhost, 127.0.0.0/8 and ::1 by parsed address, nothing else", () => {
+    for (const h of [
+      "localhost",
+      "LocalHost:1",
+      "127.0.0.1",
+      "127.0.0.2:8787",
+      "127.1",
+      "0x7f.0.0.9",
+      "127.255.255.255",
+      "[::1]",
+      "[::1]:8787",
+      "[0:0:0:0:0:0:0:1]",
+    ]) {
+      expect(isLoopbackHost(h), h).toBe(true);
+    }
+    for (const h of [
+      "",
+      "localhost.example.com",
+      "127.0.0.1.nip.io",
+      "127.example.com",
+      "128.0.0.1",
+      "126.255.255.255",
+      "0.0.0.0",
+      "[::2]",
+      "[::ffff:127.0.0.1]",
+      "finchmcp.com",
+      "not a host",
+    ]) {
+      expect(isLoopbackHost(h), h).toBe(false);
+    }
   });
 });

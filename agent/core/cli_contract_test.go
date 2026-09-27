@@ -553,6 +553,8 @@ func TestTestCommandClassifiesRelayedStatuses(t *testing.T) {
 		{name: "SDK 406 without SSE accept", status: 406, body: sdk406, wantExit: 1, wantCode: "UPSTREAM", wantNext: "finch connect notes --client <client>", wantMessage: "does not mean the service is down"},
 		{name: "SDK 400 missing session", status: 400, body: sdk400, wantExit: 1, wantCode: "UPSTREAM", wantNext: "finch connect notes --client <client>", wantMessage: "Missing session ID"},
 		{name: "server's own 403", status: 403, body: `{"error":"forbidden"}`, wantExit: 1, wantCode: "UPSTREAM", wantMessage: "HTTP 403: forbidden"},
+		{name: "account without a public hostname", status: 409, body: `{"error":"no public hostname for this account","hint":"claim one"}`, wantExit: 1, wantCode: "NOT_FOUND", wantNext: "finch domain add <host>", wantMessage: "no public hostname"},
+		{name: "server's own 409", status: 409, body: `{"error":"conflict"}`, wantExit: 1, wantCode: "UPSTREAM", wantMessage: "HTTP 409: conflict"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			isolate(t)
