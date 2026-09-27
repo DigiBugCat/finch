@@ -8,8 +8,9 @@
  *  hint), and FINCH_INSTALL_DIR overrides both (FINCH_BIN_DIR is the older
  *  name, still honoured). It detects OS/arch, downloads the matching release
  *  binary from the hub-relative /releases path, verifies it against
- *  checksums.txt when a SHA-256 tool is available, and swaps it into place with
- *  an atomic rename in the target directory.
+ *  checksums.txt when a SHA-256 tool is available (failing closed when the
+ *  manifest is missing or lacks exactly one entry for the asset), and swaps it
+ *  into place with an atomic rename in the target directory.
  *
  *  POSIX sh only: it runs under `sh` on macOS and Linux. Kept free of Workers
  *  APIs so tests can execute it under a real shell. */
@@ -86,12 +87,25 @@ if command -v sha256sum >/dev/null 2>&1; then
 elif command -v shasum >/dev/null 2>&1; then
   sha="$(shasum -a 256 "$tmp" | awk '{print $1}')"
 fi
-if [ -n "$sha" ] && fetch "$HUB/releases/checksums.txt" "$sums" 2>/dev/null; then
-  want="$(awk -v a="$asset" '$2 == a {print $1}' "$sums")"
-  if [ -n "$want" ] && [ "$want" != "$sha" ]; then
+if [ -n "$sha" ]; then
+  # Fail closed: with a hash tool present, the binary installs only against
+  # exactly one checksums.txt entry for this asset.
+  if ! fetch "$HUB/releases/checksums.txt" "$sums" 2>/dev/null || [ ! -s "$sums" ]; then
+    echo "finch: could not fetch $HUB/releases/checksums.txt to verify $asset; not installing" >&2
+    exit 1
+  fi
+  count="$(awk -v a="$asset" '$2 == a || $2 == "*" a {n++} END {print n+0}' "$sums")"
+  if [ "$count" != 1 ]; then
+    echo "finch: checksums.txt has $count entries for $asset (want exactly 1); not installing" >&2
+    exit 1
+  fi
+  want="$(awk -v a="$asset" '$2 == a || $2 == "*" a {print $1}' "$sums")"
+  if [ "$want" != "$sha" ]; then
     echo "finch: checksum mismatch for $asset (got $sha, want $want); not installing" >&2
     exit 1
   fi
+else
+  echo "finch: warning: no sha256sum or shasum found; installing $asset without verifying its checksum" >&2
 fi
 
 chmod 755 "$tmp"

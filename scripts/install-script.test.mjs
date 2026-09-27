@@ -30,7 +30,9 @@ const HUB = "https://hub.example";
 const ASSETS = ["darwin-amd64", "darwin-arm64", "linux-amd64", "linux-arm64", "linux-armv6", "linux-armv7"];
 const isRoot = typeof process.getuid === "function" && process.getuid() === 0;
 
-function fixture({ badChecksum = false } = {}) {
+// manifest: undefined writes the normal checksums.txt, null serves none (a
+// 404), and a function (sha) => text writes that text.
+function fixture({ badChecksum = false, manifest } = {}) {
   const root = mkdtempSync(join(tmpdir(), "finch-install-"));
   const bin = join(root, "fakebin");
   const home = join(root, "home");
@@ -41,7 +43,11 @@ function fixture({ badChecksum = false } = {}) {
   const binary = "#!/bin/sh\necho fake-finch\n";
   writeFileSync(join(root, "binary"), binary);
   const sha = badChecksum ? "0".repeat(64) : createHash("sha256").update(binary).digest("hex");
-  writeFileSync(join(root, "checksums.txt"), ASSETS.map((a) => `${sha}  finch-${a}\n`).join(""));
+  if (manifest === undefined) {
+    writeFileSync(join(root, "checksums.txt"), ASSETS.map((a) => `${sha}  finch-${a}\n`).join(""));
+  } else if (manifest !== null) {
+    writeFileSync(join(root, "checksums.txt"), manifest(sha));
+  }
 
   // Strict fake curl: only `curl -fsSL <url> -o <file>` for the two release
   // URLs; anything else fails like a 404 would.
@@ -50,7 +56,7 @@ function fixture({ badChecksum = false } = {}) {
     `#!/bin/sh
 if [ "$#" -ne 4 ] || [ "$1" != -fsSL ] || [ "$3" != -o ]; then echo "fake curl: bad argv: $*" >&2; exit 2; fi
 case "$2" in
-  "${HUB}/releases/checksums.txt") cp "${root}/checksums.txt" "$4" ;;
+  "${HUB}/releases/checksums.txt") cp "${root}/checksums.txt" "$4" 2>/dev/null || { echo "fake curl: 404 $2" >&2; exit 22; } ;;
   "${HUB}/releases/finch-darwin-"*|"${HUB}/releases/finch-linux-"*) cp "${root}/binary" "$4" ;;
   *) echo "fake curl: 404 $2" >&2; exit 22 ;;
 esac
@@ -181,4 +187,50 @@ test("a failed download installs nothing", () => {
   });
   assert.notEqual(res.status, 0);
   assert.ok(!existsSync(join(custom, "finch")));
+});
+
+// With a SHA-256 tool present, verification fails closed: a manifest that is
+// missing, empty, lacks this asset, or lists it twice installs nothing.
+for (const [name, manifest, pattern] of [
+  ["a missing checksums.txt", null, /could not fetch .*checksums\.txt/],
+  ["an empty checksums.txt", () => "", /could not fetch .*checksums\.txt/],
+  ["a checksums.txt without this asset", (sha) => `${sha}  finch-plan9-amd64\n`, /has 0 entries/],
+  ["a checksums.txt listing the asset twice", (sha) => ASSETS.map((a) => `${sha}  finch-${a}\n${sha}  finch-${a}\n`).join(""), /has 2 entries/],
+]) {
+  test(`${name} installs nothing`, () => {
+    const fx = fixture({ manifest });
+    const custom = join(fx.root, "custom");
+    const res = run(fx, { FINCH_INSTALL_DIR: custom });
+    assert.equal(res.status, 1, res.stdout);
+    assert.match(res.stderr, pattern);
+    assert.match(res.stderr, /not installing/);
+    assert.ok(!existsSync(join(custom, "finch")));
+    assert.deepEqual(existsSync(custom) ? readdirSync(custom) : [], []);
+  });
+}
+
+test("a binary-mode (*asset) checksum entry is accepted", () => {
+  const fx = fixture({ manifest: (sha) => ASSETS.map((a) => `${sha} *finch-${a}\n`).join("") });
+  const custom = join(fx.root, "custom");
+  const res = run(fx, { FINCH_INSTALL_DIR: custom });
+  assert.equal(res.status, 0, res.stderr);
+  assertInstalled(join(custom, "finch"));
+});
+
+// Without any SHA-256 tool there is nothing to verify with: it says so and
+// installs (the manifest is not even fetched).
+test("without a SHA-256 tool it warns and installs", () => {
+  const fx = fixture({ manifest: null });
+  const tools = join(fx.root, "tools");
+  mkdirSync(tools);
+  for (const tool of ["sh", "uname", "tr", "mkdir", "awk", "chmod", "mv", "rm", "cp", "dirname", "basename", "cat"]) {
+    const found = spawnSync("sh", ["-c", `command -v ${tool}`], { encoding: "utf8" }).stdout.trim();
+    assert.ok(found.startsWith("/"), `${tool} not found`);
+    symlinkSync(found, join(tools, tool));
+  }
+  const custom = join(fx.root, "custom");
+  const res = run(fx, { FINCH_INSTALL_DIR: custom, PATH: `${fx.bin}:${tools}` });
+  assert.equal(res.status, 0, res.stderr);
+  assert.match(res.stderr, /without verifying its checksum/);
+  assertInstalled(join(custom, "finch"));
 });
