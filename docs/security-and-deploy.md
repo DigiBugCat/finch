@@ -1,434 +1,251 @@
-# Finch — Security Review & Deployment Guide
-
-Status: **pre-launch.** This document is the security gate for the first production deploy of
-Finch (the control plane for self-hosted MCP appliances). It covers (1) confirmed security
-findings, (2) the hardening checklist to apply before any prod deploy, (3) the exact
-Cloudflare deploy inventory, and (4) concrete dev/prod separation.
-
-Components:
-
-- **Hub** (`worker/`) — Cloudflare Worker + Durable Objects. `index.ts` (routing, tenant
-  resolution), `api.ts` (control API `/api/*` + agent `/join`), `auth.ts` (`finch_` keys,
-  HMAC tickets, service secret), `tenant-do.ts` (per-tenant registry), `appliance-do.ts`
-  (per-machine WebSocket relay).
-- **Web** (`web/`) — Next.js (OpenNext/Cloudflare) dashboard + landing. `lib/hub.ts`
-  (Clerk-authed bridge to the hub), `app/api/finch/*` (route handlers), `middleware.ts` (Clerk).
-- **Agent** (`agent/main.go`) — box-side relay agent: `/join` with a ticket, then holds the
-  relay WebSocket open.
-
----
-
-## 1. Security findings
-
-Ranked by severity. **Deploy is BLOCKED until every Critical and High item is fixed.** The
-single most important issue is the **unauthenticated agent relay channel** (`/_connect`) — fix
-it first.
-
-### Must-fix-before-deploy: the unauthenticated agent channel
-
-The relay WebSocket upgrade at `/<appliance>/<machine>/_connect` performs **zero credential
-checks**. `index.ts:118-131` forwards the upgrade on the `Upgrade: websocket` header alone, and
-`appliance-do.ts:64-87` calls `ctx.acceptWebSocket(server, ["agent"])` (`:76`) unconditionally.
-The `FLEET_SECRET` that is supposedly the "fleet membership proof" is minted and returned to
-every agent (`api.ts:275`) and stored in the agent's join response struct (`agent/main.go:53`),
-but the agent **never sends it** (`agent/main.go:161` dials with `websocket.Dial(ctx, wsURL, nil)`)
-and the hub **never checks it** — it is entirely dead code. Anyone who knows or guesses a
-tenant subdomain + appliance id + machine name (all low-entropy slugs, and the appliance id/URL
-is printed in the enroll response and dashboard) can open the relay socket and become THE agent.
-Because inbound MCP frames are forwarded with the full header set
-(`appliance-do.ts:101` `Object.fromEntries(req.headers)`) and the agent only strips hop-by-hop
-headers (`agent/main.go:219-225`), the attacker also receives every legitimate caller's
-`Authorization: Bearer finch_…` key. This is a full data-plane takeover plus credential
-exfiltration with no credentials required.
-
-### Findings table
-
-| # | Sev | Location | Risk | Fix |
-|---|-----|----------|------|-----|
-| C1 | **Critical** | `worker/src/index.ts:118-131`, `worker/src/appliance-do.ts:64-87,76` (key leak: `appliance-do.ts:101` + `agent/main.go:219-225`) | Agent relay WS `/_connect` is fully unauthenticated. Anyone can register as the box-side agent for any tenant/appliance/machine → relay hijack, harvest of callers' `finch_` keys, forged MCP responses, false "online" liveness. | Authenticate the `/_connect` upgrade **before** `ctx.acceptWebSocket`. Mint a **per-machine HMAC connect-token** at `/join` (reuse `auth.ts` `signToken`/`verifyToken` over `{tenant,appliance,machine,exp}` signed with `TICKET_SECRET`); have the Go agent present it on the dial (`DialOptions.HTTPHeader` `Authorization: Bearer <token>`, replacing the `nil` at `main.go:161`); verify it in `index.ts` and assert token tenant/appliance/machine match the resolved route; reject 401/403 via `verifyToken` + `timingSafeEqual`. |
-| C2 | **Critical** | `worker/src/index.ts:29`, `worker/src/api.ts:275`, `worker/src/types.ts` (`JoinResp.fleetSecret`), `agent/main.go:53` | `FLEET_SECRET` is dead code: minted, broadcast to every agent in plaintext, never sent on the dial, never verified. Creates a false sense of authentication while the relay is wide open (same root cause as C1). | After C1's per-machine connect-token is in place, **remove `FLEET_SECRET` entirely**: drop from `Env` (`index.ts:29`), the `/join` response (`api.ts:275`), `JoinResp` type, and the agent struct (`main.go:53`). Do **not** keep a single global shared secret — one leaked box would impersonate the whole fleet. |
-| C3 | **Critical** | `web/lib/hub.ts:44-48`; all mutating handlers under `web/app/api/finch/*`; user-mgmt `users/[id]/role/route.ts`, `users/[id]/route.ts`, `users/invite/route.ts`; hub trust `worker/src/api.ts:78-84`, `auth.ts:160-169` | **No authorization anywhere.** `resolveTenant` returns `orgId ?? userId` with no role check; the hub only checks the service secret and trusts `X-Finch-Tenant`. Any logged-in org **Member** can mint `finch_` keys, rewrite ACLs, change settings/subdomain, release/approve appliances — and the user-management routes call the Clerk backend admin client (`clerkClient()`) with no caller-role check, so a Member can **self-promote to org:admin** (`users/[id]/role/route.ts:28`), delete the owner, or invite outsiders. Full tenant takeover from lowest privilege. | Add a shared `requireAdmin()` in `lib/hub.ts`: `const {userId,orgId,has}=await auth();` 401 if no `userId`; if `orgId` present require `has({role:'org:admin'})` else 403; treat no-org (personal tenant) as authorized. Call it at the top of every mutating handler. The three Clerk-direct user-mgmt routes bypass `resolveTenant`/`hubFetch` — they must add `requireAdmin()` individually. Refuse demoting/removing the last admin/owner. Keep read-only `GET /api/finch/state` open to members. |
-| H1 | **High** | `worker/src/appliance-do.ts:76,90` | No single-agent enforcement: every `/_connect` socket gets the `"agent"` tag; relay picks `getWebSockets("agent")[0]` nondeterministically. A second socket coexists undetected (malicious takeover once C1 is fixed-but-not-this, or split-brain from the agent's own reconnect loop `main.go:80-92`). | On a new `/_connect`, evict prior agents before accepting (`for ws of ctx.getWebSockets("agent"): ws.close(1012,"superseded")`) — last-writer-wins. Guard `markMachine` ordering: skip `markMachine(false)` on close code 1012, or re-assert `markMachine(true)` after eviction so liveness doesn't flap. **Must be paired with C1** — without auth this just gives the attacker a clean deterministic takeover. |
-| H2 | **High** | `worker/src/appliance-do.ts:61,99-103`; `agent/main.go:214,219-225`; gate `index.ts:134` | Relay is an open **SSRF proxy** into the box's loopback: attacker-controlled method + path + query + headers are forwarded verbatim to the agent's local upstream with no allowlist. `index.ts:134` only requires the 3rd segment be `mcp` (path starts with `/mcp`); the agent does pure string concat (`main.go:214`), so `/mcp/../admin` resolves to `/admin` on most frameworks → full SSRF to anything on `127.0.0.1`. Spoofable `X-Forwarded-For`, leaked `Authorization`. | (1) Hub-side: in `relayMcp` only forward the exact `/<appliance>/<machine>/mcp` route. (2) Agent-side (`main.go forward`): `path.Clean` the path **before** the check, then allowlist (only `POST`/`GET` where cleaned path `== "/mcp"` or has prefix `/mcp/` if subpaths are intended); 403 otherwise. (3) Replace `Object.fromEntries(req.headers)` (`appliance-do.ts:101`) with an explicit header safelist and drop inbound `Authorization`. |
-| H3 | **High** | `worker/src/index.ts:187,214-218` → `appliance-do.ts:101` → `agent/main.go:219-226` | Caller's `Authorization: Bearer finch_…` key is forwarded verbatim to the box's local upstream on every relayed call (credential leak across trust boundary). Default key scope is "all appliances" (`tenant-do.ts:473`), so a key harvested from one box's upstream logs is valid against every appliance in the tenant. | In `relayMcp` strip the credential before relaying: build the relay `Request` from a `Headers` clone with `authorization` deleted (`req.body` is still unconsumed at `index.ts:218`). Add `authorization` to the agent's hop-by-hop strip switch (`main.go:221`) as defense-in-depth. If a box upstream needs auth, inject a separate per-appliance secret — never the caller's `finch_` key. |
-| H4 | **High** | `worker/src/tenant-do.ts:529-557` (ACL stored only), `:251` (echoed in state), `:774-793` (checkKey, sole gate); `worker/src/index.ts:194-202`; web `access.tsx:62,106`, `panels.tsx:152` | **ACL rules are stored, logged, and advertised-as-enforced but NEVER evaluated** on MCP traffic. The only runtime gate is `checkKey` (key-hash exists + scope match). The dashboard explicitly promises "Every rule is enforced at the door" — a missing control turned into an actively misleading one. The mint form submits no `scope`, so `mintKey` defaults every key to fleet-wide. Net: any valid `finch_` key reaches every appliance in the tenant (intra-tenant confused-deputy / priv-esc). | Evaluate `s.acl` (default-deny, src→dst) inside the DO atomically with `checkKey` before forwarding: extend `checkKey` to return the key identity, resolve src entities (`key`→id/label, `user`→owner, `group`/`tag`→appliance's group/tags, `all`→wildcard), evaluate against the target appliance. Until then, remove the false UI copy (`access.tsx:62,106`, `panels.tsx:152`) and wire the mint form to send a real scope. |
-| H5 | **High** | `worker/src/api.ts:78-84`; `auth.ts:160-169`; `web/lib/hub.ts:55-76` | **Unscoped `FINCH_SERVICE_SECRET` is a fleet-wide god-key:** every `/api/*` route gates only on `serviceOk()` then trusts `X-Finch-Tenant` verbatim. Any holder can name any tenant and dump state, mint keys + join tickets, mutate ACLs/settings/appliances. Web→hub is a **public-internet `fetch` over `HUB_URL`** (not a service binding) to a publicly-routed `/api/*` surface. | Replace the public `fetch` with a **Cloudflare Worker-to-Worker service binding** (add `finch` to `finch-web`'s `services[]`) so the secret never crosses the public wire and `/api/*` stops being publicly callable. Add per-request cryptographic tenant binding (web HMACs/signs the tenant id with a key the hub verifies) so a leaked secret can't be replayed for arbitrary tenants. Add tenant-mismatch alerting. |
-| H6 | **High** | `worker/wrangler.jsonc:11-13`, `worker/src/index.ts:37-46,108` | `tenantFromHost` **fails OPEN** to the committed `DEFAULT_TENANT="dev-tenant"` for any non-subdomain host (apex, `www`, `*.workers.dev`). Ships a debug fallback tenant to prod; combined with H7, it's currently the sole live ingress and every request resolves to `dev-tenant`. | Remove `DEFAULT_TENANT` from committed `vars`; provide it only via `worker/.dev.vars` (dev) and **only under the dev env** (see §4). Make `tenantFromHost` **fail closed**: if no `<sub>.finchmcp.com` subdomain resolves and `DEFAULT_TENANT` is unset, return 400/404 ("tenant could not be resolved from host"). Reject apex and `*.workers.dev` in prod. |
-| H7 | **High** | `worker/wrangler.jsonc:32-33` (routes commented out, no `workers_dev:false`); `worker/package.json` (bare `wrangler deploy`) | Prod Worker is reachable on `*.workers.dev` (a stable public hostname **outside any WAF / CF Access** bound to `*.finchmcp.com`) and, via H6, pins all traffic to `dev-tenant`. | Under a production env set `"workers_dev": false` and bind the real routes (`finchmcp.com/*`, `*.finchmcp.com/*`) so only subdomain-scoped, WAF-coverable hostnames are reachable. Keep `workers.dev` only under the dev env. Deploy with `wrangler deploy --env production`. |
-| M1 | **Medium** | `worker/src/auth.ts:74-78,110-151`; `api.ts:24,216,243-260`; `tenant-do.ts:605-612` | Join tickets are **replayable for the full 1h TTL** ("one-shot" in comments, but `verifyToken` checks only signature + structure + `exp`; no `jti`/nonce/used-ticket store). `body.machine` is attacker-chosen and uncapped → registry pollution, machine-name squatting, unbounded DO creation within the ticket's tenant+appliance. Mitigated somewhat because `requireApproval` defaults true. | Add a random `jti` to `TicketPayload`; in `handleJoin` atomically check/record it in `TenantDO` (used-tickets set with TTL eviction at `exp`) before `registerMachine`. Shorten `TICKET_TTL_SECONDS` to ~5-10 min. Validate/clamp `body.machine` (length + charset) and bound machines-per-appliance. |
-| M2 | **Medium** | `worker/src/tenant-do.ts:460-488` (`mintKey` default `'all appliances'`), `:776-793` (`checkKey`); `api.ts:127-143` (scope passed unvalidated) | `checkKey` scope is the sole appliance gate, **defaults to fleet-wide**, and parses free-text/magic strings (`"all appliances"`/`"all"`/`"*"`, CSV). Unvalidated scope CSV (no check that ids are real appliances). Combined with H4 (ACL unenforced), every minted key is whole-tenant by default. | Change `Key.scope` to structured form (`string[]` of appliance ids, or `{all:true} \| {appliances:string[]}`). Default `mintKey` to least privilege (explicit selection required). Validate at mint time that every appliance id exists; reject unknown ids 400. Drop the magic-string overloads; gate fleet-wide behind an explicit validated boolean. |
-| M3 | **Medium** | `worker/wrangler.jsonc:1-34`, `web/wrangler.jsonc:1-23`, `worker/package.json`, `web/package.json` | **No wrangler environments:** single Worker name + one DO namespace per class for all deploys; env-less deploy scripts publish straight to the implicit top-level (prod) Worker. Prod-overwrite footgun and zero deploy-target isolation. (Note: `wrangler dev` defaults to local Miniflare, so routine local dev does **not** touch deployed prod DOs.) | Add `[env.production]` and `[env.dev]` blocks to both `wrangler.jsonc` files with distinct names, routes, vars (see §4). Change `deploy` scripts to target `--env production`. DO ids are name-scoped per Worker, so distinct names = separate DO state. |
-| M4 | **Medium** | `worker/.dev.vars:3-5`, `web/.dev.vars` (`FINCH_SERVICE_SECRET` duplicated), no `.example`, no env blocks | No dev/prod secret-separation hardening: identical dev `TICKET_SECRET`/`FINCH_SERVICE_SECRET` exist in two `.dev.vars` files; nothing structurally prevents an operator seeding prod with known dev values (e.g. `wrangler secret bulk .dev.vars`). `TICKET_SECRET` forges join tickets for any tenant; `FINCH_SERVICE_SECRET` is the web→hub trust root. | Add tracked `worker/.dev.vars.example` + `web/.dev.vars.example` (placeholders only) and a secrets checklist. Generate fresh high-entropy prod values; set per-worker via `wrangler secret put …` — never `secret bulk .dev.vars`. Add a deploy preflight that refuses to deploy if any live secret equals a known dev value. |
-| M5 | **Medium** | `worker/src/index.ts:88,178-202,194`; `api.ts:78,237`; `tenant-do.ts:358-384,597-653,765,781`; `worker/wrangler.jsonc` (no rate-limit binding) | **No rate limiting / abuse controls.** A well-formed-but-wrong `Bearer finch_…` forces a `checkKey` DO round-trip + state load before any gate (`index.ts:194`) → cheap unbounded DO-invocation/cost-amplification DoS for anyone who knows a tenant subdomain. `appliances[]` (enroll) and `machines[]` (registerMachine) are pushed uncapped → unbounded DO state growth. (Brute-force/oracle sub-claims are overstated: tickets/keys are 256-bit, and wrong vs. nonexistent keys both return 403.) | Bind Cloudflare Rate Limiting (`unsafe.bindings ratelimit`); gate per-(tenant,IP) in `relayMcp` **before** the `checkKey` round-trip and per-IP on `/join`. Cap appliances-per-tenant in `enroll` and machines-per-appliance in `registerMachine`; error past the cap. (Skip Turnstile on `/api/enroll` — it's service-secret-gated, no browser.) |
-| L1 | Low | `worker/src/auth.ts:160-169`; `api.ts:78-98,200-233` | Service-authed enroll/join can target any tenant via attacker-controlled `X-Finch-Tenant` (subset of H5). Architecture/secret-hygiene observation — the secret is only ever held by two first-party server-side components; not an attacker-reachable cross-tenant exploit. | Treat `FINCH_SERVICE_SECRET` as a root credential: store only in wrangler secrets in prod, isolate from the Clerk key in dev (currently co-located in `web/.dev.vars`), rotate independently, log/monitor its use. Optionally HMAC-bind per tenant (defense-in-depth, not a hard boundary — tenant ids are low-entropy Clerk org/user ids). |
-| L2 | Low | `web/app/api/finch/*` (all POST/PUT/DELETE), `web/lib/hub.ts:44-76`, `web/middleware.ts:5-11` | No CSRF/Origin defense on cookie-authed mutating handlers. **Mitigated in modern browsers** by Clerk's default `SameSite=Lax` session cookie (Lax does not attach to cross-site POST). Defense-in-depth gap, not a live CSRF. | Add a same-origin guard rejecting non-GET `/api/finch/*` whose `Origin` is absent/not allowlisted (or lacking `Sec-Fetch-Site: same-origin`), enforced in `middleware.ts` so all current/future handlers are covered. Don't rely on content-type as CSRF defense. |
-| L3 | Low | `worker/src/index.ts:88-155` (OPTIONS → 404 at `:153`), `api.ts`, `appliance-do.ts` | No CORS/OPTIONS handling. **Not a live vuln**: both planes use header-based credentials (service secret; Bearer key), no cookie/ambient-credential surface, and OPTIONS already fails closed to 404 with no `Access-Control-Allow-Origin`. Posture/possible-functional gap. | Make posture explicit. Control API: keep header-only, emit no `Access-Control-*`. MCP relay: add an allowlist OPTIONS/CORS handler **only if** browser MCP clients are a goal (`Access-Control-Allow-Headers: authorization, content-type`, omit `Allow-Credentials`); otherwise document as non-browser only. |
-| L4 | Low | `worker/src/api.ts:223`; `web/components/dash/panels.tsx:30,33`; `web/components/HowItWorks.tsx:36` | Advertised `/install` pipe-to-shell endpoint does not exist (`/install`, `/install.ps1`, `/start` all 404; the `finch join` verb doesn't exist — agent parses `finch --ticket`; dashboard copies a mock `tk_` ticket). Broken onboarding now; `curl\|sh` is a future supply-chain risk. | Fix all surfaces consistently; correct the CLI invocation (`finch --ticket`, not `finch join`); render the real hub-issued ticket. When `/install` is built: serve over HTTPS from a fixed apex with a published SHA-256 / signed (cosign/minisign) release binary, or ship a directly-run binary instead of `\| sh`. |
-| L5 | Low | `web/.dev.vars` (`CLERK_SECRET_KEY=sk_test_…`, `FINCH_SERVICE_SECRET`), `worker/.dev.vars` (`FINCH_SERVICE_SECRET`/`FLEET_SECRET`/`TICKET_SECRET`) | Dev-only Clerk `sk_test_` key + finch dev secrets sit in plaintext in correctly-gitignored `.dev.vars`. Confirmed NOT tracked / never committed / not leaked into `.next`. Standard local-dev hygiene; blast radius is the dev Clerk instance only. (Rotate because the `sk_test_` value was disclosed into a review transcript.) | Rotate the disclosed `sk_test_` key + dev finch secrets. Add tracked `.dev.vars.example` stubs (none exist today). `.dev.vars` IS the intended Wrangler/OpenNext local-dev mechanism — keep it (gitignored), don't move local dev to a secret manager. |
-| L6 | Low | `web/lib/hub.ts:83-91` (`hubProxy`), `web/lib/hub.ts:98` (`errorResponse`) | Hub-internal error details pass straight through to the client. Largely redundant (the web `/api/finch/*` routes are a 1:1 public projection of the hub API) — the only genuine leak is the raw exception message at `errorResponse:98`. No secrets leak; all routes post-auth. | In `errorResponse` non-`HttpError` branch: log `err.message` server-side, return generic `{error:'internal error'}` 500. In `hubProxy`: pass structured `{error}` through for expected 4xx (dashboard relies on it), genericize only 5xx bodies. |
-| L7 | Low | `web/.env.local`, `web/.dev.vars`, `web/lib/hub.ts:44-48`, `web/wrangler.jsonc` | Only a Clerk **dev** instance (`pk_test`/`sk_test`) is wired; `resolveTenant` makes Clerk identity the tenant root-of-trust. A dev-grade auth instance would undermine prod tenant identity if deployed. Pre-launch hardening note (nothing deployed yet). | Provision a Clerk **production** instance before deploy; set `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=pk_live_…` as a build-time var for the prod build and `CLERK_SECRET_KEY=sk_live_…` via `wrangler secret put` under the production env. Configure Organizations on the live instance (`resolveTenant` depends on `orgId`). Lock authorized parties / origins to `finchmcp.com`. |
-| L8 | Low | `web/wrangler.jsonc:14-20`; `web/lib/hub.ts:55-76` (secret set at `:69`) | `HUB_URL` has no env separation (committed default `http://localhost:8787`). A misconfigured non-https override would send the `X-Finch-Service` root secret in cleartext. Fail-broken in practice (localhost unroutable on CF + `global_fetch_strictly_public`), pre-prod. | Add an in-code guard in `hubFetch`: after resolving `hubUrl`, throw 500 unless it is `https:` or a localhost/`127.0.0.1` dev URL (fail-closed regardless of config). Move `HUB_URL` into per-env config (https hub under `[env.production]`, localhost only under dev). The service binding in H5 makes this moot for the hub call. |
-| L9 | Low | `worker/src/appliance-do.ts:102` (buffering); `index.ts:178-239` | No request-size limit on the relay — full body buffered into the per-machine DO heap (`await req.text()`), no 413/content-length check anywhere. Authenticated (post-`checkKey`), single-machine scope; single-request OOM impossible (CF 100MB cap) but concurrent POSTs can sum past DO heap. | In `relayMcp` (post-auth, pre-`stub.fetch`) reject when `content-length` exceeds a small cap (a few MB suits MCP JSON-RPC) → 413. **Also** enforce in `ApplianceDO.fetch` after `req.text()` by checking string length (content-length is client-controlled/absent for chunked), else a spoofed header bypasses the index.ts check. |
-
----
-
-## 2. Hardening checklist (ordered, grouped — apply before any prod deploy)
-
-Apply top to bottom. The **auth channel** group is the deploy gate.
-
-### A. Auth channel (relay `/_connect`) — DEPLOY BLOCKER
-1. **Mint a per-machine HMAC connect-token at `/join`** (`api.ts handleJoin`): `signToken({tenant,appliance,machine,exp}, TICKET_SECRET)`; add `machine` to `TicketPayload` and update `verifyToken`'s shape check. Return it in `JoinResp` (e.g. `connectToken`). [C1]
-2. **Send it from the Go agent on the dial**: replace `websocket.Dial(ctx, wsURL, nil)` (`main.go:161`) with `DialOptions{HTTPHeader: {"Authorization": "Bearer <token>"}}`; re-/join on reconnect (agent loops forever — don't let a short TTL fail closed mid-life; use a renewable/long-lived relay token). [C1]
-3. **Verify before `acceptWebSocket`**: in `index.ts` (upgrade headers available there) `verifyToken` it and assert token tenant/appliance/machine match the host/path-resolved route; reject 401/403 with `timingSafeEqual`. Re-verify or pass a trust flag into `appliance-do.ts` so the DO can't be hit directly. [C1]
-4. **Enforce single-agent** in `appliance-do.ts`: evict prior `getWebSockets("agent")` sockets (`ws.close(1012,"superseded")`) before accepting; skip `markMachine(false)` on close code 1012 (or re-assert `true`) to avoid liveness flapping. [H1]
-5. **Remove `FLEET_SECRET` entirely** once the connect-token is load-bearing (`index.ts:29`, `api.ts:275`, `JoinResp` type, `main.go:53`, wrangler comments). [C2]
-
-### B. Secrets
-6. Generate fresh high-entropy prod values for `TICKET_SECRET`, `FINCH_SERVICE_SECRET` (and the new connect-token secret if separate). Set per-worker via `wrangler secret put …` (never `secret bulk .dev.vars`). [M4]
-7. Add tracked `worker/.dev.vars.example` + `web/.dev.vars.example` (placeholders only) and a secrets checklist. [M4, L5]
-8. Rotate the disclosed dev `sk_test_` Clerk key + dev finch secrets. [L5]
-9. Add a deploy preflight that refuses to deploy if any live secret equals a known dev value. [M4]
-10. Isolate `FINCH_SERVICE_SECRET` from the Clerk secret in dev (`web/.dev.vars` co-locates them); treat it as a root credential, rotate independently, monitor use. [L1]
-
-### C. Tenant isolation
-11. Make `tenantFromHost` **fail closed** (no `DEFAULT_TENANT` fallback in prod; 400/404 on unresolved host). Reject apex + `*.workers.dev`. [H6]
-12. Add per-request **cryptographic tenant binding** on web→hub (web signs/HMACs the tenant id; hub verifies), so a leaked service secret can't be replayed for arbitrary tenants. [H5, L1]
-13. **Evaluate ACL rules** in the relay (default-deny, atomic with `checkKey` inside the DO); remove the false "enforced at the door" UI copy until done. [H4]
-14. Replace free-text scope with structured least-privilege scope; validate appliance ids at mint; drop magic strings. [M2]
-
-### D. Web / Clerk authz + CSRF
-15. Add `requireAdmin()` to `lib/hub.ts`; gate every mutating `/api/finch/*` handler. [C3]
-16. Gate the three Clerk-direct user-management routes (`users/[id]/role`, `users/[id]`, `users/invite`) individually — they bypass `resolveTenant`/`hubFetch`; refuse demoting/removing the last admin/owner. [C3]
-17. Provision a Clerk **production** instance (`pk_live`/`sk_live`); configure Organizations; lock origins to `finchmcp.com`. [L7]
-18. Add a same-origin/`Sec-Fetch-Site` guard for non-GET `/api/finch/*` in `middleware.ts`. [L2]
-19. Genericize 5xx error bodies in `errorResponse`/`hubProxy`; log details server-side. [L6]
-
-### E. Transport / CORS / rate-limit
-20. Move web→hub to a **CF Worker-to-Worker service binding** (add `finch` to `finch-web`'s `services[]`); `/api/*` stops being publicly callable. [H5]
-21. Add the `hubFetch` https-or-localhost guard (belt-and-suspenders if a binding isn't used everywhere). [L8]
-22. Fix the **SSRF**: hub-side exact-route forward + agent-side `path.Clean` + method/path allowlist; header safelist + drop inbound `Authorization`. [H2]
-23. **Strip the caller's `finch_` key** before relaying (hub-side + agent-side defense). [H3]
-24. Bind Cloudflare Rate Limiting; gate `relayMcp` (before the DO round-trip) and `/join` per-IP/per-tenant. Cap appliances/machines counts. [M5]
-25. Add request-size 413 caps in `relayMcp` and `ApplianceDO.fetch`. [L9]
-26. Make join tickets single-use (`jti` + used-set), shorten TTL, validate `body.machine`. [M1]
-27. Bind real routes + `workers_dev:false` under the prod env so traffic is WAF/Access-coverable. [H7]
-28. Fix the `/install` onboarding surfaces / CLI verb / mock ticket (and design a signed-binary install before enabling `curl|sh`). [L4]
-
----
-
-## 3. Cloudflare deploy inventory
-
-What actually ships, with the exact secrets/vars/routes per worker.
-
-### 3.1 Workers (two)
-
-| Worker | Source | Build/deploy | Plan |
-|--------|--------|--------------|------|
-| **`finch`** (hub) | `worker/src/index.ts` | `wrangler deploy --env production` | **Workers Paid** (Durable Objects require it) |
-| **`finch-web`** (dashboard + landing) | OpenNext build → `.open-next/worker.js` | `opennextjs-cloudflare build && opennextjs-cloudflare deploy -- --env production` | Workers Paid (shares account) |
-
-### 3.2 Durable Objects (hub only)
-
-- Classes: **`ApplianceDO`** (per-machine WS relay), **`TenantDO`** (per-tenant control-plane state).
-- Bindings: `APPLIANCE → ApplianceDO`, `TENANT → TenantDO`.
-- Migrations (already present): `v1` `new_sqlite_classes: ["ApplianceDO"]`, `v2` `new_sqlite_classes: ["TenantDO"]`. SQLite-backed (required for the modern DO API). **Do not renumber existing tags.**
-- DO ids are derived from `idFromName` (`${tenant}:${appliance}:${machine}` for ApplianceDO, tenant id for TenantDO) and are **scoped per Worker name** — so a distinct prod Worker name (`finch-prod`) gives a fully separate DO namespace from dev (see §4).
-
-### 3.3 Secrets & vars
-
-**Hub (`finch`)** — set under the production env: `wrangler secret put <NAME> --env production`
-- `FINCH_SERVICE_SECRET` (secret) — web→hub shared secret.
-- `TICKET_SECRET` (secret) — HMAC key for join tickets (and the new per-machine connect-token).
-- ~~`FLEET_SECRET`~~ — **delete** (dead code, C2). If the connect-token uses a separate signing secret, `wrangler secret put CONNECT_TOKEN_SECRET` instead.
-- `DEFAULT_TENANT` (var) — **dev env only.** Must NOT be set in production (H6: prod must fail closed).
-- Routes (prod env): `finchmcp.com/*` and `*.finchmcp.com/*`; `workers_dev: false`.
-
-**Web (`finch-web`)** — secrets via `wrangler secret put <NAME> --env production`; publishable key is a build-time env var
-- `CLERK_SECRET_KEY` (secret) — `sk_live_…` (prod Clerk instance).
-- `FINCH_SERVICE_SECRET` (secret) — must equal the hub's. *(Eliminated from the wire by the service binding in H5, but still configured for the bridge.)*
-- `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` (build-time var) — `pk_live_…`. Must be present at build or Clerk silently falls back; supply via CI build env or wrangler var.
-- `NEXT_PUBLIC_CLERK_SIGN_IN_URL` / `_SIGN_UP_URL` / `_SIGN_IN_FALLBACK_REDIRECT_URL` / `_SIGN_UP_FALLBACK_REDIRECT_URL` (build-time vars).
-- `HUB_URL` (var) — prod hub origin under the production env (or unused once the service binding lands).
-- Service binding (recommended, H5): `services: [{ binding: "FINCH_HUB", service: "finch" }]` in addition to the existing `WORKER_SELF_REFERENCE`.
-- Routes (prod env): `finchmcp.com/*` (apex/app).
-
-### 3.4 DNS / routes for `finchmcp.com`
-
-- **Apex + app** (`finchmcp.com`, `www`/app host) → **`finch-web`** (dashboard + landing).
-- **Tenant subdomains** (`*.finchmcp.com`) → **`finch`** (hub) for MCP relay + agent `/connect`. The wildcard is how `tenantFromHost` resolves the tenant.
-- Zone `finchmcp.com` must be on Cloudflare (orange-cloud) so Worker routes + WAF apply.
-- After H6/H7: `workers_dev:false` and the only reachable hostnames are the bound routes.
-
-### 3.4.1 Custom hostnames
-
-Relay routing uses a single **host key** namespace in RouterDO: `<slug>.finchmcp.com` stores the
-bare slug (`pelican`), while vanity and BYO domains store the full lowercase hostname
-(`pelican.aviary.run`, `mcp.acme.com`). Unknown host keys fail closed with 404. The hub sets no
-cookies on relay hosts (the browser login wall was removed), and a box's own `Set-Cookie` is
-stripped of any `Domain` attribute so it stays host-only.
-
-Vanity hostnames are gated by `VANITY_SUFFIXES` and `VANITY_TENANT`: production sets
-`VANITY_SUFFIXES="aviary.run"`, and `VANITY_TENANT` must be set to the only tenant allowed to
-claim names below that suffix. Without a matching `VANITY_TENANT`, vanity registration returns
-403 so tenants cannot squat first-party names.
-
-BYO domains use Cloudflare for SaaS when `CF_API_TOKEN` and `CF_SAAS_ZONE_ID` are configured.
-Set the token with `wrangler secret put CF_API_TOKEN --env production`; never place it in vars or
-logs. `BYO_CNAME_TARGET` controls the customer-facing CNAME target and defaults to
-`finchmcp.com`.
-
-Ops setup:
-- `aviary.run`: create a proxied wildcard DNS record and bind the Worker route
-  `*.aviary.run/*`.
-- `finchmcp.com`: configure Cloudflare for SaaS with the Worker as fallback origin and keep the
-  catch-all route for custom-hostname requests.
-- Customers add the CNAME returned by `finch domain add <hostname>`; traffic is inert until DNS
-  points at Finch and, for BYO domains, Cloudflare DCV issues the cert.
-
-Collisions are first-come in RouterDO. A tenant can register a BYO name before the DNS owner has
-completed DCV, so operationally treat stale or disputed registrations as an admin support path.
-
-### 3.5 Clerk
-
-- A **production Clerk instance** (separate from dev). `pk_live`/`sk_live`. Organizations are not used: a signed-in user's tenant is their Clerk user id (§5). No webhook endpoint is needed. Authorized parties / allowed origins locked to `finchmcp.com`.
-
-### 3.6 Step-by-step deploy order
-
-1. **Plan**: confirm the Cloudflare account is on **Workers Paid** (DOs).
-2. **Zone**: add `finchmcp.com` to Cloudflare; verify DNS is active (orange-cloud).
-3. **Clerk prod**: create the production instance (Organizations stay off); set authorized parties to `finchmcp.com`; note `pk_live`/`sk_live`.
-4. **Apply all Critical + High fixes** from §2 (deploy is blocked otherwise) — especially the `/_connect` connect-token (A1-A5).
-5. **Hub secrets**: `wrangler secret put FINCH_SERVICE_SECRET --env production`, `... TICKET_SECRET --env production`, (connect-token secret if separate). Do NOT set `DEFAULT_TENANT` in prod.
-6. **Deploy hub**: `cd worker && wrangler deploy --env production`. Confirm DO migrations applied and `workers_dev:false` / routes bound.
-7. **Web build-time vars**: set `NEXT_PUBLIC_CLERK_*` (incl. `pk_live`) in the build env.
-8. **Web secrets**: `wrangler secret put CLERK_SECRET_KEY --env production` (`sk_live`), `... FINCH_SERVICE_SECRET --env production` (matching the hub).
-9. **Deploy web**: `cd web && opennextjs-cloudflare build && opennextjs-cloudflare deploy -- --env production`.
-10. **Smoke test**: `finch login` approval at `/cli`, enroll an appliance, agent `/join` + `/_connect` with the connect-token, a relayed MCP call with a `finch_` key, and confirm the apex + a tenant subdomain both route correctly. Verify `*.workers.dev` and the apex no longer resolve to `dev-tenant`.
-
----
-
-## 4. Dev vs Prod separation
-
-Goal: **a dev build can never point at prod secrets or prod tenant data.** Achieved with
-wrangler **environments** for both workers (distinct names → distinct DO namespaces, routes,
-vars, and secrets), separate Clerk instances, and `DEFAULT_TENANT` confined to dev.
-
-### 4.1 Design
-
-- **Distinct Worker names per env** — `finch` / `finch-web` for dev, `finch-prod` / `finch-web-prod` for production. Because DO ids are name-scoped per Worker, the prod Worker has a **completely separate `ApplianceDO`/`TenantDO` namespace**; dev deploys can never read or mutate prod tenant registries, keys, or ACLs.
-- **Distinct routes** — prod binds `finchmcp.com/*` + `*.finchmcp.com/*` with `workers_dev:false`; dev uses `workers.dev` (or a `dev.finchmcp.com` zone) and may keep `workers_dev:true`.
-- **Distinct secrets** — secrets are per-deployed-worker; `wrangler secret put … --env production` only touches `finch-prod`. Generate fresh prod values; never copy dev `.dev.vars` into prod.
-- **Distinct Clerk instances** — dev uses `pk_test`/`sk_test`, prod uses `pk_live`/`sk_live`, each its own JWKS issuer. Since `resolveTenant` makes Clerk identity the tenant root-of-trust, this keeps prod tenant identity off the dev auth instance.
-- **`DEFAULT_TENANT` is dev-only** — set only in `[env.dev]` vars and `worker/.dev.vars`. Prod has it **unset**, and `tenantFromHost` fails closed (H6) so a missing subdomain is a 400/404, never a silent fallback tenant.
-- **Local dev → dev env** — `.dev.vars` (gitignored, throwaway values) feeds `wrangler dev` / `next dev` in local Miniflare mode; local DOs live in gitignored `.wrangler/` and never touch edge DOs (only `wrangler dev --remote`, which we don't use, would).
-- **Guardrail** — change the bare `deploy` scripts to require `--env`, and add a deploy preflight (M4) that aborts if a live secret equals a known dev value. A dev checkout therefore cannot `npm run deploy` onto the prod Worker by accident.
-
-### 4.2 `worker/wrangler.jsonc` env blocks to add
-
-```jsonc
-{
-  "name": "finch",                 // dev / default
-  "main": "src/index.ts",
-  "compatibility_date": "2026-06-01",
-  "compatibility_flags": ["nodejs_compat"],
-  "observability": { "enabled": true },
-  "durable_objects": {
-    "bindings": [
-      { "name": "APPLIANCE", "class_name": "ApplianceDO" },
-      { "name": "TENANT", "class_name": "TenantDO" }
-    ]
-  },
-  "migrations": [
-    { "tag": "v1", "new_sqlite_classes": ["ApplianceDO"] },
-    { "tag": "v2", "new_sqlite_classes": ["TenantDO"] }
-  ],
-
-  "env": {
-    "dev": {
-      "name": "finch-dev",
-      "workers_dev": true,
-      // DEFAULT_TENANT lives ONLY here (and in .dev.vars) — never in prod.
-      "vars": { "DEFAULT_TENANT": "dev-tenant" }
-    },
-    "production": {
-      "name": "finch-prod",
-      "workers_dev": false,
-      // NO DEFAULT_TENANT — tenantFromHost must fail closed in prod.
-      "vars": {},
-      "routes": [
-        { "pattern": "finchmcp.com/*",   "zone_name": "finchmcp.com" },
-        { "pattern": "*.finchmcp.com/*", "zone_name": "finchmcp.com" }
-      ]
-    }
-  }
-  // Secrets per env: wrangler secret put FINCH_SERVICE_SECRET --env production
-  //                  wrangler secret put TICKET_SECRET        --env production
-  //                  (CONNECT_TOKEN_SECRET if separate). FLEET_SECRET removed.
-}
-```
-
-> Note: top-level `durable_objects`/`migrations` apply to all environments. Keep them at the
-> top level (as above) so dev and prod share the same class definitions but get separate
-> name-scoped DO instances.
-
-### 4.3 `web/wrangler.jsonc` env blocks to add
-
-```jsonc
-{
-  "main": ".open-next/worker.js",
-  "name": "finch-web",             // dev / default
-  "compatibility_date": "2025-09-23",
-  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
-  "assets": { "directory": ".open-next/assets", "binding": "ASSETS" },
-
-  "env": {
-    "dev": {
-      "name": "finch-web-dev",
-      "services": [
-        { "binding": "WORKER_SELF_REFERENCE", "service": "finch-web-dev" },
-        { "binding": "FINCH_HUB", "service": "finch-dev" }   // service binding (H5)
-      ],
-      "vars": { "HUB_URL": "http://localhost:8787" }
-    },
-    "production": {
-      "name": "finch-web-prod",
-      "workers_dev": false,
-      "services": [
-        { "binding": "WORKER_SELF_REFERENCE", "service": "finch-web-prod" },
-        { "binding": "FINCH_HUB", "service": "finch-prod" }  // service binding (H5)
-      ],
-      "vars": { "HUB_URL": "https://finchmcp.com" },         // unused once FINCH_HUB binding is used
-      "routes": [
-        { "pattern": "finchmcp.com/*", "zone_name": "finchmcp.com" }
-      ]
-    }
-  }
-  // Secrets per env: wrangler secret put CLERK_SECRET_KEY      --env production  (sk_live_…)
-  //                  wrangler secret put FINCH_SERVICE_SECRET  --env production  (== hub)
-  // Build-time: NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=pk_live_… (CI build env / wrangler var)
-}
-```
-
-### 4.4 Local dev mapping
-
-- `worker`: `wrangler dev` reads `worker/.dev.vars` (incl. `DEFAULT_TENANT=dev-tenant`) in local Miniflare — separate from any deployed DO state.
-- `web`: `next dev` / `opennextjs-cloudflare preview` reads `web/.dev.vars` (`pk_test`/`sk_test`, local `HUB_URL`).
-- Both `.dev.vars` are gitignored; commit `.dev.vars.example` stubs (M4) so a new clone knows what to fill in without inheriting real values.
-
----
-
-## 5. Single-user tenancy
-
-A tenant is one Clerk user: its id is that user's Clerk user id, and that user
-is its only member (the owner). Clerk Organizations are not used. The hub
-authorizes only three kinds of relay caller — a `finch_` key, a Clerk OAuth
-token whose user id IS the tenant id, or the first-party service assertion
-used by `POST /api/cli/call` — plus anyone at all on a service marked
-`public`. A browser without a key on a key-gated service gets a plain JSON
-401; there is no login-wall redirect, portal grant, or session cookie, and the
-relay forwards the Cookie header untouched.
-
-- **Web.** `resolveTenant` (web/lib/hub.ts) uses the Clerk `userId` as the
-  tenant, signs every hub assertion for it, and confirms with
-  `POST /api/member-context` that the user is its active owner. A tenant that
-  has never been set up answers `{needsBootstrap:true}`; the web retries with
-  the user's verified primary email and the hub creates the owner row. There
-  is no tenant chooser, owner lookup, or account label.
-- **Hub.** `TenantDO.memberContext` reports a member only for the Clerk user
-  whose tenant it is; anyone else gets `{member:null, tenantMeta:null}`.
-  `gateOauth` admits an OAuth token iff its user id equals the tenant id (a
-  public service admits anyone); organization claims are not read, and
-  `verifyClerkOAuthToken` keeps only `sub`/`user_id`.
-- **Keys.** `checkKey` allows a key iff it exists (revocation deletes it), the
-  service exists, and its scope is `{all:true}` or lists the service — plus
-  expiry when a tenant enforces it. There are no ACL rules, groups, or
-  per-user grants, and every key's owner is the tenant owner (a caller cannot
-  name another).
-- **Boxes.** `/join` and `/refresh` are unchanged for ordinary boxes. Grants
-  carrying a per-box credential `epoch` were only issued by the retired
-  Aviary device flow; they no longer verify, so such a box must be re-added
-  with `finch add`. Aviary manifest route prefixes are no longer enforced.
-
-### 5.1 The single-user migration (owner-approved, destructive)
-
-Deploying this version permanently deletes legacy data:
-
-- **Durable Object migration `v7`** (`deleted_classes`) deletes
-  `AviaryEnrollmentDO` (the retired device-enrollment records) and
-  `DirectoryDO` (the global Clerk-user → tenant index) with all their stored
-  data, in every environment. `deploy-preflight` (scripts/do-migrations.mjs)
-  allows exactly this deletion and refuses any other `deleted_classes` step,
-  and refuses any edit to the applied migration history.
-- **TenantDO purge.** On the first request each TenantDO serves after the
-  deploy, `purgeLegacyTenancy` runs once, recorded by the versioned
-  `singleUserPurge` flag in the stored state (tenants created afterwards are
-  born flagged; bump `SINGLE_USER_PURGE_VERSION` to run a new pass). The
-  owner is the member row whose `clerkUserId` is the tenant id; a team
-  workspace or Clerk-org tenant (`kind: "team"` or an `org_` id) has no owner.
-  The purge:
-  - deletes every other member row (co-owners, admins, members,
-    invitations) and normalizes the owner's row to an active owner; with no
-    owner it also deletes `tenantMeta`, so the tenant's own user bootstraps
-    it afresh;
-  - deletes `groups`, `acl`, `accessRequests`, `sessionEpoch`, the earlier
-    `cliSingleUserCut` flag, the Aviary fields on services
-    (`aviaryManaged`, `aviaryManifestSha256`, `aviaryApprovalNonce`, and the
-    manifest's `routes`) and boxes (`aviaryCredentialEpoch`,
-    `aviaryPendingCredentialEpoch`, `aviaryPendingApprovalNonce`);
-  - deletes `access` audit rows and any audit row naming a non-owner member;
-  - decides whether the tenant was **exposed**: anyone besides the owner
-    could have signed in to it. That is a team/org tenant, or any other
-    member row that is not a never-accepted invitation (`state: "invited"`
-    with no `clerkUserId`/`boundAt`). A removed member who had signed in was
-    kept as a `disabled` row, so the rows are a complete record.
-  - **exposed:** revokes every `finch_` key, removes every box, and bumps
-    `cliTokenEpoch` once. Stored state never records who minted a key or
-    enrolled a box. A key's `owner` is only who it was labelled for; the
-    Keys view defaulted it to the tenant owner, and a CLI mint always used
-    the owner's email, so an admin's key can carry the owner's label.
-    Removing a box is what makes `/refresh` refuse its long-lived `/join`
-    credential (those carry no epoch) and stops the relay routing to it,
-    pinned paths included. Marking boxes `pending` would not be enough: a
-    pinned path still reaches a pending box, and `finch approve` clears a
-    whole service at once. Services stay. Each one emptied here is listed in
-    `reenroll`, so the owner's next `finch add <name>` (the command a revoked
-    box's agent prints) re-enrolls it in place at the same URL, once,
-    instead of creating `<name>-2`.
-  - **not exposed:** revokes only keys labelled with an email other than
-    the owner's (a key labelled with the owner's email or the `"you"`
-    placeholder stays). Boxes and CLI logins are untouched, so never-accepted
-    invitations cost the owner nothing.
-  - removes revoked key ids from service and box key lists.
-  - **ownerless tenants** (team/Clerk-org) also get every service set to
-    `auth: "key"`, so with no key and no box nothing on them answers. If
-    exactly one active owner row with a Clerk id existed, that user is
-    recorded as `routeHeir`, and `handOffRoutes` moves every RouterDO host
-    key the tenant holds (its finchmcp.com slugs and custom hostnames) to
-    that user's tenant. Before this change, the tenant chooser sent that user
-    to the team tenant. Each key moves atomically (`RouterDO.transfer`), so
-    it is never claimable in between. Cloudflare custom hostnames are keyed
-    by hostname, so they need no change. The marker is cleared only when
-    every key has moved, and a router failure is retried by the next
-    instance. With no single former owner, the hosts stay with the inert
-    tenant, since slugs are never recycled.
-
-  Because the purge is lazy, a sleeping team tenant could still hold a slug
-  or hostname its former owner tries to claim. On a collision,
-  `routerRegisterWakingHolder` (used by the subdomain setting and
-  `POST /api/hostnames`) wakes the holder once, which runs its purge and
-  hand-off, and then re-checks. `POST /api/hostnames` never provisions a
-  hostname at Cloudflare again when the tenant already owns it (for
-  example, after a hand-off). A duplicate would fail, and its failure path
-  would unregister the hostname.
-
-  A tenant with only its owner changes nothing but the flag (plus dropping
-  the always-present `acl`/`groups` defaults). A tenant no request touches
-  keeps its legacy rows until one does. After `v7` there is no index of such
-  tenants. RouterDO's `slugs` table still lists every tenant that holds a hub
-  domain, which covers every tenant that ever loaded state or enrolled a
-  service, and that is the source a later sweep would use.
-
-`SESSION_SECRET` (hub) and `CLERK_WEBHOOK_SECRET` (web) are no longer read;
-either can be deleted as a separate step. The Clerk production webhook
-endpoint, whose web route was removed with the CLI cut, should be removed
-from the Clerk dashboard.
+# Security model and deployment
+
+Status: **current.** How finch authenticates each hop, what it deploys to
+Cloudflare, and how the environments are kept apart. The June 2026 pre-launch
+audit that used to live here is in
+[`archive/security-review-2026-06.md`](archive/security-review-2026-06.md),
+with a note on how each finding was resolved. To report a vulnerability, see
+[`SECURITY.md`](../SECURITY.md).
+
+## Components
+
+| Component | Code | Runs as |
+|---|---|---|
+| **Hub** | `worker/` | Cloudflare Worker `finch-prod` with three Durable Object classes: `RouterDO` (one global index from host to account), `TenantDO` (one per account: services, machines, key hashes, settings, call records) and `BoxDO` (one per service per machine: the relay socket). |
+| **Web** | `web/` | Cloudflare Worker `finch-web-prod` (Next.js through OpenNext): the landing page, docs, Clerk sign-in and the `finch login` approval page at `/cli`. |
+| **CLI** | `agent/` | The `finch` binary on your machine. `finch run` (usually as a launchd or systemd user service) holds one outbound WebSocket per service. |
+
+In code an account is a *tenant* and a machine is a *box*; user-facing text
+says account and machine.
+
+## Who authenticates to whom
+
+### Your machine to the hub
+
+1. **CLI login.** `finch login` starts a device-code flow. You approve the code
+   on `/cli` while signed in; the hub then issues a CLI token (30 days, signed
+   with `FINCH_SERVICE_SECRET` and bound to a per-account epoch) that the CLI
+   stores in `~/.finch/cli.json` with mode `0600`. `finch revoke-tokens`
+   bumps the epoch, which invalidates every CLI token for the account.
+2. **Join ticket.** `finch add` asks the hub for a join ticket (15 minutes,
+   single use: its `jti` is burned on first use) and trades it at `/join` for a
+   refresh token.
+3. **Refresh token.** Long-lived (30 days), stored per service in the
+   credentials directory (`~/.finch/<service>.json` by default, `0600`). The agent
+   presents it at `/refresh` to get connect tokens, so restarts and reboots need
+   no new ticket.
+4. **Connect token.** Short-lived (120 seconds), HMAC-signed with
+   `TICKET_SECRET` for exactly one account, service and machine. The agent
+   dials `wss://<host>/<service>/<machine>/_connect?ct=<token>`; the hub checks
+   the token against the route before it accepts the socket. A new connection
+   for the same service and machine closes the old one.
+
+The CLI refuses a non-loopback `http://` hub URL, a plaintext relay URL and a
+redirect from TLS to plaintext.
+
+### Callers to a service
+
+A key-gated service (the default) accepts one of:
+
+- a **`finch_` key** as `Authorization: Bearer finch_…`. The hub stores only
+  the key's SHA-256 hash, its last four characters, a label and a scope
+  (`{all:true}` or a list of services, validated when the key is minted).
+  `finch connect` mints a key for one service and writes it into the client's
+  configuration without printing it.
+- a **Clerk OAuth access token**, for clients that only speak OAuth (for
+  example claude.ai custom connectors). The hub serves RFC 9728
+  protected-resource metadata that points at Clerk, and admits a token only
+  when its Clerk user is the account owner.
+- the hub's own first-party assertion, used by `finch test` and `finch call`
+  (`POST /api/cli/call`).
+
+A service marked `--public` accepts anyone with the URL.
+
+Before relaying, the hub removes the credentials it reads, so a caller's key
+or token never reaches your local server:
+
+- by name: `Authorization`, `Proxy-Authorization` and every `X-Finch-*`
+  header (which carry the service secret and the first-party assertion);
+- by value: any other header whose value contains the exact bearer token
+  presented in `Authorization` on that request (a client that copies its key
+  into `X-Api-Key`, say). Other text that merely looks like a key, such as
+  `Mcp-Name: finch_search`, is left alone.
+
+Everything else passes through, including the whole `Cookie` header. That
+includes the retired `__Host-finch_session` and `finch_session` cookies of the
+removed browser login wall; the hub no longer reads or strips them, and they
+expired within 12 hours of that feature's removal.
+
+The hub then adds a short-lived ES256 **caller assertion**
+(`X-Finch-Assertion`), which a service can verify against the hub's JWKS to
+learn who is calling
+([`worker/CALLER_ASSERTIONS.md`](../worker/CALLER_ASSERTIONS.md)), whenever
+assertions are configured and the call was authenticated by:
+
+- a `finch_` key on a key-gated service (`sub` is `key:<id>`);
+- a Clerk OAuth token, on any service (`sub` is `user:<id>`); or
+- the first-party `finch test` / `finch call` path (`sub` is
+  `service:finch-dashboard`), on any service.
+
+A public service therefore gets no assertion for a keyless call or a call
+with a `finch_` key, but does get one when the caller signed in with OAuth or
+used `finch test`. On a public service the OAuth check admits any user of the
+hub's Clerk instance, not only the account owner, so the assertion there says
+who called, not that they were allowed to. Treat an assertion as
+authorization only on a key-gated service.
+
+On your machine, the agent confines relayed paths to the service's base path
+(the path in the service URL; `/mcp` when it has none, or the whole service
+with `forward_all` and a pathless URL), collapses `.` and
+`..` segments first, and builds the upstream URL from its own configuration,
+never from the request.
+
+### Web to hub
+
+The web calls the hub over a Worker **service binding** (`FINCH_HUB`). Each
+call carries the shared `FINCH_SERVICE_SECRET` and a short-lived assertion,
+`{tenant, exp}` HMAC-signed with that same secret, naming the signed-in user's
+account. The web builds the assertion from the signed-in Clerk user's own ID
+and confirms with the hub that this user is the account's owner.
+
+The assertion stops a caller without the secret from choosing an account; it
+is no boundary for someone who has the secret. **`FINCH_SERVICE_SECRET` is a
+fleet-wide credential.** The hub also accepts it on requests from the public
+internet, not only over the binding, and whoever holds it can sign an
+assertion for any account and use the control API as that account, sign CLI
+tokens (they are HMAC-signed with the same secret, bound to a per-account
+epoch), and relay calls to any account's services the way `finch test` does.
+Keep it only in the hub's and web's Worker secrets, and rotate it on both
+together if it may have leaked.
+
+### Isolation between accounts
+
+Account services live on sibling subdomains (`<slug>.finchmcp.com`), and a
+public service can serve arbitrary HTML there. The web therefore:
+
+- pins Clerk's `authorizedParties` to the exact app origin
+  (`NEXT_PUBLIC_APP_ORIGIN`), so a session token minted on an account subdomain
+  is rejected;
+- pins Clerk's redirect allowlist to the app origin;
+- denies framing (`frame-ancestors 'none'`, `X-Frame-Options: DENY`); and
+- rejects cross-site mutations using `Sec-Fetch-Site` with an `Origin`
+  fallback.
+
+The hub sets no cookies on relay hosts and strips the `Domain` attribute from
+any `Set-Cookie` your service sends, so cookies stay host-only.
+
+### Limits
+
+- The relay is rate limited per account and IP (600 requests per 60
+  seconds). The limiter needs the account, so it runs after the host is
+  resolved: a request on an account subdomain or custom hostname first looks
+  the host up in the global `RouterDO`, and a host `RouterDO` does not know
+  answers 404 without reaching the limiter. (A request on a host with no
+  lookup key, such as `workers.dev` in single-account mode, skips `RouterDO`.)
+  The limiter does run before the relay's `TenantDO` and `BoxDO` work: the
+  machine pin check, the key check and the relay itself.
+- `/join` and `/refresh` are limited per IP (10 per 60 seconds) before any
+  Durable Object is touched; the CLI API has its own per-IP and per-account
+  limits on the same binding.
+- Request bodies are capped at 4 MiB. Responses stream with flow control; see
+  [`relay-protocol.md`](relay-protocol.md).
+- An unknown host fails closed with 404. The dev-only `DEFAULT_TENANT` fallback
+  exists only when `DEV=1`.
+
+## What is deployed
+
+### Workers and storage
+
+| Resource | Production name | Notes |
+|---|---|---|
+| Hub Worker | `finch-prod` | Needs Workers Paid (Durable Objects). |
+| Web Worker | `finch-web-prod` | Binds `FINCH_HUB` to `finch-prod` and `WORKER_SELF_REFERENCE` to itself. |
+| Durable Objects | `BoxDO`, `TenantDO`, `RouterDO` | SQLite-backed. Migrations are append-only; `deploy-preflight` refuses any edit to applied history. |
+| R2 bucket | `finch-releases` | Agent binaries served at `/releases/<asset>`. Without the binding the hub redirects to the GitHub release instead. |
+| Rate limits | `RELAY_LIMIT`, `JOIN_LIMIT` | `unsafe.bindings` of type `ratelimit`, repeated in every environment. |
+
+### Hub configuration
+
+| Name | Kind | What it does |
+|---|---|---|
+| `FINCH_SERVICE_SECRET` | secret | Shared with the web; authenticates web-to-hub calls and signs account assertions and CLI tokens. Fleet-wide: its holder can act for any account (see [Web to hub](#web-to-hub)). |
+| `TICKET_SECRET` | secret | HMAC key for join tickets, refresh tokens and connect tokens. |
+| `FINCH_ASSERTION_PRIVATE_JWKS` | secret | ES256 private JWKS for caller assertions. Generate with `worker/scripts/generate-assertion-jwks.mjs`. |
+| `CF_API_TOKEN` | secret, optional | Cloudflare for SaaS token for bring-your-own custom hostnames. |
+| `WEB_URL` | var | Web origin; the `finch login` approval page is `<WEB_URL>/cli`. |
+| `CLERK_ISSUER` | var | Clerk frontend API origin. Turns on the MCP OAuth plane; unset turns it off. |
+| `FINCH_ASSERTION_ACTIVE_KID` | var | Which key in the private JWKS signs. |
+| `FINCH_ASSERTION_ISSUER` | var | `iss` of caller assertions and the origin that serves `/.well-known/finch-jwks.json`. |
+| `VANITY_SUFFIXES`, `VANITY_TENANT` | var, optional | First-party hostname suffixes and the one account allowed to claim them. |
+| `CF_SAAS_ZONE_ID`, `BYO_CNAME_TARGET` | var, optional | Zone and CNAME target for bring-your-own hostnames. |
+| `RELEASES_BASE` | var, optional | Where `/releases/<asset>` redirects when there is no R2 binding. Defaults to the GitHub release. |
+| `DEV`, `DEFAULT_TENANT`, `ALLOW_INSECURE_HTTP` | var, dev only | Local and staging conveniences; preflight refuses them in production. |
+
+### Web configuration
+
+| Name | Kind | What it does |
+|---|---|---|
+| `CLERK_SECRET_KEY` | secret | Clerk backend key (`sk_live_…` in production). |
+| `FINCH_SERVICE_SECRET` | secret | Must equal the hub's. |
+| `HUB_URL` | var | The hub origin the web addresses (the host the hub sees on binding calls). Must be https. |
+| `NEXT_PUBLIC_APP_ORIGIN` | var | Exact web origin for Clerk `authorizedParties`; preflight refuses a wildcard. |
+| `NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY` | var and build env | Clerk publishable key (`pk_live_…` in production). |
+| `NEXT_PUBLIC_CLERK_SIGN_IN_URL`, `…_SIGN_UP_URL`, `…_FALLBACK_REDIRECT_URL` | var | Clerk routing. |
+
+### Routes on finchmcp.com
+
+| Pattern | Worker |
+|---|---|
+| `finchmcp.com/*` | web |
+| `finchmcp.com/join*`, `/refresh*`, `/api/cli/*`, `/install*`, `/releases/*` | hub (more specific routes win over the web's catch-all) |
+| `jwks.finchmcp.com/.well-known/finch-jwks.json` | hub (caller-assertion JWKS) |
+| `*.finchmcp.com/*` | hub (account subdomains, and `hub.finchmcp.com`, which the web uses as `HUB_URL`) |
+
+The `*.aviary.run/*` vanity route and the `*/*` catch-all that bring-your-own
+hostnames need are commented out in `worker/wrangler.jsonc` until the deploy
+token and Cloudflare for SaaS are set up for them.
+
+## Environments
+
+| Environment | Hub | Web | Host routing |
+|---|---|---|---|
+| `dev` | `finch-dev` | `finch-web-dev` | `wrangler dev` on localhost; `DEV=1` resolves every request to `DEFAULT_TENANT`. |
+| `staging` | `finch-staging` | `finch-web-staging` | `workers.dev` hosts with `DEV=1` and a fixed staging account. |
+| `production` | `finch-prod` | `finch-web-prod` | Real routes, `workers_dev: false`, fail-closed host resolution. |
+
+Durable Object IDs are scoped to the Worker name, so each environment has its
+own state. Secrets are set per environment with
+`wrangler secret put <NAME> --env <env>`, never copied from `.dev.vars`.
+Both `deploy-preflight` scripts refuse a production deploy that ships a
+dev-only variable, a known dev secret value, a `pk_test_` Clerk key, a missing
+or wildcard `NEXT_PUBLIC_APP_ORIGIN`, persistent invocation logs, or a missing
+assertion signer. How code reaches each environment is in
+[`releases.md`](releases.md).
+
+## Accounts are single-user
+
+An account is one Clerk user: its ID is that user's Clerk user ID and that user
+is its only member. Clerk Organizations are not used. The relay admits a
+`finch_` key whose scope covers the service, a Clerk OAuth token whose user is
+the account owner, the first-party `/api/cli/call` assertion, or anyone on a
+public service. A caller without a credential on a key-gated service gets a 401
+with an OAuth challenge; there is no browser login wall or session cookie.
+
+Accounts created before September 2026 are migrated once, lazily: the purge
+runs when an account's `TenantDO` is first loaded after the single-user
+release, so an account that has not been used since keeps its legacy rows
+until then. What the migration deletes, and why it is lazy, is recorded in
+[`archive/single-user-migration.md`](archive/single-user-migration.md).
+
+## Known gaps
+
+- **Not end-to-end encrypted.** Cloudflare terminates TLS and the relay
+  handles plaintext while forwarding. See [`privacy.md`](privacy.md).
+- **Custom hostnames are first-come.** Registering a hostname does not prove
+  you own the domain; traffic only flows once its DNS points at finch. A
+  design for ownership checks is in
+  [`archive/hostname-ownership-design.md`](archive/hostname-ownership-design.md).
+- **The last hop is yours.** The agent accepts a plaintext `http://` upstream
+  whose host is loopback or a single DNS label (such as a Docker Compose
+  service name). If that name resolves off the machine, the hop crosses your
+  network unencrypted. Use `https://` for anything not on the machine.

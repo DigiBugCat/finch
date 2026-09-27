@@ -8,15 +8,20 @@ dedicated Worker-to-agent `req.assertion` field. The agent removes every
 reserved caller-identity header and sets `X-Finch-Assertion` from that field
 only.
 
-Public services do not receive an assertion. An open edge route must not be
-mistaken for an authenticated principal.
+On a public service, a keyless call and a call with a `finch_` key get no
+assertion. A call that authenticates with a Clerk OAuth token or the
+first-party service assertion does get one, on public services too, and on a
+public service the OAuth check admits any user of the hub's Clerk instance,
+not only the tenant owner. An assertion on a public route says who called; it
+does not mean they were authorized.
 
 ## Bird-side enforcement gate
 
 Before a bird enforces caller assertions:
 
-- Configure it as a private, key-authenticated service. Public services
-  intentionally receive no assertion and cannot establish a caller principal.
+- Configure it as a private, key-authenticated service. A public service
+  receives an assertion only for OAuth and first-party calls (and from any
+  Clerk user, for OAuth), so it cannot use assertions as an access check.
 - Confirm signing is enabled in the target environment, including the
   `FINCH_ASSERTION_PRIVATE_JWKS` secret, by running `npm run smoke:assertions`.
   The non-secret variables alone do not prove the signing key is deployed.
