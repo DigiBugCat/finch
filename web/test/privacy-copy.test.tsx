@@ -1,15 +1,23 @@
 import { describe, expect, it } from 'vitest';
 import { render, screen } from '@testing-library/react';
 
-import Safety from '@/components/Safety';
+import SightingLog from '@/components/fieldguide/SightingLog';
 import PrivacyAndDataHandling from '@/app/docs/privacy/page';
 
 describe('customer-facing privacy copy', () => {
   it('states the ordinary relay boundary without claiming E2EE', () => {
-    render(<Safety />);
+    // The landing's sighting log is where the relay boundary is stated.
+    render(<SightingLog />);
 
-    expect(screen.getByText("Payloads aren't retained")).toBeInTheDocument();
-    expect(screen.getByText(/handled in memory while Finch relays them/i)).toBeInTheDocument();
+    const lede = screen.getByText(/Bodies pass through and are never stored/i);
+    expect(lede).toHaveTextContent(/encrypted on both hops/i);
+    expect(lede).toHaveTextContent(/Cloudflare decrypts it at its edge/i);
+    expect(lede).toHaveTextContent(/finch is not end-to-end encrypted/i);
+    expect(screen.getByRole('link', { name: 'The full privacy boundary' })).toHaveAttribute('href', '/docs/privacy');
+    // Every logged call shows its body as not kept.
+    const rows = screen.getAllByRole('row').slice(1); // minus the header row
+    expect(rows.length).toBeGreaterThan(0);
+    for (const row of rows) expect(row).toHaveTextContent(/not kept$/);
     expect(screen.queryByText(/never sees/i)).toBeNull();
   });
 

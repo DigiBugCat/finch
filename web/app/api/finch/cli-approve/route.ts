@@ -24,9 +24,9 @@ export async function POST(req: Request) {
     const clientEmail = parseOptionalClientEmail(body.email);
 
     // The approver's email, for the box's account label. Prefer the authoritative
-    // server lookup, but fall back to the email the client sent (from useUser).
-    // On staging the server lookup fails — ctx.userId is the forced DEFAULT_TENANT
-    // id, not a real Clerk user — so the client value is what makes it work.
+    // server lookup (ctx.userId is the real Clerk user id, which is also the
+    // tenant), and fall back to the email the client sent (from useUser) only if
+    // that lookup fails, e.g. a transient Clerk Backend API error.
     let serverEmail = "";
     try {
       const user = await (await clerkClient()).users.getUser(ctx.userId);
@@ -40,7 +40,7 @@ export async function POST(req: Request) {
           user.username,
       );
     } catch {
-      // Expected on staging (synthetic tenant id) — the client email covers it.
+      // Best-effort: the label is cosmetic, so the client email covers it.
     }
     const email = serverEmail || clientEmail;
 

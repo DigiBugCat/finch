@@ -12,12 +12,16 @@
 //     pk_test_/sk_test_ in the build env (or shipped vars) is rejected.
 //   - .dev.vars.example must keep REPLACE_… stubs (never real dev secrets that
 //     someone might `secret put` verbatim into prod).
+//   - staging/production must ship every static file the landing points at
+//     (public/agents.md, public/llms.txt; see landing-files.mjs), so the
+//     copied agent prompt never starts on a 404.
 //
 // Usage: node scripts/deploy-preflight.mjs <env>   (env = production | dev)
 import { readFileSync, existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { readJsonc } from "./jsonc.mjs";
+import { missingLandingFiles } from "./landing-files.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, "..");
@@ -80,6 +84,20 @@ if (env === "staging" || env === "production") {
 }
 if (envCfg.logpush !== false) {
   fail(`[env.${env}].logpush must be false.`);
+}
+
+// The landing's agent prompt says "Read https://finchmcp.com/agents.md" and
+// its footer links there. Deploying the landing without that file hands every
+// visitor's agent a 404 on its first step, so a real deploy waits for it.
+if (env === "staging" || env === "production") {
+  const missing = missingLandingFiles(join(root, "public"));
+  if (missing.length > 0) {
+    fail(
+      `the landing links to ${missing.map((f) => `/${f}`).join(", ")} but web/public has no ` +
+        `non-empty ${missing.join(", ")}. Land it (agents.md comes with the CLI track) ` +
+        `before deploying the landing.`,
+    );
+  }
 }
 
 if (isProd && envCfg.workers_dev === true) {
@@ -156,4 +174,4 @@ if (existsSync(examplePath)) {
   }
 }
 
-console.log(`finch-web deploy-preflight OK for --env ${env} (no dev-secret/vars leak, no dev Clerk key).`);
+console.log(`finch-web deploy-preflight OK for --env ${env} (no dev-secret/vars leak, no dev Clerk key${env === "staging" || env === "production" ? ", landing files present" : ""}).`);

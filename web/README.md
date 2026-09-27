@@ -12,7 +12,7 @@ approval page. Next.js (App Router) deployed to **Cloudflare Workers via
 
 | Surface | What |
 |---|---|
-| **Landing** (`/`) | The marketing page. |
+| **Landing** (`/`) | "finch, a field guide": seven illustrated plates in the Indigo Wash design system (`components/fieldguide/`). SVG + CSS/SMIL animation, final frames under `prefers-reduced-motion`; fonts self-hosted via `next/font`. |
 | **Docs** (`/docs/*`) | Quickstart, services and boxes, keys and auth, access control, domains, the CLI reference, privacy. Also `/llms.txt` for agents. |
 | **Sign-in / sign-up** | Clerk. Lands on `/docs` unless a `redirect_url` (such as a `/cli` link) says otherwise. |
 | **CLI approval** (`/cli`) | `finch login` prints a link + code; the signed-in owner confirms the code here and the hub mints the box's CLI token. |
@@ -78,7 +78,14 @@ npm run dev          # http://localhost:3000  (run the hub in worker/ first)
 | `npm run lint` | eslint |
 | `npm test` | vitest (BFF auth, the signAssertion↔hub contract, the hub transport, …) |
 | `npm run build` | `next build` |
-| `npm run deploy` | OpenNext build + deploy to Cloudflare |
+| `npm run deploy` | preflight, then OpenNext build + deploy to Cloudflare |
+
+`scripts/deploy-preflight.mjs` runs first on every staging/production deploy.
+Besides the secret and Clerk-key checks, it refuses to deploy until every
+static file the landing points at exists in `public/` (`agents.md`,
+`llms.txt`; the list is `scripts/landing-files.mjs`). The copied agent prompt
+starts with "Read https://finchmcp.com/agents.md", so shipping the landing
+without that file would hand every agent a 404 on its first step.
 
 ## Layout
 
