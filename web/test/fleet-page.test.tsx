@@ -167,7 +167,8 @@ describe('/fleet with services', () => {
     expect(keys).not.toHaveTextContent('expire');
 
     const update = screen.getByRole('region', { name: 'Update available' });
-    expect(update).toHaveTextContent('finch 1.8.0 is out. 1 machine still runs an older version: old-laptop (notes, 1.7.1)');
+    expect(update).toHaveTextContent('finch 1.8.0 is out. 1 machine still runs an older version:');
+    expect(update).toHaveTextContent('old-laptop · finch 1.7.1 · 1 service');
   });
 
   it('shows expiry dates when the account enforces them', async () => {
