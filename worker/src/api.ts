@@ -10,8 +10,13 @@
 //     shared X-Finch-Service secret and names the tenant with X-Finch-Tenant.
 //   - /join is the ONE exception — it's TICKET-authed (the box presents the
 //     stateless join ticket it was handed at enroll). No service secret.
+//
+// Tenancy is single-user: a tenant IS one Clerk user — its id is their Clerk
+// user id and they are its only member (the owner). The web signs assertions
+// for exactly that id. There are no shared members, invitations, workspaces,
+// ACL rules, or per-user app grants.
 
-import { rateLimitOk, clientIp, serviceClientIp, json, tenantOp, boxStub, type Env } from "./index";
+import { rateLimitOk, clientIp, json, tenantOp, boxStub, pickHealthyPool, hostKeyFromHost, type Env } from "./index";
 import {
   serviceOk,
   signToken,
@@ -21,7 +26,7 @@ import {
 } from "./auth";
 import {
   routerLookup,
-  routerRegister,
+  routerRegisterWakingHolder,
   routerUnregister,
   routerListForTenant,
   isValidHostKey,
@@ -31,20 +36,11 @@ import {
   routerDeviceDescribe,
 } from "./router-do";
 import { signAssertion, verifyAssertionPayload } from "./auth";
-import {
-  handleAviaryEnrollmentApi,
-  handleAviaryEnrollmentCliApi,
-  isAviaryEnrollmentPath,
-} from "./aviary-enrollment-api";
-
+import { cliMcpCall, type McpSend } from "./cli-call";
 
 async function tenantOpRaw(env: Env, tenant: string, op: string, args: Record<string, unknown> = {}): Promise<Response> {
   const id = env.TENANT.idFromName(tenant);
   return env.TENANT.get(id).fetch("https://tenant.internal/", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ op, ...args }) });
-}
-async function directoryOp<T=any>(env: Env, op: string, args: Record<string, unknown> = {}): Promise<T> {
-  const id=env.DIRECTORY.idFromName("global"); const res=await env.DIRECTORY.get(id).fetch("https://directory.internal/",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({op,...args})});
-  if(!res.ok) throw new Error(`directory ${op} failed: ${res.status}`); return res.json<T>();
 }
 function cloneResponse(res: Response): Promise<Response> { return res.text().then(text=>new Response(text,{status:res.status,headers:{"content-type":res.headers.get("content-type")??"application/json"}})); }
 
@@ -65,8 +61,7 @@ async function mintCliToken(
     { tenant, exp, kind: "cli", epoch: epoch ?? 0 },
     env.FINCH_SERVICE_SECRET,
   );
-  const scheme =
-    host.startsWith("localhost") || host.startsWith("127.") ? "http" : "https";
+  const scheme = isLoopbackHost(host) ? "http" : "https";
   return { token, expiresAt: exp, hub: `${scheme}://${host}` };
 }
 
@@ -105,10 +100,6 @@ const CONNECT_TOKEN_TTL_SECONDS = 120; // per-box _connect grants live 120s
 // any realistic always-on uptime; a box removed from the dashboard is
 // rejected at /refresh (boxExists) well before this elapses.
 const REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60; // 30d
-// Browser login-wall portal grant: short + single-use (jti). 60s is ample for the
-// portal page → /__finch/cb hand-off while sharply bounding the replay window of
-// a captured grant (which is also burned on first use). (login-wall contract)
-const PORTAL_GRANT_TTL_SECONDS = 60;
 const DEFAULT_BYO_CNAME_TARGET = "finchmcp.com";
 
 // Box-name clamp at the door (M1): bound length + charset before the name
@@ -300,13 +291,6 @@ async function handleApiInner(
   const path = url.pathname;
   const method = req.method;
 
-  // Aviary service-device enrollment is intentionally separate from the CLI
-  // tenant-admin device flow. start/poll are proof-bound public routes;
-  // describe/approve/deny authenticate inside their dedicated handler.
-  if (isAviaryEnrollmentPath(path)) {
-    return handleAviaryEnrollmentApi(req, env, host);
-  }
-
   // ---- /join — ticket-authed (NOT service-authed) ----
   if (path === "/join") {
     if (method !== "POST") return json(405, { error: "POST only" });
@@ -400,12 +384,6 @@ async function handleApiInner(
     if (path === "/api/cli/whoami" && method === "GET") {
       return json(200, { ok: true, tenant: cliTenant });
     }
-    // Tenant-admin, headless approval for Aviary service-device enrollment.
-    // This is the same proof-bound transaction used by the browser flow; only
-    // the approver authentication differs (revocable CLI token vs web BFF).
-    if (path.startsWith("/api/cli/aviary/")) {
-      return handleAviaryEnrollmentCliApi(req, env, host, cliTenant);
-    }
     // POST /api/cli/token — an already-authed box mints a FRESH CLI token, so a
     // new box can be provisioned with no human in the loop:
     //   finch token | ssh newbox "finch login --token -"
@@ -448,16 +426,21 @@ async function handleApiInner(
     //      credential, same as the dashboard) — so an agent can manage and
     //      REVOKE access without the dashboard. ----
 
-    // GET /api/cli/state — full tenant state (fleet, keys, ACL) for finch fleet/keys.
+    // GET /api/cli/state — full tenant state (fleet, keys) for finch fleet/keys,
+    // plus serviceBase: the origin clients reach this tenant's services on
+    // (the slug host in prod, the inbound hub in dev/staging and local), which
+    // `finch connect` writes into client configs.
     if (path === "/api/cli/state" && method === "GET") {
-      return json(200, await tenantOp(env, cliTenant, "getState"));
+      const state = await tenantOp<Record<string, unknown> & { host?: string }>(env, cliTenant, "getState");
+      return json(200, { ...state, serviceBase: hostBase(env, host, state?.host).http });
     }
-    // POST /api/cli/keys {label,scope,owner} — mint a client finch_ key (once).
+    // POST /api/cli/keys {label,scope} — mint a client finch_ key (once). The
+    // key's owner is always the tenant owner.
     if (path === "/api/cli/keys" && method === "POST") {
       const b = await readJson(req);
       if (!b.label) return json(400, { error: "label required" });
       const out = await tenantOp<{ plaintext: string; key: PublicKey } | { error: string }>(
-        env, cliTenant, "mintKey", { label: b.label, scope: b.scope, owner: b.owner },
+        env, cliTenant, "mintKey", { label: b.label, scope: b.scope },
       );
       if ("error" in out) return json(400, { error: out.error });
       return json(200, { key: out.plaintext, ...out.key });
@@ -481,31 +464,74 @@ async function handleApiInner(
       return json(200, await tenantOp(env, cliTenant, "revokeCliTokens"));
     }
 
-    // POST /api/cli/call {service, method, params} — relay an MCP call to the
-    // tenant's own service, so an agent can test it from the CLI (no throwaway
-    // finch_ key). Relays via the SELF binding using a first-party service
-    // assertion for cliTenant (the same trusted internal path the chat uses).
+    // POST /api/cli/call {service, method, params} — run one MCP request
+    // against the tenant's own service, so an agent can test it from the CLI
+    // (no throwaway finch_ key). cli-call.ts speaks real MCP (initialize
+    // handshake, SSE or JSON replies, session id, 2026-07-28 stateless
+    // fallback) and answers with the single JSON-RPC response. Every HTTP
+    // exchange goes via the SELF binding using a first-party service assertion
+    // for cliTenant (relayMcp's trusted internal path).
     if (path === "/api/cli/call" && method === "POST") {
       const b = await readJson(req);
       const service = String(b.service || "").trim();
       const rpcMethod = String(b.method || "").trim();
       if (!service || !rpcMethod) return json(400, { error: "service and method required" });
+      const params = b.params ?? {};
+      if (typeof params !== "object" || params === null || Array.isArray(params)) {
+        return json(400, { error: "params must be a JSON object" });
+      }
+      // One assertion covers the whole exchange: it outlives the call's own
+      // deadline (CLI_CALL_DEADLINE_MS) with margin.
       const exp = Math.floor(Date.now() / 1000) + 120;
       const assertion = await signAssertion({ tenant: cliTenant, exp }, env.FINCH_SERVICE_SECRET);
-      const scheme = host.startsWith("localhost") || host.startsWith("127.") ? "http" : "https";
-      const res = await env.SELF.fetch(`${scheme}://${host}/${encodeURIComponent(service)}/mcp`, {
-        method: "POST",
-        headers: {
-          "X-Finch-Service": env.FINCH_SERVICE_SECRET,
-          "X-Finch-Auth": assertion,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: rpcMethod, params: b.params ?? {} }),
-      });
-      return new Response(await res.text(), {
-        status: res.status,
-        headers: { "content-type": res.headers.get("content-type") ?? "application/json" },
-      });
+      // SESSION AFFINITY: the exchange is several HTTP requests and a stateful
+      // server's Mcp-Session-Id only exists on the box that answered
+      // initialize, but the load-balanced /<svc>/mcp route picks a box per
+      // request. So pin every request to one box via /<svc>/<box>/mcp. Until
+      // the first real answer, a stale pick (the DO's X-Finch-Offline 503)
+      // moves on to the next healthy box, like relayMcp's own failover.
+      const pool = await pickHealthyPool(env, cliTenant, service);
+      if (!pool) return json(404, { error: "no such service", service });
+      if (!pool.length) return json(503, { error: "service offline", service });
+      // The relay resolves its tenant from the request HOST (the assertion
+      // only confirms it), so every relayed request must name a host that
+      // routes to cliTenant. The host the CLI called — the apex or
+      // hub.finchmcp.com — routes to no tenant in production.
+      const origin = await relayOriginForTenant(env, cliTenant, host);
+      if (!origin) {
+        return json(409, {
+          error: "no public hostname for this account",
+          hint: "claim a hub subdomain in the dashboard, or map one with `finch domain add <host>`",
+        });
+      }
+      let pick = 0;
+      let committed = false;
+      const send: McpSend = async (init) => {
+        while (true) {
+          const url =
+            `${origin}/${encodeURIComponent(service)}` +
+            `/${encodeURIComponent(pool[pick])}/mcp`;
+          const res = await env.SELF.fetch(url, {
+            method: init.method,
+            headers: {
+              ...init.headers,
+              "X-Finch-Service": env.FINCH_SERVICE_SECRET,
+              "X-Finch-Auth": assertion,
+            },
+            body: init.body,
+            signal: init.signal,
+          });
+          const offline = res.status === 503 && res.headers.get("X-Finch-Offline") === "1";
+          if (offline && !committed && pick + 1 < pool.length) {
+            await res.body?.cancel().catch(() => {});
+            pick++;
+            continue;
+          }
+          committed = true;
+          return res;
+        }
+      };
+      return cliMcpCall(send, rpcMethod, params, { service });
     }
 
     return json(404, { error: "unknown CLI route", path });
@@ -523,205 +549,7 @@ async function handleApiInner(
     return json(401, { error: "bad or missing X-Finch-Service" });
   }
   const assertion = req.headers.get("X-Finch-Auth") || "";
-  const userScoped = ["/api/user/sync","/api/tenant-create","/api/tenant-bootstrap","/api/adapter/org-member","/api/portal-grant"].includes(path);
-  if (userScoped) {
-    const clerkUserId=await verifyAssertion(assertion,env.FINCH_SERVICE_SECRET,"user");
-    if(!clerkUserId)return json(401,{error:"invalid user assertion"});
-    if(clerkUserId){
-    const body=await readJson(req); const emails=Array.isArray(body.emails)?body.emails.map((x:any)=>String(x).trim().toLowerCase()):[];
-    if(body.primaryEmail&&!emails.includes(String(body.primaryEmail).trim().toLowerCase()))return json(400,{error:"primaryEmail must be verified"});
-    if(path==="/api/portal-grant"){
-      const slug=String(body.slug||"").trim().toLowerCase();
-      if(!slug)return json(400,{error:"slug required"});
-      const owner=await routerLookup(env,slug);
-      if(!owner)return json(404,{error:"unknown service host"});
-      const ctxRes=await tenantOpRaw(env,owner,"memberContext",{clerkUserId});
-      if(!ctxRes.ok)return cloneResponse(ctxRes);
-      const ctx:any=await ctxRes.json();
-      let email="",admin=true,mid:string|undefined;
-      if(ctx.tenantMeta){if(!ctx.member||ctx.member.state!=="active")return json(403,{error:"not an active member of this workspace"});email=ctx.member.email;admin=ctx.member.role!=="member";mid=ctx.member.id;}
-      else if(owner!==clerkUserId)return json(403,{error:"not a member of this workspace"});
-      const exp=Math.floor(Date.now()/1000)+PORTAL_GRANT_TTL_SECONDS;
-      const grant=await signToken({kind:"portal",tenant:owner,slug,userId:clerkUserId,...(email?{email}:{}),...(admin?{admin:true}:{}),...(mid?{mid}:{}),exp,jti:genJti()},env.TICKET_SECRET);
-      return json(200,{grant});
-    }
-    if(path==="/api/user/sync"){
-      if(body.primaryEmail){const r=await tenantOpRaw(env,clerkUserId,"memberContext",{clerkUserId,email:body.primaryEmail});if(!r.ok)return cloneResponse(r);}
-      const invites=await directoryOp<any>(env,"invitesForEmails",{emails});
-      for(const tenantId of invites.tenantIds??[]){const r=await tenantOpRaw(env,tenantId,"bindIdentity",{clerkUserId,emails,source:"sync"});if(!r.ok){if(r.status===409)continue;return cloneResponse(r);}const out:any=await r.json();if(out.member)await directoryOp(env,"upsertMembership",{clerkUserId,tenantId,memberId:out.member.id,role:out.member.role,state:out.member.state});for(const email of [...(out.consumedEmails??[]),...(out.staleInviteEmails??[])])await directoryOp(env,"clearInvitePointer",{email,tenantId});}
-      const listed=await directoryOp<any>(env,"listForUser",{clerkUserId});
-      if(!(listed.memberships??[]).some((m:any)=>m.tenantId===clerkUserId))listed.memberships=[{tenantId:clerkUserId,role:"owner",state:body.primaryEmail?"active":"invited"},...(listed.memberships??[])];
-      const memberships=[];
-      for(const indexed of listed.memberships??[]){
-        const tenantId=String(indexed.tenantId), contextRes=await tenantOpRaw(env,tenantId,"memberContext",{clerkUserId});
-        if(!contextRes.ok)continue;
-        const context:any=await contextRes.json();
-        const personalPending=tenantId===clerkUserId&&context.needsBootstrap===true;
-        if(context.member?.state!=="active"&&!personalPending)continue;
-        memberships.push({...indexed,...(context.member??{}),tenantId,name:context.tenantMeta?.displayName??tenantId,kind:context.tenantMeta?.kind??(tenantId===clerkUserId?"personal":"team"),...(personalPending?{state:"invited"}:{})});
-      }
-      const claimable:any[]=[];
-      for(const clerkOrgId of Array.isArray(body.adminOrgIds)?body.adminOrgIds:[]){const probe=await tenantOpRaw(env,String(clerkOrgId),"legacyClaimStatus");if(probe.ok){const status:any=await probe.json();if(!status.migrated&&status.hasState)claimable.push({clerkOrgId:String(clerkOrgId)});}}
-      return json(200,{tenants:memberships,claimable});
-    }
-    if(path==="/api/tenant-create"){
-      // THROTTLE WORKSPACE CREATION. This branch had no limiter at all, unlike
-      // /join, /refresh, device-approve, box-update and hostnames. Each create
-      // persists a TenantDO and reindexes the single global DirectoryDO that
-      // every sign-in reads, and each workspace can then hold 200 invited
-      // members whose e: pointers permanently enlarge that DO's keyspace --
-      // so unbounded creation was an availability lever against other users,
-      // not just self-inflicted resource growth. Keyed per user AND per IP so
-      // neither a single account nor a single host can spin freely. The IP is
-      // the browser's, forwarded by the web (serviceClientIp): the request
-      // itself arrives over a service binding with no client IP of its own.
-      if(!(await rateLimitOk(env.JOIN_LIMIT,`tcreate:${clerkUserId}`))||!(await rateLimitOk(env.JOIN_LIMIT,`tcreate:${serviceClientIp(req)}`)))return json(429,{error:"rate limited"});
-      if(!body.email||!emails.includes(String(body.email).trim().toLowerCase()))return json(400,{error:"email must be verified"});
 
-      // THE IDEMPOTENCY KEY IS REQUIRED — there is no unkeyed path. Creation
-      // must be idempotent because the failure this design exists for is:
-      // bootstrapMembers commits, the directory index write fails, we return
-      // 503, the user retries. A retry that mints a fresh id bootstraps a
-      // SECOND workspace and leaves the first committed and permanently
-      // unindexed — the retry advice manufacturing the very orphan-plus-
-      // duplicate it was meant to prevent. An optional key would keep exactly
-      // that failure alive for every unkeyed caller (a dashboard tab from
-      // before this deploy, a direct API user, a malformed key), so the
-      // contract is strict: no valid key, no state created, 400 with the
-      // recipe. "Sometimes idempotent" is not idempotent.
-      //
-      // The id is derived from (caller, key): 128 bits of SHA-256, the same
-      // 32-hex shape as a UUID, so a retry lands on the SAME tenant —
-      // bootstrap replays as the 409 recognized below and the index write
-      // repairs itself. Deriving from a client-chosen key is safe because the
-      // caller's clerkUserId is mixed in AND the replay branch authorizes via
-      // the TENANT'S OWN membership: it proceeds only when the caller is that
-      // tenant's active owner. Someone who somehow occupied the derived id
-      // first just makes this create 409 — they cannot hand the caller a
-      // foreign workspace. (Full-width ids also bury the old 32-bit birthday
-      // problem: the previous 8-hex ids collided at ~1% by 9,300 workspaces,
-      // and a collision failed the create outright. Existing short ids keep
-      // working — nothing parses the suffix.)
-      const idemKey=typeof body.idempotencyKey==="string"&&/^[A-Za-z0-9_-]{8,64}$/.test(body.idempotencyKey)?body.idempotencyKey:null;
-      if(!idemKey)return json(400,{error:"idempotencyKey required: 8-64 characters of [A-Za-z0-9_-], held constant across retries of the same creation attempt"});
-      // The name is validated HERE, before any state exists, because it is
-      // also the replay fingerprint. bootstrapMembers persists
-      // String(displayName || tenantId), so a falsy or non-string name would
-      // bootstrap under a FALLBACK value the fingerprint can never match —
-      // the caller's own identical retry would 409 and the committed
-      // workspace would be stranded unindexed, defeating the retry guarantee.
-      // Requiring a non-empty string makes persisted === sent, exactly.
-      if(typeof body.name!=="string"||!body.name.trim())return json(400,{error:"name required"});
-      const tenantId="ft_"+[...new Uint8Array(await crypto.subtle.digest("SHA-256",new TextEncoder().encode(`${clerkUserId}:${idemKey}`)))].slice(0,16).map(b=>b.toString(16).padStart(2,"0")).join("");
-      const r=await tenantOpRaw(env,tenantId,"bootstrapMembers",{kind:"team",displayName:body.name,bootstrappedFrom:"fresh",members:[{clerkUserId,email:body.email,role:"owner",state:"active"}],claimantClerkUserId:clerkUserId});
-      let owner:any;
-      if(!r.ok){
-        // Replay of our own earlier create: the derived id already bootstrapped.
-        // Discriminated by the tenant's membership, not by parsing the error
-        // text — the DO's contract carries no machine-readable code, and "this
-        // caller is the active owner of exactly the tenant this key derives"
-        // is the stronger claim anyway.
-        if(r.status===409){
-          const ctxRes=await tenantOpRaw(env,tenantId,"memberContext",{clerkUserId});
-          if(ctxRes.ok){
-            const ctx:any=await ctxRes.json();
-            const m=ctx?.member;
-            if(m&&m.role==="owner"&&m.state==="active"){
-              // A replay must be a replay of the SAME creation, so fingerprint
-              // it against the persisted display name. Without this, reusing
-              // workspace A's key while asking for workspace "B" would return
-              // 200 with A's id — the bridge would then activate A and report
-              // B created, silently ignoring body.name. Same key + different
-              // data is a caller bug, and it gets a loud conflict, not a
-              // quietly wrong workspace.
-              if(ctx?.tenantMeta?.displayName!==body.name){
-                return json(409,{error:"idempotencyKey was already used to create a different workspace — use a fresh key for a new workspace"});
-              }
-              owner=m;
-            }
-          }
-        }
-        if(!owner)return cloneResponse(r);
-      }else{
-        const out:any=await r.json();
-        // Found by clerkUserId rather than by position: the roster is hardcoded
-        // to one member today, but this route already receives `emails`, so
-        // adding invitees is the obvious next change and an index keyed on [0]
-        // would silently drop their invite pointers.
-        owner=(out.members??[]).find((m:any)=>m.clerkUserId===clerkUserId);
-        if(!owner)return json(502,{error:"invalid response from hub"});
-      }
-
-      // Index the owner directly instead of calling reindexTenant. reindex
-      // exists to purge rows that reference a tenant before rewriting them, and
-      // it finds those by LISTING the whole u:/e: keyspace of the single global
-      // DirectoryDO that every sign-in contends for. For an id minted three
-      // lines ago no existing row can possibly reference it, so that scan is
-      // provably dead work: O(total platform identities) reads to delete
-      // nothing. upsertMembership writes a byte-identical row.
-
-      // NOT swallowed. The directory row is the ONLY handle on this workspace:
-      // /api/user/sync enumerates exclusively through listForUser, and the sole
-      // self-heal there is the hardcoded personal tenant. A team tenant with no
-      // u: row is never listed, so the browser's active-tenant cookie is cleared
-      // on the next load and the committed workspace becomes permanently
-      // unreachable — while the user was told it was created.
-      //
-      // RETRY HERE, for THIS tenant, rather than pushing the caller into one.
-      // The TenantDO is already committed at this point, so the identity worth
-      // preserving is the one we hold; a client retry mints a fresh id and
-      // bootstraps a SECOND workspace, so a directory blip would otherwise
-      // accumulate orphans one failed attempt at a time. upsertMembership is
-      // idempotent by construction — it filters any existing row for this
-      // tenantId before appending — so re-running it is always safe, including
-      // when a previous attempt actually committed and only its response was
-      // lost.
-      // The log carries only the sanitized error message — the same reviewed
-      // shape as every other console site. The tenant id deliberately does NOT
-      // go to the log: it is now derived from the client's idempotency key
-      // (request data), and rather than teaching the privacy gate which
-      // derivations launder and which do not, the id travels in the 503
-      // RESPONSE below — where it reaches the one party who can act on it, and
-      // where the idempotent retry makes the orphan self-repairing anyway.
-      let indexed=false;
-      for(let attempt=0;attempt<3&&!indexed;attempt++){
-        try{
-          await directoryOp(env,"upsertMembership",{clerkUserId,tenantId,memberId:owner.id,role:owner.role,state:owner.state});
-          indexed=true;
-        }catch(error){
-          if(attempt===2)console.error("tenant directory index failed",error instanceof Error?error.message:String(error));
-        }
-      }
-      // Still failing after retries: report it, and hand back the id so the
-      // workspace is identifiable rather than lost (the web layer relays error
-      // bodies verbatim and the id is not sensitive). When the client sent an
-      // idempotency key, "please retry" is now genuinely true: the retry
-      // derives the SAME tenant id, the bootstrap replay is recognized above,
-      // and this index write runs again — recovery, not duplication. Without a
-      // key the residual is a committed-but-unindexed TenantDO, bounded by the
-      // per-user and per-IP rate limits above.
-      if(!indexed)return json(503,{error:"workspace index unavailable — please retry",tenantId});
-      return json(200,{tenantId});}
-    if(path==="/api/tenant-bootstrap"){const owner=(body.members??[]).find((m:any)=>m.role==="owner"&&m.state==="active");if(owner?.clerkUserId!==clerkUserId)return json(403,{error:"claimant must be owner"});const r=await tenantOpRaw(env,body.tenantId,"bootstrapMembers",{...body,claimantClerkUserId:clerkUserId});if(!r.ok)return cloneResponse(r);const out:any=await r.json();if(body.clerkOrgId)await directoryOp(env,"mapOrg",{clerkOrgId:body.clerkOrgId,tenantId:body.tenantId});await directoryOp(env,"reindexTenant",{tenantId:body.tenantId,members:out.members});return json(200,out);}
-    if(path==="/api/adapter/org-member"){
-      const map=await directoryOp<any>(env,"orgLookup",{clerkOrgId:body.clerkOrgId});
-      if(!map.tenantId)return json(200,{ok:true,mapped:false});
-      const tenantId=String(map.tenantId);
-      const context=await tenantOpRaw(env,tenantId,"memberContext",{clerkUserId});
-      if(context.ok){const current:any=await context.json();if(current.member?.state==="disabled")return json(200,{ok:true,mapped:true,skipped:"disabled"});}
-      const email=body.primaryEmail||emails[0];
-      if(!email)return json(200,{ok:true,mapped:true,skipped:"no-verified-email"});
-      const bound=await tenantOpRaw(env,tenantId,"adapterOrgMember",{clerkUserId,emails,primaryEmail:email});
-      if(!bound.ok)return cloneResponse(bound);
-      const out:any=await bound.json();
-      if(out.skipped)return json(200,{ok:true,mapped:true,skipped:out.skipped});
-      if(out.member)await directoryOp(env,"upsertMembership",{clerkUserId,tenantId,memberId:out.member.id,role:out.member.role,state:out.member.state});
-      for(const em of [...(out.consumedEmails??[]),...(out.staleInviteEmails??[])])await directoryOp(env,"clearInvitePointer",{email:em,tenantId});
-      return json(200,{ok:true,mapped:true});
-    }
-    return json(404,{error:"unknown user-scoped route"});
-    }
-  }
   const tenant = await verifyAssertion(assertion, env.FINCH_SERVICE_SECRET);
   if (!tenant) {
     return json(401, {
@@ -737,52 +565,24 @@ async function handleApiInner(
   }
 
 
-  const membershipOps: Record<string,string>={"member-context":"memberContext","members/invite":"inviteMember","members/role":"setMemberRole","members/state":"setMemberState","members/remove":"removeMember","access/approve":"approveAccess","access/deny":"denyAccess","access/revoke":"revokeAccess"};
-  const membershipKey=seg.join("/");
-  if (method === "POST" && membershipOps[membershipKey]) {
+  // POST /api/member-context {clerkUserId, email?} — who this Clerk user is in
+  // THIS tenant. Only the Clerk user whose tenant it is (tenant id === their
+  // user id) is a member, as its owner; anyone else gets {member:null} and the
+  // web refuses them. An `email` bootstraps the owner row on first use
+  // ({needsBootstrap:true} until then).
+  if (method === "POST" && seg.length === 1 && seg[0] === "member-context") {
     const body = await readJson(req);
-    const res = await tenantOpRaw(env, tenant, membershipOps[membershipKey], body);
-    if (!res.ok) {
-      if (membershipKey === "members/remove" && res.status === 404) {
-        const stateRes = await tenantOpRaw(env, tenant, "getState");
-        if (stateRes.ok) {
-          const state: any = await stateRes.json();
-          await directoryOp(env, "reindexTenant", { tenantId: tenant, members: state.members ?? [] }).catch(() => undefined);
-        }
-      }
-      return cloneResponse(res);
-    }
-    const out: any = await res.clone().json();
-    if (membershipKey === "members/invite" && out.member?.state === "invited" && !out.member.clerkUserId) {
-      await directoryOp(env, "addInvitePointer", { email: out.member.email, tenantId: tenant });
-    }
-    if (membershipKey === "access/approve") {
-      if (out.status === "invited" && out.member && !out.member.clerkUserId) await directoryOp(env, "addInvitePointer", { email: out.member.email, tenantId: tenant });
-      if (out.status === "granted" && (out.email || out.member?.email)) await directoryOp(env, "clearInvitePointer", { email: out.email ?? out.member.email, tenantId: tenant }).catch(() => undefined);
-    }
-    if (["members/role", "members/state"].includes(membershipKey) && out.member?.clerkUserId) {
-      await directoryOp(env, "upsertMembership", { clerkUserId: out.member.clerkUserId, tenantId: tenant, memberId: out.member.id, role: out.member.role, state: out.member.state });
-    }
-    if (membershipKey === "members/remove" && out.member) {
-      if (out.removed === "canceled") {
-        await directoryOp(env, "clearInvitePointer", { email: out.member.email, tenantId: tenant });
-        if (out.member.clerkUserId) await directoryOp(env, "removeMembership", { clerkUserId: out.member.clerkUserId, tenantId: tenant });
-      } else if (out.member.clerkUserId) {
-        await directoryOp(env, "upsertMembership", { clerkUserId: out.member.clerkUserId, tenantId: tenant, memberId: out.member.id, role: out.member.role, state: out.member.state });
-      }
-    }
-    return cloneResponse(res);
+    return cloneResponse(await tenantOpRaw(env, tenant, "memberContext", {
+      clerkUserId: body.clerkUserId,
+      email: body.email,
+    }));
   }
 
-  // GET /api/state[?viewer=<memberId>] — the dashboard's read. `viewer` names
-  // the MEMBER on whose behalf the web is asking; the DO then returns only the
-  // services/boxes that member may reach (TenantDO.viewerFilter, the same rule
-  // the browser door applies). The id is a tenant-local member id and is
-  // resolved inside the DO against this tenant's active roster, so a wrong or
-  // stale one narrows to nothing rather than widening.
+  // GET /api/state — the tenant's full state. (A `viewer` query parameter used
+  // to narrow it for a shared member; there are no members to narrow for, and
+  // a scoped read no longer echoes viewerScoped, so an old web fails closed.)
   if (method === "GET" && seg.length === 1 && seg[0] === "state") {
-    const viewer = url.searchParams.get("viewer") ?? undefined;
-    const state = await tenantOp<TenantState>(env, tenant, "getState", { viewer });
+    const state = await tenantOp<TenantState>(env, tenant, "getState");
     return json(200, state);
   }
 
@@ -876,60 +676,6 @@ async function handleApiInner(
     return json(200, await tenantOp(env, tenant, "revokeCliTokens"));
   }
 
-  // POST /api/sessions-revoke — "sign everyone out" of the browser login wall:
-  // bump the tenant's sessionEpoch so every live finch_session cookie (stamped
-  // with the old epoch) is rejected at the relay gate (browserGate). The web BFF
-  // calls this; mirrors cli-revoke for the CLI-token plane.
-  if (method === "POST" && seg.length === 1 && seg[0] === "sessions-revoke") {
-    return json(200, await tenantOp(env, tenant, "bumpSessionEpoch"));
-  }
-
-  // POST /api/portal-grant {slug,userId} — the login-wall hand-off. The Clerk-
-  // gated portal page (web) calls this for a browser that hit a private service
-  // with no session cookie. The TENANT is the security-critical part and comes
-  // from the verified assertion (NOT the body); userId is carried for the cookie's
-  // identity/audit. We VERIFY OWNERSHIP — routerLookup(slug) MUST resolve to this
-  // tenant — so a tenant can't mint a portal grant for a slug it doesn't own (which
-  // would let it set a session cookie on someone else's slug host). 403 otherwise.
-  // Returns a short (~60s), single-use (jti) portal grant the browser carries to
-  // <slug>.finchmcp.com/__finch/cb.
-  if (method === "POST" && seg.length === 1 && seg[0] === "portal-grant") {
-    const body = await readJson(req);
-    const slug = String(body.slug || "").trim().toLowerCase();
-    const userId = String(body.userId || "").trim();
-    if (!slug || !userId) {
-      return json(400, { error: "slug and userId required" });
-    }
-    // Ownership check: the slug must belong to THIS tenant (the assertion's
-    // tenant). A slug owned by another tenant (or unregistered) is refused — a
-    // portal grant for it could otherwise set a cookie on a foreign slug host.
-    const owner = await routerLookup(env, slug);
-    if (owner !== tenant) {
-      return json(403, { error: "slug is not owned by this tenant" });
-    }
-    // The caller's email + admin bit ride the grant into the session cookie so
-    // browserGate can enforce per-app user grants at the door: admins pass
-    // everywhere; members need a user→service ACL rule. Both come from the
-    // Clerk-authed web (portal/start), never from the browser.
-    const email = String(body.email || "").trim().toLowerCase();
-    const admin = body.admin === true;
-    const exp = Math.floor(Date.now() / 1000) + PORTAL_GRANT_TTL_SECONDS;
-    const grant = await signToken(
-      {
-        kind: "portal",
-        tenant,
-        slug,
-        userId,
-        ...(email ? { email } : {}),
-        ...(admin ? { admin } : {}),
-        exp,
-        jti: genJti(),
-      },
-      env.TICKET_SECRET,
-    );
-    return json(200, { grant });
-  }
-
   if (method === "GET" && seg.length === 1 && seg[0] === "slug-available") {
     const slug = (url.searchParams.get("slug") || "").trim().toLowerCase();
     if (!slug) return json(400, { error: "slug required" });
@@ -953,29 +699,6 @@ async function handleApiInner(
     return json(404, { error: "unknown service action", action });
   }
 
-  // PUT /api/services/:id/auth {mode} — set the public-relay access mode
-  // ("key" requires a finch_ bearer; "public" is an open webpage). The dashboard
-  // BFF half of the generic-HTTP-hosting feature (same op as `finch auth`).
-  if (
-    method === "PUT" &&
-    seg[0] === "services" &&
-    seg.length === 3 &&
-    seg[2] === "auth"
-  ) {
-    const id = safeDecode(seg[1]);
-    const body = await readJson(req);
-    const out = await tenantOp<{ ok: boolean; error?: string }>(
-      env,
-      tenant,
-      "setAuth",
-      { service: id, mode: body.mode },
-    );
-    if (out?.ok === false) {
-      return json(out.error === "unknown service" ? 404 : 400, out);
-    }
-    return json(200, out);
-  }
-
   // PUT /api/services/:id/tags {tags}
   if (
     method === "PUT" &&
@@ -992,23 +715,7 @@ async function handleApiInner(
     return json(out?.ok === false ? 404 : 200, out);
   }
 
-  // PUT /api/services/:id/group {group}
-  if (
-    method === "PUT" &&
-    seg[0] === "services" &&
-    seg.length === 3 &&
-    seg[2] === "group"
-  ) {
-    const id = safeDecode(seg[1]);
-    const body = await readJson(req);
-    const out = await tenantOp(env, tenant, "setGroup", {
-      id,
-      group: String(body.group ?? ""),
-    });
-    return json(out?.ok === false ? 404 : 200, out);
-  }
-
-  // POST /api/keys {label,scope,owner}. scope is the STRUCTURED KeyScope
+  // POST /api/keys {label,scope}. scope is the STRUCTURED KeyScope
   // ({all:true} | {services:[...]}); TenantDO.mintKey validates every listed
   // service id exists and 400s on an unknown id. We pass it through and
   // surface the DO's error verbatim (no validation duplicated here).
@@ -1020,7 +727,6 @@ async function handleApiInner(
     >(env, tenant, "mintKey", {
       label: body.label,
       scope: body.scope,
-      owner: body.owner,
     });
     if ("error" in out) return json(400, { error: out.error });
     const resp: MintKeyResp = {
@@ -1056,97 +762,6 @@ async function handleApiInner(
       box: hasService ? box : "",
       key: body.key,
     });
-    return json(out?.ok === false ? 404 : 200, out);
-  }
-
-  // GET /api/access — access-request queue + user→service ACL grants
-  if (method === "GET" && seg.length === 1 && seg[0] === "access") {
-    return json(200, await tenantOp(env, tenant, "listAccess"));
-  }
-
-  // POST /api/access/request {email,service,requestedBy}
-  if (
-    method === "POST" &&
-    seg.length === 2 &&
-    seg[0] === "access" &&
-    seg[1] === "request"
-  ) {
-    const body = await readJson(req);
-    if (!body.email || !body.service) {
-      return json(400, { error: "email and service required" });
-    }
-    const out = await tenantOp<{ ok: boolean; error?: string }>(
-      env,
-      tenant,
-      "requestAccess",
-      {
-        email: body.email,
-        service: body.service,
-        requestedBy: body.requestedBy,
-        requestedByUserId: body.requestedByUserId,
-      },
-    );
-    return json(out?.ok === false ? 400 : 200, out);
-  }
-
-  // POST /api/access/status {id,status,resolvedBy}
-  if (
-    method === "POST" &&
-    seg.length === 2 &&
-    seg[0] === "access" &&
-    seg[1] === "status"
-  ) {
-    const body = await readJson(req);
-    if (!body.id || !body.status) {
-      return json(400, { error: "id and status required" });
-    }
-    const out = await tenantOp<{ ok?: boolean; error?: string }>(
-      env,
-      tenant,
-      "setAccessStatus",
-      { id: body.id, status: body.status, resolvedBy: body.resolvedBy, resolvedByUserId: body.resolvedByUserId },
-    );
-    return json(out?.error ? 400 : 200, out);
-  }
-
-  // POST /api/access/revoke-grant {email,service} — surgically remove ONE
-  // user→service grant (multi-dst rules keep their other services); returns
-  // {removed, stillAllowed} so the BFF can refuse a false-ok revoke when a
-  // broader (all/tag/group/locked) rule still covers the user.
-  if (
-    method === "POST" &&
-    seg.length === 2 &&
-    seg[0] === "access" &&
-    seg[1] === "revoke-grant"
-  ) {
-    const body = await readJson(req);
-    if (!body.email || !body.service) {
-      return json(400, { error: "email and service required" });
-    }
-    const out = await tenantOp<{ ok: boolean }>(env, tenant, "removeUserGrant", {
-      email: body.email,
-      service: body.service,
-    });
-    return json(out?.ok === false ? 400 : 200, out);
-  }
-
-  // POST /api/acl {src,dst}
-  if (method === "POST" && seg.length === 1 && seg[0] === "acl") {
-    const body = await readJson(req);
-    if (!body.src || !body.dst) {
-      return json(400, { error: "src and dst required" });
-    }
-    const out = await tenantOp(env, tenant, "addAcl", {
-      src: body.src,
-      dst: body.dst,
-    });
-    return json(200, out);
-  }
-
-  // DELETE /api/acl/:id
-  if (method === "DELETE" && seg[0] === "acl" && seg.length === 2) {
-    const id = safeDecode(seg[1]);
-    const out = await tenantOp(env, tenant, "removeAcl", { id });
     return json(out?.ok === false ? 404 : 200, out);
   }
 
@@ -1204,13 +819,20 @@ async function handleHostnames(
   }
 
   if (method === "POST") {
-    const reg = await routerRegister(env, hostname, tenant);
+    // Already this tenant's (registered before, or handed over from the
+    // user's former team tenant by the single-user purge): Cloudflare already
+    // has it, and provisioning again would fail as a duplicate, whose failure
+    // path would then unregister the hostname the tenant owns.
+    const alreadyOwned = (await routerLookup(env, hostname)) === tenant;
+    const reg = alreadyOwned
+      ? { ok: true, handedOff: false }
+      : await routerRegisterWakingHolder(env, hostname, tenant);
     if (!reg.ok) {
       if (reg.reason === "collision") return json(409, { error: "hostname already registered" });
       return json(400, { error: "invalid hostname" });
     }
     let ssl: unknown = undefined;
-    if (!vanity) {
+    if (!vanity && !alreadyOwned && !reg.handedOff) {
       const cf = await provisionCfHostname(env, hostname);
       if (!cf.ok) {
         await routerUnregister(env, hostname, tenant);
@@ -1248,20 +870,80 @@ async function tenantHostBase(
   tenant: string,
   inboundHost: string,
 ): Promise<{ http: string; ws: string; host: string }> {
-  const local =
-    inboundHost.startsWith("localhost") || inboundHost.startsWith("127.");
-  // In dev/staging (DEV=1: a single DEFAULT_TENANT, no per-slug subdomains) the
-  // ONLY reachable host is the inbound workers.dev host we were called on. The
-  // tenant's stored <slug>.finchmcp.com resolves only in prod (wildcard DNS +
-  // slug routing), so using it here hands operators an unresolvable install/URL.
-  // Prod (DEV unset) routes by slug subdomain, so there we must use it.
-  const useInbound = local || env.DEV === "1";
-  let host = inboundHost;
-  if (!useInbound) {
+  let stateHost: string | undefined;
+  if (!usesInboundHost(env, inboundHost)) {
     const state = await tenantOp<{ host?: string }>(env, tenant, "getState");
-    if (state?.host) host = state.host;
+    stateHost = state?.host;
   }
-  const s = local ? "" : "s";
+  return hostBase(env, inboundHost, stateHost);
+}
+
+// In dev/staging (DEV=1: a single DEFAULT_TENANT, no per-slug subdomains) the
+// ONLY reachable host is the inbound workers.dev host we were called on. The
+// tenant's stored <slug>.finchmcp.com resolves only in prod (wildcard DNS +
+// slug routing), so using it there hands operators an unresolvable install/URL.
+// Prod (DEV unset) routes by slug subdomain, so there we must use it.
+/** Whether a Host header (with or without a port) names this machine: the
+ *  parsed hostname is exactly `localhost`, an IPv4 address in 127.0.0.0/8, or
+ *  the IPv6 loopback ::1 — the same set the agent's net.IP.IsLoopback accepts.
+ *  The WHATWG URL parser canonicalizes IP literals first (127.1, 0x7f.0.0.2
+ *  and [0:0:0:0:0:0:0:1] all come out dotted-quad / [::1]), so the checks run
+ *  on the parsed address, never on a prefix of the raw text:
+ *  localhost.example.com or 127.0.0.1.nip.io is a routed public host, and
+ *  plain http there would carry client credentials in the clear. */
+export function isLoopbackHost(hostHeader: string): boolean {
+  let hostname: string;
+  try {
+    hostname = new URL(`http://${hostHeader}`).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  if (hostname === "localhost" || hostname === "[::1]") return true;
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(hostname);
+  return !!v4 && v4.slice(1).every((o) => Number(o) <= 255) && v4[1] === "127";
+}
+
+/** The origin POST /api/cli/call relays through, chosen so the relay's
+ *  host-based tenant resolution (index.ts resolveTenant) lands on `tenant`.
+ *  A pure read: it lists the host keys RouterDO already maps to the tenant and
+ *  never claims one (no getState / ensureDefaultSlug writes). Prefers a
+ *  <slug>.finchmcp.com key, then a custom hostname; each candidate must
+ *  round-trip through hostKeyFromHost to its own key, so the relay looks up
+ *  exactly the row that names this tenant. With none, only dev/loopback falls
+ *  back to the inbound host (resolved by the dev-only DEFAULT_TENANT);
+ *  production gets null and the caller answers 409. SELF hands the request
+ *  straight to this Worker, so the chosen host needs no DNS. */
+async function relayOriginForTenant(
+  env: Env,
+  tenant: string,
+  inboundHost: string,
+): Promise<string | null> {
+  const keys = await routerListForTenant(env, tenant);
+  const candidates: Array<[string, string]> = [
+    ...keys.filter((k) => !k.includes(".")).map((k): [string, string] => [k, `${k}.finchmcp.com`]),
+    ...keys.filter((k) => k.includes(".")).map((k): [string, string] => [k, k]),
+  ];
+  for (const [key, host] of candidates) {
+    if (hostKeyFromHost(host) === key) return `https://${host}`;
+  }
+  if (usesInboundHost(env, inboundHost)) {
+    return `${isLoopbackHost(inboundHost) ? "http" : "https"}://${inboundHost}`;
+  }
+  return null;
+}
+
+function usesInboundHost(env: Env, inboundHost: string): boolean {
+  return isLoopbackHost(inboundHost) || env.DEV === "1";
+}
+
+/** tenantHostBase for a caller that already holds the tenant's stored host. */
+function hostBase(
+  env: Env,
+  inboundHost: string,
+  stateHost: string | undefined,
+): { http: string; ws: string; host: string } {
+  const host = !usesInboundHost(env, inboundHost) && stateHost ? stateHost : inboundHost;
+  const s = isLoopbackHost(inboundHost) ? "" : "s";
   return { http: `http${s}://${host}`, ws: `ws${s}://${host}`, host };
 }
 
@@ -1336,8 +1018,7 @@ async function handleJoin(
   }
   const payload = await verifyToken(body.ticket, env.TICKET_SECRET);
   // A join ticket is service-scoped — validateTicket already requires
-  // `service` for non-browser kinds, but narrow it here for the type checker
-  // (TicketPayload.service is optional for the browser portal/session kinds).
+  // `service`, but narrow it here for the type checker.
   if (
     !payload ||
     payload.kind !== "join" ||
@@ -1441,8 +1122,8 @@ async function handleRefresh(
   }
 
   const payload = await verifyToken(body.refreshToken, env.TICKET_SECRET);
-  // A refresh token is service- AND box-scoped (browser kinds carry
-  // neither); narrow `service` for the type checker as well.
+  // A refresh token is service- AND box-scoped; narrow `service` for the
+  // type checker as well.
   if (
     !payload ||
     payload.kind !== "refresh" ||
@@ -1462,20 +1143,6 @@ async function handleRefresh(
   });
   if (!reg.exists) {
     return json(403, { error: "box no longer registered" });
-  }
-  // Aviary-issued refresh credentials carry a per-box epoch. A successfully
-  // persisted re-enrollment ACK atomically advances it, invalidating the prior
-  // refresh token without affecting legacy tokens (which have no epoch).
-  if (typeof payload.epoch === "number") {
-    const current = await tenantOp<{ exists: boolean; epoch?: number }>(
-      env,
-      tenant,
-      "boxCredentialEpoch",
-      { service, box },
-    );
-    if (!current.exists || current.epoch !== payload.epoch) {
-      return json(403, { error: "refresh credential superseded" });
-    }
   }
 
   // Re-stamp the agent version when the box reports one (it re-execs onto a

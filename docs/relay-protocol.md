@@ -37,10 +37,6 @@ must never be placed in application logs, Durable Object storage, call history,
 traces, or metrics. Retained per-call state is restricted to the operational
 metadata documented in [`privacy.md`](privacy.md).
 
-Dashboard **Test in chat** is not part of this ordinary relay guarantee. It
-explicitly sends chat history, tool definitions, tool arguments, and tool
-results to Cloudflare Workers AI as described in the privacy document.
-
 The wire-format reference below stands; treat the OPEN.route / SessionDO /
 binary-frame sections as the original v2 ambition, superseded as noted above.
 
@@ -138,7 +134,8 @@ response has no duration limit.
 The relay forwards request headers byte-for-byte except those the hub accepts a
 credential in: `Authorization`, `Proxy-Authorization`, every `X-Finch-*` header
 (the namespace is hub-reserved; `X-Finch-Assertion` is minted afterwards), and
-the login-wall cookie pairs inside `Cookie`. The scrub is by **name**, never by
+any stale cookie pair from the retired browser login wall (`finch_session`,
+`__Host-finch_session`) inside `Cookie`. The scrub is by **name**, never by
 value — MCP 2026-07-28's `Mcp-Name` / `Mcp-Param-*` mirror the JSON-RPC body,
 and deleting one because a tool or argument happened to contain `finch_` makes
 the server reject the call as a header/body mismatch (400, -32020). Unknown
@@ -153,6 +150,12 @@ sight, write `sessionId → machine` to a per-session sharded `SessionDO`
 `Mcp-Session-Id` to the pinned machine; tear the mapping down on `DELETE /mcp`.
 Single-machine appliances (the common IoT case) need none of this — they pin
 trivially. (Do **not** use cookie affinity — MCP clients drop `Set-Cookie`.)
+
+The hub's own MCP client — `POST /api/cli/call`, behind `finch test` and
+`finch call` (`worker/src/cli-call.ts`) — does not wait for this: it runs the
+whole initialize → call → `DELETE` exchange against one box's pinned
+`/<service>/<box>/mcp` path, failing over to the next healthy box only while
+the pick is answering the DO's `X-Finch-Offline` 503.
 
 ## What changes in the existing code
 

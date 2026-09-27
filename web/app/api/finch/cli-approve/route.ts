@@ -1,9 +1,10 @@
 // POST /api/finch/cli-approve {userCode} — approve a `finch login` device code.
-// Admin-only; mints the CLI token on the hub and stamps it onto the pending code.
-// We also pass the approver's Clerk email so the box (and its tray app) can show
+// Acts as the signed-in user's own account (tenant = their Clerk user id);
+// mints the CLI token on the hub and stamps it onto the pending code.
+// We also pass the approver's Clerk email so the box can show
 // WHO it's signed in as.
 import { clerkClient } from "@clerk/nextjs/server";
-import { errorResponse, HttpError, hubFetchAs, requireAdmin } from "@/lib/hub";
+import { errorResponse, HttpError, hubFetchAs, resolveTenant } from "@/lib/hub";
 import { readJsonObject } from "@/lib/request-body";
 import { readHubJsonObject, forwardHubResponse } from "../_shared";
 import {
@@ -16,16 +17,16 @@ import {
 
 export async function POST(req: Request) {
   try {
-    // Reuse the identity requireAdmin already validated — no second auth() hop.
-    const ctx = await requireAdmin();
+    // Reuse the identity resolveTenant already validated — no second auth() hop.
+    const ctx = await resolveTenant();
     const body = await readJsonObject(req, MAX_CLI_REQUEST_BYTES);
     const userCode = parseCliUserCode(body.userCode);
     const clientEmail = parseOptionalClientEmail(body.email);
 
     // The approver's email, for the box's account label. Prefer the authoritative
-    // server lookup, but fall back to the email the client sent (from useUser).
-    // On staging the server lookup fails — ctx.userId is the forced DEFAULT_TENANT
-    // id, not a real Clerk user — so the client value is what makes it work.
+    // server lookup (ctx.userId is the real Clerk user id, which is also the
+    // tenant), and fall back to the email the client sent (from useUser) only if
+    // that lookup fails, e.g. a transient Clerk Backend API error.
     let serverEmail = "";
     try {
       const user = await (await clerkClient()).users.getUser(ctx.userId);
@@ -39,7 +40,7 @@ export async function POST(req: Request) {
           user.username,
       );
     } catch {
-      // Expected on staging (synthetic tenant id) — the client email covers it.
+      // Best-effort: the label is cosmetic, so the client email covers it.
     }
     const email = serverEmail || clientEmail;
 

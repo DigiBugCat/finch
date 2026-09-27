@@ -56,14 +56,6 @@ function chunkedBody(chunkBytes: number, chunks: number) {
 // check (arrayBuffer()/text()) is a memory-exhaustion lever that takes
 // co-resident in-flight requests with it. (security F2 / F5)
 describe("unbounded chunked bodies are cut off while streaming, not after", () => {
-  it("caps the /chat/completions body ahead of the model calls", async () => {
-    const { body, state } = chunkedBody(64 * 1024, 256); // 16 MiB offered
-    const res = await call("/chat/completions", body);
-    expect(res.status).toBe(413);
-    expect(await res.json()).toEqual({ error: "request body too large" });
-    expect(state.pulled).toBeLessThan(16); // 256 KiB cap
-  });
-
   it("caps the relay body before it is buffered for failover replay", async () => {
     // hub.test is not a slug host, so resolveTenant falls back to DEFAULT_TENANT;
     // the service must live in THAT tenant for the relay to find it.
@@ -124,19 +116,27 @@ describe("public credential endpoints fail closed on hostile bodies", () => {
   });
 });
 
-describe("portal grants require a user-scoped assertion", () => {
-  it("does not accept a tenant assertion with body-controlled admin identity", async () => {
+describe("tenant resolution is the tenant assertion alone", () => {
+  it("no longer serves the user-scoped owner lookup", async () => {
     const assertion = await signAssertion({
       tenant: env.DEFAULT_TENANT!, kind: "assertion", exp: now() + 60,
     }, env.FINCH_SERVICE_SECRET);
-    const res = await call("/api/portal-grant", JSON.stringify({
-      slug: "victim", userId: "attacker", email: "attacker@example.test", admin: true,
-    }), {
+    const res = await call("/api/user/sync", JSON.stringify({ emails: [] }), {
+      "X-Finch-Service": env.FINCH_SERVICE_SECRET,
+      "X-Finch-Auth": assertion,
+    });
+    expect(res.status).toBe(404);
+  });
+
+  it("does not accept a user-scoped assertion as a tenant credential", async () => {
+    const assertion = await signAssertion({
+      tenant: env.DEFAULT_TENANT!, kind: "user", exp: now() + 60,
+    }, env.FINCH_SERVICE_SECRET);
+    const res = await call("/api/member-context", JSON.stringify({ clerkUserId: env.DEFAULT_TENANT }), {
       "X-Finch-Service": env.FINCH_SERVICE_SECRET,
       "X-Finch-Auth": assertion,
     });
     expect(res.status).toBe(401);
-    expect(await res.json()).toEqual({ error: "invalid user assertion" });
   });
 });
 
@@ -210,301 +210,6 @@ describe("box-scoped key detach semantics", () => {
       hash: await hashKey(minted.plaintext),
       service,
     })).toMatchObject({ allowed: false, reason: "no-key" });
-  });
-});
-
-// The workspace-creation path: three defects that all landed on one line.
-describe("/api/tenant-create", () => {
-  async function userHeaders(clerkUserId: string) {
-    return {
-      "X-Finch-Service": env.FINCH_SERVICE_SECRET,
-      "X-Finch-Auth": await signAssertion(
-        { tenant: clerkUserId, kind: "user", exp: now() + 60 },
-        env.FINCH_SERVICE_SECRET,
-      ),
-    };
-  }
-  const createBody = (email: string, idempotencyKey?: string, name = "Acme") =>
-    JSON.stringify({ name, email, emails: [email], ...(idempotencyKey ? { idempotencyKey } : {}) });
-
-  const listForUser = async (clerkUserId: string) =>
-    env.DIRECTORY.get(env.DIRECTORY.idFromName("global"))
-      .fetch("https://directory.internal/", {
-        method: "POST",
-        body: JSON.stringify({ op: "listForUser", clerkUserId }),
-      })
-      .then((r) => r.json() as Promise<any>);
-
-  // REGRESSION: a failed directory write was swallowed and the route still
-  // returned 200. The u: row is the ONLY handle on a team workspace --
-  // /api/user/sync enumerates exclusively through listForUser and its lone
-  // self-heal is the hardcoded personal tenant -- so the browser cleared its
-  // active-tenant cookie on the next load and the committed workspace became
-  // permanently unreachable, having been reported as created.
-  it("does not report success when the workspace index write fails", async () => {
-    const clerkUserId = `user_reindex_${crypto.randomUUID()}`;
-    const real = env.DIRECTORY;
-    const DIRECTORY = {
-      idFromName: (name: string) => real.idFromName(name),
-      get: (id: any) => ({
-        fetch: async (input: any, init?: any) => {
-          const { op } = JSON.parse(String(init?.body ?? "{}"));
-          // Fail exactly the write this route makes.
-          if (op === "upsertMembership" || op === "reindexTenant") {
-            return new Response(JSON.stringify({ error: "boom" }), { status: 500 });
-          }
-          return real.get(id).fetch(input, init);
-        },
-      }),
-    };
-
-    const res = await call(
-      "/api/tenant-create",
-      createBody("owner@example.test", crypto.randomUUID()),
-      await userHeaders(clerkUserId),
-      { DIRECTORY },
-    );
-
-    expect(res.status).toBe(503);
-    // The claim the 200 was making is false, and this is what makes it false.
-    expect((await listForUser(clerkUserId)).memberships).toEqual([]);
-  });
-
-  // REGRESSION (P1): when all in-request index retries failed, the 503 told
-  // the user to retry — but each retry minted a FRESH id and bootstrapped a
-  // SECOND workspace, leaving the first committed and permanently unindexed.
-  // With an idempotency key the id derives from (caller, key), so the retry
-  // lands on the SAME tenant: bootstrap replays, the index write repairs.
-  it("recovers the SAME workspace on retry with an idempotency key", async () => {
-    const clerkUserId = `user_idem_${crypto.randomUUID()}`;
-    const key = crypto.randomUUID();
-    const headers = await userHeaders(clerkUserId);
-    const real = env.DIRECTORY;
-    let down = true;
-    const DIRECTORY = {
-      idFromName: (name: string) => real.idFromName(name),
-      get: (id: any) => ({
-        fetch: async (input: any, init?: any) => {
-          const { op } = JSON.parse(String(init?.body ?? "{}"));
-          if (op === "upsertMembership" && down) {
-            return new Response(JSON.stringify({ error: "boom" }), { status: 500 });
-          }
-          return real.get(id).fetch(input, init);
-        },
-      }),
-    };
-
-    // Every in-request retry fails: workspace committed, index missing, 503.
-    const first = await call("/api/tenant-create", createBody("idem@example.test", key), headers, { DIRECTORY });
-    expect(first.status).toBe(503);
-    const firstBody = (await first.json()) as any;
-    expect(firstBody.tenantId).toMatch(/^ft_[0-9a-f]{32}$/);
-
-    // The user retries after the outage. Same key -> same tenant, repaired —
-    // NOT a duplicate.
-    down = false;
-    const second = await call("/api/tenant-create", createBody("idem@example.test", key), headers, { DIRECTORY });
-    expect(second.status).toBe(200);
-    const { tenantId } = (await second.json()) as any;
-    expect(tenantId).toBe(firstBody.tenantId);
-
-    const listed = await listForUser(clerkUserId);
-    expect(listed.memberships).toHaveLength(1);
-    expect(listed.memberships[0].tenantId).toBe(tenantId);
-  });
-
-  it("keys the derived id to the caller: replay is owner-gated, keys are per-attempt", async () => {
-    const clerkUserId = `user_idem2_${crypto.randomUUID()}`;
-    const headers = await userHeaders(clerkUserId);
-    const key = crypto.randomUUID();
-
-    // Plain replay of a fully successful create: same tenant back, still one row.
-    const a = await call("/api/tenant-create", createBody("idem2@example.test", key), headers);
-    expect(a.status).toBe(200);
-    const idA = ((await a.json()) as any).tenantId;
-    const replay = await call("/api/tenant-create", createBody("idem2@example.test", key), headers);
-    expect(replay.status).toBe(200);
-    expect(((await replay.json()) as any).tenantId).toBe(idA);
-    expect((await listForUser(clerkUserId)).memberships).toHaveLength(1);
-
-    // A different key is a different attempt -> a different workspace.
-    const b = await call("/api/tenant-create", createBody("idem2@example.test", crypto.randomUUID()), headers);
-    expect(b.status).toBe(200);
-    expect(((await b.json()) as any).tenantId).not.toBe(idA);
-
-    // Another USER with the same key must not land on (or be handed) that
-    // tenant: the id mixes in the caller, and the replay branch authorizes via
-    // the tenant's own membership.
-    const otherUser = `user_idem3_${crypto.randomUUID()}`;
-    const c = await call("/api/tenant-create", createBody("idem3@example.test", key), await userHeaders(otherUser));
-    expect(c.status).toBe(200);
-    expect(((await c.json()) as any).tenantId).not.toBe(idA);
-  });
-
-  // REGRESSION: a transient directory failure used to surface as a 503, and the
-  // caller's retry minted a FRESH id and bootstrapped a SECOND workspace -- so a
-  // brief blip accumulated orphans one attempt at a time. The TenantDO is
-  // already committed here, so the retry belongs to this request and this
-  // tenant. upsertMembership is idempotent (it filters any existing row for the
-  // tenantId before appending), which is what makes retrying safe.
-  it("retries the idempotent index write instead of making the caller re-create", async () => {
-    const clerkUserId = `user_retry_${crypto.randomUUID()}`;
-    const real = env.DIRECTORY;
-    let attempts = 0;
-    const DIRECTORY = {
-      idFromName: (name: string) => real.idFromName(name),
-      get: (id: any) => ({
-        fetch: async (input: any, init?: any) => {
-          const { op } = JSON.parse(String(init?.body ?? "{}"));
-          if (op === "upsertMembership") {
-            attempts++;
-            // Fail once, then let it through — an ordinary transient blip.
-            if (attempts === 1) {
-              return new Response(JSON.stringify({ error: "boom" }), { status: 500 });
-            }
-          }
-          return real.get(id).fetch(input, init);
-        },
-      }),
-    };
-
-    const res = await call(
-      "/api/tenant-create",
-      createBody("owner3@example.test", crypto.randomUUID()),
-      await userHeaders(clerkUserId),
-      { DIRECTORY },
-    );
-
-    expect(res.status).toBe(200);
-    expect(attempts).toBeGreaterThan(1); // it really did retry
-    const { tenantId } = (await res.json()) as any;
-
-    // Exactly ONE workspace exists, indexed — no orphan, no duplicate.
-    const listed = await listForUser(clerkUserId);
-    expect(listed.memberships).toHaveLength(1);
-    expect(listed.memberships[0].tenantId).toBe(tenantId);
-  });
-
-  // REGRESSION (round 6): the fingerprint must never strand a retry. A
-  // missing name used to bootstrap under the DO's fallback displayName, and
-  // the identical retry then failed the fingerprint against that fallback —
-  // 409, workspace committed and unindexed forever. The name is now required
-  // before any state exists, so persisted === sent, exactly.
-  it("requires a name before bootstrapping, so the fingerprint cannot strand a retry", async () => {
-    const clerkUserId = `user_name_${crypto.randomUUID()}`;
-    const headers = await userHeaders(clerkUserId);
-    for (const name of [undefined, "", "   ", 42]) {
-      const res = await call(
-        "/api/tenant-create",
-        JSON.stringify({ ...(name === undefined ? {} : { name }), email: "n@example.test", emails: ["n@example.test"], idempotencyKey: crypto.randomUUID() }),
-        headers,
-      );
-      expect(res.status).toBe(400);
-      expect((((await res.json()) as any).error ?? "")).toContain("name");
-    }
-    expect((await listForUser(clerkUserId)).memberships).toEqual([]);
-  });
-
-  // REGRESSION (round 5): a replay must be a replay of the SAME creation.
-  // Reusing workspace A's key while asking for "B" used to return 200 with
-  // A's id — the bridge would then activate A and report B created, silently
-  // ignoring the requested name. Same key + different data is a caller bug
-  // and must be a loud conflict.
-  it("rejects a key replayed with a different workspace name", async () => {
-    const clerkUserId = `user_fp_${crypto.randomUUID()}`;
-    const headers = await userHeaders(clerkUserId);
-    const key = crypto.randomUUID();
-
-    const a = await call("/api/tenant-create", createBody("fp@example.test", key, "Acme"), headers);
-    expect(a.status).toBe(200);
-    const idA = ((await a.json()) as any).tenantId;
-
-    const b = await call("/api/tenant-create", createBody("fp@example.test", key, "Beta"), headers);
-    expect(b.status).toBe(409);
-    expect((((await b.json()) as any).error ?? "")).toContain("idempotencyKey");
-
-    // The true replay (same name) still works and still maps to A.
-    const c = await call("/api/tenant-create", createBody("fp@example.test", key, "Acme"), headers);
-    expect(c.status).toBe(200);
-    expect(((await c.json()) as any).tenantId).toBe(idA);
-    expect((await listForUser(clerkUserId)).memberships).toHaveLength(1);
-  });
-
-  // REGRESSION (P1, round 3): the key used to be OPTIONAL, and the unkeyed
-  // fallback minted a fresh random id per request — so every caller without a
-  // key (a dashboard tab from before the deploy, a direct API user, a
-  // malformed key) kept the exact orphan-plus-duplicate retry behaviour the
-  // key was introduced to remove. "Sometimes idempotent" is not idempotent:
-  // no valid key, no state created.
-  it("refuses to create anything without a valid idempotency key", async () => {
-    const clerkUserId = `user_nokey_${crypto.randomUUID()}`;
-    const headers = await userHeaders(clerkUserId);
-    for (const body of [
-      createBody("nokey@example.test"),
-      createBody("nokey@example.test", "short"),
-      createBody("nokey@example.test", "has spaces in it"),
-      createBody("nokey@example.test", "x".repeat(65)),
-    ]) {
-      const res = await call("/api/tenant-create", body, headers);
-      expect(res.status).toBe(400);
-      expect((((await res.json()) as any).error ?? "")).toContain("idempotencyKey");
-    }
-    // Nothing was bootstrapped or indexed for any of the rejected calls.
-    expect((await listForUser(clerkUserId)).memberships).toEqual([]);
-  });
-
-  it("indexes the owner and returns a high-entropy id on success", async () => {
-    const clerkUserId = `user_ok_${crypto.randomUUID()}`;
-    const res = await call(
-      "/api/tenant-create",
-      createBody("owner2@example.test", crypto.randomUUID()),
-      await userHeaders(clerkUserId),
-    );
-    expect(res.status).toBe(200);
-    const { tenantId } = (await res.json()) as any;
-
-    // REGRESSION: the id was "ft_" + 8 hex = 32 bits, ~1% collision odds around
-    // 9,300 workspaces. A collision is not benign: bootstrapMembers finds the
-    // EXISTING tenant, returns 409, and the create just fails.
-    expect(tenantId).toMatch(/^ft_[0-9a-f]{32}$/);
-
-    // The owner is discoverable, which is the whole point of the write.
-    const listed = await listForUser(clerkUserId);
-    expect(listed.memberships).toHaveLength(1);
-    expect(listed.memberships[0].tenantId).toBe(tenantId);
-    expect(listed.memberships[0].role).toBe("owner");
-    expect(listed.memberships[0].state).toBe("active");
-  });
-
-  // The web calls this over the FINCH_HUB service binding, which carries no
-  // CF-Connecting-IP — clientIp() is "unknown" for every dashboard user, so the
-  // per-IP bucket (10/min) would be shared globally. The web forwards the
-  // browser's IP in X-Finch-Client-IP; this path is service-authed, so it's
-  // trusted here (and only here).
-  it("keys the per-IP creation throttle on the IP the web forwards", async () => {
-    const keys: string[] = [];
-    const JOIN_LIMIT = { limit: async ({ key }: { key: string }) => (keys.push(key), { success: true }) };
-    const clerkUserId = `user_ip_${crypto.randomUUID()}`;
-    const headers = await userHeaders(clerkUserId);
-
-    const forwarded = await call(
-      "/api/tenant-create",
-      createBody("ip@example.test", crypto.randomUUID()),
-      { ...headers, "X-Finch-Client-IP": "2001:db8::7" },
-      { JOIN_LIMIT },
-    );
-    expect(forwarded.status).toBe(200);
-    expect(keys).toEqual([`tcreate:${clerkUserId}`, "tcreate:2001:db8::7"]);
-
-    // A value that isn't an IP literal can't choose an arbitrary bucket.
-    keys.length = 0;
-    await call(
-      "/api/tenant-create",
-      createBody("ip@example.test", crypto.randomUUID()),
-      { ...headers, "X-Finch-Client-IP": "victim:bucket" },
-      { JOIN_LIMIT },
-    );
-    expect(keys[1]).toBe("tcreate:unknown");
   });
 });
 

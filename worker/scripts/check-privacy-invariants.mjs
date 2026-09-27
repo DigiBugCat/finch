@@ -102,11 +102,6 @@ function walk(node, visit) {
 const SAFE_CONSOLE_MESSAGES = new Set([
   "caller assertion JWKS unavailable",
   "caller assertion signing failed",
-  // Renamed from "tenant directory reindex failed" when /api/tenant-create
-  // stopped calling reindexTenant (the whole-keyspace scan) in favour of a
-  // single upsertMembership. Same sanitized-error-only shape as the others;
-  // the tenant id goes in the route's 503 response, never the log.
-  "tenant directory index failed",
 ]);
 
 function bindingIdentifiers(name) {
@@ -255,13 +250,7 @@ function sanitizedErrorReference(node) {
 }
 
 // Every reviewed message shares ONE argument shape: the sanitized error
-// message, nothing else. There used to be a second, richer shape for the
-// tenant-create failure log ({ tenantId, error }) with its own data-flow rule;
-// once the tenant id became derived from the client's idempotency key, keeping
-// it loggable would have meant teaching this gate which derivations launder
-// request data (digests, presence bits, ...) — a growing carve-out surface in
-// a gate whose value is being blunt. The id moved to the route's 503 response
-// instead, and the special case was DELETED rather than refined.
+// message, nothing else — no request-derived data rides along.
 function isReviewedArguments(message, args, call, bindings) {
   if (args.length !== 2) return false;
   const error = sanitizedErrorReference(args[1]);

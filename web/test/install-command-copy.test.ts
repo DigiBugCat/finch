@@ -15,7 +15,7 @@ function read(path: string): string {
 const SURFACES = [
   'public/llms.txt',
   'app/docs/page.tsx',
-  'components/HowItWorks.tsx',
+  'components/fieldguide/prompt.ts',
 ];
 
 describe('published install one-liner', () => {

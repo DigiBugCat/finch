@@ -137,36 +137,39 @@ signed `X-Finch-Assertion` for assertion-aware services; see
 
 ## Use it
 
-For a new Python service, the private Aviary pilot can use
-[AviaryMCP](https://finchmcp.com/docs/aviarymcp): define a tool once, expose it
-through MCP and generated REST/OpenAPI routes, and let the application register
-itself with Finch. Existing services and other languages use the CLI flow below.
+**With an AI agent** (Claude Code, Cursor, Codex, …), paste one line:
 
-Three commands on the box, from a logged-in CLI (see
-[`agent/README.md`](agent/README.md) for the full reference):
+> Read https://finchmcp.com/agents.md and use finch to publish my MCP server on
+> http://127.0.0.1:8000 as notes. Show me the sign-in link when you get it. Run
+> it as a background service, check it with finch test, then connect it to this
+> agent.
+
+The agent installs finch, shows you a sign-in link to approve, and does the
+rest. [`web/public/agents.md`](web/public/agents.md) is the guide it follows.
+
+**By hand**, on macOS or Linux (see [`agent/README.md`](agent/README.md) for
+the full reference):
 
 ```bash
-# 1. log in — opens the dashboard to approve a short code (like `gh auth login`)
-finch login --hub https://finchmcp.com
+curl -fsSL https://finchmcp.com/install | sh          # no sudo; ~/.local/bin if /usr/local/bin is not writable
 
-# 2. expose a local MCP server (running on :8000) as the service "printer"
-finch add printer --service http://127.0.0.1:8000 --name "Label Printer"
-
-# 3. serve it — dials out, auto-approves, prints the public URL
-finch run            #  → https://<your-slug>.finchmcp.com/printer/mcp
+finch login                                           # prints a link + code; approve on any device
+finch add notes --service http://127.0.0.1:8000       # prints https://<your-slug>.finchmcp.com/notes/mcp
+finch service install                                 # runs finch run as a launchd / systemd --user service
+finch test notes                                      # lists its MCP tools; non-zero exit if it fails
+finch connect notes --client claude-code              # or cursor | codex | json
 ```
 
 `finch add` writes a [`finch.yml`](agent/finch.example.yml) manifest; `finch
-run` serves every rule in it (add more services with more `finch add` calls —
-one process fronts them all). Then point any MCP client at the printed URL with
-a `finch_` key (mint one in the dashboard → **Keys**), or test it right in the
-dashboard with the service's **"test in chat"** panel.
+run` (or the service) serves every rule in it, so add more services with more
+`finch add` calls and re-run `finch service install`. `finch connect` mints a
+`finch_` key for one client and writes it into that client's config without
+printing it; `--public` on `finch add` skips keys entirely. Every command takes
+`--json` and uses fixed exit codes (0 ok, 1 error, 2 usage, 10 waiting for
+approval, 11 expired, 12 not logged in), so scripts and agents can branch on them.
 
 A runnable end-to-end example lives in
 [`examples/hello-mcp/`](examples/hello-mcp/).
-
-> No CLI yet? You can also enroll a single box from the dashboard ("Add box")
-> and run `finch join --ticket … --upstream …` — see the agent README.
 
 ## Local dev
 

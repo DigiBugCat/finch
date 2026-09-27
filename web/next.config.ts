@@ -35,7 +35,7 @@ function clerkScriptOrigin(): string {
  *   - object-src 'none' kills <object>/<embed> payloads
  *   - form-action 'self' blocks posting credentials to an attacker endpoint
  *   - frame-src is closed, and frame-ancestors 'none' keeps the one-click
- *     consent pages (/cli, /aviary/authorize) unframeable — see the note below,
+ *     consent page (/cli) unframeable — see the note below,
  *     that one is load-bearing rather than defence in depth.
  *
  * A nonce-based 'strict-dynamic' policy WOULD stop execution and Next does
@@ -75,8 +75,9 @@ function contentSecurityPolicy(): string {
       "https://img.clerk.com",
     )}`,
     "img-src 'self' data: blob: https://img.clerk.com",
-    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
-    "font-src 'self' data: https://fonts.gstatic.com",
+    // next/font self-hosts every face (app/layout.tsx), so no font host.
+    "style-src 'self' 'unsafe-inline'",
+    "font-src 'self' data:",
     "frame-src 'self' https://challenges.cloudflare.com",
     "worker-src 'self' blob:",
     "manifest-src 'self'",
@@ -85,7 +86,7 @@ function contentSecurityPolicy(): string {
 
 const nextConfig: NextConfig = {
   // Browsers that have reached Finch securely must never downgrade future
-  // dashboard/API requests (including tenant subdomains) to plaintext HTTP.
+  // app/API requests (including tenant subdomains) to plaintext HTTP.
   async headers() {
     return [
       {
@@ -95,10 +96,9 @@ const nextConfig: NextConfig = {
             key: "Strict-Transport-Security",
             value: "max-age=31536000; includeSubDomains",
           },
-          // FRAME DENIAL IS LOAD-BEARING, NOT HYGIENE. /cli and
-          // /aviary/authorize are one-click consent screens seeded from a query
-          // parameter, and approving /cli mints a ~30-day TENANT-ADMIN token
-          // bound to the approver's workspace.
+          // FRAME DENIAL IS LOAD-BEARING, NOT HYGIENE. /cli is a one-click
+          // consent screen seeded from a query parameter, and approving it
+          // mints a ~30-day TENANT-ADMIN token bound to the approver's account.
           //
           // SameSite does not protect them: every tenant gets
           // <slug>.finchmcp.com, and a service with auth "public" serves
@@ -112,7 +112,7 @@ const nextConfig: NextConfig = {
           // rest. Nothing in this app is framed, so 'none'/DENY costs nothing.
           { key: "Content-Security-Policy", value: contentSecurityPolicy() },
           { key: "X-Frame-Options", value: "DENY" },
-          // Don't leak ?code= consent tokens or dashboard paths to third parties.
+          // Don't leak ?code= consent tokens or app paths to third parties.
           { key: "Referrer-Policy", value: "strict-origin-when-cross-origin" },
           { key: "X-Content-Type-Options", value: "nosniff" },
         ],

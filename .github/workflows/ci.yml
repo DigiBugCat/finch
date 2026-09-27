@@ -52,7 +52,6 @@ jobs:
       - run: node --test scripts/*.test.mjs
       - run: node scripts/check-versions.mjs
       - run: node scripts/check-assertion-vector-drift.mjs
-      - run: python3 e2e/staging/test_safety.py
       - name: Test the dependency-free examples
         run: |
           python3 -m unittest discover -s examples/hello-mcp -p 'test_*.py'
@@ -113,8 +112,7 @@ jobs:
       - run: go build ./...
       - run: go vet ./...
       - run: go test -race ./...
-      - run: sh -n docker-entrypoint.sh docker-entrypoint_test.sh dependency-lock-sha256.sh
-      - run: sh docker-entrypoint_test.sh
+      - run: sh -n dependency-lock-sha256.sh
       - run: ./dependency-lock-sha256.sh "$(./dependency-lock-sha256.sh)"
       - name: Build hardened container image
         working-directory: .

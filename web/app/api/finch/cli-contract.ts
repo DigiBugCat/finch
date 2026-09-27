@@ -4,7 +4,6 @@ export const MAX_CLI_REQUEST_BYTES = 4 * 1024;
 
 const CLI_CODE_ALPHABET = "A-HJ-NP-Z2-9";
 const CLI_CODE_RE = new RegExp(`^[${CLI_CODE_ALPHABET}]{4}-?[${CLI_CODE_ALPHABET}]{4}$`);
-const CLI_TOKEN_RE = /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
 const EMAIL_LABEL_LIMIT = 200;
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f]/;
 
@@ -55,14 +54,6 @@ export function validApproveResponse(value: JsonObject): boolean {
   return value.ok === true;
 }
 
-export function validRevokeResponse(value: JsonObject): boolean {
-  return (
-    value.ok === true &&
-    Number.isSafeInteger(value.epoch) &&
-    (value.epoch as number) >= 0
-  );
-}
-
 export function cleanDescribeResponse(value: JsonObject): JsonObject | null {
   if (typeof value.found !== "boolean") return null;
   if (value.found === false) return { found: false };
@@ -87,48 +78,4 @@ export function cleanDescribeResponse(value: JsonObject): JsonObject | null {
     ...(ageSeconds !== undefined ? { ageSeconds } : {}),
     ...(approved !== undefined ? { approved } : {}),
   };
-}
-
-function validHubOrigin(value: string): boolean {
-  let url: URL;
-  try {
-    url = new URL(value);
-  } catch {
-    return false;
-  }
-  if (
-    url.username ||
-    url.password ||
-    url.search ||
-    url.hash ||
-    (url.pathname && url.pathname !== "/")
-  ) {
-    return false;
-  }
-  if (url.protocol === "https:") return true;
-  return (
-    url.protocol === "http:" &&
-    (url.hostname === "localhost" ||
-      url.hostname === "127.0.0.1" ||
-      url.hostname === "[::1]" ||
-      url.hostname === "::1")
-  );
-}
-
-export function validMintResponse(value: unknown): value is {
-  token: string;
-  hub: string;
-  expiresAt: number;
-} {
-  if (!isJsonObject(value)) return false;
-  return (
-    typeof value.token === "string" &&
-    value.token.length <= 4096 &&
-    CLI_TOKEN_RE.test(value.token) &&
-    typeof value.hub === "string" &&
-    value.hub.length <= 2048 &&
-    validHubOrigin(value.hub) &&
-    Number.isSafeInteger(value.expiresAt) &&
-    (value.expiresAt as number) > Math.floor(Date.now() / 1000)
-  );
 }

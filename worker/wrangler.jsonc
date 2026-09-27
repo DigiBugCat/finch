@@ -19,24 +19,28 @@
   // migrations. The class definitions are identical, but DO ids are name-scoped
   // per Worker — so finch-dev and finch-prod get fully separate
   // BoxDO/TenantDO/RouterDO namespaces. A dev deploy can never read or
-  // mutate prod tenant registries, keys, or ACLs.
+  // mutate prod tenant registries or keys.
   "durable_objects": {
     "bindings": [
       { "name": "BOX", "class_name": "BoxDO" },
       { "name": "TENANT", "class_name": "TenantDO" },
-      { "name": "ROUTER", "class_name": "RouterDO" },
-      { "name": "AVIARY_ENROLLMENT", "class_name": "AviaryEnrollmentDO" },
-          { "name": "DIRECTORY", "class_name": "DirectoryDO" }
+      { "name": "ROUTER", "class_name": "RouterDO" }
     ]
   },
   // Cloudflare Rate Limiting (unsafe.bindings) is defined PER-ENV below — wrangler
   // does not inherit top-level `unsafe` into named environments (same as
   // durable_objects / migrations / vars), and deploys always target --env. See
   // each env's "unsafe" block. RELAY_LIMIT gates the MCP relay per-(tenant,IP)
-  // BEFORE any DO round-trip (login-wall probe + checkKey); its 600/60s budget
+  // BEFORE any DO round-trip (box pin / route check / checkKey); its 600/60s budget
   // covers a single web page's sub-resource burst (one HTML hit fans out to many
   // asset requests sharing the bucket). JOIN_LIMIT gates /join per-IP. The code
   // fails OPEN when the binding is absent (dev/test). (security M5)
+  //
+  // Migrations are append-only history: never edit or drop an applied tag.
+  // v7 DELETES the retired AviaryEnrollmentDO (v5) and DirectoryDO (v6)
+  // classes and every object's stored data with them — the owner-approved
+  // single-user migration. deploy-preflight allows exactly that one
+  // deleted_classes step and refuses any other.
   "migrations": [
     {
       // SQLite-backed DOs — required for the free tier and the modern DO API.
@@ -61,7 +65,8 @@
       "tag": "v5",
       "new_sqlite_classes": ["AviaryEnrollmentDO"]
     },
-    { "tag": "v6", "new_sqlite_classes": ["DirectoryDO"] }
+    { "tag": "v6", "new_sqlite_classes": ["DirectoryDO"] },
+    { "tag": "v7", "deleted_classes": ["AviaryEnrollmentDO", "DirectoryDO"] }
   ],
 
   "env": {
@@ -92,9 +97,7 @@
         "bindings": [
           { "name": "BOX", "class_name": "BoxDO" },
           { "name": "TENANT", "class_name": "TenantDO" },
-          { "name": "ROUTER", "class_name": "RouterDO" },
-          { "name": "AVIARY_ENROLLMENT", "class_name": "AviaryEnrollmentDO" },
-          { "name": "DIRECTORY", "class_name": "DirectoryDO" }
+          { "name": "ROUTER", "class_name": "RouterDO" }
         ]
       },
       // unsafe is NOT inherited into named envs — repeat it per env (see CLAUDE.md).
@@ -120,7 +123,8 @@
         { "tag": "v3", "new_sqlite_classes": ["RouterDO"] },
         { "tag": "v4", "renamed_classes": [{ "from": "ApplianceDO", "to": "BoxDO" }] },
         { "tag": "v5", "new_sqlite_classes": ["AviaryEnrollmentDO"] },
-        { "tag": "v6", "new_sqlite_classes": ["DirectoryDO"] }
+        { "tag": "v6", "new_sqlite_classes": ["DirectoryDO"] },
+        { "tag": "v7", "deleted_classes": ["AviaryEnrollmentDO", "DirectoryDO"] }
       ]
     },
 
@@ -148,10 +152,6 @@
         "CLERK_ISSUER": "https://strong-terrier-95.clerk.accounts.dev",
         "FINCH_ASSERTION_ACTIVE_KID": "finch-staging-2026-07",
         "FINCH_ASSERTION_ISSUER": "https://finch-staging.pantainos.workers.dev",
-        "AVIARY_VERIFICATION_ORIGINS": "https://finch-web-staging.pantainos.workers.dev",
-        // Grants must point back to the staging relay even though this tenant's
-        // normal state also owns a production-shaped *.finchmcp.com hostname.
-        "AVIARY_PUBLIC_ORIGIN": "https://finch-staging.pantainos.workers.dev",
         "DEV": "1",
         "WEB_URL": "https://finch-web-staging.pantainos.workers.dev",
         // Custom-hostname tiers, demoable on staging: the operator tenant may
@@ -161,23 +161,21 @@
         "VANITY_TENANT": "user_3F74fiQzwjM6UPfl9axNpA1jgyQ",
         "BYO_CNAME_TARGET": "finchmcp.com"
       },
-      "ai": { "binding": "AI" },
       // Agent release binaries, served directly at GET /releases/<asset>. The
       // repo is PRIVATE so the old GitHub-redirect 404s for anonymous callers
       // (installer + remote update both broke); binaries are uploaded to this
       // bucket by the release workflow instead. Same bucket for staging + prod.
       "r2_buckets": [{ "binding": "RELEASES", "bucket_name": "finch-releases" }],
-      // Self service-binding: the /chat tool-runner relays MCP calls back through
-      // our own service path. A direct fetch to our workers.dev host is blocked
-      // (error 1042); a service binding to ourselves is the supported way.
+      // Self service-binding: POST /api/cli/call (`finch call` / `finch tools`)
+      // relays MCP calls back through our own service path. A direct fetch to
+      // our workers.dev host is blocked (error 1042); a service binding to
+      // ourselves is the supported way.
       "services": [{ "binding": "SELF", "service": "finch-staging" }],
       "durable_objects": {
         "bindings": [
           { "name": "BOX", "class_name": "BoxDO" },
           { "name": "TENANT", "class_name": "TenantDO" },
-          { "name": "ROUTER", "class_name": "RouterDO" },
-          { "name": "AVIARY_ENROLLMENT", "class_name": "AviaryEnrollmentDO" },
-          { "name": "DIRECTORY", "class_name": "DirectoryDO" }
+          { "name": "ROUTER", "class_name": "RouterDO" }
         ]
       },
       "unsafe": {
@@ -202,7 +200,8 @@
         { "tag": "v3", "new_sqlite_classes": ["RouterDO"] },
         { "tag": "v4", "renamed_classes": [{ "from": "ApplianceDO", "to": "BoxDO" }] },
         { "tag": "v5", "new_sqlite_classes": ["AviaryEnrollmentDO"] },
-        { "tag": "v6", "new_sqlite_classes": ["DirectoryDO"] }
+        { "tag": "v6", "new_sqlite_classes": ["DirectoryDO"] },
+        { "tag": "v7", "deleted_classes": ["AviaryEnrollmentDO", "DirectoryDO"] }
       ]
     },
 
@@ -230,7 +229,6 @@
         // CF_API_TOKEN is a secret:
         //   wrangler secret put CF_API_TOKEN --env production
       },
-      "ai": { "binding": "AI" },
       // Release binaries at GET /releases/<asset> — see the staging note.
       "r2_buckets": [{ "binding": "RELEASES", "bucket_name": "finch-releases" }],
       "services": [{ "binding": "SELF", "service": "finch-prod" }],
@@ -241,7 +239,6 @@
         { "pattern": "finchmcp.com/join*", "zone_name": "finchmcp.com" },
         { "pattern": "finchmcp.com/refresh*", "zone_name": "finchmcp.com" },
         { "pattern": "finchmcp.com/api/cli/*", "zone_name": "finchmcp.com" },
-        { "pattern": "finchmcp.com/api/aviary/*", "zone_name": "finchmcp.com" },
         // Dedicated canonical caller-assertion issuer/JWKS origin. Keeping it
         // off the apex avoids competing with finch-web-prod's catch-all route.
         { "pattern": "jwks.finchmcp.com/.well-known/finch-jwks.json", "zone_name": "finchmcp.com" },
@@ -266,9 +263,7 @@
         "bindings": [
           { "name": "BOX", "class_name": "BoxDO" },
           { "name": "TENANT", "class_name": "TenantDO" },
-          { "name": "ROUTER", "class_name": "RouterDO" },
-          { "name": "AVIARY_ENROLLMENT", "class_name": "AviaryEnrollmentDO" },
-          { "name": "DIRECTORY", "class_name": "DirectoryDO" }
+          { "name": "ROUTER", "class_name": "RouterDO" }
         ]
       },
       // unsafe is NOT inherited into named envs — repeat it per env (see CLAUDE.md).
@@ -294,23 +289,19 @@
         { "tag": "v3", "new_sqlite_classes": ["RouterDO"] },
         { "tag": "v4", "renamed_classes": [{ "from": "ApplianceDO", "to": "BoxDO" }] },
         { "tag": "v5", "new_sqlite_classes": ["AviaryEnrollmentDO"] },
-        { "tag": "v6", "new_sqlite_classes": ["DirectoryDO"] }
+        { "tag": "v6", "new_sqlite_classes": ["DirectoryDO"] },
+        { "tag": "v7", "deleted_classes": ["AviaryEnrollmentDO", "DirectoryDO"] }
       ]
     }
   }
   // Secrets per env (never `secret bulk .dev.vars`):
   //   wrangler secret put FINCH_SERVICE_SECRET --env production
   //   wrangler secret put TICKET_SECRET        --env production
-  //   wrangler secret put SESSION_SECRET       --env production
   //   wrangler secret put FINCH_ASSERTION_PRIVATE_JWKS --env production
-  // SESSION_SECRET is the SEPARATE login-wall session-cookie signer (kind:"session")
-  // — keep it distinct from TICKET_SECRET so a leaked session signer can't forge a
-  // join/connect/portal grant. Set it for BOTH staging and production:
-  //   wrangler secret put SESSION_SECRET --env staging
-  //   wrangler secret put SESSION_SECRET --env production
-  // WEB_URL (the login-wall 302 target) is already a var for staging + production
-  // above; dev relies on the same fallback. In dev, add SESSION_SECRET to
-  // .dev.vars alongside FINCH_SERVICE_SECRET/TICKET_SECRET.
+  // SESSION_SECRET (the retired browser login-wall cookie signer) is no longer
+  // read; an already-set secret is harmless and can be deleted separately.
+  // WEB_URL (the `finch login` device page origin) is a var for staging +
+  // production above.
   // FINCH_ASSERTION_PRIVATE_JWKS is an ES256 private JWKS. Generate it without
   // touching disk via scripts/generate-assertion-jwks.mjs, pipe it through
   // scripts/validate-assertion-jwks.mjs --passthrough, then into `wrangler

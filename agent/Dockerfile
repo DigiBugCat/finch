@@ -8,7 +8,7 @@
 # so mounting your own manifest at /data/finch.yml works too.
 #
 #   docker build -t finch-agent ./agent
-#   docker run -v finch-data:/data finch-agent login --hub https://finchmcp.com <token>
+#   docker run -i -v finch-data:/data finch-agent login --hub https://finchmcp.com --token - <<<"$CLI_TOKEN"
 #   docker run -v finch-data:/data finch-agent add hello --service http://host.docker.internal:8000
 #   docker run -d -v finch-data:/data finch-agent          # = `finch run`
 #
@@ -47,6 +47,5 @@ WORKDIR /data
 VOLUME /data
 USER finch
 COPY --from=build /finch /usr/local/bin/finch
-COPY --chmod=0555 docker-entrypoint.sh /usr/local/bin/finch-container-entrypoint
-ENTRYPOINT ["finch-container-entrypoint"]
+ENTRYPOINT ["finch"]
 CMD ["run"]

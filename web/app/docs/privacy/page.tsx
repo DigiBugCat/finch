@@ -49,35 +49,30 @@ export default function PrivacyAndDataHandling() {
         <li>aggregate request counts, latency, and error-rate metrics.</li>
       </ul>
       <p>
-        Finch also stores the account, service, box, key, access-control, and audit
-        configuration needed to operate your workspace. Finch access keys are
-        stored as hashes; the plaintext key is shown only when it is minted.
-        Ordinary MCP request and response bodies are not part of call history,
-        logs, or analytics.
+        Finch also stores the account, service, box, key, and audit configuration
+        needed to operate your account. Finch access keys are stored as hashes;
+        the plaintext key is shown only when it is minted. Ordinary MCP request
+        and response bodies are not part of call history, logs, or analytics.
       </p>
-
-      <h2>Test Chat is a separate processing path</h2>
       <p>
-        Dashboard <b>Test Chat</b> deliberately uses a hosted model. When you use it,
-        Finch sends your chat messages and your service&apos;s tool names, descriptions,
-        and input schemas to Cloudflare Workers AI. If the model invokes a tool,
-        its arguments and the tool&apos;s result are also sent to Workers AI so the model
-        can complete its answer.
+        Each Finch account belongs to one person. If your account used Finch&apos;s
+        earlier sharing features, the records they created are deleted on
+        migration: team members and invitations, groups, access-control rules,
+        access requests, and the activity-log entries about them, including the
+        email addresses in them. If anyone besides the account owner could sign
+        in to the account, every access key, connected box and CLI login is
+        revoked, because none of them records which person created it; you re-add
+        your own with the finch CLI. Otherwise only access keys labelled for
+        someone else are revoked. A one-time migration removes all of this from an
+        account the first time Finch handles a request for it after the update.
+        The sign-in index that linked people to shared accounts and the records of
+        the retired device-enrollment flow are deleted outright.
       </p>
-      <div className="docs-note">
-        Do not put sensitive information into Test Chat. The ordinary relay-body
-        non-retention guarantee does not mean that Workers AI cannot process the
-        Test Chat data described above.
-      </div>
 
       <h2>What this means in practice</h2>
       <ul>
-        <li>Use the ordinary Finch endpoint when you want the relay non-retention guarantee.</li>
-        <li>Use Test Chat only when sending the relevant data to Workers AI is acceptable.</li>
-        <li>
-          Treat operational metadata as visible to workspace owners through the
-          dashboard and audit surfaces.
-        </li>
+        <li>Every request through a Finch endpoint gets the relay non-retention guarantee.</li>
+        <li>Treat operational metadata as visible to the account owner.</li>
       </ul>
 
       <div className="docs-foot">

@@ -6,7 +6,7 @@ vi.mock("@clerk/nextjs/server", () => ({
 }));
 
 import { verifyAssertion } from "@worker-auth";
-import { hubFetchAs, userFetch } from "@/lib/hub";
+import { hubFetchAs } from "@/lib/hub";
 import { installCloudflareContext, workerdFetch } from "./cloudflare-context";
 
 // The web→hub bridge must ride the FINCH_HUB service binding whenever the
@@ -64,12 +64,12 @@ describe("hub bridge transport", () => {
     expect(headers.get("content-type")).toBe("application/json");
   });
 
-  it("sends user-scoped assertions over the binding too", async () => {
+  it("overwrites caller-supplied auth headers on the binding path too", async () => {
     const binding = { fetch: workerdFetch(() => Response.json({ ok: true })) };
     vi.stubGlobal("fetch", workerdFetch(() => Response.json({ ok: true })));
     restoreContext = installCloudflareContext(deployedEnv({ FINCH_HUB: binding }));
 
-    await userFetch("user_1", "/api/user/sync", {
+    await hubFetchAs("user_1", "/api/member-context", {
       method: "POST",
       body: "{}",
       headers: { "X-Finch-Service": "attacker", "X-Finch-Auth": "attacker" },
@@ -77,16 +77,11 @@ describe("hub bridge transport", () => {
 
     expect(fetch).not.toHaveBeenCalled();
     const [url, init] = binding.fetch.mock.calls[0] as [string, RequestInit];
-    expect(url).toBe("https://hub.example.test/api/user/sync");
+    expect(url).toBe("https://hub.example.test/api/member-context");
     expect(init.redirect).toBe("manual");
     const headers = new Headers(init.headers);
     expect(headers.get("x-finch-service")).toBe(SECRET);
-    const verifyWithKind = verifyAssertion as unknown as (
-      token: string,
-      secret: string,
-      expectedKind: string,
-    ) => Promise<string | null>;
-    expect(await verifyWithKind(headers.get("x-finch-auth")!, SECRET, "user")).toBe("user_1");
+    expect(await verifyAssertion(headers.get("x-finch-auth")!, SECRET)).toBe("user_1");
   });
 
   it("refuses a 3xx the hub returns over the binding", async () => {

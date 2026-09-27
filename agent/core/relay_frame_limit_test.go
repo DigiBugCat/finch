@@ -85,7 +85,7 @@ func TestRelayReadLimitAcceptsWorstCaseFrame(t *testing.T) {
 		t.Fatalf("dial: %v", err)
 	}
 	defer c.Close(websocket.StatusNormalClosure, "bye")
-	c.SetReadLimit(maxRelayFrameBytes) // exactly as serveWithRoutesStatus does
+	c.SetReadLimit(maxRelayFrameBytes) // exactly as serve does
 
 	_, got, err := c.Read(ctx)
 	if err != nil {

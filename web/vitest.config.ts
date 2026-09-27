@@ -3,10 +3,10 @@ import react from "@vitejs/plugin-react";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
-// Vitest config for the Finch web app (the Next BFF + dashboard).
+// Vitest config for the Finch web app (the Next BFF + pages).
 //
 // These are UNIT tests, run in plain Node (not the OpenNext/workerd adapter):
-//   - happy-dom gives the React component tests a DOM (scope formatter, panels).
+//   - happy-dom gives the React component tests a DOM (landing, docs copy).
 //   - The crypto used by lib/assertion.ts is Node's global Web Crypto
 //     (crypto.subtle / crypto.getRandomValues), present in Node 20+ — the same
 //     primitives the worker's auth.ts uses, so the CONTRACT test exercises the

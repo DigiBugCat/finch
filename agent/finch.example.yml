@@ -5,15 +5,16 @@
 # protocol-agnostic tunnel — point a rule at an MCP server, a website, or any
 # HTTP/WebSocket app. Copy to `finch.yml` and run `finch run`.
 #
-# This file holds NO secrets. Enroll each app once (writes a credential to
-# credentials-dir), then it resumes ticketless on every run:
+# This file holds NO secrets. `finch add` enrolls each app once (writes a
+# credential to credentials-dir) and appends its rule here; every run resumes
+# from that credential:
 #
-#   finch enroll printer --ticket <ticket-from-dashboard>
+#   finch add printer --service http://127.0.0.1:8000
 #   finch run
 
 hub: https://finchmcp.com        # the finch hub (default; omit for prod)
 box: mac-mini                # this box's name (default: hostname)
-credentials-dir: ~/.finch        # where `finch enroll` writes per-app credentials
+credentials-dir: ~/.finch        # where `finch add` writes per-app credentials (a relative path is relative to this file)
 
 # Each rule forwards one local service:
 #   app_path    — the public URL segment AND the service you enrolled.

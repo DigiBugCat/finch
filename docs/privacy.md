@@ -1,8 +1,8 @@
 # Finch privacy and data handling
 
 This document defines the privacy guarantee for Finch's production relay. It
-distinguishes transport encryption, application retention, and Dashboard **Test
-in chat**, because treating those as one claim would be misleading.
+distinguishes transport encryption from application retention, because treating
+those as one claim would be misleading.
 
 ## The short version
 
@@ -17,9 +17,9 @@ in chat**, because treating those as one claim would be misleading.
 - Finch retains documented operational and control-plane metadata needed to
   authenticate callers, route calls, show health, enforce access, and operate
   the service.
-- Dashboard **Test in chat** is opt-in and separately sends chat and tool data
-  to Cloudflare Workers AI. It is not provider-blind and is not covered by the
-  ordinary relay's no-body-retention statement.
+- Finch sends no relay data to an AI model. (The dashboard's former **Test in
+  chat**, which sent chat and tool data to Cloudflare Workers AI, has been
+  removed along with the hub's Workers AI binding.)
 
 Accordingly, Finch must not be described as E2EE or as technically unable to
 see messages. Accurate language is: **encrypted in transit; ordinary relayed
@@ -102,44 +102,45 @@ not part of the retained recent-call record.
 
 Finch also retains control-plane data that is not message content:
 
-- tenant/workspace identifiers, user membership, email, role, and invitation
-  or access-request state;
-- service, route, box, group, tag, hostname, manifest, and settings metadata;
-- access-control rules and key metadata, including the key hash, label, scope,
-  last four characters, creation time, and expiry (the plaintext `finch_` key
-  is returned only when minted);
-- authentication/enrollment state needed to operate and revoke box, CLI, and
-  browser sessions; and
-- bounded administrative, device, access, and key audit events.
+- tenant identifiers and the tenant owner's Clerk user id and email (a tenant
+  is one Clerk user; there are no other members);
+- service, box, group label, tag, hostname, and settings metadata;
+- key metadata, including the key hash, label, scope, last four characters,
+  creation time, and expiry (the plaintext `finch_` key is returned only when
+  minted);
+- authentication/enrollment state needed to operate and revoke box and CLI
+  credentials; and
+- bounded administrative, device, and key audit events.
 
 This list is the allowed application-retention surface. Adding new retained
 relay metadata or any body capture requires an explicit documentation update,
 privacy review, and automated coverage proving the ordinary payload remains
 absent from storage and logs.
 
-## Dashboard Test in chat
+### Legacy sharing records are deleted on migration
 
-**Test in chat** is an explicit diagnostic feature powered by Cloudflare
-Workers AI. When a user sends a chat turn, Finch:
+Finch's retired team, sharing and device-enrollment features wrote records
+that named other people. The single-user migration deletes them:
 
-1. reads the recent chat history supplied by the dashboard;
-2. calls `tools/list` on the selected service;
-3. sends the chat history plus tool names, descriptions, and input schemas to
-   the Workers AI model;
-4. if the model selects a tool, sends its arguments to the service; and
-5. sends the returned tool result back to Workers AI so the model can compose
-   the final answer. This loop can repeat for multiple tool calls.
+- Each tenant's stored state is purged once, on the first request the hub
+  serves for it after the migration deploys (`TenantDO.purgeLegacyTenancy`,
+  recorded by a versioned `singleUserPurge` flag): member rows other than the
+  owner, invitations, groups, access-control rules, access requests, the
+  retired login wall's session epoch, the Aviary manifest, route and
+  credential-epoch fields, the `access` audit-log rows, and any other audit
+  row that names a member other than the owner. If anyone besides the owner
+  could have signed in to the tenant, every access key, every box and every
+  CLI login is revoked, because none of them records which person created
+  it; the owner re-adds their own. Otherwise only keys labelled for someone
+  else are revoked. A team tenant's hostnames move to its one former owner
+  when it had exactly one. A tenant that no request touches keeps its legacy
+  rows until one does; after the migration there is no index that lists
+  such tenants.
+- The global sign-in index (`DirectoryDO`) and the retired device-enrollment
+  records (`AviaryEnrollmentDO`) are deleted outright by Durable Object
+  migration `v7` when it deploys.
 
-Therefore Cloudflare Workers AI processes chat messages, tool definitions,
-tool arguments, and tool results. Users should not place sensitive data in
-**Test in chat** unless they accept that processing. This path is separate from
-an MCP client calling the service directly, and its disclosure must remain
-visible anywhere the feature is offered.
-
-Finch does not add Test in chat payloads to the ordinary Durable Object
-recent-call body storage (there is no such body storage). Any processing or
-retention performed by Cloudflare Workers AI is governed by the configured
-Cloudflare service and terms, not by Finch's ordinary-relay no-retention claim.
+Nothing from these records is retained afterwards.
 
 ## Approved language
 
@@ -147,8 +148,7 @@ Use language such as:
 
 > Finch encrypts traffic in transit. Ordinary MCP request and response bodies
 > are processed transiently to relay the call and are not logged or persisted
-> by Finch. Operational metadata is retained. Dashboard Test in chat separately
-> sends chat and tool data to Cloudflare Workers AI.
+> by Finch. Operational metadata is retained.
 
 Do not use:
 
