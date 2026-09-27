@@ -3,6 +3,7 @@
 import type { CSSProperties } from 'react';
 import { Bird } from './Bird';
 import PlateHead from './PlateHead';
+import { EXAMPLE_SLUG } from './prompt';
 
 const f = (token: string): CSSProperties => ({ fill: `var(--${token})` });
 
@@ -10,7 +11,7 @@ const f = (token: string): CSSProperties => ({ fill: `var(--${token})` });
 // written, never case-transformed: the service path is case-sensitive, so a
 // reader who copies the ring must get a URL that works.
 const SEGMENTS: { text: string; label: string; kind: 'bracket' | 'muted' }[] = [
-  { text: 'maray', label: 'your account', kind: 'bracket' },
+  { text: EXAMPLE_SLUG, label: 'your account address (finch picks it)', kind: 'bracket' },
   { text: '.finchmcp.com', label: 'the relay', kind: 'muted' },
   { text: '/notes', label: 'the name you chose', kind: 'bracket' },
   { text: '/mcp', label: 'where clients connect', kind: 'bracket' },
@@ -133,7 +134,7 @@ function Migration() {
           <div key={s.place}>
             <span className="fg-stop-place">{s.place}</span>
             <span className="fg-stop-when">{s.when}</span>
-            <span className="fg-stop-ok">✓ maray.finchmcp.com/notes/mcp</span>
+            <span className="fg-stop-ok">✓ {ADDRESS}</span>
           </div>
         ))}
       </figcaption>
@@ -147,8 +148,8 @@ export default function BandPlate() {
       <PlateHead
         id="fg-band-title"
         plate="Plate II · The band"
-        title="Every service gets a band it keeps for life"
-        lede="Birders ring a bird once and know it wherever it lands. finch does the same for your server: one address that survives restarts, reboots and new networks."
+        title="Every service gets a band that stays put"
+        lede="Birders ring a bird once and know it wherever it lands. finch does the same for your server: one address that stays the same across restarts, reboots and new networks."
       />
       <Band />
       <Migration />

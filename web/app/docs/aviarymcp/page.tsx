@@ -1,24 +1,20 @@
 import type { Metadata } from 'next';
+import { docsMetadata } from '../meta';
 import Link from 'next/link';
 
-export const metadata: Metadata = {
-  title: 'AviaryMCP | Finch docs',
-  description: 'Build one Python tool surface for MCP, REST, and OpenAPI, and publish it with the Finch CLI.',
-};
+import Code from '../code';
 
-function Code({ children }: { children: string }) {
-  return <pre className="docs-code"><code dangerouslySetInnerHTML={{ __html: children }} /></pre>;
-}
+export const metadata: Metadata = docsMetadata('AviaryMCP', 'A Python SDK that serves one set of tools as MCP, REST and OpenAPI, published with the finch CLI.');
 
 export default function AviaryMCPDocs() {
   return (
     <>
       <h1>AviaryMCP</h1>
       <p className="docs-lede">
-        AviaryMCP is an opinionated Python SDK for new MCP services. Define a tool
-        once and get the MCP transport, typed REST endpoints, and OpenAPI from the
-        same registry. Run it on loopback like any other local service, then publish
-        it with the Finch CLI.
+        AviaryMCP is a separate Python SDK for new MCP services.
+        Define a tool once and get the MCP transport, typed REST endpoints and
+        OpenAPI from the same registry. Run it on your machine like any other local
+        app, then publish it with finch. You don&apos;t need it to use finch.
       </p>
 
       <div className="docs-note">
@@ -47,7 +43,7 @@ export default function AviaryMCPDocs() {
             </tr>
             <tr>
               <td>An existing HTTP/MCP service, or another language</td>
-              <td>The <Link href="/docs">Finch quickstart</Link> as is.</td>
+              <td>The <Link href="/docs">finch quickstart</Link> as is.</td>
             </tr>
             <tr>
               <td>Several existing FastMCP servers</td>
@@ -71,30 +67,36 @@ export default function AviaryMCPDocs() {
 mcp = AviaryMCP("calculator")
 
 @mcp.tool
-def add(a: int, b: int) -&gt; int:
+def add(a: int, b: int) -> int:
     """Add two integers."""
     return a + b
 
 if __name__ == "__main__":
     mcp.run(transport="http", host="127.0.0.1", port=8000)`}</Code>
       <p>
-        By default AviaryMCP binds only to loopback, which is exactly what the Finch
-        agent on the same box needs. It serves MCP at <code>/mcp</code>, the REST
+        By default AviaryMCP binds only to loopback, which is exactly what finch on
+        the same machine needs. It serves MCP at <code>/mcp</code>, the REST
         API under <code>/api/v1</code>, and liveness at <code>/birdz</code>.
       </p>
 
-      <h2>3. Publish it with Finch</h2>
+      <h2>3. Publish it with finch</h2>
       <p>
-        From here it is an ordinary Finch service. With the CLI installed and
-        logged in (see the <Link href="/docs">quickstart</Link>):
+        From here it is an ordinary finch service. With finch installed and logged
+        in (see the <Link href="/docs">quickstart</Link>), publish it with{' '}
+        <code>--forward-all</code>, so the REST and OpenAPI paths are forwarded as
+        well as <code>/mcp</code>:
       </p>
-      <Code>{`python server.py &amp;
-finch add calculator --service http://127.0.0.1:8000
-finch run
-<span class="o">✓ https://your-slug.finchmcp.com/calculator/</span>`}</Code>
+      <Code>{`python server.py &
+finch add calculator --service http://127.0.0.1:8000 --forward-all
+<span class="o">finch: added "calculator" → http://127.0.0.1:8000</span>
+<span class="o">       public URL: https://sunny-wren-42.finchmcp.com/calculator/mcp</span>
+finch service install`}</Code>
 
       <h2>4. Use MCP or REST</h2>
-      <p>The same <code>add</code> tool is available through each generated interface:</p>
+      <p>
+        The same <code>add</code> tool is available through each generated interface.
+        Without <code>--forward-all</code>, only the MCP row works:
+      </p>
       <div className="docs-table-wrap">
         <table>
           <thead>
@@ -113,14 +115,14 @@ finch run
 finch call calculator add --args '{"a": 20, "b": 22}'
 
 curl -X POST \\
-  https://your-slug.finchmcp.com/calculator/api/v1/tools/add \\
+  https://sunny-wren-42.finchmcp.com/calculator/api/v1/tools/add \\
   -H 'Authorization: Bearer finch_...' \\
   -H 'content-type: application/json' \\
   -d '{"a": 20, "b": 22}'`}</Code>
       <p>
-        A caller authenticates to Finch with a <code>finch_</code> key or OAuth.
-        Finch validates that credential at the edge and strips it before the request
-        reaches your box, so the service never sees the caller&apos;s key.
+        A caller authenticates to finch with a <code>finch_</code> key or OAuth.
+        finch checks that credential and removes it before the request reaches your
+        machine, so the service never sees the caller&apos;s key.
       </p>
 
       <h2>Compose existing FastMCP servers</h2>
@@ -130,7 +132,7 @@ from aviary_mcp import AviaryMCP
 weather = FastMCP("weather")
 
 @weather.tool
-def forecast(city: str) -&gt; str:
+def forecast(city: str) -> str:
     return f"sunny in {city}"
 
 mcp = AviaryMCP("aviary")
@@ -142,7 +144,7 @@ mcp.mount(weather, namespace="weather")`}</Code>
 
       <div className="docs-foot">
         <Link href="/docs">&larr; Quickstart</Link>
-        <Link href="/docs/services">Services &amp; boxes &rarr;</Link>
+        <Link href="/docs/services">Services &amp; machines &rarr;</Link>
       </div>
     </>
   );

@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -150,9 +151,20 @@ type fakeHub struct {
 	authDown bool // POST /api/cli/auth answers 503
 	// revokeDown makes POST /api/cli/keys/revoke answer 503.
 	revokeDown bool
+	// joinDown makes POST /join answer 503 (after enroll registered the service).
+	joinDown bool
 	// relayDown makes the relay socket (/connect/<id>) answer 502, as a hub
 	// that accepts the credential but cannot take the relay would.
 	relayDown bool
+	// machines counts the machines registered per service (state "boxes").
+	machines map[string]int
+	// calls are the recorded calls per service, newest first (real hub shape).
+	calls map[string][]map[string]any
+	// legacyLogs makes the hub predate GET /api/cli/logs (1.7): the route is
+	// unknown and the calls are only in the state's recentCalls.
+	legacyLogs bool
+	released   []string
+	enrolled   []string
 }
 
 func newFakeHub(t *testing.T) *fakeHub {
@@ -165,6 +177,8 @@ func newFakeHub(t *testing.T) *fakeHub {
 		keys:        map[string]string{},
 		keyScope:    map[string]string{},
 		keyLast4:    map[string]string{},
+		machines:    map[string]int{},
+		calls:       map[string][]map[string]any{},
 	}
 	h.call = func(method string) (int, string, string) {
 		return 200, "application/json", `{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"echo","description":"Echo it"}]}}`
@@ -285,6 +299,10 @@ func (h *fakeHub) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		id := strings.TrimPrefix(b.Ticket, "tkt_")
+		if h.joinDown {
+			writeJSON(w, 503, map[string]string{"error": "try again"})
+			return
+		}
 		if _, ok := h.services[id]; !ok || !strings.HasPrefix(b.Ticket, "tkt_") || b.Box == "" {
 			writeJSON(w, 403, map[string]string{"error": "bad ticket"})
 			return
@@ -311,13 +329,21 @@ func (h *fakeHub) serve(w http.ResponseWriter, r *http.Request) {
 		if !h.body(w, r, &b) {
 			return
 		}
-		// The real hub slugifies the name into the service id (lowercase).
+		// The real hub slugifies the name into the service id (lowercase),
+		// and de-dupes an id the account already has to "<id>-2".
 		id := strings.ToLower(b.Name)
 		if !slugRE.MatchString(id) {
 			writeJSON(w, 400, map[string]string{"error": "bad name"})
 			return
 		}
+		for n, base := 2, id; ; n++ {
+			if _, taken := h.services[id]; !taken {
+				break
+			}
+			id = fmt.Sprintf("%s-%d", base, n)
+		}
 		h.services[id] = "key"
+		h.enrolled = append(h.enrolled, id)
 		writeJSON(w, 200, map[string]any{"id": id, "ticket": "tkt_" + id, "url": h.srv.URL + "/" + id + "/mcp", "install": "x", "expiresAt": 1})
 	case "POST /api/cli/auth":
 		var b struct{ Service, Mode string }
@@ -342,7 +368,15 @@ func (h *fakeHub) serve(w http.ResponseWriter, r *http.Request) {
 	case "GET /api/cli/state":
 		services := []map[string]any{}
 		for id, auth := range h.services {
-			services = append(services, map[string]any{"id": id, "state": "online", "auth": auth})
+			boxes := []map[string]any{}
+			for i := 0; i < h.machines[id]; i++ {
+				boxes = append(boxes, map[string]any{"name": fmt.Sprintf("machine-%d", i+1)})
+			}
+			svc := map[string]any{"id": id, "state": "online", "auth": auth, "boxes": boxes}
+			if calls := h.calls[id]; calls != nil {
+				svc["recentCalls"] = calls
+			}
+			services = append(services, svc)
 		}
 		keys := []map[string]any{}
 		for id, label := range h.keys {
@@ -400,6 +434,44 @@ func (h *fakeHub) serve(w http.ResponseWriter, r *http.Request) {
 		delete(h.keys, b.ID)
 		h.revoked = append(h.revoked, b.ID)
 		writeJSON(w, 200, map[string]any{"ok": true})
+	case "POST /api/cli/services/release":
+		var b struct {
+			ID string `json:"id"`
+		}
+		if !h.body(w, r, &b) {
+			return
+		}
+		if _, ok := h.services[b.ID]; !ok {
+			writeJSON(w, 404, map[string]any{"ok": false})
+			return
+		}
+		delete(h.services, b.ID)
+		h.released = append(h.released, b.ID)
+		writeJSON(w, 200, map[string]any{"ok": true})
+	case "GET /api/cli/logs":
+		if h.legacyLogs {
+			writeJSON(w, 404, map[string]string{"error": "unknown CLI route", "path": r.URL.Path})
+			return
+		}
+		q := r.URL.Query()
+		svc := q.Get("service")
+		limit, err := strconv.Atoi(q.Get("limit"))
+		if err != nil || limit < 1 || limit > 100 {
+			writeJSON(w, 400, map[string]string{"error": "limit must be 1-100"})
+			return
+		}
+		if _, ok := h.services[svc]; !ok {
+			writeJSON(w, 404, map[string]string{"error": "no such service", "service": svc})
+			return
+		}
+		calls := h.calls[svc]
+		if len(calls) > limit {
+			calls = calls[:limit]
+		}
+		if calls == nil {
+			calls = []map[string]any{}
+		}
+		writeJSON(w, 200, map[string]any{"service": svc, "calls": calls})
 	case "POST /api/cli/call":
 		var b struct {
 			Service string         `json:"service"`

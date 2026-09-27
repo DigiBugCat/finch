@@ -4,7 +4,7 @@ export default function SiteFooter() {
   return (
     <footer className="iw-wrap site-foot">
       <span className="site-foot-note">
-        finch is part of the Aviary. MIT licensed.{' '}
+        finch is free and open source, under the MIT license.{' '}
         <span className="iw-hand">Drawn at home, mostly after midnight.</span>
       </span>
       <nav aria-label="Footer">
@@ -12,7 +12,7 @@ export default function SiteFooter() {
         <a href="/agents.md">agents.md</a>
         <a href="/llms.txt">llms.txt</a>
         <Link href="/docs/privacy">Privacy</Link>
-        <a href="https://github.com/DigiBugCat/finch">GitHub</a>
+        <a href="https://github.com/DigiBugCat/finch">Source on GitHub</a>
       </nav>
     </footer>
   );

@@ -95,14 +95,20 @@ test("installs to the system dir when it is writable", () => {
   assertInstalled(join(fx.system, "finch"));
   assert.doesNotMatch(res.stdout, /not on your PATH/);
   assert.doesNotMatch(res.stdout, /shadows/);
-  assert.match(res.stdout, /^ {2}Next: {2}finch login --start/m);
+  // A person logs in with the one-step login; agents follow agents.md.
+  assert.match(res.stdout, /^ {2}Next: {2}finch login +# opens your browser/m);
+  assert.doesNotMatch(res.stdout, /--start|--poll/);
+  assert.match(res.stdout, /finch connect <name> --client claude-code/);
   assert.match(res.stdout, /https:\/\/finchmcp\.com\/agents\.md/);
+  // The closing line names the version that landed (the fake binary's
+  // `version` output).
+  assert.ok(res.stdout.includes(`finch: installed fake-finch to ${fx.system}/finch`), res.stdout);
   assert.ok(!existsSync(join(fx.root, "sudo-called")));
 });
 
 test("falls back to ~/.local/bin without sudo and prints a PATH hint", { skip: isRoot && "root can write anywhere" }, () => {
   const fx = fixture();
-  const res = run(fx);
+  const res = run(fx, { SHELL: "/bin/bash" });
   assert.equal(res.status, 0, res.stderr);
   const target = join(fx.home, ".local", "bin", "finch");
   assertInstalled(target);
@@ -110,8 +116,10 @@ test("falls back to ~/.local/bin without sudo and prints a PATH hint", { skip: i
   assert.ok(!existsSync(join(fx.root, "sudo-called")), "the installer called sudo");
   assert.match(res.stdout, /is not on your PATH/);
   assert.match(res.stdout, new RegExp(`export PATH="${join(fx.home, ".local", "bin")}:\\$PATH"`));
+  // It also says how to keep it on PATH in new shells.
+  assert.ok(res.stdout.includes(`echo 'export PATH="${join(fx.home, ".local", "bin")}:$PATH"' >> ${fx.home}/.bashrc`), res.stdout);
   // The next steps use the full path, since `finch` is not on PATH yet.
-  assert.ok(res.stdout.includes(`${target} login --start`));
+  assert.ok(res.stdout.includes(`${target} login `));
 });
 
 test("warns when an older finch earlier on PATH shadows the new one", { skip: isRoot && "root can write anywhere" }, () => {
@@ -129,7 +137,7 @@ test("warns when an older finch earlier on PATH shadows the new one", { skip: is
   assert.doesNotMatch(res.stdout, /not on your PATH/);
   assert.ok(res.stdout.includes(`'finch' on your PATH is ${join(old, "finch")}`), res.stdout);
   // The next steps name the new binary, not the shadowing one.
-  assert.ok(res.stdout.includes(`Next:  ${target} login --start`), res.stdout);
+  assert.ok(res.stdout.includes(`Next:  ${target} login `), res.stdout);
   assert.equal(readFileSync(join(old, "finch"), "utf8"), "#!/bin/sh\necho old-finch\n");
 });
 
@@ -143,6 +151,17 @@ test("a symlinked PATH entry to the install dir is not a shadow", () => {
   assert.equal(res.status, 0, res.stderr);
   assertInstalled(join(custom, "finch"));
   assert.doesNotMatch(res.stdout, /shadows/);
+});
+
+test("a directory where the binary goes is refused, not filled", () => {
+  const fx = fixture();
+  const custom = join(fx.root, "custom");
+  mkdirSync(join(custom, "finch"), { recursive: true });
+  const res = run(fx, { FINCH_INSTALL_DIR: custom });
+  assert.equal(res.status, 1, res.stdout);
+  assert.match(res.stderr, /finch is a directory/);
+  assert.deepEqual(readdirSync(join(custom, "finch")), []);
+  assert.deepEqual(readdirSync(custom), ["finch"]);
 });
 
 test("FINCH_INSTALL_DIR wins over both defaults", () => {

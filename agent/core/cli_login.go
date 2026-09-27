@@ -156,8 +156,8 @@ func completeLogin(hub, token, email string) (account string, err error) {
 // runLogin: finch login [--hub URL] [--start | --poll | --cancel | --token -] [--headless] [--json]
 func runLogin(c *cli, args []string) error {
 	fs := newFlagSet("login")
-	hubFlag := fs.String("hub", agentDefaultHub(), "finch hub base URL")
-	tokenFlag := fs.String("token", "", "CLI token; '-' reads it from stdin, or set FINCH_CLI_TOKEN (a literal value on argv is accepted but leaks into the process table and shell history)")
+	hubFlag := fs.String("hub", agentDefaultHub(), "the finch hub `url` (default https://finchmcp.com)")
+	tokenFlag := fs.String("token", "", "log in with a `token` from 'finch token': '-' reads it from stdin (or set FINCH_CLI_TOKEN); a literal value leaks into the process table and shell history")
 	headless := fs.Bool("headless", false, "blocking login without opening a local browser (the link works on any device)")
 	start := fs.Bool("start", false, "start a login, save it to ~/.finch/login-pending.json, print the link + code, and exit")
 	poll := fs.Bool("poll", false, "poll the login saved by --start once: exit 0 approved, 10 pending, 11 expired")

@@ -212,7 +212,7 @@ func TestWaitForNewCredential_WakesOnReplacementOnly(t *testing.T) {
 
 func TestServeConfig_RejectsEmptyManifest(t *testing.T) {
 	err := serveConfig(context.Background(), &config{Hub: "https://finch.example", CredentialsDir: t.TempDir()})
-	if err == nil || !strings.Contains(err.Error(), "no ingress rules") {
+	if err == nil || !strings.Contains(err.Error(), "lists no services") {
 		t.Fatalf("empty manifest=%v", err)
 	}
 }
@@ -280,7 +280,7 @@ func TestServeConfig_RefusesWhileAnotherRunHoldsTheLock(t *testing.T) {
 		Hub: "https://finch.example", CredentialsDir: dir,
 		Ingress: []ingress{{AppPath: "alpha", Service: "http://127.0.0.1:7342"}},
 	})
-	if err == nil || !strings.Contains(err.Error(), "already serves") {
+	if err == nil || !strings.Contains(err.Error(), "already serving this machine") {
 		t.Fatalf("second run=%v, want lock refusal", err)
 	}
 }

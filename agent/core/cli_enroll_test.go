@@ -86,7 +86,7 @@ func TestEnrollPersistFailureIsInternal(t *testing.T) {
 	stdout, stderr, code := finch(t, "enroll", "printer", "--ticket", "tkt", "--hub", srv.URL, "--credentials-dir", dir, "--json")
 	env := decodeJSONError(t, stderr)
 	if code != 1 || stdout != "" || env.Error.Code != "INTERNAL" ||
-		!strings.Contains(env.Error.Message, `the hub registered "printer"`) ||
+		!strings.Contains(env.Error.Message, `finch registered "printer"`) || strings.Contains(env.Error.Message, "dashboard") ||
 		!strings.Contains(env.Error.Message, "ticket is used up") ||
 		!strings.Contains(env.Error.Message, "finch rm printer") {
 		t.Fatalf("exit=%d stdout=%q env=%+v", code, stdout, env)
@@ -117,7 +117,7 @@ func TestAddPersistFailureIsInternal(t *testing.T) {
 	stdout, stderr, code := finch(t, "add", "notes", "--service", "http://127.0.0.1:8000", "--config", cfg, "--json")
 	env := decodeJSONError(t, stderr)
 	if code != 1 || stdout != "" || env.Error.Code != "INTERNAL" || env.Error.Next != "finch rm notes" ||
-		!strings.Contains(env.Error.Message, `the hub registered "notes"`) ||
+		!strings.Contains(env.Error.Message, `finch registered "notes"`) ||
 		!strings.Contains(env.Error.Message, "'finch add notes --service http://127.0.0.1:8000' again") {
 		t.Fatalf("exit=%d stdout=%q env=%+v", code, stdout, env)
 	}

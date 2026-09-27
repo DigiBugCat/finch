@@ -1,73 +1,65 @@
+import type { Metadata } from 'next';
+import { docsMetadata } from '../meta';
 import Link from 'next/link';
+import Code from '../code';
 
-function Code({ children }: { children: string }) {
-  return <pre className="docs-code"><code dangerouslySetInnerHTML={{ __html: children }} /></pre>;
-}
+export const metadata: Metadata = docsMetadata('Domains', 'Your finch account address, <slug>.finchmcp.com, and the state of custom domains.');
 
 export default function Domains() {
   return (
     <>
       <h1>Domains</h1>
       <p className="docs-lede">
-        Every account gets a hub domain: <code>&lt;slug&gt;.finchmcp.com</code>. Services
-        live under it as paths. You can also bring your own hostname and serve the same
-        services on your domain.
+        Every account gets an address on finchmcp.com, and every service you publish
+        lives under it as a path. Custom domains are on the way but don&apos;t serve
+        traffic yet.
       </p>
 
-      <h2>Your hub domain</h2>
+      <h2>Your account address</h2>
       <p>
-        The slug is the routing key. It resolves <code>&lt;slug&gt;.finchmcp.com</code> to
-        your account, and each service answers under its <code>app_path</code>:
+        Your account address (also called the slug) is the first part of every URL
+        finch gives you. finch picks it the first time you use your account: a word, a
+        bird and a number, such as <code>sunny-wren-42</code>. Each service answers under its
+        name:
       </p>
-      <Code>{`https://<slug>.finchmcp.com/<app_path>/
-<span class="c"># an MCP server answers at /<app_path>/mcp</span>`}</Code>
+      <Code>{`https://<slug>.finchmcp.com/<name>/
+<span class="c"># an MCP server answers at /<name>/mcp</span>
+
+https://sunny-wren-42.finchmcp.com/notes/mcp`}</Code>
       <p>
-        A slug is assigned automatically the first time a box enrolls, so your account
-        always has a working public host. Slugs are lowercase letters, digits, and
-        hyphens, at least 3 characters. <code>finch add</code> prints each service&apos;s
-        public endpoint, slug included (the <code>url</code> field with{' '}
+        The address stays the same across restarts, reboots and network changes, and
+        for every machine that serves your services. There is no command to rename it
+        yet. <code>finch add</code> prints each service&apos;s full URL, and{' '}
+        <code>finch fleet</code> lists them all (the <code>url</code> field with{' '}
         <code>--json</code>).
       </p>
+      <p>
+        A mistyped address gets a <code>404</code> that says no finch account uses
+        it, so check the URL against <code>finch fleet</code>.
+      </p>
 
-      <h2>Custom domains</h2>
-      <p>
-        Serve your boxes on your own domain instead of <code>.finchmcp.com</code>. The
-        recommended naming is one hostname per box, with the service in the path:
-      </p>
-      <Code>{`https://<box>.yourdomain.com/<service>/`}</Code>
-      <p>Setup is three steps, all with <code>finch domain</code>:</p>
-      <div className="docs-table-wrap">
-        <table>
-          <thead>
-            <tr><th>Step</th><th>What happens</th></tr>
-          </thead>
-          <tbody>
-            <tr>
-              <td>1. Add the hostname</td>
-              <td><code>finch domain add pelican.yourdomain.com</code>. Name it after the box it reaches.</td>
-            </tr>
-            <tr>
-              <td>2. Create the DNS record</td>
-              <td>The command prints the exact CNAME record to create at your DNS provider. It points your hostname at Finch.</td>
-            </tr>
-            <tr>
-              <td>3. Wait for DNS</td>
-              <td>Once the record resolves, the certificate is issued automatically and your services go live on the new name.</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-      <Code>{`finch domain ls                    <span class="c"># list custom hostnames on this account</span>
-finch domain add mcp.example.com   <span class="c"># add one; prints the CNAME to configure</span>
-finch domain rm mcp.example.com    <span class="c"># remove one; traffic stops immediately</span>`}</Code>
-      <p>
-        <code>finch domain ls</code> supports <code>--json</code> for scripting. Removal
-        only works for hostnames on your account.
-      </p>
+      <h2>Custom domains <span className="docs-badge">Not live yet</span></h2>
       <div className="docs-note">
-        <b>Removal is immediate.</b> Removing a hostname stops traffic on it right away.
-        Your hub domain keeps working; custom domains are additional names, not replacements.
+        <b>Custom domains don&apos;t serve traffic yet.</b> The{' '}
+        <code>finch domain</code> commands below accept and list hostnames, but the
+        part of finch that routes a custom hostname to your services isn&apos;t
+        switched on. Use your <code>&lt;slug&gt;.finchmcp.com</code> address for now.
+        This page will say when that changes.
       </div>
+      <p>
+        When they are live, you&apos;ll be able to serve your services on your own
+        hostname, one per machine, with the service in the path:
+      </p>
+      <Code>{`https://<machine>.yourdomain.com/<name>/`}</Code>
+      <p>The commands that exist today:</p>
+      <Code>{`finch domain ls                    <span class="c"># list custom hostnames on this account</span>
+finch domain add mcp.example.com   <span class="c"># record one and print the DNS record it will need</span>
+finch domain rm mcp.example.com    <span class="c"># remove one</span>`}</Code>
+      <p>
+        <code>finch domain ls</code> takes <code>--json</code>. Removal only works for
+        hostnames on your account. Your finchmcp.com address keeps working either way;
+        a custom domain would be an extra name, not a replacement.
+      </p>
 
       <div className="docs-foot">
         <Link href="/docs/acls">← Access control</Link>

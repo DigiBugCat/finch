@@ -1,6 +1,7 @@
 // The landing: finch as a field guide, seven plates in Indigo Wash.
-// Server-rendered; only the gate dial, the agent session, the sighting log and
-// the copy buttons hydrate.
+// Server-rendered; only the gate dial, the agent session and the copy buttons
+// hydrate.
+import type { Metadata } from 'next';
 import SiteNav from '@/components/fieldguide/SiteNav';
 import SiteFooter from '@/components/fieldguide/SiteFooter';
 import HeroPlate from '@/components/fieldguide/HeroPlate';
@@ -11,6 +12,10 @@ import AgentPlate from '@/components/fieldguide/AgentPlate';
 import SightingLog from '@/components/fieldguide/SightingLog';
 import PricingPlate from '@/components/fieldguide/PricingPlate';
 import '@/components/fieldguide/landing.css';
+
+export const metadata: Metadata = {
+  alternates: { canonical: '/' },
+};
 
 export default function Home() {
   return (

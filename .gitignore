@@ -30,3 +30,10 @@ __pycache__/
 .DS_Store
 /design-ref/
 /design-ref-dash/
+
+# Local build outputs (never commit binaries)
+/agent/agent
+/agent/finch
+/agent/finch-tray
+/agent/finch-bar
+/dist/

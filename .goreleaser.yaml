@@ -56,6 +56,57 @@ checksum:
 release:
   draft: false
   prerelease: auto
+  name_template: "finch {{ .Version }}"
+  # Release notes open with how to get this version, then GoReleaser's grouped
+  # commit list (below). The human-written summary lives in CHANGELOG.md.
+  header: |
+    ## Install or update
 
+    ```sh
+    curl -fsSL https://finchmcp.com/install | sh
+    ```
+
+    Already have finch? Run `finch update`. Binaries for macOS and Linux are
+    attached below; verify them against `checksums.txt`.
+
+    What changed, in plain words: see
+    [CHANGELOG.md](https://github.com/DigiBugCat/finch/blob/{{ .Tag }}/CHANGELOG.md).
+  footer: |
+    ---
+    Running your own hub? Redeploy it from `{{ .Tag }}`; see
+    [docs/self-host.md](https://github.com/DigiBugCat/finch/blob/{{ .Tag }}/docs/self-host.md).
+    **Full diff:** https://github.com/DigiBugCat/finch/compare/{{ .PreviousTag }}...{{ .Tag }}
+
+# Commit messages here are plain sentences ("Fix …", "Make …"), not
+# conventional-commit prefixes, so groups match on the leading verb and on a
+# few keywords. Groups are checked in order; the first match wins. Each entry
+# may start with its short SHA, which the optional prefix in the anchored
+# patterns skips.
 changelog:
   use: github
+  sort: asc
+  abbrev: 7
+  filters:
+    exclude:
+      - "(?i)^(?:[0-9a-f]{7,40}:? )?merge "
+      - "(?i)^(?:[0-9a-f]{7,40}:? )?promote"
+      - "(?i)^(?:[0-9a-f]{7,40}:? )?bump "
+      - "(?i)^(?:[0-9a-f]{7,40}:? )?pin .*staging"
+  groups:
+    - title: Security
+      regexp: '(?i)(security|vulnerab|privilege|revocation|fail closed|^(?:[0-9a-f]{7,40}:? )?harden)'
+      order: 0
+    - title: New
+      regexp: '(?i)^(?:[0-9a-f]{7,40}:? )?(add|introduce|support|speak)\b'
+      order: 1
+    - title: Fixes
+      regexp: '(?i)^(?:[0-9a-f]{7,40}:? )?(fix|correct|stop|restore|keep|repair|resolve)\b'
+      order: 2
+    - title: Removed
+      regexp: '(?i)^(?:[0-9a-f]{7,40}:? )?(remove|cut|drop|delete|wipe|untrack)\b'
+      order: 3
+    - title: Documentation
+      regexp: '(?i)^(?:[0-9a-f]{7,40}:? )?(document|docs?\b|readme|changelog|refine .*\bdocs\b|publish .*\bguide\b|make .*\bguide\b)'
+      order: 4
+    - title: Other changes
+      order: 999

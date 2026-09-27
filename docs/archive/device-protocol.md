@@ -1,4 +1,6 @@
-# finch — device protocol
+# Device mailbox protocol (proposal, not built)
+
+> **Historical proposal.** A design for small devices (such as an ESP32) that sync a hub-held mailbox. None of it was built; finch relays HTTP to a machine that runs the `finch` CLI. Kept for reference only.
 
 > How a device (a Mac mini, a Raspberry Pi, an **ESP32**) talks to the finch
 > hub. The design goal: **thin device, smart hub.** The hub does all the MCP

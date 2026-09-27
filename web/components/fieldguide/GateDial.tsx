@@ -3,6 +3,7 @@
 // between the three ways in: a key per client, OAuth sign-in, or public.
 import { Fragment, useState, type CSSProperties } from 'react';
 import PlateHead from './PlateHead';
+import { EXAMPLE_URL } from './prompt';
 
 export type GateMode = 'key' | 'oauth' | 'public';
 
@@ -32,19 +33,19 @@ const DETAIL: Record<GateMode, { who: string; title: string; body: string; code:
     who: 'claude.ai and ChatGPT connectors',
     title: 'Sign in at the gate',
     body: 'Add the address as a connector. It sends you to sign in to finch in your browser, then connects. There is no key to copy.',
-    code: 'https://maray.finchmcp.com/notes/mcp',
+    code: EXAMPLE_URL,
   },
   public: {
-    who: 'Demos and public pages',
+    who: 'Demos, web apps and public pages',
     title: 'Leave the gate open',
-    body: 'Anyone with the address gets in. Use it for a demo or a public page. Every other service on your machine stays behind its own gate.',
-    code: 'finch add demo --service http://127.0.0.1:3000 --public',
+    body: 'Anyone with the address gets in. --forward-all passes every path through, so a whole web app works, not just its MCP endpoint. Every other service on your machine stays behind its own gate.',
+    code: 'finch add demo --service http://127.0.0.1:3000 --public --forward-all',
   },
 };
 
 // A command may wrap only between words, never inside a flag like --service,
 // so each piece is an unbreakable span. A URL may also wrap after a path
-// slash (https://maray.finchmcp.com/ | notes/ | mcp), since on its own it can
+// slash (https://sunny-wren-42.finchmcp.com/ | notes/ | mcp), since on its own it can
 // be wider than the detail column.
 export function breakableParts(token: string): string[] {
   const url = /^(https?:\/\/[^/]+\/?)(.*)$/.exec(token);
