@@ -15,9 +15,10 @@ const (
 	MenuBarURL = "https://finchmcp.com/docs/menu-bar"
 )
 
-// FleetRowURL is a service's row on the fleet page.
+// FleetRowURL is a service's card on the fleet page, which gives each card's
+// heading the id "svc-<name>" (web/components/fleet/FleetView.tsx).
 func FleetRowURL(name string) string {
-	return FleetURL + "#" + url.PathEscape(name)
+	return FleetURL + "#svc-" + url.PathEscape(name)
 }
 
 // ActionKind is what clicking a menu item does.
@@ -44,6 +45,9 @@ type Action struct {
 	Kind    ActionKind
 	Service string
 	Text    string
+	// What names the copied text in the confirmation ("the approve command");
+	// ActCopy only. Empty: the service's URL, or the install command.
+	What string
 }
 
 // Item is one menu entry. A Separator ignores everything else; an item with
@@ -221,6 +225,11 @@ func serviceMenu(sv ServiceView, ui UI, busy func(string) (string, bool)) Item {
 		kids = append(kids, Item{ID: id + ":copy", Title: "Copy URL (needs finch 1.8.0)", Disabled: true,
 			Tooltip: "Update finch to see each service's URL here"})
 	}
+	// Always present (hidden unless waiting), so approving the service
+	// changes the menu in place.
+	approve := "finch approve " + sv.Name
+	kids = append(kids, Item{ID: id + ":approve", Title: "Copy approve command", Tooltip: approve, Hidden: !sv.Waiting,
+		Action: Action{Kind: ActCopy, Service: sv.Name, Text: approve, What: "the approve command"}})
 	if label, ok := busy("test:" + sv.Name); ok {
 		kids = append(kids, Item{ID: id + ":test", Title: label, Disabled: true})
 	} else {

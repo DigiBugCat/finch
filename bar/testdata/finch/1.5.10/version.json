@@ -1,0 +1,9 @@
+{
+  "args": [
+    "--version",
+    "--json"
+  ],
+  "exit": 2,
+  "stdout": "",
+  "stderr": "flag provided but not defined: -version\nUsage of /Users/you/.local/bin/finch:\n  -box string\n    \tthis box's name (default \"Mac.localdomain\")\n  -config string\n    \tpath to a finch.yml manifest; serves every ingress rule (one local service per app_path) over one process\n  -forward-all\n    \tforward the WHOLE loopback host (every path), not just /mcp — for a website or any non-MCP HTTP app (single-service mode)\n  -hub string\n    \tfinch hub base URL (http[s]://…) (default \"https://finchmcp.com\")\n  -state string\n    \tfile that persists the per-box refresh credential so a restart needs no new ticket (default \"/Users/you/.finch/agent.json\")\n  -ticket string\n    \tone-shot enrollment ticket from the dashboard (first run only; '-' reads it from stdin, or set FINCH_TICKET; later runs resume from --state)\n  -upstream string\n    \tlocal MCP server base URL (default \"http://127.0.0.1:8000\")\n"
+}

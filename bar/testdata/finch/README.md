@@ -17,6 +17,15 @@ Each file is one invocation: `args`, `exit`, `stdout`, `stderr`.
   uninstall). Re-record these against a 1.8.0 binary once it ships.
 - `1.6.0/version.json` was recorded from a real finch 1.6.0 binary.
   `1.6.0/update.json` is written by hand.
+- `1.5.10/` was **recorded** from a finch built from the `v1.5.10` tag, except
+  `update.json` (written by hand; a real run replaces the binary). finch 1.5
+  has no `version` command: `version.json` shows `--version --json` failing at
+  flag parsing, and `version-subcommand.json` shows `version --json` falling
+  through to the relay agent (exit 0, nothing on stdout), which is why
+  finch-bar asks with the flag form.
+- Every `version.json` is `finch --version --json`. For 1.6.0 and 1.7.1 the
+  payload was recorded from `finch version --json`; both forms print the same
+  thing (checked against binaries built from those tags).
 
 `internal/fakefinch` serves these to the tests as a fake `finch` on `PATH`. It
 refuses a fixture whose `args` don't match the command it was asked to run.

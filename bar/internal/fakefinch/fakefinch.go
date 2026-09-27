@@ -34,8 +34,10 @@ const (
 // Scenario says how the fake answers.
 type Scenario struct {
 	// Grammar is the finch release whose command line the fake accepts:
-	// "1.7" (1.7.x and 1.8.0 share every command finch-bar runs) or "1.6"
-	// (no login --start/--poll/--cancel).
+	// "1.7" (1.7.x and 1.8.0 share every command finch-bar runs), "1.6"
+	// (no login --start/--poll/--cancel) or "1.5" (no --json contract at
+	// all: finch-bar may only ask `--version --json` and run a plain
+	// `update`; any other command line could start 1.5's relay agent).
 	Grammar string `json:"grammar"`
 	// Responses maps a command key ("status", "service install", "test notes",
 	// "login --poll"; see Key) to fixture files, relative to testdata/finch.
@@ -177,11 +179,14 @@ func allowed(grammar string, args []string) (bool, string) {
 	if slices.Equal(words, []string{"update"}) && jsonCount == 0 {
 		return true, "" // the legacy update for a finch older than 1.7
 	}
+	if grammar == "1.5" && !slices.Equal(args, []string{"--version", "--json"}) {
+		return false, fmt.Sprintf("finch-bar must not run %q on a finch before 1.6 (it has no --json contract, and an unknown command starts its relay agent)", args)
+	}
 	if jsonCount != 1 || args[len(args)-1] != "--json" {
 		return false, fmt.Sprintf("finch-bar must pass --json exactly once, last: %q", args)
 	}
 	switch {
-	case slices.Equal(words, []string{"version"}),
+	case slices.Equal(words, []string{"--version"}),
 		slices.Equal(words, []string{"status"}),
 		slices.Equal(words, []string{"fleet"}),
 		slices.Equal(words, []string{"update"}):

@@ -2,6 +2,7 @@ package finch_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -252,8 +253,8 @@ func TestUpdate(t *testing.T) {
 
 func TestOldFinch(t *testing.T) {
 	f := fakefinch.Install(t, "1.6", map[string][]string{
-		"version": {"1.6.0/version.json"},
-		"update":  {"1.6.0/update.json"},
+		"--version": {"1.6.0/version.json"},
+		"update":    {"1.6.0/update.json"},
 	})
 	c := finch.New(f.Path)
 	v, err := c.Version(context.Background())
@@ -269,7 +270,81 @@ func TestOldFinch(t *testing.T) {
 	if err := c.UpdateLegacy(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	wantCalls(t, f, []string{"version", "--json"}, []string{"login", "--start", "--json"}, []string{"update"})
+	wantCalls(t, f, []string{"--version", "--json"}, []string{"login", "--start", "--json"}, []string{"update"})
+}
+
+// A finch before 1.6 has no version command: finch-bar asks with the flag
+// form, which 1.5.x rejects at flag parsing (recorded from v1.5.10) instead of
+// starting its relay agent. That answer means "too old", and the plain
+// `finch update` is the way out.
+func TestPre16Finch(t *testing.T) {
+	f := fakefinch.Install(t, "1.5", map[string][]string{
+		"--version": {"1.5.10/version.json"},
+		"update":    {"1.5.10/update.json"},
+	})
+	c := finch.New(f.Path)
+	_, err := c.Version(context.Background())
+	if err == nil || !finch.TooOld(err) {
+		t.Fatalf("version on 1.5.10 = %v, want a too-old answer", err)
+	}
+	if err := c.UpdateLegacy(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	wantCalls(t, f, []string{"--version", "--json"}, []string{"update"})
+}
+
+// stubRunner answers one command line and refuses every other.
+type stubRunner struct {
+	args []string
+	out  finch.Output
+	err  error
+}
+
+func (r stubRunner) Run(_ context.Context, args ...string) (finch.Output, error) {
+	if !slices.Equal(args, r.args) {
+		return finch.Output{}, errors.New("stub: unexpected command line " + strings.Join(args, " "))
+	}
+	return r.out, r.err
+}
+
+func TestVersionTooOldOrNotRunning(t *testing.T) {
+	// What finch 1.5.10 did with the old `version --json` probe (recorded):
+	// exit 0, nothing on stdout.
+	b, err := os.ReadFile(filepath.Join("..", "..", "testdata", "finch", "1.5.10", "version-subcommand.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var legacy fakefinch.Fixture
+	if err := json.Unmarshal(b, &legacy); err != nil {
+		t.Fatal(err)
+	}
+	if legacy.Exit != 0 || legacy.Stdout != "" {
+		t.Fatalf("fixture = %+v", legacy)
+	}
+	for name, tc := range map[string]struct {
+		out    finch.Output
+		runErr error
+		tooOld bool
+	}{
+		"exit 0, empty stdout":  {out: finch.Output{Stderr: []byte(legacy.Stderr)}, tooOld: true},
+		"plain text":            {out: finch.Output{Stdout: []byte("finch 1.5.0\n")}, tooOld: true},
+		"JSON without schema":   {out: finch.Output{Stdout: []byte(`{"version":"1.5.0"}` + "\n")}, tooOld: true},
+		"schema but no version": {out: finch.Output{Stdout: []byte(`{"schema_version":1}` + "\n")}, tooOld: true},
+		"flag rejected":         {out: finch.Output{Exit: 2, Stderr: []byte("flag provided but not defined: -version\n")}, tooOld: true},
+		"timed out":             {runErr: errors.New("finch --version --json did not finish: context deadline exceeded")},
+		"newer schema":          {out: finch.Output{Stdout: []byte(`{"schema_version":2,"version":"9.0.0"}` + "\n")}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			c := &finch.Client{Runner: stubRunner{args: finch.VersionArgs, out: tc.out, err: tc.runErr}}
+			_, err := c.Version(context.Background())
+			if err == nil {
+				t.Fatal("version succeeded")
+			}
+			if got := finch.TooOld(err); got != tc.tooOld {
+				t.Fatalf("TooOld(%v) = %v, want %v", err, got, tc.tooOld)
+			}
+		})
+	}
 }
 
 func TestDecodeRejectsNonContractOutput(t *testing.T) {

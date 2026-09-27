@@ -53,7 +53,7 @@ func fake(t *testing.T, goos string, installed ...string) (*Desktop, *[]call) {
 func TestCheckURL(t *testing.T) {
 	for _, ok := range []string{
 		"https://finchmcp.com/cli?code=WXYZ-2345",
-		"https://finchmcp.com/fleet#notes",
+		"https://finchmcp.com/fleet#svc-notes",
 		"http://127.0.0.1:8787/cli",
 		"http://localhost:8787/cli",
 	} {

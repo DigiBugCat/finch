@@ -236,14 +236,17 @@ func (a *App) Poll(ctx context.Context) {
 	a.render()
 }
 
-// finchVersion runs `finch version --json` when the binary is new or changed.
+// finchVersion runs `finch --version --json` when the binary is new or
+// changed. The answer is kept until then, including "too old": asking an old
+// finch again on every poll would only get the same answer. A finch that
+// could not be run, or timed out, is asked again on the next poll.
 func (a *App) finchVersion(ctx context.Context, f Finch, bin string) (string, error) {
 	mod, _ := a.cfg.Stat(bin)
 	a.mu.Lock()
-	if bin == a.verBin && mod.Equal(a.verMod) && a.verErr == nil {
-		v := a.version
+	if bin == a.verBin && mod.Equal(a.verMod) && (a.verErr == nil || finch.TooOld(a.verErr)) {
+		v, err := a.version, a.verErr
 		a.mu.Unlock()
-		return v, nil
+		return v, err
 	}
 	a.mu.Unlock()
 	info, err := f.Version(ctx)
@@ -350,7 +353,9 @@ func (a *App) Do(ctx context.Context, act model.Action) {
 		}
 	case model.ActCopy:
 		what := "the URL"
-		if act.Service != "" {
+		if act.What != "" {
+			what = act.What
+		} else if act.Service != "" {
 			what = act.Service + "'s URL"
 		} else if act.Text == finch.InstallCommand {
 			what = "the install command"

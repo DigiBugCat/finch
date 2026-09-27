@@ -141,9 +141,9 @@ func (h *harness) item(t *testing.T, id string) model.Item {
 }
 
 var signedIn = map[string][]string{
-	"version": {"1.8.0/version.json"},
-	"status":  {"1.8.0/status-logged-in.json"},
-	"fleet":   {"1.8.0/fleet-all-online.json"},
+	"--version": {"1.8.0/version.json"},
+	"status":    {"1.8.0/status-logged-in.json"},
+	"fleet":     {"1.8.0/fleet-all-online.json"},
 }
 
 func with(base map[string][]string, extra map[string][]string) map[string][]string {
@@ -165,7 +165,7 @@ func TestPollRunsVersionOnceThenStatusAndFleet(t *testing.T) {
 	if st := h.app.State(); st.Kind != model.AllConnected {
 		t.Fatalf("state = %v %q", st.Kind, st.Headline)
 	}
-	want := []string{"version", "status", "fleet", "status", "fleet"}
+	want := []string{"--version", "status", "fleet", "status", "fleet"}
 	if got := h.keys(); !slices.Equal(got, want) {
 		t.Fatalf("finch calls = %q, want %q", got, want)
 	}
@@ -176,11 +176,11 @@ func TestPollRunsVersionOnceThenStatusAndFleet(t *testing.T) {
 
 func TestPollSkipsFleetWhenSignedOut(t *testing.T) {
 	h := newHarness(t, "1.7", map[string][]string{
-		"version": {"1.7.1/version.json"},
-		"status":  {"1.7.1/status-logged-out.json"},
+		"--version": {"1.7.1/version.json"},
+		"status":    {"1.7.1/status-logged-out.json"},
 	})
 	h.app.Poll(context.Background())
-	if got := h.keys(); !slices.Equal(got, []string{"version", "status"}) {
+	if got := h.keys(); !slices.Equal(got, []string{"--version", "status"}) {
 		t.Fatalf("finch calls = %q", got)
 	}
 	if h.app.State().Kind != model.LoggedOut {
@@ -189,14 +189,76 @@ func TestPollSkipsFleetWhenSignedOut(t *testing.T) {
 }
 
 func TestPollOldFinchStopsAtVersion(t *testing.T) {
-	h := newHarness(t, "1.6", map[string][]string{"version": {"1.6.0/version.json"}})
+	h := newHarness(t, "1.6", map[string][]string{"--version": {"1.6.0/version.json"}})
 	h.app.Poll(context.Background())
-	if got := h.keys(); !slices.Equal(got, []string{"version"}) {
+	if got := h.keys(); !slices.Equal(got, []string{"--version"}) {
 		t.Fatalf("finch calls = %q (must not run commands 1.6 lacks)", got)
 	}
 	if h.app.State().Kind != model.TooOld {
 		t.Fatalf("state = %v", h.app.State().Kind)
 	}
+}
+
+// finch 1.5.x: finch-bar says it is too old, asks only once per binary, and
+// "Check for updates" runs the plain `finch update` 1.5 understands.
+func TestPre16FinchIsTooOldAndUpdates(t *testing.T) {
+	h := newHarness(t, "1.5", map[string][]string{
+		"--version": {"1.5.10/version.json"},
+		"update":    {"1.5.10/update.json"},
+	})
+	ctx := context.Background()
+	h.app.Poll(ctx)
+	h.app.Poll(ctx)
+	if got := h.keys(); !slices.Equal(got, []string{"--version"}) {
+		t.Fatalf("finch calls = %q, want one --version (cached until the binary changes)", got)
+	}
+	st := h.app.State()
+	if st.Kind != model.TooOld || st.Headline != "This finch is too old" {
+		t.Fatalf("state = %+v", st)
+	}
+	h.app.Do(ctx, h.item(t, "update").Action)
+	h.app.Wait()
+	if m := h.item(t, "message"); m.Title != "Updated finch" {
+		t.Fatalf("message = %q", m.Title)
+	}
+	h.app.Poll(ctx)
+	want := []string{"--version", "update", "--version"}
+	if got := h.keys(); !slices.Equal(got, want) {
+		t.Fatalf("finch calls = %q, want %q (asks again after an update)", got, want)
+	}
+}
+
+// A finch that could not answer (here: not executable) is asked again on the
+// next poll rather than remembered.
+func TestVersionNotCachedWhenFinchCannotRun(t *testing.T) {
+	calls := 0
+	a := app.New(app.Config{
+		Locate: func() (string, error) { return "/nonexistent/finch", nil },
+		NewFinch: func(bin string) app.Finch {
+			return countVersion{Finch: finch.New(bin), n: &calls}
+		},
+		Stat:    func(string) (time.Time, error) { return time.Unix(1, 0), nil },
+		Desktop: &fakeDesktop{},
+		Render:  func(model.State, []model.Item) {},
+	})
+	a.Poll(context.Background())
+	if a.State().Kind != model.FinchError {
+		t.Fatalf("state = %v", a.State().Kind)
+	}
+	a.Poll(context.Background())
+	if calls != 2 {
+		t.Fatalf("version asked %d times, want 2", calls)
+	}
+}
+
+type countVersion struct {
+	app.Finch
+	n *int
+}
+
+func (c countVersion) Version(ctx context.Context) (finch.VersionInfo, error) {
+	*c.n++
+	return c.Finch.Version(ctx)
 }
 
 func TestPollWithoutFinch(t *testing.T) {
@@ -216,7 +278,7 @@ func TestPollWithoutFinch(t *testing.T) {
 
 func TestSignIn(t *testing.T) {
 	h := newHarness(t, "1.7", map[string][]string{
-		"version":       {"1.7.1/version.json"},
+		"--version":     {"1.7.1/version.json"},
 		"status":        {"1.7.1/status-logged-out.json"},
 		"login --start": {"1.7.1/login-start.json"},
 		"login --poll":  {"1.7.1/login-poll-pending.json", "1.7.1/login-poll-pending.json", "1.7.1/login-poll-approved.json"},
@@ -229,7 +291,7 @@ func TestSignIn(t *testing.T) {
 	if !slices.Equal(h.desk.opened, []string{"https://finchmcp.com/cli?code=WXYZ-2345"}) {
 		t.Fatalf("opened = %q", h.desk.opened)
 	}
-	want := []string{"version", "status", "login --start", "login --poll", "login --poll", "login --poll"}
+	want := []string{"--version", "status", "login --start", "login --poll", "login --poll", "login --poll"}
 	if got := h.keys(); !slices.Equal(got, want) {
 		t.Fatalf("finch calls = %q, want %q", got, want)
 	}
@@ -248,7 +310,7 @@ func TestSignIn(t *testing.T) {
 
 func TestSignInExpires(t *testing.T) {
 	h := newHarness(t, "1.7", map[string][]string{
-		"version":       {"1.8.0/version.json"},
+		"--version":     {"1.8.0/version.json"},
 		"status":        {"1.8.0/status-logged-out.json"},
 		"login --start": {"1.8.0/login-start.json"},
 		"login --poll":  {"1.8.0/login-poll-pending.json", "1.8.0/login-poll-expired.json"},
@@ -263,7 +325,7 @@ func TestSignInExpires(t *testing.T) {
 }
 
 func TestSignInOnOldFinchFailsPlainly(t *testing.T) {
-	h := newHarness(t, "1.6", map[string][]string{"version": {"1.6.0/version.json"}})
+	h := newHarness(t, "1.6", map[string][]string{"--version": {"1.6.0/version.json"}})
 	h.app.Do(context.Background(), model.Action{Kind: model.ActSignIn})
 	h.app.Wait()
 	if m := h.item(t, "message"); !strings.HasPrefix(m.Title, "Couldn't start sign-in") {
@@ -358,7 +420,7 @@ func TestUpdateCurrentAndRereadVersion(t *testing.T) {
 		t.Fatalf("message = %q", m.Title)
 	}
 	h.app.Poll(ctx)
-	want := []string{"version", "status", "fleet", "update", "version", "status", "fleet"}
+	want := []string{"--version", "status", "fleet", "update", "--version", "status", "fleet"}
 	if got := h.keys(); !slices.Equal(got, want) {
 		t.Fatalf("finch calls = %q, want %q", got, want)
 	}
@@ -366,8 +428,8 @@ func TestUpdateCurrentAndRereadVersion(t *testing.T) {
 
 func TestUpdateOldFinchUsesPlainUpdate(t *testing.T) {
 	h := newHarness(t, "1.6", map[string][]string{
-		"version": {"1.6.0/version.json"},
-		"update":  {"1.6.0/update.json"},
+		"--version": {"1.6.0/version.json"},
+		"update":    {"1.6.0/update.json"},
 	})
 	ctx := context.Background()
 	h.app.Poll(ctx)
@@ -382,6 +444,22 @@ func TestUpdateOldFinchUsesPlainUpdate(t *testing.T) {
 	}
 }
 
+func TestWaitingServiceOffersApproveCommand(t *testing.T) {
+	h := newHarness(t, "1.7", with(signedIn, map[string][]string{"fleet": {"1.8.0/fleet-waiting.json"}}))
+	ctx := context.Background()
+	h.app.Poll(ctx)
+	if st := h.app.State(); st.Kind != model.AwaitingApproval || st.Headline != "kanban is waiting for approval" {
+		t.Fatalf("state = %+v", st)
+	}
+	h.app.Do(ctx, h.item(t, "svc:kanban:approve").Action)
+	if !slices.Equal(h.desk.copied, []string{"finch approve kanban"}) {
+		t.Fatalf("copied = %q", h.desk.copied)
+	}
+	if m := h.item(t, "message"); m.Title != "Copied the approve command" {
+		t.Fatalf("message = %q", m.Title)
+	}
+}
+
 func TestCopyURLAndOpenFleetRow(t *testing.T) {
 	h := newHarness(t, "1.7", signedIn)
 	ctx := context.Background()
@@ -391,7 +469,7 @@ func TestCopyURLAndOpenFleetRow(t *testing.T) {
 	if !slices.Equal(h.desk.copied, []string{"https://wren.finchmcp.com/kanban/"}) {
 		t.Fatalf("copied = %q", h.desk.copied)
 	}
-	if !slices.Equal(h.desk.opened, []string{"https://finchmcp.com/fleet#kanban"}) {
+	if !slices.Equal(h.desk.opened, []string{"https://finchmcp.com/fleet#svc-kanban"}) {
 		t.Fatalf("opened = %q", h.desk.opened)
 	}
 	if m := h.item(t, "message"); m.Title != "Copied kanban's URL" {

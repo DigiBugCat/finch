@@ -1,0 +1,9 @@
+{
+  "args": [
+    "version",
+    "--json"
+  ],
+  "exit": 0,
+  "stdout": "",
+  "stderr": "finch: not enrolled — run: finch enroll <app_path> --ticket <t>\n"
+}

@@ -16,6 +16,19 @@ import (
 // ErrNotInstalled means no finch binary was found.
 var ErrNotInstalled = errors.New("finch is not installed")
 
+// ErrNoContract means finch answered (exit 0) without a --json payload: a
+// finch older than MinVersion, or not the finch CLI at all.
+var ErrNoContract = errors.New("finch did not answer with the --json contract")
+
+// TooOld reports whether err, from Version, means this finch answered but is
+// too old for finch-bar: it rejected `--version --json` (a finch before 1.6
+// fails that flag with a usage error) or answered without the --json
+// contract. A finch that could not be run, or timed out, is not "too old".
+func TooOld(err error) bool {
+	var fe *Error
+	return errors.As(err, &fe) || errors.Is(err, ErrNoContract)
+}
+
 // Locate finds the finch binary: override (a --finch flag or FINCH_BAR_FINCH)
 // when set, else finch on PATH, else the places the installer puts it. The
 // fallback matters on macOS, where an app started from Finder or at login gets
@@ -152,13 +165,16 @@ func Decode(args []string, out Output, v any, okExits ...int) error {
 func decodePayload(stdout []byte, v any) error {
 	line := lastJSONLine(stdout)
 	if line == nil {
-		return fmt.Errorf("unexpected output %q (not the --json contract; is this finch older than %s?)", snippet(stdout), MinVersion)
+		return fmt.Errorf("%w: unexpected output %q (is this finch older than %s?)", ErrNoContract, snippet(stdout), MinVersion)
 	}
 	var head struct {
 		SchemaVersion int `json:"schema_version"`
 	}
 	if err := json.Unmarshal(line, &head); err != nil {
 		return fmt.Errorf("unreadable JSON %q: %v", snippet(line), err)
+	}
+	if head.SchemaVersion == 0 {
+		return fmt.Errorf("%w: no schema_version in %q (is this finch older than %s?)", ErrNoContract, snippet(line), MinVersion)
 	}
 	if head.SchemaVersion != 1 {
 		return fmt.Errorf("unsupported schema_version %d (finch-bar reads version 1)", head.SchemaVersion)
@@ -230,12 +246,20 @@ func snippet(b []byte) string {
 	return s
 }
 
-// Version runs `finch version --json`.
+// VersionArgs is how finch-bar asks finch its version. It is the flag form,
+// not `finch version`: every finch from 1.6 on answers both the same way, but
+// a finch before 1.6 has no version command and treats an unknown first word
+// as its relay agent's command line, so `finch version` would start serving
+// finch.yml. An unknown flag stops it at flag parsing (exit 2) instead.
+var VersionArgs = []string{"--version", "--json"}
+
+// Version runs `finch --version --json`. Use TooOld to tell a finch that is
+// too old from one that could not be run.
 func (c *Client) Version(ctx context.Context) (VersionInfo, error) {
 	var v VersionInfo
-	_, err := c.run(ctx, quickTimeout, &v, nil, "version", "--json")
+	_, err := c.run(ctx, quickTimeout, &v, nil, VersionArgs...)
 	if err == nil && v.Version == "" {
-		err = errors.New("finch version --json did not report a version")
+		err = fmt.Errorf("%w: finch --version --json did not report a version", ErrNoContract)
 	}
 	return v, err
 }

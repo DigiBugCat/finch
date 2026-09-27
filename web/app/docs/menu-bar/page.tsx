@@ -29,21 +29,27 @@ export default function MenuBar() {
 
       <h2>Install on macOS</h2>
       <p>
-        Download{' '}
-        <a href={`${RELEASES}/download/finch-bar-darwin-universal.zip`}>finch-bar-darwin-universal.zip</a>{' '}
-        from the <a href={RELEASES}>latest release</a>, unzip it, move{' '}
-        <code>finch-bar.app</code> to your Applications folder and open it. The same
-        app runs on Apple silicon and Intel Macs with macOS 11 or later. It lives in
-        the menu bar only, with no Dock icon. From a terminal:
+        Open the <a href={RELEASES}>latest release</a> and download{' '}
+        <code>finch-bar-darwin-universal.zip</code>, or{' '}
+        <code>finch-bar-darwin-universal-unsigned.zip</code> if that is the only one
+        listed. Unzip it, move <code>finch-bar.app</code> to your Applications folder
+        and open it. The same app runs on Apple silicon and Intel Macs with macOS 11
+        or later. It lives in the menu bar only, with no Dock icon. From a terminal:
       </p>
-      <Code>{`curl -fsSLO ${RELEASES}/download/finch-bar-darwin-universal.zip
-ditto -x -k finch-bar-darwin-universal.zip /Applications
+      <Code>{`cd "$(mktemp -d)"
+curl -fsSLO ${RELEASES}/download/finch-bar-darwin-universal.zip ||
+  curl -fsSLO ${RELEASES}/download/finch-bar-darwin-universal-unsigned.zip
+ditto -x -k finch-bar-darwin-universal*.zip /Applications
 open /Applications/finch-bar.app`}</Code>
       <div className="docs-note">
-        <b>Only an -unsigned.zip in the release?</b> That build is not notarized by
-        Apple, so macOS refuses to open it. After moving it to Applications, clear
-        the download flag once with{' '}
-        <code>xattr -dr com.apple.quarantine /Applications/finch-bar.app</code>.
+        <b>Both downloads fail?</b> The Mac build is published a little after the rest
+        of a release, once Apple has checked it. Try again in half an hour, or pick an
+        earlier release from the <a href={RELEASES.replace(/\/latest$/, '')}>releases page</a>.
+      </div>
+      <div className="docs-note">
+        <b>Got the -unsigned.zip?</b> That build is not notarized by Apple, so macOS
+        refuses to open it when it came from a browser. Clear the download flag once
+        with <code>xattr -dr com.apple.quarantine /Applications/finch-bar.app</code>.
       </div>
 
       <h2>Install on Linux</h2>
@@ -56,15 +62,25 @@ curl -fsSL "${RELEASES}/download/finch-bar-linux-$arch.tar.gz" | tar -xz
 cd "finch-bar-linux-$arch"
 install -Dm755 finch-bar ~/.local/bin/finch-bar
 install -Dm644 finch-bar.png ~/.local/share/icons/hicolor/256x256/apps/finch-bar.png
-install -Dm644 finch-bar.desktop ~/.local/share/applications/finch-bar.desktop
-finch-bar &amp;`}</Code>
+mkdir -p ~/.local/share/applications
+sed "s|^Exec=.*|Exec=$HOME/.local/bin/finch-bar|" finch-bar.desktop \\
+  &gt; ~/.local/share/applications/finch-bar.desktop
+~/.local/bin/finch-bar &amp;`}</Code>
+      <p>
+        The commands use the full path because <code>~/.local/bin</code> is often not
+        on your <code>PATH</code> until you next log in.
+      </p>
 
       <h2>Open it at login</h2>
       <p>
         Turn on <b>Open finch-bar at login</b> in its menu, or run:
       </p>
-      <Code>{`finch-bar --install-login-item     <span class="c"># open finch-bar when you log in</span>
-finch-bar --uninstall-login-item   <span class="c"># stop opening it at login</span>`}</Code>
+      <Code>{`<span class="c"># macOS</span>
+/Applications/finch-bar.app/Contents/MacOS/finch-bar --install-login-item
+/Applications/finch-bar.app/Contents/MacOS/finch-bar --uninstall-login-item
+<span class="c"># Linux</span>
+~/.local/bin/finch-bar --install-login-item     <span class="c"># open finch-bar when you log in</span>
+~/.local/bin/finch-bar --uninstall-login-item   <span class="c"># stop opening it at login</span>`}</Code>
       <p>
         On macOS this writes a LaunchAgent at{' '}
         <code>~/Library/LaunchAgents/com.finchmcp.finch-bar.plist</code>; on Linux, an
@@ -154,6 +170,13 @@ finch-bar --uninstall-login-item   <span class="c"># stop opening it at login</s
               <td>The next line names them. A service is offline when no machine serving it is connected.</td>
             </tr>
             <tr>
+              <td>notes is waiting for approval</td>
+              <td>
+                A machine joined to serve it and waits for you to approve it. Run{' '}
+                <code>finch approve notes</code>; the service&apos;s <b>Copy approve command</b> copies it.
+              </td>
+            </tr>
+            <tr>
               <td>All connected</td>
               <td>Every service on your account is online.</td>
             </tr>
@@ -170,6 +193,7 @@ finch-bar --uninstall-login-item   <span class="c"># stop opening it at login</s
       <ul>
         <li><b>This machine → &lt;local URL&gt;</b>, when this machine serves it.</li>
         <li><b>Copy URL</b> copies its public URL (finch 1.8.0 or later).</li>
+        <li><b>Copy approve command</b>, when it is waiting for approval.</li>
         <li><b>Test</b> runs <code>finch test &lt;name&gt;</code> and shows the result, with a notification.</li>
         <li><b>Open in fleet page</b> opens the service on finchmcp.com.</li>
       </ul>
@@ -205,14 +229,19 @@ finch-bar --uninstall-login-item   <span class="c"># stop opening it at login</s
       </p>
 
       <h2>Remove it</h2>
-      <Code>{`finch-bar --uninstall-login-item
-rm -rf /Applications/finch-bar.app        <span class="c"># macOS</span>
+      <p>Quit it from its menu first, then:</p>
+      <Code>{`<span class="c"># macOS</span>
+rm -f ~/Library/LaunchAgents/com.finchmcp.finch-bar.plist
+rm -rf /Applications/finch-bar.app
+<span class="c"># Linux</span>
+~/.local/bin/finch-bar --uninstall-login-item
 rm ~/.local/bin/finch-bar ~/.local/share/applications/finch-bar.desktop \\
-   ~/.local/share/icons/hicolor/256x256/apps/finch-bar.png   <span class="c"># Linux</span>`}</Code>
+   ~/.local/share/icons/hicolor/256x256/apps/finch-bar.png`}</Code>
       <p>
-        Quit it from its menu first. Removing finch-bar leaves finch, your services and
-        your sign-in as they were. To learn more about the background service it
-        controls, see <Link href="/docs/services">Services</Link>.
+        The first line on each removes the login item, if you turned it on.
+        Removing finch-bar leaves finch, your services and your sign-in as they were.
+        To learn more about the background service it controls, see{' '}
+        <Link href="/docs/services">Services</Link>.
       </p>
     </>
   );

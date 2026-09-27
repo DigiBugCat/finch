@@ -1,0 +1,9 @@
+{
+  "args": [
+    "update",
+    "--json"
+  ],
+  "exit": 2,
+  "stdout": "",
+  "stderr": "flag provided but not defined: -json\nUsage of update:\n  -force\n    \treinstall even if already on the latest version\n  -hub string\n    \tfinch hub base URL (defaults to the logged-in hub)\n  -restart string\n    \thow to restart the running serve: auto|service|self|none (default \"auto\")\n"
+}

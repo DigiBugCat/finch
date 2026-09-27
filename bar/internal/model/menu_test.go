@@ -58,7 +58,7 @@ func TestMenuAllConnected(t *testing.T) {
 	if tst := mustFind(t, items, "svc:notes:test"); tst.Action != (model.Action{Kind: model.ActTest, Service: "notes"}) {
 		t.Fatalf("test = %+v", tst)
 	}
-	if o := mustFind(t, items, "svc:notes:open"); o.Action.Kind != model.ActOpenURL || o.Action.Text != "https://finchmcp.com/fleet#notes" {
+	if o := mustFind(t, items, "svc:notes:open"); o.Action.Kind != model.ActOpenURL || o.Action.Text != "https://finchmcp.com/fleet#svc-notes" {
 		t.Fatalf("open = %+v", o)
 	}
 	if tg := mustFind(t, items, "svc:notes:target"); tg.Title != "This machine → http://127.0.0.1:8000" || !tg.Disabled {
@@ -211,7 +211,7 @@ func TestMenuNoDoubleSeparators(t *testing.T) {
 }
 
 func TestFleetRowURLEscapes(t *testing.T) {
-	if got := model.FleetRowURL("my app"); got != "https://finchmcp.com/fleet#my%20app" {
+	if got := model.FleetRowURL("my app"); got != "https://finchmcp.com/fleet#svc-my%20app" {
 		t.Fatalf("FleetRowURL = %q", got)
 	}
 }

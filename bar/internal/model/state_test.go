@@ -3,6 +3,7 @@ package model_test
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -136,6 +137,17 @@ func TestDeriveUnparseableVersionIsTooOldOnlyWhenFinchSaysSo(t *testing.T) {
 	if st.Kind != model.TooOld || st.Headline != "This finch is too old" {
 		t.Fatalf("state = %+v", st)
 	}
+	// Recorded from finch 1.5.10: `--version --json` fails at flag parsing.
+	st = model.Derive(snap(t, "1.5.10/version.json", "", ""))
+	if st.Kind != model.TooOld || st.Headline != "This finch is too old" || !strings.Contains(st.Detail, "1.7.0 or later") {
+		t.Fatalf("1.5.10: state = %+v", st)
+	}
+	// A finch that answers without the --json contract (exit 0, nothing on
+	// stdout) is too old too, not "not responding".
+	st = model.Derive(model.Snapshot{Binary: "/bin/finch", VersionErr: fmt.Errorf("finch --version --json: %w: unexpected output \"\"", finch.ErrNoContract)})
+	if st.Kind != model.TooOld {
+		t.Fatalf("no contract: state = %+v", st)
+	}
 	// A dev build is trusted.
 	st = model.Derive(model.Snapshot{Binary: "/bin/finch", Version: "dev", StatusErr: errors.New("x")})
 	if st.Kind == model.TooOld {
@@ -183,7 +195,16 @@ func TestHeadlineCounts(t *testing.T) {
 		{[]string{"offline"}, "1 service offline"},
 		{[]string{"offline", "offline"}, "All 2 services offline"},
 		{[]string{"online", "offline", "offline", "offline", "offline"}, "4 of 5 services offline"},
-		{[]string{"online", "pending"}, "1 service connecting"},
+		// "pending": a machine waits for `finch approve`; it never resolves on
+		// its own, so it is not "connecting".
+		{[]string{"online", "pending"}, "b is waiting for approval"},
+		{[]string{"pending", "pending"}, "2 services waiting for approval"},
+		{[]string{"pending", "offline"}, "1 of 2 services offline"},
+		// "invited": added, but no machine has joined. Unknown states read
+		// as offline too, like the fleet page.
+		{[]string{"online", "invited"}, "1 of 2 services offline"},
+		{[]string{"online", "some-future-state"}, "1 of 2 services offline"},
+		{[]string{"online", "in_use"}, "All connected"},
 		{[]string{"online"}, "All connected"},
 	} {
 		fl := &finch.Fleet{}
@@ -194,6 +215,26 @@ func TestHeadlineCounts(t *testing.T) {
 		if st.Headline != tc.want {
 			t.Errorf("%v: headline = %q, want %q", tc.states, st.Headline, tc.want)
 		}
+	}
+}
+
+func TestWaitingForApproval(t *testing.T) {
+	yes := true
+	fl := &finch.Fleet{Services: []finch.FleetService{{ID: "notes", State: "online"}, {ID: "kanban", State: "pending"}}}
+	st := model.Derive(model.Snapshot{Binary: "/bin/finch", Version: "1.8.0", Status: &finch.Status{LoggedInSnake: &yes}, Fleet: fl})
+	if st.Kind != model.AwaitingApproval || st.Icon != icons.Alert || st.Detail != "Approve it with: finch approve kanban" {
+		t.Fatalf("state = %+v", st)
+	}
+	if sv := st.Services[1]; !sv.Waiting || sv.Offline || sv.State != "waiting for approval" {
+		t.Fatalf("service = %+v", sv)
+	}
+	items := model.Build(st, model.UI{})
+	approve := mustFind(t, items, "svc:kanban:approve")
+	if approve.Hidden || approve.Action.Kind != model.ActCopy || approve.Action.Text != "finch approve kanban" {
+		t.Fatalf("approve item = %+v", approve)
+	}
+	if !mustFind(t, items, "svc:notes:approve").Hidden {
+		t.Fatal("an online service offers the approve command")
 	}
 }
 

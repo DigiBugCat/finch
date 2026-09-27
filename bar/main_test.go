@@ -44,9 +44,9 @@ func TestBadUsage(t *testing.T) {
 
 func TestPrintAgainstFakeFinch(t *testing.T) {
 	f := fakefinch.Install(t, "1.7", map[string][]string{
-		"version": {"1.8.0/version.json"},
-		"status":  {"1.8.0/status-logged-in.json"},
-		"fleet":   {"1.8.0/fleet.json"},
+		"--version": {"1.8.0/version.json"},
+		"status":    {"1.8.0/status-logged-in.json"},
+		"fleet":     {"1.8.0/fleet.json"},
 	})
 	t.Setenv("HOME", t.TempDir())
 	code, out, errOut := runMain(t, "--print", "--finch", f.Path)

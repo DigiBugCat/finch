@@ -4,7 +4,6 @@
 package model
 
 import (
-	"errors"
 	"fmt"
 	"strings"
 
@@ -41,6 +40,7 @@ const (
 	FleetError
 	NoServices
 	SomeOffline
+	AwaitingApproval
 	Connecting
 	AllConnected
 )
@@ -50,7 +50,7 @@ var kindNames = map[Kind]string{
 	LoginPending: "login-pending", LoggedOut: "logged-out", HubUnreachable: "hub-unreachable",
 	ServiceNotInstalled: "service-not-installed", ServiceStopped: "service-stopped",
 	FleetError: "fleet-error", NoServices: "no-services", SomeOffline: "some-offline",
-	Connecting: "connecting", AllConnected: "all-connected",
+	AwaitingApproval: "awaiting-approval", Connecting: "connecting", AllConnected: "all-connected",
 }
 
 func (k Kind) String() string {
@@ -71,13 +71,14 @@ type Background struct {
 // ServiceView is one service as the menu shows it.
 type ServiceView struct {
 	Name    string
-	State   string // online | offline | connecting | unknown
+	State   string // online | offline | waiting for approval | unknown
 	URL     string // public URL; empty before finch 1.8.0
 	Local   bool   // served by this machine's finch.yml
 	Target  string // the local URL, when Local
 	Public  bool   // callers need no finch key
 	Offline bool
 	Online  bool
+	Waiting bool // a machine joined and waits for `finch approve <name>`
 }
 
 // State is what finch-bar shows.
@@ -106,8 +107,7 @@ func Derive(s Snapshot) State {
 		return st
 	}
 	if s.VersionErr != nil || finch.OlderThan(s.Version, finch.MinVersion) {
-		var fe *finch.Error
-		if s.VersionErr != nil && !errors.As(s.VersionErr, &fe) {
+		if s.VersionErr != nil && !finch.TooOld(s.VersionErr) {
 			// finch could not be run at all (or timed out): not an age problem.
 			st.Kind, st.Icon = FinchError, icons.Alert
 			st.Headline = "finch isn't responding"
@@ -188,7 +188,7 @@ func Derive(s Snapshot) State {
 		return st
 	}
 
-	var offline, connecting []string
+	var offline, waiting, connecting []string
 	online := 0
 	for _, sv := range st.Services {
 		switch {
@@ -196,7 +196,10 @@ func Derive(s Snapshot) State {
 			online++
 		case sv.Offline:
 			offline = append(offline, sv.Name)
+		case sv.Waiting:
+			waiting = append(waiting, sv.Name)
 		default:
+			// Only a local service the fleet does not list yet.
 			connecting = append(connecting, sv.Name)
 		}
 	}
@@ -217,6 +220,15 @@ func Derive(s Snapshot) State {
 			st.Headline = fmt.Sprintf("%d of %d services offline", len(offline), total)
 		}
 		st.Detail = "Offline: " + names(offline)
+	case len(waiting) == 1:
+		// It stays this way until someone approves it, so say how.
+		st.Kind, st.Icon = AwaitingApproval, icons.Alert
+		st.Headline = waiting[0] + " is waiting for approval"
+		st.Detail = "Approve it with: finch approve " + waiting[0]
+	case len(waiting) > 1:
+		st.Kind, st.Icon = AwaitingApproval, icons.Alert
+		st.Headline = fmt.Sprintf("%d services waiting for approval", len(waiting))
+		st.Detail = "Run finch approve <name> for: " + names(waiting)
 	case len(connecting) > 0:
 		st.Kind, st.Icon = Connecting, icons.Busy
 		st.Headline = plural(len(connecting), "service", "services") + " connecting"
@@ -250,14 +262,15 @@ func services(status *finch.Status, fleet *finch.Fleet) []ServiceView {
 				Public:  f.Auth == "public",
 				Online:  f.Online(),
 				Offline: f.Offline(),
+				Waiting: f.Waiting(),
 			}
 			switch {
 			case v.Online:
 				v.State = "online"
-			case v.Offline:
-				v.State = "offline"
+			case v.Waiting:
+				v.State = "waiting for approval"
 			default:
-				v.State = "connecting"
+				v.State = "offline"
 			}
 			if in, ok := local[f.ID]; ok {
 				v.Local, v.Target = true, in.Target

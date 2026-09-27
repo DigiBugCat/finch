@@ -58,7 +58,7 @@ func (e *Error) Error() string {
 	return e.Message
 }
 
-// VersionInfo is `finch version --json`.
+// VersionInfo is `finch --version --json` (the same as `finch version --json`).
 type VersionInfo struct {
 	Product string `json:"product"`
 	Version string `json:"version"`
@@ -130,8 +130,15 @@ type FleetService struct {
 // Online reports a service a caller can reach right now.
 func (f FleetService) Online() bool { return f.State == "online" || f.State == "in_use" }
 
-// Offline reports a service whose machines are all disconnected.
-func (f FleetService) Offline() bool { return f.State == "offline" }
+// Waiting reports a service whose machine joined but waits for
+// `finch approve <name>` (the hub's "pending").
+func (f FleetService) Waiting() bool { return f.State == "pending" }
+
+// Offline reports a service no machine is serving: "offline" (its machines
+// disconnected), "invited" (added, but no machine has joined yet) or a state
+// this finch-bar does not know. Like the fleet page, anything that is neither
+// online nor waiting for approval reads as offline.
+func (f FleetService) Offline() bool { return !f.Online() && !f.Waiting() }
 
 // Fleet is `finch fleet --json`.
 type Fleet struct {

@@ -49,9 +49,14 @@ Install for your user:
 
   install -Dm755 finch-bar ~/.local/bin/finch-bar
   install -Dm644 finch-bar.png ~/.local/share/icons/hicolor/256x256/apps/finch-bar.png
-  install -Dm644 finch-bar.desktop ~/.local/share/applications/finch-bar.desktop
-  finch-bar --install-login-item   # open it when you log in (optional)
-  finch-bar &
+  mkdir -p ~/.local/share/applications
+  sed "s|^Exec=.*|Exec=\$HOME/.local/bin/finch-bar|" finch-bar.desktop \\
+    > ~/.local/share/applications/finch-bar.desktop
+  ~/.local/bin/finch-bar --install-login-item   # open it when you log in (optional)
+  ~/.local/bin/finch-bar &
+
+The full paths matter: ~/.local/bin is often not on your PATH until you
+next log in, and the application-menu entry needs finch-bar's full path.
 
 More: https://finchmcp.com/docs/menu-bar
 EOF
