@@ -33,12 +33,12 @@ finch status --json
 ```
 
 - Exit code 127, or `command not found`: finch is not installed yet. Go to step 1.
-- The output has no `"schema_version":1`, its `"version"` is below `1.7.0`, or
-  the command fails: this finch is too old for these steps (older versions
-  print `{"loggedIn":…}` without a `schema_version`). Go to step 1 and install
-  finch 1.7.0 or later, even though a `finch` is already on `PATH`.
-- `"logged_in": true`: skip step 2. (finch 1.7 prints only `"loggedIn"`; it
-  means the same, and 1.8 prints both.)
+- The output has no `"schema_version":1`, its `"version"` is below `1.8.0`, or
+  the command fails: this finch is too old for these steps (finch 1.7 has no
+  `finch logs` or `finch uninstall`, and re-running `finch add` there creates
+  a second service instead of updating the first). Go to step 1 and install
+  finch 1.8.0 or later, even though a `finch` is already on `PATH`.
+- `"logged_in": true`: skip step 2.
 - `"login_pending": true`: a login is waiting for approval. Go to step 2 and
   poll; do not start a new one. While it is pending, `"logged_in"` is `false`
   even if an older login is saved, because that login is blocked until the
@@ -71,7 +71,7 @@ older copy in a root-owned `/usr/local/bin`, say), plain `finch` still runs the
 old binary. Use the full path the installer printed after `Next:` for every
 command in this session, and tell your human they can remove the old copy.
 Then run `finch status --json` again (by that path) and check that it has
-`"schema_version":1` and a `"version"` of `1.7.0` or later.
+`"schema_version":1` and a `"version"` of `1.8.0` or later.
 
 ## 2. Log in (the one human step)
 
@@ -279,12 +279,16 @@ When `next` is present, it is the command to run next. Exit codes are
 - `finch keys revoke <key_id> --json` cuts off one client.
 - `finch rm notes --json` removes the service from the account, from
   `finch.yml`, and its saved credential on this machine, and restarts the
-  background service if it runs.
+  background service if it runs. When that was the last service and the
+  background service is installed, its `"next"` is `finch service uninstall`.
 - `finch service uninstall --json` stops the background service (it exits `1`
   and keeps the unit if finch could not be stopped).
 - `finch uninstall --json` removes everything finch set up on this machine:
-  the background service, the keys `finch connect` created here (revoked),
-  the client entries it wrote, and `~/.finch`. Services stay in the account.
+  the background service, the keys `finch connect` created here (revoked,
+  `revoked_key_ids`), the client entries it wrote, and `~/.finch`. Services
+  stay in the account. On a machine set up before finch 1.8 it cannot tell
+  which keys were its own, so it revokes none and lists the likely ones in
+  `candidate_key_ids`; show them to your human rather than revoking them.
   It does not delete the `finch` binary; its output says how
   (`remove_binary`).
 

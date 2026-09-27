@@ -151,6 +151,8 @@ type fakeHub struct {
 	authDown bool // POST /api/cli/auth answers 503
 	// revokeDown makes POST /api/cli/keys/revoke answer 503.
 	revokeDown bool
+	// joinDown makes POST /join answer 503 (after enroll registered the service).
+	joinDown bool
 	// relayDown makes the relay socket (/connect/<id>) answer 502, as a hub
 	// that accepts the credential but cannot take the relay would.
 	relayDown bool
@@ -297,6 +299,10 @@ func (h *fakeHub) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		id := strings.TrimPrefix(b.Ticket, "tkt_")
+		if h.joinDown {
+			writeJSON(w, 503, map[string]string{"error": "try again"})
+			return
+		}
 		if _, ok := h.services[id]; !ok || !strings.HasPrefix(b.Ticket, "tkt_") || b.Box == "" {
 			writeJSON(w, 403, map[string]string{"error": "bad ticket"})
 			return

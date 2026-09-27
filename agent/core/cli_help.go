@@ -152,10 +152,12 @@ var commandDocs = []cmdDoc{
 		usage:   []string{"uninstall"},
 		summary: "Remove finch's background service, logins, keys and client entries from this machine",
 		details: "Stops and removes the background service, revokes the finch_ keys this\n" +
-			"machine created with 'finch connect', removes the client entries connect\n" +
-			"added, and deletes finch's local credentials and config (~/.finch). Your\n" +
-			"services stay in your account (remove them first with 'finch rm <name>' if\n" +
-			"you want them gone). It never deletes the finch binary; it prints how to.",
+			"machine created with 'finch connect' (a machine set up before finch 1.8\n" +
+			"has no record of them, so it lists the likely ones for you to check),\n" +
+			"removes the client entries connect added, and deletes finch's local\n" +
+			"credentials and config (~/.finch). Your services stay in your account\n" +
+			"(remove them first with 'finch rm <name>' if you want them gone). It never\n" +
+			"deletes the finch binary; it prints how to.",
 		example: "finch uninstall",
 	},
 	{
@@ -450,8 +452,13 @@ func commandHelp(c *cli, name string) error {
 	return h(c, []string{"-h"})
 }
 
-// helpCommands is the command table for `finch help --json`.
-func helpCommands() []map[string]any { return helpCommandsWhere(false) }
+// helpCommands is the command table for `finch help --json`: every command,
+// the advanced ones marked "advanced":true. As in 1.7, "usage" leaves out the
+// leading "finch " (callers prefix it themselves).
+func helpCommands() []map[string]any {
+	rows := helpCommandsWhere(false)
+	return append(rows, helpCommandsWhere(true)...)
+}
 
 func helpCommandsWhere(advanced bool) []map[string]any {
 	rows := []map[string]any{}
@@ -459,9 +466,12 @@ func helpCommandsWhere(advanced bool) []map[string]any {
 		if d.advanced != advanced {
 			continue
 		}
-		row := map[string]any{"name": d.name, "usage": "finch " + d.usage[0], "summary": d.summary}
+		row := map[string]any{"name": d.name, "usage": d.usage[0], "summary": d.summary}
 		if len(d.aliases) > 0 {
 			row["aliases"] = d.aliases
+		}
+		if advanced {
+			row["advanced"] = true
 		}
 		rows = append(rows, row)
 	}

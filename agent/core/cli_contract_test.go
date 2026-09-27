@@ -717,14 +717,21 @@ func TestHelpAndGuideJSON(t *testing.T) {
 		if len(rows) < 15 {
 			t.Fatalf("help commands=%v", got["commands"])
 		}
+		// 1.7's shape: "usage" has no leading "finch " (callers add it).
 		first, _ := rows[0].(map[string]any)
-		if first["name"] != "login" || first["usage"] != "finch login [--headless]" || !strings.HasPrefix(first["summary"].(string), "Sign in to finch") {
+		if first["name"] != "login" || first["usage"] != "login [--headless]" || !strings.HasPrefix(first["summary"].(string), "Sign in to finch") {
 			t.Fatalf("first row=%v", first)
 		}
+		// Every 1.7 command is still a row; the advanced ones say so.
+		byName := map[string]map[string]any{}
 		for _, r := range rows {
 			m := r.(map[string]any)
+			byName[m["name"].(string)] = m
 			if m["name"] == "" || m["usage"] == "" || m["summary"] == "" {
 				t.Fatalf("bad row %v", m)
+			}
+			if u, _ := m["usage"].(string); strings.HasPrefix(u, "finch ") || !strings.HasPrefix(u, m["name"].(string)) {
+				t.Fatalf("usage is not in the 1.7 form: %v", m)
 			}
 			// Aliases are structured, never folded into the summary.
 			if m["name"] == "fleet" && !reflect.DeepEqual(m["aliases"], []any{"ls"}) {
@@ -733,6 +740,21 @@ func TestHelpAndGuideJSON(t *testing.T) {
 			if strings.Contains(m["summary"].(string), "alias") {
 				t.Fatalf("alias in a summary: %v", m)
 			}
+		}
+		for _, name := range []string{"login", "add", "run", "service", "connect", "test", "call", "status", "fleet", "keys", "auth", "rm",
+			"approve", "domain", "token", "enroll", "update", "revoke-tokens", "version", "guide", "help"} {
+			if byName[name] == nil {
+				t.Fatalf("no %q row in help --json", name)
+			}
+		}
+		for name, m := range byName {
+			wantAdvanced := findDoc(name).advanced
+			if (m["advanced"] == true) != wantAdvanced || (!wantAdvanced && m["advanced"] != nil) {
+				t.Fatalf("%s row advanced=%v, want %v", name, m["advanced"], wantAdvanced)
+			}
+		}
+		if byName["token"]["advanced"] != true {
+			t.Fatalf("token row=%v", byName["token"])
 		}
 	}
 	// Without --json they stay prose.

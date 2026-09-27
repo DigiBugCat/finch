@@ -72,12 +72,16 @@ func runRm(c *cli, args []string) error {
 		return newCLIError(codeNotFound, "finch fleet", "no service named %q in your account or on this machine", name)
 	}
 
-	restarted, remaining := false, -1
+	restarted, remaining, idleService := false, -1, false
 	if removedEntry {
 		if cfg, err := loadConfig(*configPath, host); err == nil {
 			remaining = len(cfg.Ingress)
 		}
-		if remaining > 0 && currentServiceStatus().Running {
+		svc := currentServiceStatus()
+		// With nothing left to serve, 'finch run' exits at its next start and
+		// launchd / systemd would restart it over and over: say to remove it.
+		idleService = remaining == 0 && (svc.Installed || svc.Running)
+		if remaining > 0 && svc.Running {
 			if err := restartManagedService(); err != nil {
 				return newCLIError(codeInternal, "finch service install", "removed %s, but restarting the background service failed: %v", name, err)
 			}
@@ -88,6 +92,9 @@ func runRm(c *cli, args []string) error {
 		p := map[string]any{"removed": name, "account": inAccount, "config_entry": removedEntry, "restarted": restarted}
 		if removedCred {
 			p["credential"] = credPath
+		}
+		if idleService {
+			p["next"] = "finch service uninstall"
 		}
 		return c.emit(p)
 	}
@@ -106,8 +113,8 @@ func runRm(c *cli, args []string) error {
 	if restarted {
 		c.printf("       restarted the background service\n")
 	}
-	if remaining == 0 {
-		c.printf("       no services left on this machine; 'finch service uninstall' stops the background service\n")
+	if idleService {
+		c.printf("       no services left on this machine; run 'finch service uninstall' to stop the background service\n")
 	}
 	return nil
 }
@@ -243,17 +250,25 @@ type connection struct {
 func connectionsPath() string { return filepath.Join(finchHome(), "connections.json") }
 
 func readConnections() []connection {
+	list, _ := readLedger()
+	return list
+}
+
+// readLedger reads the connect ledger. ok is false when there is none to go
+// on: the file is missing (a machine that never ran finch 1.8's connect) or
+// unreadable.
+func readLedger() (list []connection, ok bool) {
 	b, err := readCredentialFile(connectionsPath(), credentialStateLimit)
 	if err != nil || b == nil {
-		return nil
+		return nil, false
 	}
 	var doc struct {
 		Connections []connection `json:"connections"`
 	}
 	if json.Unmarshal(b, &doc) != nil {
-		return nil
+		return nil, false
 	}
-	return doc.Connections
+	return doc.Connections, true
 }
 
 // recordConnection adds (or replaces) the ledger entry for one client entry.
@@ -341,15 +356,19 @@ func runUninstall(c *cli, args []string) error {
 	} else {
 		warnings = append(warnings, "not logged in, so the finch_ keys this machine created were not revoked; revoke them from another machine with 'finch keys list' and 'finch keys revoke <id>'")
 	}
-	ledger := readConnections()
+	ledger, haveLedger := readLedger()
 	entries, entryWarnings := removeClientEntries(ledger, st)
 	warnings = append(warnings, entryWarnings...)
 	done = append(done, entries...)
-	result["client_entries_removed"] = entries
+	result["client_entries_removed"] = nonNil(entries)
 
-	revoked := []string{}
+	revoked, candidates := []string{}, []string{}
 	if st != nil {
-		ids := keysMintedHere(st, ledger, host)
+		ids, maybe := keysMintedHere(st, ledger, haveLedger)
+		candidates = maybe
+		if len(maybe) > 0 {
+			warnings = append(warnings, fmt.Sprintf("this machine has no record of the keys it created with finch connect (it was set up before finch 1.8), so none were revoked. These keys carry this machine's name and may be its own: %s. Another machine with the same name labels its keys the same way, so check them with 'finch keys list' and revoke the ones that were this machine's with 'finch keys revoke <id>' from a logged-in machine", strings.Join(maybe, ", ")))
+		}
 		for _, id := range ids {
 			if _, err := cliRequest("POST", cred.Hub, "/api/cli/keys/revoke", cred.Token, map[string]string{"id": id}); err != nil {
 				var he *hubError
@@ -366,6 +385,7 @@ func runUninstall(c *cli, args []string) error {
 		}
 	}
 	result["revoked_key_ids"] = revoked
+	result["candidate_key_ids"] = candidates
 
 	// 3. Local credentials and config.
 	deleted, fileWarnings := deleteLocalState(host)
@@ -373,7 +393,7 @@ func runUninstall(c *cli, args []string) error {
 	for _, p := range deleted {
 		done = append(done, "deleted "+p)
 	}
-	result["deleted"] = deleted
+	result["deleted"] = nonNil(deleted)
 
 	// 4. The binary: say how, never do it.
 	exe, _ := os.Executable()
@@ -409,10 +429,14 @@ func runUninstall(c *cli, args []string) error {
 	return nil
 }
 
-// keysMintedHere is the keys `finch connect` created on this machine: those in
-// the ledger, plus (for connects made before the ledger existed) every key
-// labelled "<client> on <this hostname>".
-func keysMintedHere(st map[string]any, ledger []connection, host string) []string {
+// keysMintedHere is the keys `finch connect` created on this machine: exactly
+// the key ids its ledger recorded that the account still has. A label is not
+// proof ("<client> on <hostname>" repeats across machines with the same name,
+// and anyone can mint a key with that label), so it never revokes anything.
+// Only when there is no ledger (connects made before finch 1.8) are the keys
+// with this machine's connect labels returned, as candidates for the person
+// to check, each as "<id> (<label>)".
+func keysMintedHere(st map[string]any, ledger []connection, haveLedger bool) (ids, candidates []string) {
 	labels := map[string]bool{}
 	for _, cl := range connectClients {
 		labels[connectLabel(cl)] = true
@@ -423,18 +447,23 @@ func keysMintedHere(st map[string]any, ledger []connection, host string) []strin
 			inLedger[e.KeyID] = true
 		}
 	}
-	var ids []string
+	ids, candidates = []string{}, []string{}
 	keys, _ := st["keys"].([]any)
 	for _, k := range keys {
 		m, _ := k.(map[string]any)
 		id, _ := m["id"].(string)
 		label, _ := m["label"].(string)
-		if id != "" && (inLedger[id] || labels[label]) {
+		switch {
+		case id == "":
+		case inLedger[id]:
 			ids = append(ids, id)
+		case !haveLedger && labels[label]:
+			candidates = append(candidates, id+" ("+label+")")
 		}
 	}
 	sort.Strings(ids)
-	return ids
+	sort.Strings(candidates)
+	return ids, candidates
 }
 
 // removeClientEntries takes out the client entries finch connect wrote. It
@@ -601,6 +630,16 @@ func deleteLocalState(host string) (deleted, warnings []string) {
 		}
 		for _, ing := range cfg.Ingress {
 			p := cfg.statePathFor(ing.AppPath)
+			if !fileExists(p) {
+				continue
+			}
+			// The manifest may be any project's finch.yml (the current
+			// directory's is read too), so a file it names is deleted only if
+			// it really is a finch credential.
+			if !isFinchCredential(p) {
+				warnings = append(warnings, fmt.Sprintf("%s names %s as the credential for %s, but it does not look like one (a private file with a hub and a refresh token), so it was left in place", m, p, ing.AppPath))
+				continue
+			}
 			if err := os.Remove(p); err == nil {
 				deleted = append(deleted, p)
 			}
@@ -632,6 +671,27 @@ func deleteLocalState(host string) (deleted, warnings []string) {
 		}
 	}
 	return deleted, warnings
+}
+
+// isFinchCredential reports whether path is a regular file holding a saved
+// finch machine credential (a hub and a refresh token), as `finch add` and
+// `finch enroll` write it.
+func isFinchCredential(path string) bool {
+	b, err := readCredentialFile(path, credentialStateLimit)
+	if err != nil || b == nil {
+		return false
+	}
+	var st agentState
+	return json.Unmarshal(b, &st) == nil && st.Hub != "" && st.RefreshToken != ""
+}
+
+// nonNil turns a nil list into an empty one, so a JSON list field is always
+// an array, never null.
+func nonNil(list []string) []string {
+	if list == nil {
+		return []string{}
+	}
+	return list
 }
 
 // isWithin reports whether path is dir or inside it.

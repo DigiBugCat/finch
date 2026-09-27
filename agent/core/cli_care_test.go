@@ -216,6 +216,71 @@ func TestRmRemovesTheServiceEverywhere(t *testing.T) {
 	}
 }
 
+// Removing the last service while the background service is installed says
+// to remove that too: with nothing to serve, 'finch run' would exit at every
+// start and launchd / systemd would keep restarting it.
+func TestRmOfTheLastServiceSaysToUninstallTheService(t *testing.T) {
+	home := isolate(t)
+	h := newFakeHub(t)
+	loginTo(t, h)
+	cfg := filepath.Join(home, ".finch", "finch.yml")
+	for _, name := range []string{"notes", "wiki"} {
+		if _, stderr, code := finch(t, "add", name, "--service", "http://127.0.0.1:8000"); code != 0 {
+			t.Fatalf("add %s: %q", name, stderr)
+		}
+	}
+	serviceGOOS = "darwin" // restored by isolate
+	if err := os.MkdirAll(filepath.Dir(launchdPlistPath()), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(launchdPlistPath(), []byte("<plist/>"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stdout, _, code := finch(t, "rm", "notes", "--json")
+	if got := decodeJSONOut(t, stdout); code != 0 || got["next"] != nil {
+		t.Fatalf("rm with a service left: exit=%d payload=%v", code, got)
+	}
+	stdout, _, code = finch(t, "rm", "wiki", "--config", cfg, "--json")
+	if got := decodeJSONOut(t, stdout); code != 0 || got["next"] != "finch service uninstall" || got["restarted"] != false {
+		t.Fatalf("rm of the last service: exit=%d payload=%v", code, got)
+	}
+	// Without a background service there is nothing to say.
+	if err := os.Remove(launchdPlistPath()); err != nil {
+		t.Fatal(err)
+	}
+	if _, stderr, code := finch(t, "add", "notes", "--service", "http://127.0.0.1:8000"); code != 0 {
+		t.Fatalf("re-add: %q", stderr)
+	}
+	stdout, _, code = finch(t, "rm", "notes")
+	if code != 0 || strings.Contains(stdout, "service uninstall") {
+		t.Fatalf("rm without a background service: exit=%d\n%s", code, stdout)
+	}
+}
+
+// When the hub registered the service but this machine could not join it, a
+// plain retry would publish "<name>-2": the error says to remove it first.
+func TestAddJoinFailureSaysToRemoveTheService(t *testing.T) {
+	isolate(t)
+	h := newFakeHub(t)
+	loginTo(t, h)
+	h.set(func(h *fakeHub) { h.joinDown = true })
+	_, stderr, code := finch(t, "add", "notes", "--service", "http://127.0.0.1:8000", "--json")
+	env := decodeJSONError(t, stderr)
+	if code != 1 || env.Error.Code != "UPSTREAM" || env.Error.Next != "finch rm notes" ||
+		!strings.Contains(env.Error.Message, "could not join it") || !strings.Contains(env.Error.Message, "finch add notes --service http://127.0.0.1:8000") {
+		t.Fatalf("exit=%d env=%+v", code, env)
+	}
+	// Following that next step clears the way for the same name.
+	h.set(func(h *fakeHub) { h.joinDown = false })
+	if _, stderr, code := finch(t, "rm", "notes", "--json"); code != 0 {
+		t.Fatalf("rm: exit=%d stderr=%q", code, stderr)
+	}
+	stdout, _, code := finch(t, "add", "notes", "--service", "http://127.0.0.1:8000", "--json")
+	if code != 0 || decodeJSONOut(t, stdout)["app_path"] != "notes" {
+		t.Fatalf("retry: exit=%d stdout=%q", code, stdout)
+	}
+}
+
 func TestLogs(t *testing.T) {
 	isolate(t)
 	h := newFakeHub(t)
@@ -400,9 +465,14 @@ func TestUninstall(t *testing.T) {
 			t.Fatalf("connect %s: %q", client, stderr)
 		}
 	}
-	// A key someone minted by hand is not this machine's connect key.
-	if _, stderr, code := finch(t, "keys", "mint", "ci-bot", "--service", "notes"); code != 0 {
-		t.Fatalf("mint: %q", stderr)
+	// A key someone minted by hand is not this machine's connect key, and
+	// neither is one another machine with the same hostname made with
+	// connect: it carries the very same "cursor on <host>" label.
+	host, _ := os.Hostname()
+	for _, label := range []string{"ci-bot", "cursor on " + host} {
+		if _, stderr, code := finch(t, "keys", "mint", label, "--service", "notes"); code != 0 {
+			t.Fatalf("mint %s: %q", label, stderr)
+		}
 	}
 	if !fileExists(filepath.Join(home, ".finch", "connections.json")) {
 		t.Fatal("connect kept no record of what it wired")
@@ -413,14 +483,15 @@ func TestUninstall(t *testing.T) {
 		t.Fatalf("uninstall: exit=%d stderr=%q", code, stderr)
 	}
 	got := decodeJSONOut(t, stdout)
-	if !reflect.DeepEqual(got["revoked_key_ids"], []any{"k_1", "k_2"}) {
-		t.Fatalf("revoked=%v", got["revoked_key_ids"])
+	if !reflect.DeepEqual(got["revoked_key_ids"], []any{"k_1", "k_2"}) || !reflect.DeepEqual(got["candidate_key_ids"], []any{}) {
+		t.Fatalf("revoked=%v candidates=%v", got["revoked_key_ids"], got["candidate_key_ids"])
 	}
 	h.mu.Lock()
 	_, handMinted := h.keys["k_3"]
+	_, twinMachine := h.keys["k_4"]
 	h.mu.Unlock()
-	if !handMinted {
-		t.Fatal("uninstall revoked a key connect did not create")
+	if !handMinted || !twinMachine {
+		t.Fatalf("uninstall revoked a key connect did not create here: k_3 kept=%v k_4 kept=%v", handMinted, twinMachine)
 	}
 	if fileExists(filepath.Join(home, ".finch")) {
 		t.Fatal("~/.finch is still there")
@@ -443,6 +514,102 @@ func TestUninstall(t *testing.T) {
 	stdout, _, code = finch(t, "uninstall")
 	if code != 0 || !strings.Contains(stdout, "nothing to remove") || !strings.Contains(stdout, "finch binary is still at") {
 		t.Fatalf("second uninstall: exit=%d\n%s", code, stdout)
+	}
+	// Its JSON list fields are arrays even when empty, never null.
+	stdout, _, code = finch(t, "uninstall", "--json")
+	got = decodeJSONOut(t, stdout)
+	for _, field := range []string{"client_entries_removed", "deleted", "revoked_key_ids", "candidate_key_ids", "warnings"} {
+		if _, ok := got[field].([]any); code != 0 || !ok {
+			t.Fatalf("empty uninstall: exit=%d %s=%v", code, field, got[field])
+		}
+	}
+}
+
+// A machine set up before finch 1.8 has no record of the keys its connects
+// made. Labels are not proof (hostnames repeat), so uninstall revokes none of
+// them: it lists the ones with this machine's connect labels for the person.
+func TestUninstallWithoutALedgerRevokesNothing(t *testing.T) {
+	_, h := connectFixture(t)
+	host, _ := os.Hostname()
+	for _, label := range []string{"cursor on " + host, "ci-bot"} {
+		if _, stderr, code := finch(t, "keys", "mint", label, "--service", "notes"); code != 0 {
+			t.Fatalf("mint %s: %q", label, stderr)
+		}
+	}
+	stdout, stderr, code := finch(t, "uninstall", "--json")
+	if code != 0 {
+		t.Fatalf("uninstall: exit=%d stderr=%q", code, stderr)
+	}
+	got := decodeJSONOut(t, stdout)
+	want := "k_1 (cursor on " + host + ")"
+	if !reflect.DeepEqual(got["revoked_key_ids"], []any{}) || !reflect.DeepEqual(got["candidate_key_ids"], []any{want}) {
+		t.Fatalf("revoked=%v candidates=%v", got["revoked_key_ids"], got["candidate_key_ids"])
+	}
+	h.mu.Lock()
+	kept, revoked := len(h.keys), append([]string(nil), h.revoked...)
+	h.mu.Unlock()
+	if kept != 2 || len(revoked) != 0 {
+		t.Fatalf("keys left=%d revoked=%v", kept, revoked)
+	}
+	warnings, _ := got["warnings"].([]any)
+	found := false
+	for _, w := range warnings {
+		if s, _ := w.(string); strings.Contains(s, want) && strings.Contains(s, "none were revoked") && strings.Contains(s, "finch keys revoke <id>") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no warning names the candidate: %v", warnings)
+	}
+}
+
+// uninstall reads the current directory's finch.yml too, but deletes a file
+// it names only if that file is a finch credential.
+func TestUninstallDeletesOnlyFinchCredentials(t *testing.T) {
+	home := isolate(t)
+	project := filepath.Join(home, "project")
+	if err := os.MkdirAll(project, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(project)
+	manifest := "hub: https://finchmcp.com\nbox: testbox\ncredentials-dir: .\ningress:\n" +
+		"  - app_path: package\n    service: http://127.0.0.1:8000\n" +
+		"  - app_path: notes\n    service: http://127.0.0.1:8001\n"
+	if err := os.WriteFile(filepath.Join(project, "finch.yml"), []byte(manifest), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pkg := filepath.Join(project, "package.json")
+	if err := os.WriteFile(pkg, []byte(`{"name":"my-app"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cred := filepath.Join(project, "notes.json")
+	if err := writeCredentialFile(cred, []byte(`{"hub":"https://finchmcp.com","service":"notes","box":"testbox","refreshToken":"rt_notes"}`)); err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr, code := finch(t, "uninstall", "--json")
+	if code != 0 {
+		t.Fatalf("uninstall: exit=%d stderr=%q", code, stderr)
+	}
+	got := decodeJSONOut(t, stdout)
+	if !fileExists(pkg) {
+		t.Fatal("uninstall deleted package.json")
+	}
+	if fileExists(cred) {
+		t.Fatal("uninstall left the finch credential notes.json")
+	}
+	deleted, _ := got["deleted"].([]any)
+	if len(deleted) != 1 || deleted[0] != cred {
+		t.Fatalf("deleted=%v", deleted)
+	}
+	warnings, _ := got["warnings"].([]any)
+	found := false
+	for _, w := range warnings {
+		if s, _ := w.(string); strings.Contains(s, pkg) && strings.Contains(s, "left in place") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("no warning for %s: %v", pkg, warnings)
 	}
 }
 

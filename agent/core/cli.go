@@ -1113,7 +1113,11 @@ func runAdd(c *cli, args []string) error {
 				"finch registered %q, but saving its credential on this machine failed (%v). Nothing was added to %s. Make %s writable, then run 'finch rm %s' and 'finch add %s --service %s' again",
 				id, pe, *configPath, filepath.Dir(pe.Path), id, wantPath, *service)
 		}
-		return newCLIError(codeUpstream, "", "add %s: %v", id, err)
+		// The hub has the service now, but this machine did not join it. A
+		// plain retry would publish "<name>-2" beside it, so remove it first.
+		return newCLIError(codeUpstream, "finch rm "+id,
+			"finch registered %q in your account, but this machine could not join it (%v). Run 'finch rm %s', then 'finch add %s --service %s' again",
+			id, err, id, wantPath, *service)
 	}
 	if err := appendIngressOpts(*configPath, cred.Hub, id, *service, box, fwd); err != nil {
 		return newCLIError(codeInternal, "", "could not write %s: %v", *configPath, err)
