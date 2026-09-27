@@ -1,6 +1,10 @@
-# Release environments
+# Releases and environments
 
-Finch has three deliberately separate lanes:
+Status: **current.** How code reaches staging and production, and how agent
+binaries are released. Self-hosting? The lanes below are this repository's
+own; [`self-host.md`](self-host.md) covers deploying your own copy.
+
+finch has three deliberately separate lanes:
 
 | Source | Destination | Trigger |
 | --- | --- | --- |
@@ -9,7 +13,7 @@ Finch has three deliberately separate lanes:
 | `production` | production (`finch-prod`, `finch-web-prod`) | Successful CI push; Environment approval when supported |
 
 Version tags remain the trigger for `.github/workflows/release.yml`, which
-builds and publishes Finch **agent binaries only**. A tag never deploys the hub
+builds and publishes finch **agent binaries only**. A tag never deploys the hub
 or dashboard; `.github/workflows/deploy.yml` accepts only successful CI runs
 whose source branch is exactly `main` or `production`.
 
@@ -77,10 +81,29 @@ That is a break-glass procedure: record the selected Worker version, incident,
 and operator, then immediately reconcile the `production` branch through the
 normal PR path so Git and the deployed state agree again.
 
-## Native-tenancy cutover
+## Agent releases
 
-The native Finch tenancy cutover is developed on the unpushed `app-level-access`
-branch and uses the direct, preflight-gated Wrangler path for its controlled
-staging rehearsal and production release. This does not change the normal
-branch-promotion lanes above. The hard order is worker first (including migration
-v6), then web; the new web must never run against the old worker.
+The agent version lives in two places that must agree:
+`agentVersion` in `agent/core/agent.go` and `LATEST_AGENT` in
+`worker/src/types.ts` (the hub tells `finch update` which version is latest).
+`node scripts/check-versions.mjs` checks them in CI.
+
+To release:
+
+1. In a normal pull request, bump both literals, and move the `Unreleased`
+   entries in [`CHANGELOG.md`](../CHANGELOG.md) under the new version with
+   today's date.
+2. After it merges, tag the merge commit and push the tag:
+   `git tag v1.8.0 && git push origin v1.8.0`.
+3. `.github/workflows/release.yml` re-runs the version check against the tag
+   (`check-versions.mjs --expected-tag`), race-tests the agent, and runs
+   GoReleaser. GoReleaser builds `finch-<os>-<arch>` binaries for macOS and
+   Linux (amd64, arm64, armv6, armv7) plus `checksums.txt`, and publishes a
+   GitHub release whose notes start with the install line and group the
+   commits since the previous tag.
+4. The workflow mirrors the assets into the `finch-releases` R2 bucket, which
+   the hub serves at `/releases/<asset>` for the installer and `finch update`.
+5. Promote the hub to production (the `LATEST_AGENT` bump ships with it), so
+   `finch update` on existing machines offers the new version.
+
+A tag never deploys the hub or the web.

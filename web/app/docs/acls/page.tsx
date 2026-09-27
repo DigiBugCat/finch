@@ -1,20 +1,21 @@
+import type { Metadata } from 'next';
+import { docsMetadata } from '../meta';
 import Link from 'next/link';
+import Code from '../code';
 
-function Code({ children }: { children: string }) {
-  return <pre className="docs-code"><code dangerouslySetInnerHTML={{ __html: children }} /></pre>;
-}
+export const metadata: Metadata = docsMetadata('Access control', 'Who can reach a finch service: scoped finch_ keys, OAuth sign-in, or public.');
 
 export default function Acls() {
   return (
     <>
       <h1>Access control</h1>
       <p className="docs-lede">
-        Finch decides who can reach a service at the hub, before a request ever
-        touches your box. Everything is managed from the CLI: you choose, per
+        finch decides who can reach a service before a request ever touches your
+        machine. Everything is managed from the CLI: you choose, per
         service, whether callers need a key, and you choose what each key can reach.
       </p>
       <p>
-        A Finch account belongs to one person. There are no teams, groups,
+        A finch account belongs to one person. There are no teams, groups,
         shared members, or access-control rules to maintain: the scope of each
         key is the whole policy.
       </p>
@@ -42,16 +43,17 @@ export default function Acls() {
         </table>
       </div>
       <p>
-        Anything else is refused with a <code>401</code> at the edge. There is no
-        sign-in page in front of your services: a browser opening a key-protected
-        service gets the same plain <code>401</code> an unauthenticated client
-        does.
+        Anything else is refused before it reaches your machine: a <code>401</code>{' '}
+        when no key was sent, a <code>403</code> when the key is unknown, revoked or
+        scoped to other services. There is no sign-in page in front of your services:
+        a browser opening a key-protected service gets the same <code>401</code> an
+        unauthenticated client does.
       </p>
 
       <h2>Key scope</h2>
       <p>
         Every key is scoped when it is minted, and that scope is the only thing
-        that decides what it reaches. <code>--service &lt;id&gt;</code>{' '}
+        that decides what it reaches. <code>--service &lt;name&gt;</code>{' '}
         limits it to one service; <code>--all</code> lets it reach every service on
         the account. There is no unscoped default.
       </p>
@@ -73,12 +75,17 @@ finch keys revoke &lt;id&gt;`}</Code>
 
       <h2>Public services</h2>
       <p>
-        A service whose auth is <code>public</code> is an open endpoint: no key,
-        no OAuth. Use it for a webpage or an API you mean to publish. Switch a
+        A service whose auth is <code>public</code> is open: no key, no OAuth. Use
+        it for a web page or an API you mean to publish, and add{' '}
+        <code>--forward-all</code> when you publish it so every path is forwarded,
+        not just <code>/&lt;name&gt;/mcp</code> (see{' '}
+        <Link href="/docs/services#web-apps">Web apps and REST APIs</Link>). Switch a
         service back to requiring a key at any time.
       </p>
-      <Code>{`finch auth docs-site public   <span class="c"># anyone can reach it</span>
-finch auth docs-site key      <span class="c"># back to finch_ keys (and OAuth)</span>`}</Code>
+      <Code>{`finch add docs-site --service http://127.0.0.1:3000 --public --forward-all
+<span class="c"># later:</span>
+finch auth docs-site key      <span class="c"># back to finch_ keys (and OAuth)</span>
+finch auth docs-site public   <span class="c"># open to anyone again</span>`}</Code>
 
       <div className="docs-foot">
         <Link href="/docs/auth">← Keys &amp; auth</Link>

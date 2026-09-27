@@ -35,9 +35,9 @@ import (
 //	none    — swap the binary only; restart the serve yourself.
 func runUpdate(c *cli, args []string) error {
 	fs := newFlagSet("update")
-	hubFlag := fs.String("hub", "", "finch hub base URL (defaults to the logged-in hub)")
+	hubFlag := fs.String("hub", "", "the finch hub `url` (default: the one you logged in to)")
 	force := fs.Bool("force", false, "reinstall even if already on the latest version")
-	restart := fs.String("restart", "auto", "how to restart the running serve: auto|service|self|none")
+	restart := fs.String("restart", "auto", "how to restart a running 'finch run' (`mode`): auto, service, self or none")
 	fs.Bool("json", false, "JSON output")
 	pos, err := c.parseArgs(fs, args)
 	if err != nil {
@@ -62,28 +62,46 @@ func runUpdate(c *cli, args []string) error {
 	}
 	hub = strings.TrimRight(hub, "/")
 
-	self, updated, err := performUpdate(hub, *force)
+	latest := ""
+	if !*force {
+		// Know the latest version before touching anything: a check that
+		// fails is reported, never taken as a reason to reinstall.
+		v, verr := hubLatestVersion(hub)
+		if verr != nil || v == "" {
+			if verr == nil {
+				verr = fmt.Errorf("the hub did not say")
+			}
+			return newCLIError(codeUpstream, "finch update --force",
+				"could not check the latest finch version (%v); 'finch update --force' reinstalls anyway", verr)
+		}
+		latest = v
+		if latest == agentVersion {
+			if c.json {
+				return c.emit(map[string]any{"updated": false, "version": agentVersion, "latest": latest})
+			}
+			c.printf("finch %s is already the latest\n", agentVersion)
+			return nil
+		}
+	}
+	self, _, err := performUpdate(hub, true)
 	if err != nil {
 		return updateFailure(err)
 	}
-	if !updated {
-		if c.json {
-			return c.emit(map[string]any{"updated": false, "version": agentVersion})
-		}
-		c.printf("finch: already on the latest version (%s)\n", agentVersion)
-		return nil
+	if latest != "" {
+		c.printf("finch: updated %s → %s at %s\n", agentVersion, latest, self)
+	} else {
+		c.printf("finch: reinstalled the latest finch at %s\n", self)
 	}
-	c.printf("finch: installed new binary at %s\n", self)
 
 	switch mode {
 	case "none":
-		c.printf("finch: binary swapped — restart your serve to apply ('finch service install' manages this for you).\n")
+		c.printf("finch: restart 'finch run' to use it ('finch service install' does that for you)\n")
 	case "service":
-		c.printf("finch: restarting the finch login service (clean handoff, no supersede)…\n")
+		c.printf("finch: restarting the background service…\n")
 		if err := restartManagedService(); err != nil {
-			return newCLIError(codeInternal, "finch service install", "binary IS updated, but the service restart failed: %v", err)
+			return newCLIError(codeInternal, "finch service install", "finch is updated, but restarting the background service failed: %v", err)
 		}
-		c.printf("finch: service restarted on the new version.\n")
+		c.printf("finch: the background service now runs the new version\n")
 	case "self":
 		// Re-exec this process over the new binary. syscall.Exec REPLACES the
 		// process image, so a running `finch run` continues as the new version.
@@ -97,7 +115,11 @@ func runUpdate(c *cli, args []string) error {
 		}
 	}
 	if c.json {
-		return c.emit(map[string]any{"updated": true, "binary": self, "restart": mode})
+		p := map[string]any{"updated": true, "binary": self, "restart": mode}
+		if latest != "" {
+			p["version"] = latest
+		}
+		return c.emit(p)
 	}
 	return nil
 }
@@ -238,9 +260,21 @@ func updateArch() string {
 }
 
 // hubLatestVersion asks the hub for the current LATEST_AGENT so `finch update`
-// can no-op when already current. Best-effort: any error → "" (caller updates
-// anyway). The hub exposes it at /api/version (public, unauthenticated).
+// can no-op when already current. The hub answers at /api/cli/version (routed
+// to the hub on the shared finchmcp.com apex, where the site owns /api/*) and,
+// on hubs from before 1.8, only at /api/version.
 func hubLatestVersion(hub string) (string, error) {
+	v, err := hubVersionAt(hub, "/api/cli/version")
+	if err == nil && v != "" {
+		return v, nil
+	}
+	if legacy, lerr := hubVersionAt(hub, "/api/version"); lerr == nil && legacy != "" {
+		return legacy, nil
+	}
+	return v, err
+}
+
+func hubVersionAt(hub, path string) (string, error) {
 	validatedHub, err := validateHubTransportURL(hub)
 	if err != nil {
 		return "", err
@@ -248,7 +282,7 @@ func hubLatestVersion(hub string) (string, error) {
 	hub = validatedHub
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, hub+"/api/version", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, hub+path, nil)
 	if err != nil {
 		return "", err
 	}
@@ -294,7 +328,7 @@ func downloadAndSwap(url, dst string) error {
 
 func downloadAndSwapWithLimit(ctx context.Context, url, dst string, limit int64) error {
 	if limit <= 0 {
-		return fmt.Errorf("invalid Finch update size limit")
+		return fmt.Errorf("invalid finch update size limit")
 	}
 	if err := validateHTTPTransportURL(url); err != nil {
 		return err

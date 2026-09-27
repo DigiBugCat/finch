@@ -135,6 +135,18 @@ const MAX_AGENT_FRAME_CHARS =
   Math.ceil(RELAY_STREAM_HARD_CAP_BYTES / 3) * 4 + 64 * 1024;
 const MAX_RESPONSE_HEADER_BYTES = 64 * 1024;
 
+/** Provenance of a pre-head error answer, from the DO to the Worker (index.ts
+ *  classifyRelayError): "agent" when the agent sent an `err` frame (it failed
+ *  before the local service produced a response: dial failure, SSRF reject),
+ *  "hub" when the DO itself gave up (timeout, reset, protocol error). A
+ *  response the local service sent (a `head` frame) never carries it: the
+ *  header is dropped from the agent's head headers, so a service cannot forge
+ *  it. The Worker strips it before a caller sees the response. */
+export const RELAY_ERROR_HEADER = "x-finch-relay-error";
+
+/** The err frames that came from the agent (not synthesized by the DO). */
+const agentErrFrames = new WeakSet<object>();
+
 // Hop-by-hop / recomputed headers we never re-emit from the upstream response.
 // Everything else (notably Mcp-Session-Id) IS forwarded so stateful MCP works.
 const HOP_BY_HOP = new Set([
@@ -403,7 +415,14 @@ export class BoxDO extends DurableObject<Env> {
       // Error before head. Return the message as a plain body with the agent's
       // status (502 dial fail / 403 SSRF). index.ts only fails over on a 503
       // X-Finch-Offline, so an err here is the box's real (terminal) answer.
-      return new Response(first.message, { status: first.status });
+      // RELAY_ERROR_HEADER tells index.ts who produced it.
+      return new Response(first.message, {
+        status: first.status,
+        headers: {
+          "content-type": "text/plain; charset=utf-8",
+          [RELAY_ERROR_HEADER]: agentErrFrames.has(first) ? "agent" : "hub",
+        },
+      });
     }
     if (first.type !== "head") {
       // Only head/err can settle the head promise; defensively 502 anything else.
@@ -419,7 +438,7 @@ export class BoxDO extends DurableObject<Env> {
     // when no headers survive the hop-by-hop filter) — iterating undefined throws.
     for (const [k, v] of first.headers ?? []) {
       const name = k.toLowerCase();
-      if (HOP_BY_HOP.has(name)) continue;
+      if (HOP_BY_HOP.has(name) || name === RELAY_ERROR_HEADER) continue;
       // Set-Cookie is the one response header whose VALUE crosses a trust
       // boundary (see hostScopedSetCookie) — everything else is re-emitted as-is.
       headers.append(k, name === "set-cookie" ? hostScopedSetCookie(v) : v);
@@ -538,7 +557,14 @@ export class BoxDO extends DurableObject<Env> {
           this.resetStream(frame.id, String(frame.message), true);
         } else {
           this.rearm(s, frame.id);
-          this.settleHead(frame.id, frame as unknown as AgentFrame);
+          const err = {
+            id: frame.id,
+            type: "err" as const,
+            status: frame.status as number,
+            message: frame.message as string,
+          };
+          agentErrFrames.add(err);
+          this.settleHead(frame.id, err);
         }
         return;
       case "chunk": {

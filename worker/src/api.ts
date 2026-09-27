@@ -16,7 +16,7 @@
 // for exactly that id. There are no shared members, invitations, workspaces,
 // ACL rules, or per-user app grants.
 
-import { rateLimitOk, clientIp, json, tenantOp, boxStub, pickHealthyPool, hostKeyFromHost, type Env } from "./index";
+import { rateLimitOk, rateLimited, clientIp, json, tenantOp, boxStub, pickHealthyPool, hostKeyFromHost, type Env } from "./index";
 import {
   serviceOk,
   signToken,
@@ -203,6 +203,64 @@ async function bestEffortDeleteCfHostname(env: Env, hostname: string): Promise<v
   }
 }
 
+// The /api/cli/* routes and the methods each answers. Matched BEFORE any
+// credential is checked, so an unknown path is a 404 and a known path called
+// with the wrong method a 405, never a misleading 401.
+const CLI_ROUTES: Record<string, string[]> = {
+  "/api/cli/device/start": ["POST"],
+  "/api/cli/device/poll": ["POST"],
+  "/api/cli/version": ["GET"],
+  "/api/cli/hostnames": ["GET", "POST", "DELETE"],
+  "/api/cli/whoami": ["GET"],
+  "/api/cli/token": ["POST"],
+  "/api/cli/enroll": ["POST"],
+  "/api/cli/approve": ["POST"],
+  "/api/cli/auth": ["POST"],
+  "/api/cli/state": ["GET"],
+  "/api/cli/logs": ["GET"],
+  "/api/cli/keys": ["POST"],
+  "/api/cli/keys/revoke": ["POST"],
+  "/api/cli/services/release": ["POST"],
+  "/api/cli/revoke-tokens": ["POST"],
+  "/api/cli/call": ["POST"],
+};
+
+/** The methods the service-secret control route `seg` (the path after /api)
+ *  answers, or null when there is no such route. Keep in step with the
+ *  handlers in handleApiInner. */
+function controlRouteMethods(seg: string[]): string[] | null {
+  if (seg.length === 1) {
+    const one: Record<string, string[]> = {
+      version: ["GET"],
+      hostnames: ["GET", "POST", "DELETE"],
+      "member-context": ["POST"],
+      state: ["GET"],
+      "cli-describe": ["POST"],
+      "box-update": ["POST"],
+      "device-approve": ["POST"],
+      "cli-mint": ["POST"],
+      "cli-revoke": ["POST"],
+      "slug-available": ["GET"],
+      enroll: ["POST"],
+      keys: ["POST"],
+      settings: ["PUT"],
+    };
+    return one[seg[0]] ?? null;
+  }
+  if (seg[0] === "services" && seg.length === 3) {
+    if (["release", "approve", "decline"].includes(seg[2])) return ["POST"];
+    if (seg[2] === "tags") return ["PUT"];
+  }
+  if (seg[0] === "boxes" && seg.length === 4 && seg[2] === "keys" && seg[3] === "revoke") {
+    return ["POST"];
+  }
+  return null;
+}
+
+function methodNotAllowed(methods: string[]): Response {
+  return json(405, { error: `use ${methods.join(", ")}` }, { allow: methods.join(", ") });
+}
+
 /** True if this path is handled by the control API (vs the MCP/relay plane). */
 export function isApiPath(path: string): boolean {
   return (
@@ -305,10 +363,12 @@ async function handleApiInner(
     return handleRefresh(req, env, host);
   }
 
-  // ---- /api/version — public, unauthenticated. The current agent version, so
-  //      `finch update` can no-op when a box is already on the latest build.
-  //      Mirrors the LATEST_AGENT literal the dashboard's update tooltip reads. ----
-  if (path === "/api/version" && method === "GET") {
+  // ---- /api/version and /api/cli/version — public, unauthenticated. The
+  //      current agent version, so `finch update` can no-op when a machine is
+  //      already on the latest build. On the shared finchmcp.com apex only
+  //      /api/cli/* is routed to the hub (the site owns the rest of /api), so
+  //      1.8 CLIs ask /api/cli/version; /api/version stays for older ones. ----
+  if ((path === "/api/version" || path === "/api/cli/version") && method === "GET") {
     return json(200, { latest: LATEST_AGENT });
   }
 
@@ -319,6 +379,9 @@ async function handleApiInner(
   //      (same trust as X-Finch-Auth). This lets the `finch` CLI enroll
   //      services from the box without the dashboard. ----
   if (path.startsWith("/api/cli/")) {
+    const methods = CLI_ROUTES[path];
+    if (!methods) return json(404, { error: "unknown CLI route", path });
+    if (!methods.includes(method)) return methodNotAllowed(methods);
     // ---- Public device-authorization flow (`finch login`): the CLI has no
     //      credentials yet, so start/poll are unauthenticated. The browser
     //      (Clerk-authed) approves the short user_code out of band. device/start
@@ -332,7 +395,7 @@ async function handleApiInner(
       // is intentionally NOT throttled — it needs the 256-bit device_code and
       // the CLI legitimately polls every few seconds.
       if (!(await rateLimitOk(env.JOIN_LIMIT, `devstart:${clientIp(req)}`))) {
-        return json(429, { error: "too many login attempts — try again shortly" });
+        return rateLimited("too many login attempts — try again in a minute");
       }
       const deviceCode = randomToken(32);
       const userCode = randomUserCode();
@@ -340,7 +403,7 @@ async function handleApiInner(
       const reqIp = clientIp(req);
       const reqUa = (req.headers.get("user-agent") || "").slice(0, 200);
       const started = await routerDeviceStart(env, deviceCode, userCode, reqIp, reqUa);
-      if (!started.ok) return json(429, { error: "too many pending logins — try again shortly" });
+      if (!started.ok) return rateLimited("too many pending logins — try again in a minute");
       const webBase = (env.WEB_URL || `https://${host}`).replace(/\/$/, "");
       return json(200, {
         device_code: deviceCode,
@@ -362,7 +425,7 @@ async function handleApiInner(
     // Throttle the AUTHENTICATED bearer routes per-IP (the CLI's real IP) — not
     // device/poll above, whose secret device_code is the real gate.
     if (!(await rateLimitOk(env.JOIN_LIMIT, `cli:${clientIp(req)}`))) {
-      return json(429, { error: "rate limited" });
+      return rateLimited();
     }
 
     // Bearer must be a CLI token (kind:"cli") whose epoch still matches the
@@ -371,7 +434,7 @@ async function handleApiInner(
     const payload = m ? await verifyAssertionPayload(m[1], env.FINCH_SERVICE_SECRET) : null;
     const cliTenant = payload && payload.kind === "cli" ? payload.tenant : null;
     if (!cliTenant) {
-      return json(401, { error: "missing, invalid, or expired CLI token (Authorization: Bearer …)" });
+      return json(401, { error: "missing or expired finch login" });
     }
     const { epoch: curEpoch } = await tenantOp<{ epoch: number }>(env, cliTenant, "cliEpoch");
     if ((payload!.epoch ?? -1) !== (curEpoch ?? 0)) {
@@ -433,6 +496,29 @@ async function handleApiInner(
     if (path === "/api/cli/state" && method === "GET") {
       const state = await tenantOp<Record<string, unknown> & { host?: string }>(env, cliTenant, "getState");
       return json(200, { ...state, serviceBase: hostBase(env, host, state?.host).http });
+    }
+    // GET /api/cli/logs?service=<id>&limit=<n> — the calls the relay recorded
+    // for one service (recordCall), newest first, for `finch logs`.
+    if (path === "/api/cli/logs" && method === "GET") {
+      const service = (url.searchParams.get("service") || "").trim();
+      const limit = Number(url.searchParams.get("limit") || "20");
+      if (!service) return json(400, { error: "service required" });
+      if (!Number.isInteger(limit) || limit < 1 || limit > 100) {
+        return json(400, { error: "limit must be a whole number from 1 to 100" });
+      }
+      const state = await tenantOp<TenantState>(env, cliTenant, "getState");
+      const svc = (state?.services ?? []).find((s) => s.id === service);
+      if (!svc) return json(404, { error: "no such service", service });
+      const calls = (svc.recentCalls ?? []).slice(0, limit).map((c) => ({
+        ts: c.ts,
+        route: c.route,
+        // Calls `finch test` / `finch call` made before 1.8 were labelled
+        // after the retired dashboard.
+        caller: c.caller === "dashboard" ? "finch-cli" : c.caller,
+        status: c.status,
+        ms: c.ms,
+      }));
+      return json(200, { service, calls });
     }
     // POST /api/cli/keys {label,scope} — mint a client finch_ key (once). The
     // key's owner is always the tenant owner.
@@ -501,7 +587,7 @@ async function handleApiInner(
       if (!origin) {
         return json(409, {
           error: "no public hostname for this account",
-          hint: "claim a hub subdomain in the dashboard, or map one with `finch domain add <host>`",
+          hint: "map one with `finch domain add <host>`",
         });
       }
       let pick = 0;
@@ -545,6 +631,15 @@ async function handleApiInner(
   //      same FINCH_SERVICE_SECRET). A leaked secret alone can't be replayed for
   //      an arbitrary tenant without also forging the signature; an expired
   //      assertion is rejected. ----
+  const parts = path.split("/").filter(Boolean); // ["api", ...]
+  const seg = parts.slice(1); // strip "api"
+
+  // Route and method first: an unknown path is a 404 and a wrong method a
+  // 405 for everyone, before the service secret is looked at.
+  const allowed = controlRouteMethods(seg);
+  if (!allowed) return json(404, { error: "not found", path });
+  if (!allowed.includes(method)) return methodNotAllowed(allowed);
+
   if (!serviceOk(req, env)) {
     return json(401, { error: "bad or missing X-Finch-Service" });
   }
@@ -556,9 +651,6 @@ async function handleApiInner(
       error: "missing, invalid, or expired tenant assertion (X-Finch-Auth)",
     });
   }
-
-  const parts = path.split("/").filter(Boolean); // ["api", ...]
-  const seg = parts.slice(1); // strip "api"
 
   if (seg.length === 1 && seg[0] === "hostnames") {
     return handleHostnames(req, env, tenant, method);
@@ -581,9 +673,12 @@ async function handleApiInner(
   // GET /api/state — the tenant's full state. (A `viewer` query parameter used
   // to narrow it for a shared member; there are no members to narrow for, and
   // a scoped read no longer echoes viewerScoped, so an old web fails closed.)
+  // serviceBase is the origin callers reach this tenant's services on, the
+  // same value /api/cli/state hands `finch fleet`, so the web's /fleet page
+  // prints exactly the public URLs the CLI does (<serviceBase>/<id>/mcp).
   if (method === "GET" && seg.length === 1 && seg[0] === "state") {
     const state = await tenantOp<TenantState>(env, tenant, "getState");
-    return json(200, state);
+    return json(200, { ...state, serviceBase: hostBase(env, host, state?.host).http });
   }
 
   // GET /api/slug-available?slug=foo — claim-free availability check for the
@@ -595,7 +690,7 @@ async function handleApiInner(
   // context so the approver can confirm it's their own device (anti-phishing).
   if (method === "POST" && seg.length === 1 && seg[0] === "cli-describe") {
     if (!(await rateLimitOk(env.JOIN_LIMIT, `describe:${tenant}`))) {
-      return json(429, { error: "rate limited" });
+      return rateLimited();
     }
     const body = await readJson(req);
     const userCode = String(body.userCode || "").trim();
@@ -611,7 +706,7 @@ async function handleApiInner(
   // no live agent socket — the dashboard falls back to the copy-paste hint.
   if (method === "POST" && seg.length === 1 && seg[0] === "box-update") {
     if (!(await rateLimitOk(env.JOIN_LIMIT, `boxupd:${tenant}`))) {
-      return json(429, { error: "rate limited" });
+      return rateLimited();
     }
     const body = await readJson(req);
     const service = String(body.service || "").trim();
@@ -640,7 +735,7 @@ async function handleApiInner(
     // Attempt limiter, keyed on the verified TENANT — the hub only sees the web
     // BFF's egress IP, so an IP key would collapse to one global bucket.
     if (!(await rateLimitOk(env.JOIN_LIMIT, `approve:${tenant}`))) {
-      return json(429, { error: "rate limited" });
+      return rateLimited();
     }
     const body = await readJson(req);
     const userCode = String(body.userCode || "").trim();
@@ -794,7 +889,7 @@ async function handleHostnames(
     return json(405, { error: "GET, POST, or DELETE only" });
   }
   if (!(await rateLimitOk(env.JOIN_LIMIT, `hostnames:${tenant}`))) {
-    return json(429, { error: "rate limited" });
+    return rateLimited();
   }
 
   const body = await readJson(req);
@@ -815,7 +910,7 @@ async function handleHostnames(
 
   const vanity = vanityTier(env, hostname);
   if (vanity && env.VANITY_TENANT !== tenant) {
-    return json(403, { error: "tenant is not allowed to claim vanity hostnames" });
+    return json(403, { error: "this account cannot claim hostnames under that domain" });
   }
 
   if (method === "POST") {
@@ -996,7 +1091,7 @@ async function handleJoin(
   // that mints DOs must not be a cheap flood vector. (security M5)
   const ip = clientIp(req);
   if (!(await rateLimitOk(env.JOIN_LIMIT, `join:${ip}`))) {
-    return json(429, { error: "rate limited" });
+    return rateLimited();
   }
 
   const body = await readJson(req);
@@ -1113,7 +1208,7 @@ async function handleRefresh(
   // endpoint that mints credentials.
   const ip = clientIp(req);
   if (!(await rateLimitOk(env.JOIN_LIMIT, `refresh:${ip}`))) {
-    return json(429, { error: "rate limited" });
+    return rateLimited();
   }
 
   const body = await readJson(req);

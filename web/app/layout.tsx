@@ -82,19 +82,29 @@ const TITLE = "finch — localhost, with a front door";
 const DESCRIPTION =
   "finch gives the MCP server on your Mac or Linux machine a stable https address, with keys or OAuth at the door. Your machine calls out to finch, so nothing on it is left open. Free.";
 
+// The share image is app/opengraph-image.png (Next adds og:image, its size and
+// alt to every page). Icons live in public/ and are declared here, not through
+// Next's app/icon.* conventions, so each page's <head> lists each one once:
+// the .ico for old browsers and tabs that ask for /favicon.ico, the SVG for
+// the rest, and a 180px PNG for iOS home screens.
 export const metadata: Metadata = {
   metadataBase: new URL("https://finchmcp.com"),
-  title: TITLE,
+  title: { default: TITLE, template: "%s · finch" },
   description: DESCRIPTION,
-  icons: { icon: [{ url: "/icon.svg", type: "image/svg+xml" }] },
+  icons: {
+    icon: [
+      { url: "/favicon.ico", sizes: "48x48" },
+      { url: "/icon.svg", type: "image/svg+xml" },
+    ],
+    apple: [{ url: "/apple-touch-icon.png", sizes: "180x180" }],
+  },
   openGraph: {
     title: TITLE,
     description: DESCRIPTION,
-    url: "https://finchmcp.com",
     siteName: "finch",
     type: "website",
   },
-  twitter: { card: "summary", title: TITLE, description: DESCRIPTION },
+  twitter: { card: "summary_large_image", title: TITLE, description: DESCRIPTION },
 };
 
 /**
