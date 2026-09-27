@@ -1,8 +1,8 @@
 // POST /api/finch/cli-describe {userCode} — return the pending device code's
-// INITIATOR context (where the `finch login` was started) so the approver can
-// confirm it's their own device before approving, plus the account the token
-// would act as. Admin-only; no secrets.
-import { errorResponse, HttpError, hubFetchAs, requireAdmin } from "@/lib/hub";
+// INITIATOR context (where the `finch login` was started) so the signed-in
+// user can confirm it's their own device before approving. The token would act
+// as their own account (tenant = their Clerk user id). No secrets.
+import { errorResponse, HttpError, hubFetchAs, resolveTenant } from "@/lib/hub";
 import { readJsonObject } from "@/lib/request-body";
 import { forwardHubResponse, readHubJsonObject } from "../_shared";
 import {
@@ -13,7 +13,7 @@ import {
 
 export async function POST(req: Request) {
   try {
-    const ctx = await requireAdmin();
+    const ctx = await resolveTenant();
     const body = await readJsonObject(req, MAX_CLI_REQUEST_BYTES);
     const userCode = parseCliUserCode(body.userCode);
     let res: Response;
@@ -29,9 +29,7 @@ export async function POST(req: Request) {
     if (!res.ok) return forwardHubResponse(res);
     const out = cleanDescribeResponse(await readHubJsonObject(res));
     if (!out) throw new HttpError(502, "invalid response from hub");
-    // Name the account the token would act as, so the approver sees it before
-    // approving (resolveTenant may pick a team the user owns, not their own).
-    return Response.json({ ...out, account: ctx.account });
+    return Response.json(out);
   } catch (err) {
     return errorResponse(err);
   }

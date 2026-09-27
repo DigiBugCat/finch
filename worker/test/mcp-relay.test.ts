@@ -163,9 +163,10 @@ describe("relay header fidelity (MCP 2026-07-28)", () => {
     expect(h["x-finch-service"]).toBeUndefined();
     expect(JSON.stringify(req)).not.toContain(key);
     expect(JSON.stringify(req)).not.toContain(SERVICE);
-    // Only the login-wall cookies are removed; the app's own cookie survives
-    // even though its value contains finch_.
-    expect(h.cookie).toBe("app_sid=finch_app_cookie");
+    // The hub reads no cookie, so the Cookie header is the app's and reaches
+    // it byte for byte — including values that contain finch_ and cookies
+    // named like the long-gone login wall's.
+    expect(h.cookie).toBe("__Host-finch_session=stale; finch_session=legacy; app_sid=finch_app_cookie");
     // MCP headers: byte-identical, known and unknown alike.
     expect(h["mcp-protocol-version"]).toBe("2026-07-28");
     expect(h["mcp-method"]).toBe("tools/call");

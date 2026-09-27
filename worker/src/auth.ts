@@ -97,10 +97,6 @@ export interface TicketPayload {
   // carrying either kind no longer verifies.)
   kind?: "join" | "connect" | "refresh";
   box?: string; // present (and verified) for kind:"connect"|"refresh" tokens
-  // Per-box credential epoch on refresh tokens issued by the retired Aviary
-  // device flow. /refresh rejects one whose epoch no longer matches the box's
-  // stored epoch. Tokens minted by /join carry none.
-  epoch?: number;
   // Random one-time id. On a join ticket the hub records it (TenantDO used-set)
   // at first /join and rejects any replay until exp, so a captured ticket can't
   // be reused for its whole TTL. Connect tokens don't carry one (they're
@@ -213,10 +209,11 @@ function validateTicket(p: any): TicketPayload | null {
   if (!knownKind) return null;
   if (typeof p.service !== "string" || !p.service) return null;
   if (p.box !== undefined && typeof p.box !== "string") return null;
-  if (
-    p.epoch !== undefined &&
-    (typeof p.epoch !== "number" || !Number.isFinite(p.epoch))
-  ) return null;
+  // Only the retired Aviary device flow issued grants carrying a per-box
+  // credential `epoch`. The single-user purge deleted the stored epochs they
+  // were checked against, so no such grant verifies any more; a box enrolled
+  // that way re-joins with `finch add`.
+  if (p.epoch !== undefined) return null;
   if (p.jti !== undefined && typeof p.jti !== "string") return null;
   return p as TicketPayload;
 }
@@ -732,12 +729,12 @@ const CLERK_TOKEN_CACHE_TTL_MS = 60_000;
 const CLERK_TOKEN_CACHE_MAX = 500;
 const MAX_CLERK_USERINFO_BYTES = 16 * 1024;
 
+/** The identity a verified Clerk OAuth token names. Only the Clerk user id
+ *  is read: a tenant is one Clerk user, so the relay admits the token iff its
+ *  user id is the tenant id. Organization claims are not read. */
 export interface ClerkIdentity {
   sub?: string;      // Clerk user id (user_…)
   user_id?: string;  // some Clerk responses use user_id
-  org_id?: string;   // present when the token is org-scoped
-  email?: string;    // present when the token carries the `email` scope
-  org_role?: string; // org role, when Clerk includes it for org-scoped tokens
 }
 
 async function boundedResponseJson(res: Response): Promise<unknown> {
@@ -803,14 +800,17 @@ export async function verifyClerkOAuthToken(
         const raw = await boundedResponseJson(r);
         if (raw && typeof raw === "object" && !Array.isArray(raw)) {
           const value = raw as Record<string, unknown>;
-          const optionalStrings = ["sub", "user_id", "org_id", "email", "org_role"];
           if (
-            optionalStrings.every(
-              (name) => value[name] === undefined || typeof value[name] === "string",
-            ) &&
+            (value.sub === undefined || typeof value.sub === "string") &&
+            (value.user_id === undefined || typeof value.user_id === "string") &&
             (typeof value.sub === "string" || typeof value.user_id === "string")
           ) {
-            who = value as ClerkIdentity;
+            // Keep only the user id: nothing else in userinfo is read, so
+            // nothing else is cached.
+            who = {
+              ...(typeof value.sub === "string" ? { sub: value.sub } : {}),
+              ...(typeof value.user_id === "string" ? { user_id: value.user_id } : {}),
+            };
             cacheable = true;
           }
         }

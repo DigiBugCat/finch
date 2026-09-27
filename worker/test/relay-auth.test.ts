@@ -91,14 +91,18 @@ async function call(req: Request): Promise<Response> {
       ...(env as any),
       ...assertionBindings,
       // Test-only service binding for Clerk userinfo. A token of the form
-      // oauth:<clerk user id>[;<org id>;<org role>] authenticates that user
-      // (org-scoped when the suffix is present); the raw token is never
-      // forwarded to the agent or placed in the assertion.
+      // oauth:<clerk user id>[;<org id>;<org role>] authenticates that user,
+      // with organization claims when the suffix is present (the hub must
+      // ignore them). Anything else is an invalid token. The raw token is
+      // never forwarded to the agent or placed in the assertion.
       CLERK_USERINFO: {
-        async fetch(_input: RequestInfo | URL, init?: RequestInit) {
+        async fetch(input: RequestInfo | URL, init?: RequestInit) {
+          if (String(input) !== "http://127.0.0.1:1/oauth/userinfo") {
+            return Response.json({ error: "unexpected userinfo URL" }, { status: 500 });
+          }
           const auth = new Headers(init?.headers).get("authorization") || "";
           const token = auth.replace(/^Bearer\s+/, "");
-          if (!token.startsWith("oauth:")) {
+          if (!/^oauth:user_[A-Za-z0-9_]+(;org_[A-Za-z0-9_]+;org:[a-z]+)?$/.test(token)) {
             return Response.json({ error: "invalid token" }, { status: 401 });
           }
           const [sub, orgId, orgRole] = token.slice("oauth:".length).split(";");
@@ -235,13 +239,10 @@ async function waitForBox(
 
 /** Stand up an approved, connected service under a fresh tenant/slug. Returns
  *  everything the relay tests need. The agent socket is left open (the caller
- *  closes it). The service is KEY-gated by default, and the tenant is a
- *  PERSONAL tenant whose owner (Clerk user id === tenant id) has signed in
- *  once, so its owner row exists. */
-async function standUpService(opts: { legacyOrg?: boolean } = {}) {
-  // A legacy Clerk-org tenant (id = the org id) that nobody has claimed:
-  // it has no owner row, so nobody signs in to bootstrap one.
-  const ctx = await freshTenantSlug(opts.legacyOrg ? "org_relay_" : "user_relay_");
+ *  closes it). The service is KEY-gated by default, and the tenant's own user
+ *  (Clerk user id === tenant id) has signed in once, so its owner row exists. */
+async function standUpService() {
+  const ctx = await freshTenantSlug("user_relay_");
   const { tenant, slug, host, base } = ctx;
 
   const enroll = (await (
@@ -289,15 +290,13 @@ async function standUpService(opts: { legacyOrg?: boolean } = {}) {
     box,
     (m) => m.connected && m.state !== "pending",
   );
-  if (!opts.legacyOrg) {
-    const boot = (await (
-      await api(tenant, host, "POST", "/api/member-context", {
-        clerkUserId: tenant,
-        email: "owner@example.com",
-      })
-    ).json()) as any;
-    expect(boot.member).toMatchObject({ role: "owner", state: "active" });
-  }
+  const boot = (await (
+    await api(tenant, host, "POST", "/api/member-context", {
+      clerkUserId: tenant,
+      email: "owner@example.com",
+    })
+  ).json()) as any;
+  expect(boot.member).toMatchObject({ role: "owner", state: "active" });
 
   return { ...ctx, service, box, agent };
 }
@@ -411,59 +410,23 @@ describe("relay auth — callers on a key-gated service", () => {
     agent.close(1000, "done");
   });
 
-  it("strips stale login-wall cookies from the Cookie header — the app's own cookies survive (#1)", async () => {
+  it("forwards the Cookie header untouched — the hub reads no cookie of its own", async () => {
     const { host, base, tenant, service, agent } = await standUpService();
     const key = await mintKey(tenant, host, "cookie-key");
+    const cookie = "__Host-finch_session=old.one; app_sid=abc123; finch_session=old.two; theme=dark";
 
     const reqSeen = nextFrame(agent);
     const relayP = call(
       new Request(`${base}/${service}/index.html`, {
         method: "GET",
-        headers: {
-          host,
-          accept: "text/html",
-          authorization: `Bearer ${key}`,
-          // A browser that used the retired login wall may still carry either
-          // session cookie name (they lived up to 12h). Neither may reach the
-          // box; a blanket "contains finch_" strip would also have deleted the
-          // hosted app's own cookies and broken the site.
-          cookie: "__Host-finch_session=stale.one; app_sid=abc123; finch_session=stale.two; theme=dark",
-        },
+        headers: { host, accept: "text/html", authorization: `Bearer ${key}`, cookie },
         redirect: "manual",
       }),
     );
     const reqFrame = await reqSeen;
     expect(reqFrame.type).toBe("req");
-    const fwd = (reqFrame.headers ?? {}) as Record<string, string>;
-    expect(fwd.cookie).toBe("app_sid=abc123; theme=dark");
+    expect((reqFrame.headers ?? {}).cookie).toBe(cookie);
     reply200(agent, reqFrame.id, "<h1>ok</h1>");
-    expect((await relayP).status).toBe(200);
-
-    agent.close(1000, "done");
-  });
-
-  it("deletes the Cookie header entirely when only stale session cookies remain (#1)", async () => {
-    const { host, base, tenant, service, agent } = await standUpService();
-    const key = await mintKey(tenant, host, "cookie-key-2");
-
-    const reqSeen = nextFrame(agent);
-    const relayP = call(
-      new Request(`${base}/${service}/index.html`, {
-        method: "GET",
-        headers: {
-          host,
-          accept: "text/html",
-          authorization: `Bearer ${key}`,
-          cookie: "finch_session=stale",
-        },
-        redirect: "manual",
-      }),
-    );
-    const reqFrame = await reqSeen;
-    const fwd = (reqFrame.headers ?? {}) as Record<string, string>;
-    // Nothing left to forward → no cookie header at all (not an empty string).
-    expect(fwd.cookie).toBeUndefined();
-    reply200(agent, reqFrame.id, "<ok/>");
     expect((await relayP).status).toBe(200);
 
     agent.close(1000, "done");
@@ -493,8 +456,8 @@ describe("relay auth — callers on a key-gated service", () => {
       error: expect.any(String),
     });
 
-    // A good key still relays (Gate1 all + the locked owner ACL rule). Its
-    // owner defaults to the tenant owner.
+    // A good key relays: it exists and its scope covers the service. Its
+    // owner is the tenant owner.
     const minted = { key: await mintKey(tenant, host, "relay-key") };
     const reqSeen = nextFrame(agent);
     const relayP = call(
@@ -635,28 +598,26 @@ describe("relay auth — callers on a key-gated service", () => {
     agent.close(1000, "done");
   });
 
-  it("relays an org-admin OAuth token to its own unclaimed legacy org tenant, and no other org token", async () => {
-    const { host, base, tenant, service, agent } = await standUpService({ legacyOrg: true });
-    const mcp = (token: string) =>
-      call(
+  it("403s every OAuth token but the tenant's own user, whatever organization claims it carries", async () => {
+    const { host, base, tenant, service, agent } = await standUpService();
+    let relayed = false;
+    agent.addEventListener("message", () => { relayed = true; });
+    const orgTenant = `org_${tenant.slice("user_".length)}`;
+    for (const token of [
+      `oauth:user_orgadmin;${orgTenant};org:admin`,
+      "oauth:user_orgadmin;org_somewhere;org:admin",
+      "oauth:user_orgmember",
+    ]) {
+      const res = await call(
         new Request(`${base}/${service}/mcp`, {
           method: "POST",
           headers: { host, "content-type": "application/json", authorization: `Bearer ${token}` },
           body: '{"jsonrpc":"2.0","id":1,"method":"initialize"}',
         }),
       );
-    for (const denied of [
-      `oauth:user_orgmember;${tenant};org:member`,
-      "oauth:user_orgadmin;org_somewhere_else;org:admin",
-      "oauth:user_orgadmin",
-    ]) {
-      expect((await mcp(denied)).status, denied).toBe(403);
+      expect(res.status, token).toBe(403);
     }
-    const reqSeen = nextFrame(agent);
-    const relayP = mcp(`oauth:user_orgadmin;${tenant};org:admin`);
-    const frame = await reqSeen;
-    reply200(agent, frame.id, "<ok/>");
-    expect((await relayP).status).toBe(200);
+    expect(relayed).toBe(false);
     agent.close(1000, "done");
   });
 

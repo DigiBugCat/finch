@@ -1,9 +1,10 @@
 // POST /api/finch/cli-approve {userCode} — approve a `finch login` device code.
-// Admin-only; mints the CLI token on the hub and stamps it onto the pending code.
+// Acts as the signed-in user's own account (tenant = their Clerk user id);
+// mints the CLI token on the hub and stamps it onto the pending code.
 // We also pass the approver's Clerk email so the box can show
 // WHO it's signed in as.
 import { clerkClient } from "@clerk/nextjs/server";
-import { errorResponse, HttpError, hubFetchAs, requireAdmin } from "@/lib/hub";
+import { errorResponse, HttpError, hubFetchAs, resolveTenant } from "@/lib/hub";
 import { readJsonObject } from "@/lib/request-body";
 import { readHubJsonObject, forwardHubResponse } from "../_shared";
 import {
@@ -16,8 +17,8 @@ import {
 
 export async function POST(req: Request) {
   try {
-    // Reuse the identity requireAdmin already validated — no second auth() hop.
-    const ctx = await requireAdmin();
+    // Reuse the identity resolveTenant already validated — no second auth() hop.
+    const ctx = await resolveTenant();
     const body = await readJsonObject(req, MAX_CLI_REQUEST_BYTES);
     const userCode = parseCliUserCode(body.userCode);
     const clientEmail = parseOptionalClientEmail(body.email);

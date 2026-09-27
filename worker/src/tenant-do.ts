@@ -1,15 +1,14 @@
 /// <reference types="@cloudflare/workers-types" />
 //
-// TenantDO — one Durable Object per tenant (a user id, or the id of a
-// workspace/Clerk org claimed before the single-user cut). It owns the
-// tenant's entire control-plane state: services, the boxes that run them,
-// finch_ keys, ACL rules, groups, settings, and the activity log.
+// TenantDO — one Durable Object per tenant. A tenant is one Clerk user: its id
+// is that user's Clerk user id, and that user is its only member (the owner).
+// It owns the tenant's entire control-plane state: services, the boxes that
+// run them, finch_ keys, settings, and the activity log.
 //
-// Single-user tenancy: a tenant has ONE owner. Member rows, invitations,
-// access requests and user→service grants written by the retired team
-// features stay in storage untouched (nothing is deleted), but no op reads
-// them to authorize anyone except the owner. The dashboard's GET /api/state returns exactly the projection this DO
-// computes; the agent join flow, the relay (BoxDO), and the MCP router
+// Data written by the retired team, sharing and Aviary features is deleted
+// once per tenant by purgeLegacyTenancy, on the first request after the
+// single-user migration deploys. GET /api/state returns exactly the projection
+// this DO computes; the agent join flow, the relay (BoxDO), and the MCP router
 // all reach in here via internal RPC.
 //
 // RPC shape: POST a JSON body { op, ...args } to this DO's fetch(); it returns
@@ -26,7 +25,7 @@
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./index";
 import { genFinchKey, hashKey, last4 } from "./auth";
-import { routerRegister } from "./router-do";
+import { routerRegister, routerRegisterWakingHolder, routerStub, routerTransfer } from "./router-do";
 import {
   type TenantState,
   type Service,
@@ -34,14 +33,10 @@ import {
   type Key,
   type KeyScope,
   type PublicKey,
-  type AclRule,
-  type AclEntity,
-  type AccessRequest,
   type LogEvent,
   type StoredLogEvent,
   type Settings,
   type Overview,
-  type Group,
   type RecentCall,
   type ServiceState,
   type TenantMember,
@@ -58,21 +53,12 @@ import {
 // fields that getState() recomputes (state/boxes/outdated/metrics live on
 // the service, but `boxes` flatten + overview are computed on read).
 
-interface StoredService extends Service {
-  // Set on services created by the retired Aviary device flow. Their manifest
-  // route prefixes are still enforced at the edge (routeAllowed).
-  aviaryManaged?: boolean;
-}
+type StoredService = Service;
 
 interface StoredState {
   host: string;
   services: StoredService[];
   keys: Key[]; // full keys incl. hash — never leaves the DO as-is
-  groups: Group[];
-  acl: AclRule[];
-  // Rows from the retired access-sharing queue. Kept (and still reported in
-  // getState) so no data is dropped; nothing writes to it any more.
-  accessRequests: AccessRequest[];
   // StoredLogEvent, not LogEvent: rows carry the `svc` subject metadata that
   // getState strips on the way out.
   logs: StoredLogEvent[];
@@ -84,12 +70,43 @@ interface StoredState {
   // Monotonic counter embedded in CLI tokens at mint. Bumped by "revoke all CLI
   // tokens"; a token whose epoch != this is rejected. Absent == 0 (legacy state).
   cliTokenEpoch?: number;
-  // Set once the single-user cut has been applied to this tenant's CLI tokens
-  // (see retireSharedCliTokens). Born true on a tenant created after the cut.
-  cliSingleUserCut?: boolean;
+  // The version of the single-user purge this record has been through (see
+  // purgeLegacyTenancy). Born current on a tenant created after it shipped.
+  singleUserPurge?: number;
+  // Set by the purge on an ownerless (team/org) tenant that had exactly one
+  // active owner: that user's Clerk id. handOffRoutes moves this tenant's
+  // RouterDO hosts to their tenant, then deletes the field.
+  routeHeir?: string;
+  // Services whose boxes the purge removed: the next `finch add` of each
+  // re-enrolls it in place instead of de-duping to "<id>-2" (see enroll).
+  reenroll?: string[];
   tenantMeta?: TenantMeta;
+  // At most one row: the owner, whose clerkUserId is the tenant id.
   members: TenantMember[];
 }
+
+// Bump to run purgeLegacyTenancy again over every tenant (and extend it to
+// cover whatever the new version removes). Never lower it.
+export const SINGLE_USER_PURGE_VERSION = 1;
+
+// Stored fields the retired features wrote, deleted by the purge.
+const LEGACY_STATE_FIELDS = [
+  "groups", // named member/key groups (ACL sources)
+  "acl", // ACL rules, including the locked r_owner rule
+  "accessRequests", // the app-level access-sharing queue
+  "sessionEpoch", // the browser login wall's sign-out epoch
+  "cliSingleUserCut", // the flag of the earlier CLI-token-only cut
+] as const;
+const LEGACY_SERVICE_FIELDS = [
+  "aviaryManaged",
+  "aviaryManifestSha256",
+  "aviaryApprovalNonce",
+] as const;
+const LEGACY_BOX_FIELDS = [
+  "aviaryCredentialEpoch",
+  "aviaryPendingCredentialEpoch",
+  "aviaryPendingApprovalNonce",
+] as const;
 
 const MAX_LOGS = 500;
 const MAX_RECENT_CALLS = 20;
@@ -210,15 +227,16 @@ export class TenantDO extends DurableObject<Env> {
   // p50/p95/err on recordCall. Lost on eviction — that only blurs the rolling
   // window briefly, the durable counters (calls, recentCalls) survive.
   private samples = new Map<string, { ms: number; ok: boolean }[]>();
-  // Whether this instance has run retireSharedCliTokens (it is persisted, so
-  // this only saves the storage read on later requests).
-  private cliCutChecked = false;
+  // Whether this instance has run purgeLegacyTenancy (the result is persisted,
+  // so this only saves the storage read on later requests).
+  private purgeChecked = false;
 
   async fetch(req: Request): Promise<Response> {
     if (req.method !== "POST") return bad(405, "POST only");
-    if (!this.cliCutChecked) {
-      await this.retireSharedCliTokens();
-      this.cliCutChecked = true;
+    if (!this.purgeChecked) {
+      await this.purgeLegacyTenancy();
+      await this.handOffRoutes();
+      this.purgeChecked = true;
     }
     let msg: { op?: string; [k: string]: unknown };
     try {
@@ -237,11 +255,7 @@ export class TenantDO extends DurableObject<Env> {
         case "memberContext":
           return this.opResponse(await this.memberContext(a.clerkUserId, a.email));
         case "gateOauth":
-          return ok(await this.gateOauth(a.clerkUserId, a.service, a.orgIdClaim, a.orgRole));
-        case "holdings":
-          return ok(await this.holdings());
-        case "claimLegacyOrg":
-          return this.opResponse(await this.claimLegacyOrg(a.clerkOrgId, a.clerkUserId, a.email));
+          return ok(await this.gateOauth(a.clerkUserId, a.service));
         case "enroll":
           return ok(await this.enroll(a.name, a.group));
         case "release":
@@ -259,7 +273,7 @@ export class TenantDO extends DurableObject<Env> {
         case "setAuth":
           return ok(await this.setAuth(a.service ?? a.id, a.mode));
         case "mintKey": {
-          const r = await this.mintKey(a.label, a.scope, a.owner);
+          const r = await this.mintKey(a.label, a.scope);
           if ("error" in r) return bad(400, r.error);
           return ok(r);
         }
@@ -287,10 +301,6 @@ export class TenantDO extends DurableObject<Env> {
           return ok(await this.claimTicket(a.jti, a.exp));
         case "boxExists":
           return ok(await this.boxExists(a.service, a.box));
-        case "boxCredentialEpoch":
-          return ok(await this.boxCredentialEpoch(a.service, a.box));
-        case "routeAllowed":
-          return ok(await this.routeAllowed(a.service, a.path));
         case "boxVersion":
           return ok(await this.boxVersion(a.service, a.box, a.version));
         case "recordCall":
@@ -335,11 +345,6 @@ export class TenantDO extends DurableObject<Env> {
         }),
       ),
       keys: Array.isArray(stored.keys) ? stored.keys : [],
-      groups: Array.isArray(stored.groups) ? stored.groups : [],
-      acl: Array.isArray(stored.acl) ? stored.acl : base.acl,
-      accessRequests: Array.isArray(stored.accessRequests)
-        ? stored.accessRequests
-        : [],
       logs: Array.isArray(stored.logs) ? stored.logs : [],
       settings:
         stored.settings && typeof stored.settings === "object"
@@ -351,71 +356,27 @@ export class TenantDO extends DurableObject<Env> {
           : {},
       cliTokenEpoch:
         typeof stored.cliTokenEpoch === "number" ? stored.cliTokenEpoch : 0,
-      // Explicit, so fresh()'s `true` never leaks into pre-cut stored state.
-      cliSingleUserCut: stored.cliSingleUserCut === true,
+      // Explicit, so fresh()'s current version never leaks into stored state
+      // the purge has not processed.
+      singleUserPurge:
+        typeof stored.singleUserPurge === "number" ? stored.singleUserPurge : 0,
       members: Array.isArray(stored.members) ? stored.members : [],
       tenantMeta: stored.tenantMeta && typeof stored.tenantMeta === "object" ? stored.tenantMeta : undefined,
     };
-    this.normalizeOwnerGrant(s);
     return s;
   }
 
-  /** Repair a locked `r_owner` rule that names someone who is no longer an
-   *  active owner.
-   *
-   *  reassignOwnerGrant fixes this at the moment ownership is lost, but only
-   *  for transitions that happen after it ships. A tenant whose owner was
-   *  demoted, disabled or removed BEFORE that — which is every tenant already
-   *  in this state — would otherwise keep the locked `-> all` grant on that
-   *  person forever, since nothing else ever revisits the rule.
-   *
-   *  So the invariant is enforced here, on every load, rather than only on the
-   *  transitions. This runs in memory before any caller sees the state, which
-   *  means the key gate (checkKey) is correct on the very first read after
-   *  deploy — no migration step, no write amplification, and it is idempotent,
-   *  so re-running it costs a scan and changes nothing. The corrected rule is
-   *  persisted whenever any op happens to save.
-   *
-   *  Leaves the rule ALONE when no active owner exists: pre-bootstrap tenants
-   *  still carry the "you" placeholder, and pointing the lockout backstop at a
-   *  non-owner (or blanking it) would be worse than a stale grant. */
-  private normalizeOwnerGrant(s: StoredState): void {
-    const rule = s.acl.find((r) => r.id === "r_owner" && r.locked);
-    if (!rule || rule.src.type !== "user") return;
-    const named = normalizeEmail(rule.src.name ?? "");
-    if (!named) return;
-    const owners = s.members.filter((m) => m.role === "owner" && m.state === "active");
-    if (!owners.length) return; // pre-bootstrap, or no heir — see above
-    if (owners.some((m) => normalizeEmail(m.email) === named)) return; // already correct
-    rule.src = { type: "user", name: normalizeEmail(owners[0].email) };
-  }
-
-  /** A brand-new tenant: empty roost, default settings, no mock seed data.
-   *  Seeds ONE locked owner rule (`user:you` may reach `all`) so the tenant
-   *  owner's keys pass the default-deny ACL gate out of the box; everyone else
-   *  is denied until an explicit allow rule is added. The rule is `locked` so it
-   *  can't be removed via removeAcl (the owner can never lock themselves out). */
+  /** A brand-new tenant: empty roost, default settings, no mock seed data. */
   private fresh(): StoredState {
     const id = this.ctx.id.name ?? "";
     return {
       host: "", // set on first enroll/getState if we learn the subdomain
       services: [],
       keys: [],
-      groups: [],
-      acl: [
-        {
-          id: "r_owner",
-          src: { type: "user", name: "you" },
-          dst: [{ type: "all" }],
-          action: "allow",
-          locked: true,
-        },
-      ],
-      accessRequests: [],
       logs: [],
       usedTickets: {},
       cliTokenEpoch: 0,
-      cliSingleUserCut: true, // no team era to retire
+      singleUserPurge: SINGLE_USER_PURGE_VERSION, // nothing legacy to purge
       members: [],
       settings: {
         org: id,
@@ -551,9 +512,6 @@ export class TenantDO extends DurableObject<Env> {
       services,
       boxes,
       keys: publicKeys,
-      groups: s.groups,
-      acl: s.acl,
-      accessRequests: s.accessRequests,
       logs,
       settings: s.settings,
       overview: this.overview(
@@ -688,7 +646,7 @@ export class TenantDO extends DurableObject<Env> {
     return false;
   }
 
-  /** This DO is keyed by the REAL tenant id (Clerk org/user id). */
+  /** This DO is keyed by the REAL tenant id: its owner's Clerk user id. */
   private tenantId(): string {
     return this.ctx.id.name ?? "";
   }
@@ -767,44 +725,268 @@ export class TenantDO extends DurableObject<Env> {
     return { epoch: s.cliTokenEpoch ?? 0 };
   }
 
-  /** One-time, on the first request after the single-user cut deploys: if
-   *  anyone other than the principal owner could have held a CLI token for
-   *  this tenant, bump cliTokenEpoch so every outstanding one dies.
+  /** One-time, idempotent purge of everything the retired team, sharing and
+   *  Aviary features left in this tenant's stored state. It runs on the first
+   *  request an instance serves and is recorded by a versioned flag
+   *  (`singleUserPurge`), so a later access is a single flag read. A tenant
+   *  with no stored state is skipped without writing; one created after the
+   *  purge shipped is born flagged.
    *
-   *  A CLI token names a tenant and an epoch, not a person, so restricting
-   *  memberContext to the owner does not touch a token a former co-owner or
-   *  admin minted before the cut; it would stay valid for up to 30 days with
-   *  full tenant powers. Who "could have": any member row other than the
-   *  principal owner that ever got past an invitation (the retired removal
-   *  disabled such rows rather than deleting them, and only deleted pending
-   *  invitations, which never had access), any team workspace, and any
-   *  Clerk-org tenant (every org admin could mint for it). A personal tenant
-   *  with only its owner is left alone, so its owner's login keeps working.
+   *  The owner is the member row whose clerkUserId is this tenant's id — the
+   *  Clerk user whose tenant this is. A team workspace or a Clerk-org tenant
+   *  (kind "team", or an `org_` id) is nobody's tenant any more, so it has no
+   *  owner.
    *
-   *  The flag makes it run once; a tenant with no stored state is skipped
-   *  without writing, and one created after the cut is born flagged. */
-  private async retireSharedCliTokens(): Promise<void> {
-    if (!(await this.ctx.storage.get("state"))) return;
-    const s = await this.load();
-    if (s.cliSingleUserCut) return;
-    const principal = this.principalOwner(s);
-    const shared =
-      s.members.some((m) => m !== principal && m.state !== "invited") ||
-      s.tenantMeta?.kind === "team" ||
-      this.tenantId().startsWith("org_");
-    if (shared) {
-      s.cliTokenEpoch = (s.cliTokenEpoch ?? 0) + 1;
-      this.log(s, {
+   *  The tenant was EXPOSED if anyone besides the owner could have signed in
+   *  to it: it is a team/org tenant, or another member row is not a
+   *  never-accepted invitation (state "invited" with no Clerk binding). A
+   *  removed member who had signed in was kept as a "disabled" row, so the
+   *  rows are a complete record of who could have. Nothing records who minted
+   *  a key or enrolled a box — a key's `owner` is who it was labelled for
+   *  (the Keys view defaulted it to the tenant owner, and a CLI mint always
+   *  used the owner's email), and a box records no enroller — so in an exposed
+   *  tenant every key and every box is treated as possibly someone else's.
+   *
+   *  The purge:
+   *    - deletes every other member row (co-owners, admins, members,
+   *      invitations) and normalizes the owner's row to an active owner. With
+   *      no owner row it also deletes `tenantMeta`, so the tenant's own user
+   *      bootstraps it afresh on their next sign-in;
+   *    - deletes groups, ACL rules, access requests, the login wall's
+   *      session epoch, and the earlier CLI-cut flag;
+   *    - deletes the Aviary manifest, route and credential-epoch fields from
+   *      services and boxes (a formerly Aviary-managed service's route list is
+   *      cleared with them);
+   *    - deletes the audit rows of the retired sharing features (category
+   *      "access"), and every other row that names a non-owner member;
+   *    - exposed: revokes every finch_ key, removes every box (so /refresh
+   *      refuses its long-lived credential and the relay stops routing to it;
+   *      the owner re-adds their own with `finch add`, which reuses the
+   *      now-empty service), and bumps cliTokenEpoch once, since a CLI token
+   *      names a tenant, not a person. An ownerless tenant's services are also
+   *      set back to key-gated, so nothing on it answers without a key, and
+   *      if exactly one active owner row existed its hosts are handed to that
+   *      user (routeHeir, see handOffRoutes);
+   *    - otherwise: revokes only keys labelled for someone other than the
+   *      owner (an email other than theirs); the owner's keys, boxes and CLI
+   *      logins are untouched. */
+  private async purgeLegacyTenancy(): Promise<void> {
+    const raw = await this.ctx.storage.get<any>("state");
+    if (!raw || typeof raw !== "object") return;
+    if (typeof raw.singleUserPurge === "number" && raw.singleUserPurge >= SINGLE_USER_PURGE_VERSION) {
+      return;
+    }
+    const tenant = this.tenantId();
+    const members: any[] = Array.isArray(raw.members)
+      ? raw.members.filter((m: unknown) => !!m && typeof m === "object")
+      : [];
+    const shared = tenant.startsWith("org_") || raw.tenantMeta?.kind === "team";
+    const owner = shared ? undefined : members.find((m) => m.clerkUserId === tenant);
+    const others = members.filter((m) => m !== owner);
+    const couldHaveSignedIn = (m: any): boolean =>
+      m.state !== "invited" ||
+      (typeof m.clerkUserId === "string" && m.clerkUserId !== "") ||
+      typeof m.boundAt === "number";
+    const exposed = shared || others.some(couldHaveSignedIn);
+    // An ownerless tenant's hosts go to its one former owner, if it had
+    // exactly one active owner who had signed in; otherwise they stay with the
+    // (now inert) tenant — slugs are never recycled to whoever asks first.
+    const formerOwners = shared
+      ? members.filter(
+          (m) =>
+            m.role === "owner" &&
+            m.state === "active" &&
+            typeof m.clerkUserId === "string" &&
+            m.clerkUserId !== "" &&
+            m.clerkUserId !== tenant,
+        )
+      : [];
+    const heir: string | undefined = formerOwners.length === 1 ? formerOwners[0].clerkUserId : undefined;
+    const now = Date.now();
+
+    // Members: the owner alone, as an active owner.
+    if (owner) {
+      const restored = owner.role !== "owner" || owner.state !== "active";
+      raw.members = [
+        {
+          id: typeof owner.id === "string" && owner.id ? owner.id : "m_" + crypto.randomUUID().slice(0, 8),
+          tenantId: tenant,
+          clerkUserId: tenant,
+          email: normalizeEmail(String(owner.email ?? "")),
+          role: "owner",
+          state: "active",
+          createdAt: typeof owner.createdAt === "number" ? owner.createdAt : now,
+          updatedAt: !restored && typeof owner.updatedAt === "number" ? owner.updatedAt : now,
+          ...(typeof owner.boundAt === "number" ? { boundAt: owner.boundAt } : {}),
+        },
+      ];
+      if (raw.tenantMeta && typeof raw.tenantMeta === "object") {
+        raw.tenantMeta = {
+          id: tenant,
+          kind: "personal",
+          displayName: String(raw.tenantMeta.displayName ?? tenant),
+          createdAt: typeof raw.tenantMeta.createdAt === "number" ? raw.tenantMeta.createdAt : now,
+          bootstrappedFrom: raw.tenantMeta.bootstrappedFrom === "fresh" ? "fresh" : "legacy-personal",
+          membershipVersion: 1,
+        };
+      }
+    } else {
+      raw.members = [];
+      delete raw.tenantMeta;
+    }
+
+    // Keys: in an exposed tenant, all of them (no key records its minter).
+    // Otherwise only the owner could have minted, so keep every key labelled
+    // for the owner — their email, or the "you" placeholder a key got before
+    // the tenant had an identity — and revoke the ones labelled for someone
+    // else. Revoked ids are detached from services and boxes below.
+    const keys: any[] = Array.isArray(raw.keys) ? raw.keys : [];
+    const ownerEmail = owner ? normalizeEmail(String(owner.email ?? "")) : "";
+    const keep = (k: any): boolean => {
+      if (exposed) return false;
+      const keyOwner = typeof k?.owner === "string" ? normalizeEmail(k.owner) : "";
+      if (!keyOwner || keyOwner === "you") return true;
+      return !!ownerEmail && keyOwner === ownerEmail;
+    };
+    raw.keys = keys.filter(keep);
+    const revokedCount = keys.length - raw.keys.length;
+    const keptIds = new Set<unknown>(raw.keys.map((k: any) => k?.id));
+    const keepKeyIds = (ids: unknown) =>
+      Array.isArray(ids) ? ids.filter((id: unknown) => keptIds.has(id)) : ids;
+
+    // Services and boxes: drop the Aviary fields and the ids of keys that no
+    // longer exist. In an exposed tenant, remove every box: none records who
+    // enrolled it, and its /join refresh token carries no epoch, so removal is
+    // the only thing that stops a box someone else runs from refreshing and
+    // from receiving this tenant's traffic (a "pending" box would still be
+    // reachable by a box-pinned path, and `finch approve` clears a whole
+    // service at once).
+    const services: any[] = Array.isArray(raw.services) ? raw.services : [];
+    let removedBoxes = 0;
+    const reenroll: string[] = [];
+    for (const svc of services) {
+      if (!svc || typeof svc !== "object") continue;
+      if (svc.aviaryManaged) svc.routes = [];
+      for (const f of LEGACY_SERVICE_FIELDS) delete svc[f];
+      svc.keys = keepKeyIds(svc.keys);
+      const boxes: any[] = Array.isArray(svc.boxes) ? svc.boxes : [];
+      if (exposed) {
+        removedBoxes += boxes.length;
+        svc.boxes = [];
+        svc.boxCount = 0;
+        svc.box = "—";
+        // Boxless, like a freshly enrolled service: the next box to join
+        // promotes it (registerBox), and getState reports this state as is.
+        svc.state = "invited";
+        if (shared) svc.auth = "key";
+        else if (typeof svc.id === "string") reenroll.push(svc.id);
+        continue;
+      }
+      for (const box of boxes) {
+        if (!box || typeof box !== "object") continue;
+        for (const f of LEGACY_BOX_FIELDS) delete box[f];
+        box.keys = keepKeyIds(box.keys);
+      }
+    }
+
+    // Audit rows: drop the sharing features' own rows, and any row that names
+    // someone other than the owner (by email, member id or Clerk user id) —
+    // e.g. "minted key" rows whose actor was an admin.
+    const otherNames = new Set<string>(); // matched anywhere in the text
+    const otherMemberIds = new Set<string>(); // short ids: matched exactly
+    for (const m of others) {
+      for (const v of [m.email, m.clerkUserId]) {
+        if (typeof v === "string" && v.trim()) otherNames.add(normalizeEmail(v));
+      }
+      if (typeof m.id === "string" && m.id) otherMemberIds.add(m.id);
+    }
+    const namesOther = (l: any): boolean =>
+      [l?.actor, l?.target].some((v) => {
+        if (typeof v !== "string") return false;
+        if (otherMemberIds.has(v)) return true;
+        const text = v.toLowerCase();
+        for (const name of otherNames) if (text.includes(name)) return true;
+        return false;
+      });
+    for (const f of LEGACY_STATE_FIELDS) delete raw[f];
+    const logs: any[] = Array.isArray(raw.logs) ? raw.logs : [];
+    raw.logs = logs.filter((l) => l?.cat !== "access" && !namesOther(l));
+
+    if (exposed) {
+      raw.cliTokenEpoch = (typeof raw.cliTokenEpoch === "number" ? raw.cliTokenEpoch : 0) + 1;
+    }
+    if (heir) raw.routeHeir = heir;
+    if (reenroll.length) raw.reenroll = reenroll;
+    if (exposed || revokedCount > 0) {
+      const ev: StoredLogEvent = {
         cat: "key",
         actor: "finch",
-        action: "revoked all CLI tokens (workspace is now single-user)",
-        target: "cli access",
+        action: exposed
+          ? `single-user migration: others could sign in (${shared ? "shared tenant" : "other members"}), ` +
+            `so no key or box has a known owner; revoked all ${revokedCount} key(s), ` +
+            `removed ${removedBoxes} box(es) and revoked every CLI token`
+          : `single-user migration: revoked ${revokedCount} key(s) labelled for someone other than the owner`,
+        target: "legacy sharing data",
         ip: "",
         svc: "",
-      });
+        ts: now,
+        ago: "",
+      };
+      raw.logs.unshift(ev);
+      if (raw.logs.length > MAX_LOGS) raw.logs.length = MAX_LOGS;
     }
-    s.cliSingleUserCut = true;
-    await this.save(s);
+    raw.singleUserPurge = SINGLE_USER_PURGE_VERSION;
+    await this.ctx.storage.put("state", raw);
+  }
+
+  /** Hand an ownerless tenant's RouterDO hosts (its finchmcp.com slugs and
+   *  custom hostnames) to its one former owner, recorded by the purge as
+   *  `routeHeir`. Before single-user tenancy that user's commands resolved to
+   *  this tenant; now they act on their own, so without this the hosts would
+   *  stay registered to a tenant no one can manage and could never be
+   *  re-pointed. Each host moves atomically (RouterDO.transfer), so it is
+   *  never claimable in between, and a Cloudflare custom hostname needs no
+   *  change (it is keyed by hostname, not tenant). The marker is deleted only
+   *  once every host moved; any failure leaves it for the next instance. */
+  private async handOffRoutes(): Promise<void> {
+    const raw = await this.ctx.storage.get<any>("state");
+    const heir = raw && typeof raw === "object" ? raw.routeHeir : undefined;
+    if (typeof heir !== "string" || !heir) return;
+    const tenant = this.tenantId();
+    let hosts: string[];
+    try {
+      const res = await routerStub(this.env).fetch("https://router/op", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ op: "listForTenant", tenant }),
+      });
+      if (!res.ok) return;
+      const out = (await res.json()) as { keys?: unknown };
+      if (!Array.isArray(out.keys)) return;
+      hosts = out.keys.filter((k): k is string => typeof k === "string");
+      for (const host of hosts) {
+        const moved = await routerTransfer(this.env, host, tenant, heir);
+        // "not-owner": someone else holds it now, so it is not ours to move.
+        if (!moved.ok && moved.reason !== "not-owner") return;
+      }
+    } catch {
+      return; // router unavailable: retry on the next instance
+    }
+    delete raw.routeHeir;
+    const ev: StoredLogEvent = {
+      cat: "admin",
+      actor: "finch",
+      action: `single-user migration: moved ${hosts.length} host(s) to the tenant's former owner`,
+      target: hosts.join(", ").slice(0, 200) || "none",
+      ip: "",
+      svc: "",
+      ts: Date.now(),
+      ago: "",
+    };
+    raw.logs = Array.isArray(raw.logs) ? raw.logs : [];
+    raw.logs.unshift(ev);
+    if (raw.logs.length > MAX_LOGS) raw.logs.length = MAX_LOGS;
+    await this.ctx.storage.put("state", raw);
   }
 
   private async revokeCliTokens(): Promise<{ ok: boolean; epoch: number }> {
@@ -823,8 +1005,22 @@ export class TenantDO extends DurableObject<Env> {
   ): Promise<{ id: string }> {
     const s = await this.load();
     let id = this.slugify(name, "service");
+    const existing = this.findService(s, id);
+    const reenroll = Array.isArray(s.reenroll) ? s.reenroll : [];
+    if (existing && existing.boxes.length === 0 && reenroll.includes(id)) {
+      // A service whose boxes the single-user purge removed is re-enrolled in
+      // place, once: the new ticket joins THIS service, so `finch add <name>`
+      // (the command a revoked box's agent prints) restores it at the same URL
+      // with its auth mode, instead of minting "<name>-2" beside a dead one.
+      s.reenroll = reenroll.filter((x) => x !== id);
+      if (!s.reenroll.length) delete s.reenroll;
+      await this.ensureDefaultSlug(s);
+      this.log(s, { cat: "device", actor: "you", action: "re-enrolled", target: id, ip: "", svc: id });
+      await this.save(s);
+      return { id };
+    }
     // de-dupe id within the tenant
-    if (this.findService(s, id)) {
+    if (existing) {
       let n = 2;
       let candidate = id;
       do {
@@ -836,11 +1032,7 @@ export class TenantDO extends DurableObject<Env> {
       } while (this.findService(s, candidate));
       id = candidate;
     }
-    const g = group || s.settings.defaultGroup;
-    s.services.push(this.newService(id, name, g));
-    if (g && !s.groups.some((gr) => gr.name === g)) {
-      s.groups.push({ name: g, members: ["you"] });
-    }
+    s.services.push(this.newService(id, name, group || s.settings.defaultGroup));
     // First enroll for a tenant whose dashboard never loaded (getState also
     // does this): make sure a default hub domain exists so the public relay
     // URL resolves.
@@ -969,7 +1161,6 @@ export class TenantDO extends DurableObject<Env> {
   private async mintKey(
     label: string,
     scope?: KeyScope,
-    owner?: string,
   ): Promise<
     { plaintext: string; key: PublicKey } | { error: string }
   > {
@@ -983,14 +1174,16 @@ export class TenantDO extends DurableObject<Env> {
     const normScope = this.normalizeScope(s, scope);
     if ("error" in normScope) return { error: normScope.error };
 
-    if (s.tenantMeta && (!owner || owner === "you")) owner = this.principalOwner(s)?.email ?? owner;
+    // Every key is the owner's: labelled with their email once the tenant has
+    // an identity, else with the "you" placeholder (rewritten on bootstrap).
+    const owner = this.owner(s)?.email || "you";
     const plaintext = genFinchKey();
     const hash = await hashKey(plaintext);
     const now = Date.now();
     const key: Key = {
       id: "k_" + crypto.randomUUID().slice(0, 8),
       label,
-      owner: owner || "you",
+      owner,
       created: new Date(now).toISOString().slice(0, 10),
       scope: normScope.scope,
       hash,
@@ -1121,54 +1314,31 @@ export class TenantDO extends DurableObject<Env> {
 
   // ---- tenant owner ---------------------------------------------------------
 
-  /** THE owner of a bootstrapped tenant. A pre-cut team could have several
-   *  active owners, and with the member-management ops gone none of them can
-   *  remove another, so exactly one is honoured: the active owner the locked
-   *  `r_owner` rule names (the lockout backstop, which normalizeOwnerGrant
-   *  keeps pointing at an active owner), else the earliest-created active
-   *  owner. The other owner rows stay in storage but authorize nothing. */
-  private principalOwner(s: StoredState): TenantMember | undefined {
-    const owners = s.members
-      .filter((m) => m.role === "owner" && m.state === "active")
-      .sort((x, y) => (x.createdAt ?? 0) - (y.createdAt ?? 0));
-    const rule = s.acl.find((r) => r.id === "r_owner" && r.locked);
-    const named = rule?.src.type === "user" ? normalizeEmail(rule.src.name ?? "") : "";
-    return owners.find((m) => named && normalizeEmail(m.email) === named) ?? owners[0];
+  /** The tenant's owner: the active owner row of the Clerk user whose tenant
+   *  this is. After the single-user purge it is the only member row. */
+  private owner(s: StoredState): TenantMember | undefined {
+    const tenant = this.tenantId();
+    return s.members.find(
+      (m) => m.clerkUserId === tenant && m.role === "owner" && m.state === "active",
+    );
   }
 
-  /** Whether this tenant has an owner row yet (`migrated`); whether it holds a
-   *  fleet its owner would lose track of — services (and with them their
-   *  boxes) or finch_ keys (`holdsFleet`); and whether it holds anything at
-   *  all, a subdomain included (`hasState`, the pre-cut claimability test). A
-   *  subdomain alone is not a fleet: getState hands every tenant it reads a
-   *  default one. */
-  private async holdings(): Promise<{ migrated: boolean; holdsFleet: boolean; hasState: boolean }> {
-    const s = await this.load();
-    const holdsFleet = s.services.length > 0 || s.keys.length > 0;
-    return { migrated: !!s.tenantMeta, holdsFleet, hasState: holdsFleet || !!s.settings.subdomain };
-  }
-
-  /** Replace the pre-membership placeholder principal ("you") with the real
-   *  owner's email, once a tenant gains its first identity. */
+  /** Replace the pre-identity placeholder key owner ("you") with the real
+   *  owner's email, once the tenant gains its identity. */
   private rewriteYou(s: StoredState, email: string): void {
-    const owner = s.acl.find((r) => r.id === "r_owner" && r.locked);
-    if (owner) owner.src = { type: "user", name: email };
     for (const k of s.keys) {
       if (!k.owner || k.owner === "you") k.owner = email;
     }
-    for (const g of s.groups) {
-      g.members = [...new Set(g.members.map((x) => (x === "you" ? email : x)))];
-    }
   }
 
-  /** First sign-in to a user's PERSONAL tenant (id === their Clerk user id):
-   *  record them as its owner. Idempotent once bootstrapped. */
+  /** First sign-in to a tenant (id === the caller's Clerk user id): record
+   *  them as its owner. Idempotent once bootstrapped. */
   private async ensureOwner(clerkUserId: string, email: unknown): Promise<any> {
     const em = typeof email === "string" ? normalizeEmail(email) : "";
     const s = await this.load();
-    if (s.tenantMeta) return this.memberContext(clerkUserId);
+    if (this.owner(s)) return this.memberContext(clerkUserId);
     if (!clerkUserId || !em || clerkUserId !== this.tenantId()) {
-      return { error: "personal workspace owner mismatch", status: 403 };
+      return { error: "tenant owner mismatch", status: 403 };
     }
     const now = Date.now();
     const member: TenantMember = {
@@ -1192,114 +1362,43 @@ export class TenantDO extends DurableObject<Env> {
     };
     s.members = [member];
     this.rewriteYou(s, em);
-    this.log(s, { cat: "access", actor: member.id, action: "bootstrapped workspace", target: em, ip: "", svc: "" });
+    this.log(s, { cat: "admin", actor: member.id, action: "bootstrapped account", target: em, ip: "", svc: "" });
     await this.save(s);
     return this.memberContext(clerkUserId);
   }
 
-  /** A legacy Clerk-org tenant (id === the Clerk org id) that holds state from
-   *  before native tenancy and was never claimed: record the caller — an admin
-   *  of that org, as verified by the web against Clerk — as its single owner.
-   *  This replaces the retired claim/import UI with a hub-side step. The first
-   *  admin to sign in wins; a repeat by that owner is idempotent and anyone
-   *  else gets a 409. An empty or already-claimed tenant is never taken. */
-  private async claimLegacyOrg(clerkOrgId: unknown, clerkUserId: unknown, email: unknown): Promise<any> {
-    const orgId = typeof clerkOrgId === "string" ? clerkOrgId : "";
-    const uid = typeof clerkUserId === "string" ? clerkUserId : "";
-    const em = typeof email === "string" ? normalizeEmail(email) : "";
-    if (!orgId.startsWith("org_") || orgId !== this.tenantId() || !uid || !em) {
-      return { error: "legacy org claim mismatch", status: 400 };
-    }
-    const s = await this.load();
-    if (s.tenantMeta) {
-      if (s.tenantMeta.clerkOrgId === orgId && this.principalOwner(s)?.clerkUserId === uid) {
-        return { ...(await this.memberContext(uid)), already: true };
-      }
-      return { error: "tenant already claimed", status: 409 };
-    }
-    if (!(await this.holdings()).hasState) return { error: "nothing to claim", status: 409 };
-    const now = Date.now();
-    const member: TenantMember = {
-      id: "m_" + crypto.randomUUID().slice(0, 8),
-      tenantId: orgId,
-      clerkUserId: uid,
-      email: em,
-      role: "owner",
-      state: "active",
-      createdAt: now,
-      updatedAt: now,
-      boundAt: now,
-    };
-    s.tenantMeta = {
-      id: orgId,
-      kind: "team",
-      displayName: orgId,
-      createdAt: now,
-      clerkOrgId: orgId,
-      bootstrappedFrom: "legacy-org",
-      membershipVersion: 1,
-    };
-    s.members = [member];
-    this.rewriteYou(s, em);
-    this.log(s, { cat: "access", actor: member.id, action: "claimed legacy org workspace", target: em, ip: "", svc: "" });
-    await this.save(s);
-    return this.memberContext(uid);
-  }
-
-  /** Resolve a Clerk user against this tenant. Only the tenant's OWNER is a
-   *  member: any other identity — including a member, admin or invitee row
-   *  left over from the retired team features — gets `member: null`. The
-   *  user's own personal tenant reports `needsBootstrap` until an email
-   *  arrives to bootstrap its owner row. */
+  /** Resolve a Clerk user against this tenant. Only the Clerk user whose
+   *  tenant this is (its id is their user id) is a member, as its owner;
+   *  anyone else gets `member: null`. Until an email arrives to bootstrap the
+   *  owner row, the owner gets `needsBootstrap`. */
   private async memberContext(clerkUserId: unknown, email?: unknown): Promise<any> {
     const uid = typeof clerkUserId === "string" ? clerkUserId : "";
+    if (!uid || uid !== this.tenantId()) return { member: null, tenantMeta: null };
     const s = await this.load();
-    if (!s.tenantMeta && uid && uid === this.tenantId()) {
+    const m = this.owner(s);
+    if (!m) {
       if (typeof email === "string" && email) return this.ensureOwner(uid, email);
       return { member: null, tenantMeta: null, needsBootstrap: true };
     }
-    const owner = this.principalOwner(s);
-    const m = uid && owner?.clerkUserId === uid ? owner : undefined;
     return {
-      member: m ? { id: m.id, role: m.role, state: m.state, email: m.email } : null,
+      member: { id: m.id, role: m.role, state: m.state, email: m.email },
       tenantMeta: s.tenantMeta ?? null,
     };
   }
 
   /** The OAuth door: a Clerk-verified caller may reach a key-gated service
-   *  only as this tenant's owner — the principal owner of a bootstrapped
-   *  tenant, or the user whose personal tenant this is. A public service
-   *  needs no identity. There are no shared members or per-user grants.
-   *
-   *  One pre-bootstrap case keeps a legacy Clerk-org tenant reachable by its
-   *  owner before anyone has claimed it: a token scoped to THIS org (org_id
-   *  === the tenant id) carrying the org admin role — the same people who may
-   *  claim it. Once claimed, the tenant has an owner row and only that owner
-   *  passes. (Pre-cut, an org token was checked against per-user ACL grants
-   *  instead; those grants are retired.) */
+   *  only if this is their own tenant (its id is their Clerk user id). A
+   *  public service needs no identity. */
   private async gateOauth(
     clerkUserId: unknown,
     service: unknown,
-    orgIdClaim?: unknown,
-    orgRole?: unknown,
   ): Promise<{ allowed: boolean; public?: boolean }> {
     const uid = typeof clerkUserId === "string" ? clerkUserId : "";
     const s = await this.load();
     if (this.findService(s, String(service || ""))?.auth === "public") {
       return { allowed: true, public: true };
     }
-    if (!uid) return { allowed: false };
-    if (s.tenantMeta) {
-      return { allowed: this.principalOwner(s)?.clerkUserId === uid };
-    }
-    if (uid === this.tenantId()) return { allowed: true };
-    return {
-      allowed:
-        typeof orgIdClaim === "string" &&
-        orgIdClaim.startsWith("org_") &&
-        orgIdClaim === this.tenantId() &&
-        (orgRole === "org:admin" || orgRole === "admin"),
-    };
+    return { allowed: !!uid && uid === this.tenantId() };
   }
 
   // ---- mutations: settings ------------------------------------------------
@@ -1333,7 +1432,9 @@ export class TenantDO extends DurableObject<Env> {
       if (slug) {
         let res: { ok: boolean; reason?: string; owner?: string };
         try {
-          res = await routerRegister(this.env, slug, this.tenantId());
+          // Waking the holder lets a user reclaim a slug their former team
+          // tenant held before its purge has run (routerRegisterWakingHolder).
+          res = await routerRegisterWakingHolder(this.env, slug, this.tenantId());
         } catch {
           res = { ok: false, reason: "router-unavailable" };
         }
@@ -1414,49 +1515,6 @@ export class TenantDO extends DurableObject<Env> {
     const ap = this.findService(s, service);
     if (!ap) return { exists: false };
     return { exists: ap.boxes.some((m) => m.name === box) };
-  }
-
-  private async boxCredentialEpoch(
-    service: unknown,
-    box: unknown,
-  ): Promise<{ exists: boolean; epoch?: number }> {
-    if (typeof service !== "string" || typeof box !== "string") {
-      return { exists: false };
-    }
-    const s = await this.load();
-    const ap = this.findService(s, service);
-    const stored = ap?.boxes.find((candidate) => candidate.name === box) as
-      | (Box & { aviaryCredentialEpoch?: number })
-      | undefined;
-    if (!ap || !stored) return { exists: false };
-    return {
-      exists: true,
-      ...(typeof stored.aviaryCredentialEpoch === "number"
-        ? { epoch: stored.aviaryCredentialEpoch }
-        : {}),
-    };
-  }
-
-  /** Defense-in-depth Worker-side enforcement of an Aviary manifest's exact
-   *  route prefixes. Legacy services have an empty route list and retain their
-   *  historical forward-all behavior. Prefixes are segment-aware: /api/v1
-   *  matches itself and /api/v1/x, never /api/v10. */
-  private async routeAllowed(
-    service: unknown,
-    path: unknown,
-  ): Promise<{ exists: boolean; allowed: boolean }> {
-    if (typeof service !== "string" || typeof path !== "string") {
-      return { exists: false, allowed: false };
-    }
-    const s = await this.load();
-    const ap = this.findService(s, service);
-    if (!ap) return { exists: false, allowed: false };
-    if (!ap.aviaryManaged) return { exists: true, allowed: true };
-    const routes = Array.isArray(ap.routes) ? ap.routes : [];
-    const allowed = routes.some(
-      (prefix) => path === prefix || path.startsWith(`${prefix}/`),
-    );
-    return { exists: true, allowed };
   }
 
   /** Re-stamp a box's agent version from /refresh. After a hub-pushed update
@@ -1710,19 +1768,14 @@ export class TenantDO extends DurableObject<Env> {
     return { ok: true };
   }
 
-  // ---- key check + ACL evaluation (MCP router) ---------------------------
+  // ---- key check (MCP router) --------------------------------------------
 
   /** Given the sha-256 hash of a presented finch_ key and the target service,
-   *  decide if the call is allowed. TWO gates, BOTH must pass (default-deny):
-   *
-   *   1. KEY SCOPE — the key's scope must be "all services"/"*" or list the
-   *      service id (the existing per-key coarse gate, kept as a floor).
-   *   2. ACL — the tenant's acl rules must contain at least one `allow` rule
-   *      whose src matches this key's identity (key label/id, the key owner as a
-   *      user, or a group the owner/key belongs to) AND whose dst matches the
-   *      target service (by service id, one of its tags, its group, or
-   *      `all`). An owner/admin "allow all" rule is honored. No matching allow
-   *      rule → denied. This is the "enforced at the door" promise made real.
+   *  decide if the call is allowed. A public service admits anyone. Otherwise
+   *  a key is allowed iff it exists (revocation deletes it), has not expired
+   *  (only when the tenant enforces expiry), the service exists, and the key's
+   *  scope is {all:true} or lists the service. There are no ACL rules, groups
+   *  or per-user grants any more.
    *
    *  Returns the key's label for logging / attribution and a `reason` for the
    *  denial (so the relay can return a precise 403). */
@@ -1735,26 +1788,25 @@ export class TenantDO extends DurableObject<Env> {
     keyId?: string;
     keyOwner?: string;
     public?: boolean;
-    reason?: "no-key" | "scope" | "acl" | "expired";
+    reason?: "no-key" | "expired" | "no-service" | "scope";
   }> {
     const s = await this.load();
 
-    // Gate −1: PUBLIC service. A public service (an ngrok-style open webpage)
-    // needs no finch_ key — allow regardless of what (if anything) was presented,
-    // BEFORE the key lookup so a missing/empty hash still passes. `public:true`
-    // tells the relay to label the caller "public" and skip the bearer 401.
-    // (auth defaults to "key" when the field is absent → fail-closed.)
+    // A PUBLIC service (an ngrok-style open webpage) needs no finch_ key —
+    // allow regardless of what (if anything) was presented, BEFORE the key
+    // lookup so a missing/empty hash still passes. `public:true` tells the
+    // relay to label the caller "public" and skip the bearer 401. (auth
+    // defaults to "key" when the field is absent → fail-closed.)
     const ap = this.findService(s, service);
     if (ap && ap.auth === "public") {
       return { allowed: true, keyLabel: "public", public: true };
     }
 
-    const key = s.keys.find((k) => k.hash === hash);
+    const key = hash ? s.keys.find((k) => k.hash === hash) : undefined;
     if (!key) return { allowed: false, keyLabel: "", reason: "no-key" };
 
-    // Gate 0: expiry. Only enforced when the tenant flips settings.enforceExpiry
-    // on — the toggle is no longer cosmetic. A key with no stamped expiry never
-    // expires (e.g. minted under keyExpiry="never").
+    // Expiry is only enforced when the tenant turns settings.enforceExpiry on.
+    // A key with no stamped expiry never expires (keyExpiry="never").
     if (
       s.settings.enforceExpiry &&
       key.expiresAt &&
@@ -1763,7 +1815,9 @@ export class TenantDO extends DurableObject<Env> {
       return { allowed: false, keyLabel: key.label, reason: "expired" };
     }
 
-    // Gate 1: key scope (structured — {all:true} or an explicit service list).
+    if (!ap) return { allowed: false, keyLabel: key.label, reason: "no-service" };
+
+    // Scope (structured — {all:true} or an explicit service list).
     const scope = key.scope;
     const scopeOk =
       !!scope &&
@@ -1775,101 +1829,11 @@ export class TenantDO extends DurableObject<Env> {
       return { allowed: false, keyLabel: key.label, reason: "scope" };
     }
 
-    // Gate 2: ACL evaluation (default-deny).
-    const aclOk = this.evalAccess(s, key, service);
-    if (!aclOk) {
-      return { allowed: false, keyLabel: key.label, reason: "acl" };
-    }
-
     return {
       allowed: true,
       keyLabel: key.label,
       keyId: key.id,
       keyOwner: key.owner,
     };
-  }
-
-  /** Evaluate the tenant's ACL rules for a key reaching a service.
-   *  Default-deny: returns true iff at least one `allow` rule's src matches the
-   *  key's identity AND its dst matches the target service. */
-  private evalAccess(s: StoredState, key: Key, service: string): boolean {
-    return this.evalIdentAccess(s, this.keyIdentities(s, key), service);
-  }
-
-  /** Core ACL walk for the key gate (checkKey): does any allow rule's src
-   *  match `ident` AND its dst match `service`? */
-  private evalIdentAccess(
-    s: StoredState,
-    ident: { keys: Set<string>; users: Set<string>; groups: Set<string> },
-    service: string,
-  ): boolean {
-    const ap = this.findService(s, service);
-    if (!ap) return false;
-
-    // The descriptors this service matches as a rule DESTINATION.
-    const apTags = new Set((ap.tags || []).map((t) => t.toLowerCase()));
-    const apGroup = (ap.group || "").toLowerCase();
-    const apId = (ap.id || "").toLowerCase();
-
-    for (const rule of s.acl) {
-      if (rule.action !== "allow") continue;
-      if (!this.srcMatches(rule.src, ident)) continue;
-      const dsts = Array.isArray(rule.dst) ? rule.dst : [rule.dst];
-      for (const d of dsts) {
-        if (d.type === "all") return true;
-        const dn = (d.name || "").toLowerCase();
-        if (d.type === "service" && dn === apId) return true;
-        if (d.type === "tag" && apTags.has(dn)) return true;
-        if (d.type === "group" && dn === apGroup) return true;
-      }
-    }
-    return false;
-  }
-
-  /** The set of ACL src identities a key presents: itself (as a key, by label
-   *  AND id), its owner (as a user), and any groups the owner/key-label belong
-   *  to. Lowercased for case-insensitive matching. */
-  private keyIdentities(
-    s: StoredState,
-    key: Key,
-  ): { keys: Set<string>; users: Set<string>; groups: Set<string> } {
-    const keys = new Set<string>();
-    if (key.label) keys.add(key.label.toLowerCase());
-    if (key.id) keys.add(key.id.toLowerCase());
-
-    const users = new Set<string>();
-    if (key.owner) users.add(key.owner.toLowerCase());
-
-    const groups = new Set<string>();
-    for (const g of s.groups || []) {
-      const members = (g.members || []).map((m) => m.toLowerCase());
-      if (
-        (key.owner && members.includes(key.owner.toLowerCase())) ||
-        (key.label && members.includes(key.label.toLowerCase()))
-      ) {
-        groups.add((g.name || "").toLowerCase());
-      }
-    }
-    return { keys, users, groups };
-  }
-
-  /** Does a rule's src entity match one of the key's identities? */
-  private srcMatches(
-    src: AclEntity,
-    ident: { keys: Set<string>; users: Set<string>; groups: Set<string> },
-  ): boolean {
-    const n = (src.name || "").toLowerCase();
-    switch (src.type) {
-      case "all":
-        return true;
-      case "key":
-        return ident.keys.has(n);
-      case "user":
-        return ident.users.has(n);
-      case "group":
-        return ident.groups.has(n);
-      default:
-        return false;
-    }
   }
 }
