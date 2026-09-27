@@ -46,6 +46,8 @@
   display:flex; flex-direction:column; gap:10px}
 .fl-update .iw-label{color:var(--ink)}
 .fl-update .fl-cmd{max-width:360px}
+.fl-update-list{margin:4px 0 10px; padding-left:18px; display:grid; gap:2px}
+.fl-calls-more{padding:10px 0 0; color:var(--ink-muted); font-size:13px}
 
 /* ---------- a command or URL with its Copy button ---------- */
 .fl-cmd{display:flex; align-items:center; gap:8px; min-width:0; background:var(--surface);
