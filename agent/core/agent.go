@@ -58,7 +58,7 @@ import (
 // `-ldflags "-X github.com/digibugcat/finch/agent/core.agentVersion=<v>"`; the
 // literal here is the source of truth that CI (scripts/check-versions.mjs)
 // asserts matches the worker's LATEST_AGENT and the web's copy. Keep them in sync.
-var agentVersion = "1.6.0"
+var agentVersion = "1.7.0"
 
 // connectSkew is how long before a connect-token's exp we treat it as already
 // expired and force a fresh /join, so we never dial with a token that lapses
@@ -76,6 +76,23 @@ var controlPlaneHTTPClient = &http.Client{
 		ExpectContinueTimeout: time.Second,
 	},
 	Timeout: 30 * time.Second,
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
+
+// relayCallHTTPClient is for /api/cli/call (finch test / finch call). The hub
+// answers only after it has run a whole MCP exchange with the service, which it
+// bounds at 25s, so the header timeout must outlast that budget or a slow but
+// successful call is reported as a transport failure.
+var relayCallHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 40 * time.Second,
+		ExpectContinueTimeout: time.Second,
+	},
+	Timeout: 45 * time.Second,
 	CheckRedirect: func(*http.Request, []*http.Request) error {
 		return http.ErrUseLastResponse
 	},
@@ -257,70 +274,14 @@ type joinResp struct {
 }
 
 func Main() {
-	// Setup subcommands (cloudflared-style): `finch login` saves a CLI token,
-	// `finch add` enrolls a service + appends an ingress rule. These run
-	// and exit; `run`/`join`/bare fall through to the relay agent below.
-	if len(os.Args) > 1 {
-		switch os.Args[1] {
-		case "login":
-			cmdLogin(os.Args[2:])
-			return
-		case "add":
-			cmdAdd(os.Args[2:])
-			return
-		case "enroll":
-			cmdEnroll(os.Args[2:])
-			return
-		case "approve":
-			cmdApprove(os.Args[2:])
-			return
-		case "auth":
-			cmdAuth(os.Args[2:])
-			return
-		case "token":
-			cmdToken(os.Args[2:])
-			return
-		case "status":
-			cmdStatus(os.Args[2:])
-			return
-		case "keys":
-			cmdKeys(os.Args[2:])
-			return
-		case "domain":
-			cmdDomain(os.Args[2:])
-			return
-		case "fleet", "ls":
-			cmdFleet(os.Args[2:])
-			return
-		case "rm":
-			cmdRm(os.Args[2:])
-			return
-		case "revoke-tokens":
-			cmdRevokeTokens(os.Args[2:])
-			return
-		case "test":
-			cmdTest(os.Args[2:])
-			return
-		case "call":
-			cmdCall(os.Args[2:])
-			return
-		case "update":
-			cmdUpdate(os.Args[2:])
-			return
-		case "version", "--version", "-v":
-			cmdVersion(os.Args[2:])
-			return
-		case "guide":
-			printGuide()
-			return
-		case "help", "-h", "--help":
-			printUsage()
-			return
-		}
-		if err := validateRelayCommandArg(os.Args[1]); err != nil {
-			log.Fatalf("finch: %v", err)
-		}
-	}
+	// Setup and control subcommands (login, add, service, connect, …) run and
+	// exit through the agent-facing CLI contract (cli_contract.go); only
+	// `run`/`join`/bare flags fall through to the relay agent below.
+	cliMain(os.Args[1:])
+
+	// Under the LaunchAgent, keep ~/.finch/finch.log bounded (launchd never
+	// rotates it). A no-op anywhere else: only the plist sets FINCH_LOG_FILE.
+	rotateServiceLogAtStart()
 
 	hostName, _ := os.Hostname()
 	defaultHub := agentDefaultHub()
@@ -483,6 +444,22 @@ func enrollToState(hub, box, ticket, statePath string) (*agentState, *joinResp, 
 	return st, jr, nil
 }
 
+// persistError is a LOCAL failure to save the credential a successful /join
+// returned (unwritable credentials-dir, full disk). The hub has already
+// consumed the one-shot ticket and registered the box, so it is not a hub
+// failure and retrying the join cannot fix it.
+type persistError struct {
+	Path    string
+	Service string
+	Err     error
+}
+
+func (e *persistError) Error() string {
+	return fmt.Sprintf("persisting credential to %s: %v", e.Path, e.Err)
+}
+
+func (e *persistError) Unwrap() error { return e.Err }
+
 // persistJoin writes the credential a successful /join returned to statePath
 // (0600). Only /join returns the long-lived refresh token, so it must be present.
 func persistJoin(hub string, jr *joinResp, statePath string) (*agentState, error) {
@@ -491,7 +468,7 @@ func persistJoin(hub string, jr *joinResp, statePath string) (*agentState, error
 	}
 	st := &agentState{Hub: hub, Tenant: jr.Tenant, Service: jr.Service, Box: jr.Box, RefreshToken: jr.RefreshToken}
 	if err := saveState(statePath, st); err != nil {
-		return nil, fmt.Errorf("persisting credential to %s: %w", statePath, err)
+		return nil, &persistError{Path: statePath, Service: jr.Service, Err: err}
 	}
 	return st, nil
 }
@@ -823,6 +800,12 @@ func (o *outStream) setPaused(p bool) {
 // to confine to /mcp (default) or forward the whole host. hub is the box's own
 // hub base URL — the pinned source a hub-pushed "update" frame downloads from.
 func serve(parent context.Context, wsURL string, upstream *url.URL, forwardAll bool, hub string) error {
+	return serveLink(parent, wsURL, upstream, forwardAll, hub, nil)
+}
+
+// serveLink is serve with onOpen, called once the hub has accepted the relay
+// socket (the connect token checked out), before any frame is served.
+func serveLink(parent context.Context, wsURL string, upstream *url.URL, forwardAll bool, hub string, onOpen func()) error {
 	if err := validateRelayTransportURL(wsURL); err != nil {
 		return err
 	}
@@ -841,6 +824,9 @@ func serve(parent context.Context, wsURL string, upstream *url.URL, forwardAll b
 	defer c.Close(websocket.StatusNormalClosure, "bye")
 	c.SetReadLimit(maxRelayFrameBytes)
 	log.Printf("finch: relay open -> %s", upstream)
+	if onOpen != nil {
+		onOpen()
+	}
 
 	// One writer at a time: coder/websocket forbids concurrent writes. write
 	// returns an error so a streaming forward() can ABORT mid-stream when the DO
@@ -1285,8 +1271,14 @@ func loadConfig(path, hostName string) (*config, error) {
 		} else {
 			c.CredentialsDir = ".finch"
 		}
+	} else if c.CredentialsDir = expandHome(c.CredentialsDir); !filepath.IsAbs(c.CredentialsDir) {
+		// A relative credentials-dir is relative to the manifest, not to the
+		// caller's cwd: `finch add --config dir/finch.yml` run from elsewhere
+		// and the service (which runs in the manifest's directory) must agree.
+		if abs, err := filepath.Abs(path); err == nil {
+			c.CredentialsDir = filepath.Join(filepath.Dir(abs), c.CredentialsDir)
+		}
 	}
-	c.CredentialsDir = expandHome(c.CredentialsDir)
 	seen := map[string]bool{}
 	for i, ing := range c.Ingress {
 		if ing.AppPath == "" || ing.Service == "" {

@@ -6,6 +6,7 @@ import {
   runInDurableObject,
 } from "cloudflare:test";
 import worker from "../src/index";
+import { isLoopbackHost } from "../src/api";
 import { hashKey, signAssertion, signToken } from "../src/auth";
 import { SINGLE_USER_PURGE_VERSION } from "../src/tenant-do";
 
@@ -689,5 +690,97 @@ describe("retired hub surfaces", () => {
   it("has no DirectoryDO or AviaryEnrollmentDO binding left", () => {
     expect((env as any).DIRECTORY).toBeUndefined();
     expect((env as any).AVIARY_ENROLLMENT).toBeUndefined();
+  });
+});
+
+// `finch connect` writes the service URL into client configs, so /api/cli/state
+// names the origin that actually reaches the tenant's services: the inbound hub
+// in dev/staging (DEV=1, no per-slug routing), the claimed slug host in prod.
+describe("GET /api/cli/state serviceBase", () => {
+  async function cliState(tenant: string, e: Record<string, unknown>, host = HOST): Promise<any> {
+    const token = await signAssertion({ tenant, exp: nowSec() + 300, kind: "cli", epoch: 0 }, SERVICE);
+    const ctx = createExecutionContext();
+    const res = await worker.fetch(
+      new Request(`https://${HOST}/api/cli/state`, { headers: { host, Authorization: `Bearer ${token}` } }),
+      e as any,
+      ctx,
+    );
+    await waitOnExecutionContext(ctx);
+    expect(res.status).toBe(200);
+    return res.json();
+  }
+
+  it("is the inbound hub under DEV=1 and the slug host in prod", async () => {
+    const tenant = `user_state_base_${++seq}`;
+    const dev = await cliState(tenant, env);
+    expect(dev.host).toMatch(/\.finchmcp\.com$/);
+    expect(dev.serviceBase).toBe(`https://${HOST}`);
+
+    const prod = await cliState(tenant, { ...env, DEV: undefined });
+    expect(prod.serviceBase).toBe(`https://${prod.host}`);
+  });
+
+  // Plain http only for a hub reached on this machine: the hostname must be
+  // exactly a loopback name, never merely start with one, or `finch connect`
+  // would write a bearer key into a client config pointed at plaintext http.
+  it("is http only for an exact loopback host", async () => {
+    const tenant = `user_state_loopback_${++seq}`;
+    for (const [host, want] of [
+      ["localhost:8787", "http://localhost:8787"],
+      ["localhost", "http://localhost"],
+      ["LOCALHOST:8787", "http://LOCALHOST:8787"],
+      ["127.0.0.1:8787", "http://127.0.0.1:8787"],
+      ["[::1]:8787", "http://[::1]:8787"],
+      ["localhost.example.com", "https://localhost.example.com"],
+      ["localhost-hub.example.com:8443", "https://localhost-hub.example.com:8443"],
+      ["127.0.0.1.nip.io", "https://127.0.0.1.nip.io"],
+      ["127.example.com", "https://127.example.com"],
+      // The whole 127.0.0.0/8 block is loopback (net.IP.IsLoopback agrees).
+      ["127.0.0.2:8787", "http://127.0.0.2:8787"],
+      ["127.255.255.254", "http://127.255.255.254"],
+      ["[0:0:0:0:0:0:0:1]:8787", "http://[0:0:0:0:0:0:0:1]:8787"],
+      ["128.0.0.1:8787", "https://128.0.0.1:8787"],
+      ["[::2]:8787", "https://[::2]:8787"],
+    ]) {
+      const st = await cliState(tenant, env, host);
+      expect(st.serviceBase, host).toBe(want);
+    }
+    // In prod a look-alike host is not local either: it gets the slug host.
+    const prod = await cliState(tenant, { ...env, DEV: undefined }, "localhost.example.com");
+    expect(prod.serviceBase).toBe(`https://${prod.host}`);
+  });
+});
+
+describe("isLoopbackHost", () => {
+  it("accepts localhost, 127.0.0.0/8 and ::1 by parsed address, nothing else", () => {
+    for (const h of [
+      "localhost",
+      "LocalHost:1",
+      "127.0.0.1",
+      "127.0.0.2:8787",
+      "127.1",
+      "0x7f.0.0.9",
+      "127.255.255.255",
+      "[::1]",
+      "[::1]:8787",
+      "[0:0:0:0:0:0:0:1]",
+    ]) {
+      expect(isLoopbackHost(h), h).toBe(true);
+    }
+    for (const h of [
+      "",
+      "localhost.example.com",
+      "127.0.0.1.nip.io",
+      "127.example.com",
+      "128.0.0.1",
+      "126.255.255.255",
+      "0.0.0.0",
+      "[::2]",
+      "[::ffff:127.0.0.1]",
+      "finchmcp.com",
+      "not a host",
+    ]) {
+      expect(isLoopbackHost(h), h).toBe(false);
+    }
   });
 });
