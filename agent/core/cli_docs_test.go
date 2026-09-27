@@ -145,6 +145,11 @@ func TestAgentDocsDetectAnOldFinch(t *testing.T) {
 		if !strings.Contains(doc[start:end], "shadows the new one") {
 			t.Fatalf("%s: the pre-check or install step does not cover a shadowing finch on PATH", name)
 		}
+		// 1.7.0 is the first release with the whole contract (login --cancel,
+		// the pending-login block, fail-closed service install).
+		if !strings.Contains(doc[start:end], "1.7.0") {
+			t.Fatalf("%s: the pre-check does not say to install finch 1.7.0 or later", name)
+		}
 	}
 	stdout, stderr, code := finch(t, "status", "--json")
 	if code != 0 || !strings.HasPrefix(stdout, `{"schema_version":1,`) {

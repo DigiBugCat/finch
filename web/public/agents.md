@@ -28,13 +28,15 @@ finch status --json
 ```
 
 - Exit code 127, or `command not found`: finch is not installed yet. Go to step 1.
-- The output has no `"schema_version":1`, or the command fails: this finch is
-  too old for these steps (older versions print `{"loggedIn":…}` without a
-  `schema_version`). Go to step 1 to install the current one, even though a
-  `finch` is already on `PATH`.
+- The output has no `"schema_version":1`, its `"version"` is below `1.7.0`, or
+  the command fails: this finch is too old for these steps (older versions
+  print `{"loggedIn":…}` without a `schema_version`). Go to step 1 and install
+  finch 1.7.0 or later, even though a `finch` is already on `PATH`.
 - `"loggedIn": true`: skip step 2.
 - `"login_pending": true`: a login is waiting for approval. Go to step 2 and
-  poll; do not start a new one.
+  poll; do not start a new one. While it is pending, `"loggedIn"` is `false`
+  even if an older login is saved, because that login is blocked until the
+  new one resolves.
 - `"ingress"` lists the services this machine already publishes, and
   `"service"` shows whether the background service is `installed` and `running`.
 
@@ -59,7 +61,7 @@ older copy in a root-owned `/usr/local/bin`, say), plain `finch` still runs the
 old binary. Use the full path the installer printed after `Next:` for every
 command in this session, and tell your human they can remove the old copy.
 Then run `finch status --json` again (by that path) and check that it has
-`"schema_version":1`.
+`"schema_version":1` and a `"version"` of `1.7.0` or later.
 
 ## 2. Log in (the one human step)
 
@@ -89,6 +91,15 @@ finch login --poll --json
 
 Keep polling until exit `0` or `11`. The login credential is saved for you in
 `~/.finch/`. You never see it, and you must never print, log, or paste it.
+
+Until the poll resolves, every other command exits `10` with
+`APPROVAL_PENDING`, even when an older login is saved: a started login may be
+for another account, so finch does not act on the old one in the meantime. If
+your human decides not to approve it, `finch login --cancel --json` drops the
+started login and the saved one works again.
+
+Plain `finch login` (no `--start`) blocks until approval and has no `--json`
+form. Always use `--start` and `--poll`.
 
 ## 3. Publish the service
 
@@ -124,12 +135,17 @@ Running it again is safe, and it is required after publishing another service
 with `finch add`: the service reads `finch.yml` only when it starts, and
 `install` restarts it. Check it at any time with `finch service status --json`.
 
+Exit `0` means `finch run` is running. If it does not come up, `install` exits
+`1` with `INTERNAL`; the unit stays installed, and `error.message` names the
+log to read and any reason finch already knows. A common one is a `finch run`
+already serving in a terminal: ask your human to stop it (Ctrl-C), then run
+`finch service install --json` again.
+
 On Linux, when the output has `"linger": false`, tell your human that
 `sudo loginctl enable-linger <user>` keeps finch running after they log out
 (it matters on a headless box). Do not run `sudo` yourself.
 
-If the output has `notes`, relay them. For example, a `finch run` already
-running in a terminal must be stopped so the service can take over.
+If the output has `notes`, relay them to your human.
 
 ## 5. Check it
 
@@ -167,15 +183,18 @@ and writes it into the client's configuration without printing it:
 
 | `--client` | What it does |
 |---|---|
-| `claude-code` | Runs `claude mcp add --transport http notes <url> --header "Authorization: Bearer <key>"`. Needs the `claude` CLI on `PATH`. |
+| `claude-code` | Adds `notes` to Claude Code for the current directory's project (`claude mcp add-json`, local scope). The key goes to `~/.finch/connect/notes.claude-code.json` (mode 0600), and the entry's `headersHelper` reads it from there, so the key never appears in a command line. Claude Code runs the helper only in a workspace your human has trusted. Needs the `claude` CLI on `PATH`. |
 | `cursor` | Adds `mcpServers.notes` to `~/.cursor/mcp.json`, keeping everything else. |
-| `codex` | Adds `[mcp_servers.notes]` to `~/.codex/config.toml`, keeping everything else. |
+| `codex` | Adds `[mcp_servers.notes]` to `~/.codex/config.toml`, keeping everything else. A name with a `.` is quoted: `[mcp_servers."notes.v2"]`. |
 | `json` | Prints an `mcpServers` JSON snippet, key included. Use it only for a client finch cannot configure, and write it straight into that client's config file. |
 
 Pick the client you are running in. The JSON output has a `key_id`, never the
-key. Running it again for `cursor` or `codex` is safe: it replaces the entry
-and revokes the key the old entry used (`revoked_key_ids`). The client usually has to reload its MCP servers (or restart) before the
-new server appears. Tell your human that.
+key. Running it again is safe for `claude-code`, `cursor` and `codex`: it
+replaces the entry and revokes the key the old entry used (`revoked_key_ids`),
+so re-running it is how you rotate a key. For `claude-code`, every project on
+this machine connected to the same service shares the headers file, so they
+all move to the new key. The client usually has to reload its MCP servers (or
+restart) before the new server appears. Tell your human that.
 
 ## Errors
 
@@ -192,12 +211,12 @@ When `next` is present, it is the command to run next. Exit codes are
 | Code | Exit | What it means | Next command |
 |---|---|---|---|
 | `NOT_LOGGED_IN` | 12 | No saved login, or it expired or was revoked. | `finch login --start --json`, then poll (step 2). |
-| `APPROVAL_PENDING` | 10 | A login was started but not approved yet. | `finch login --poll --json` every `interval` seconds. |
+| `APPROVAL_PENDING` | 10 | A login was started but not approved yet. It blocks every other command, even with an older login saved. | `finch login --poll --json` every `interval` seconds, or `finch login --cancel --json` to drop it. |
 | `EXPIRED` | 11 | The login code expired before approval. | `finch login --start --json` and show the new link. |
 | `NOT_FOUND` | 1 | The service, pending login, or client does not exist here. | The `next` field: `finch add …`, `finch login --start`, or `finch connect … --client json`. |
 | `UPSTREAM` | 1 | The hub or your MCP server failed: unreachable, offline, an HTTP error from the server itself, or an MCP error. | Check the local server is running, then `finch service status --json`; retry `finch test <name> --json`. If the message says the service is reachable but needs an MCP session, go on to `finch connect` (step 6). |
 | `USAGE` | 2 | The command line was wrong. | Fix the arguments; `finch help` lists every command. |
-| `INTERNAL` | 1 | A local problem, such as an unwritable file or a service manager error. | Read `message`; tell your human if you cannot fix it. |
+| `INTERNAL` | 1 | A local problem, such as an unwritable file, a service manager error, or a background service that did not start or stop. | Read `message`; tell your human if you cannot fix it. |
 
 ## Security rules
 
@@ -205,8 +224,9 @@ When `next` is present, it is the command to run next. Exit codes are
   including into chat, commit messages, or files you show your human. `finch
   connect` exists so you never handle a key. Use `--client json` only when no
   other client fits.
-- Never read or copy `~/.finch/cli.json`, `~/.finch/login-pending.json`, or the
-  per-service credential files. finch reads them; you do not need to.
+- Never read or copy `~/.finch/cli.json`, `~/.finch/login-pending.json`, the
+  `~/.finch/connect/` headers files, or the per-service credential files.
+  finch and your MCP client read them; you do not need to.
 - Only show your human the `verification_uri_complete` link and `user_code`.
   Never approve a login yourself, and never ask your human for their password.
 - Do not add `--public` unless your human asked for an open endpoint.
@@ -214,7 +234,8 @@ When `next` is present, it is the command to run next. Exit codes are
   machine, pipe it: `finch token | ssh host 'finch login --token -'`.
 - Publish only the local service your human named. finch forwards only
   `/<name>/mcp` unless the manifest sets `forward_all: true`.
-- To undo: `finch service uninstall` stops the background service,
+- To undo: `finch service uninstall` stops the background service (it exits
+  `1` and keeps the unit if finch could not be stopped),
   `finch rm notes` removes the service, and `finch keys revoke <key_id>` cuts
   off one client.
 

@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { env, runInDurableObject } from "cloudflare:test";
 import { hashKey } from "../src/auth";
+import { LATEST_AGENT } from "../src/types";
 
 // Drive the REAL TenantDO op logic through its fetch() RPC — exactly how
 // index.ts / api.ts call it (POST { op, ...args }). Each test names its own
@@ -129,12 +130,12 @@ describe("TenantDO.registerBox — box state", () => {
       service: "scraper",
       box: "box-1",
       os: "linux",
-      version: "1.6.0",
+      version: LATEST_AGENT,
     });
     const state = await op<any>(t, "getState");
     const ap = state.services.find((a: any) => a.id === "scraper");
     expect(ap.boxes).toHaveLength(1);
-    expect(ap.boxes[0].version).toBe("1.6.0");
+    expect(ap.boxes[0].version).toBe(LATEST_AGENT);
     expect(ap.boxes[0].outdated).toBe(false); // matches LATEST_AGENT
   });
 

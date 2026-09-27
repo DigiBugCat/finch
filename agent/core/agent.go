@@ -58,7 +58,7 @@ import (
 // `-ldflags "-X github.com/digibugcat/finch/agent/core.agentVersion=<v>"`; the
 // literal here is the source of truth that CI (scripts/check-versions.mjs)
 // asserts matches the worker's LATEST_AGENT and the web's copy. Keep them in sync.
-var agentVersion = "1.6.0"
+var agentVersion = "1.7.0"
 
 // connectSkew is how long before a connect-token's exp we treat it as already
 // expired and force a fresh /join, so we never dial with a token that lapses

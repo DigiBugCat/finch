@@ -48,11 +48,15 @@ finch connect notes --client claude-code              <span class="c"># wire it 
             </tr>
             <tr>
               <td><code>finch login --poll</code></td>
-              <td>Check the pending login once. Exit <code>0</code> when approved (the credential is saved and the pending file removed), <code>10</code> while it waits for approval, <code>11</code> once the code has expired. JSON: <code>{'{"status":"approved"|"pending"|"expired"}'}</code>.</td>
+              <td>Check the pending login once. Exit <code>0</code> when approved (the credential is saved and the pending file removed), <code>10</code> while it waits for approval, <code>11</code> once the code has expired. JSON: <code>{'{"status":"approved"|"pending"|"expired"}'}</code>. Until it resolves, every other command reports <code>APPROVAL_PENDING</code>, even when an older login is saved.</td>
+            </tr>
+            <tr>
+              <td><code>finch login --cancel</code></td>
+              <td>Drop a login started with <code>--start</code>. The saved login, if any, works again. JSON: <code>{'{"cancelled":true|false}'}</code>.</td>
             </tr>
             <tr>
               <td><code>finch login [--hub URL] [--headless]</code></td>
-              <td>The same login in one blocking step: prints the link and code, opens a browser unless <code>--headless</code>, and waits until you approve.</td>
+              <td>The same login in one blocking step: prints the link and code, opens a browser unless <code>--headless</code>, and waits until you approve. It has no <code>--json</code> form; scripts use <code>--start</code> and <code>--poll</code>.</td>
             </tr>
             <tr>
               <td><code>finch login --token -</code></td>
@@ -64,11 +68,11 @@ finch connect notes --client claude-code              <span class="c"># wire it 
             </tr>
             <tr>
               <td><code>finch service install</code></td>
-              <td>Run <code>finch run</code> as a login service that starts at login and restarts if it exits: a launchd LaunchAgent (<code>~/Library/LaunchAgents/com.finchmcp.finch.plist</code>) on macOS, a systemd user unit (<code>finch.service</code>) on Linux. Safe to run again. On a headless Linux box, <code>sudo loginctl enable-linger $USER</code> keeps it running after you log out.</td>
+              <td>Run <code>finch run</code> as a login service that starts at login and restarts if it exits: a launchd LaunchAgent (<code>~/Library/LaunchAgents/com.finchmcp.finch.plist</code>) on macOS, a systemd user unit (<code>finch.service</code>) on Linux. Safe to run again. It exits <code>1</code> if <code>finch run</code> does not come up (the unit stays installed; the message names the log). On a headless Linux box, <code>sudo loginctl enable-linger $USER</code> keeps it running after you log out.</td>
             </tr>
             <tr>
               <td><code>finch service status</code> / <code>uninstall</code></td>
-              <td>Report whether the service is installed and running, or stop and remove it.</td>
+              <td>Report whether the service is installed and running, or stop and remove it. <code>uninstall</code> exits <code>1</code> and keeps the unit if finch could not be stopped.</td>
             </tr>
             <tr>
               <td><code>finch run [--config finch.yml]</code></td>
@@ -97,7 +101,7 @@ ssh user@newbox "finch add api --service http://127.0.0.1:9000 && finch service 
           <tbody>
             <tr>
               <td><code>finch connect &lt;name&gt; --client claude-code</code></td>
-              <td>Mints a <code>finch_</code> key scoped to the service and runs <code>claude mcp add --transport http &lt;name&gt; &lt;url&gt; --header &quot;Authorization: Bearer &lt;key&gt;&quot;</code>. Needs the <code>claude</code> CLI on <code>PATH</code>.</td>
+              <td>Mints a <code>finch_</code> key scoped to the service, saves it to <code>~/.finch/connect/&lt;name&gt;.claude-code.json</code> (mode 0600), and adds the server to the current directory&apos;s Claude Code project with <code>claude mcp add-json</code>. The entry&apos;s <code>headersHelper</code> reads the key from that file, so the key never appears in a command line. Claude Code runs the helper only in a trusted workspace. Needs the <code>claude</code> CLI on <code>PATH</code>.</td>
             </tr>
             <tr>
               <td><code>finch connect &lt;name&gt; --client cursor</code></td>
@@ -119,10 +123,11 @@ ssh user@newbox "finch add api --service http://127.0.0.1:9000 && finch service 
         you can revoke one client with <code>finch keys revoke &lt;id&gt;</code> without
         touching the others. The client is checked before a key is minted, and a key
         whose setup fails is revoked again. A public service gets no key. Running
-        connect again for Cursor or Codex replaces the entry and revokes the key the
-        old entry used (listed as <code>revoked_key_ids</code> in <code>--json</code>).
-        Claude Code keeps entries per project, so for it you remove the old entry
-        with <code>claude mcp remove</code> and revoke its key yourself.
+        connect again for Claude Code, Cursor or Codex replaces the entry and revokes
+        the key the old entry used (listed as <code>revoked_key_ids</code> in{' '}
+        <code>--json</code>), so re-running it rotates the key. Every Claude Code
+        project on the machine connected to the same service shares the one headers
+        file, so they all move to the new key.
       </p>
 
       <h2>Inspect</h2>
@@ -273,7 +278,7 @@ finch call notes search --args '{"q":"finch"}'`}</Code>
 <span class="o"> "ingress":[{"app_path":"notes","service":"http://127.0.0.1:8000"}],</span>
 <span class="o"> "loggedIn":true,"login_pending":false,</span>
 <span class="o"> "service":{"installed":true,"manager":"launchd","running":true,"unit":"…"},</span>
-<span class="o"> "tenant":"user_2abc…","version":"1.6.0"}</span>`}</Code>
+<span class="o"> "tenant":"user_2abc…","version":"1.7.0"}</span>`}</Code>
 
       <h2>finch.yml</h2>
       <p>
