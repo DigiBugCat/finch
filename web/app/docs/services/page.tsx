@@ -58,7 +58,8 @@ finch service uninstall    <span class="c"># stop and remove it</span>`}</Code>
       <p>
         On macOS this writes a LaunchAgent at{' '}
         <code>~/Library/LaunchAgents/com.finchmcp.finch.plist</code> and logs to{' '}
-        <code>~/.finch/finch.log</code>. On Linux it writes a systemd user unit,{' '}
+        <code>~/.finch/finch.log</code> (moved to <code>finch.log.1</code> when a start finds it over
+        10 MiB). On Linux it writes a systemd user unit,{' '}
         <code>finch.service</code>; read its log with{' '}
         <code>journalctl --user -u finch.service</code>. Either way it needs no root,
         starts at login, restarts <code>finch run</code> if it exits, and serves the{' '}

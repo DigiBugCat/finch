@@ -262,6 +262,10 @@ func Main() {
 	// `run`/`join`/bare flags fall through to the relay agent below.
 	cliMain(os.Args[1:])
 
+	// Under the LaunchAgent, keep ~/.finch/finch.log bounded (launchd never
+	// rotates it). A no-op anywhere else: only the plist sets FINCH_LOG_FILE.
+	rotateServiceLogAtStart()
+
 	hostName, _ := os.Hostname()
 	defaultHub := agentDefaultHub()
 	defaultBox := agentDefaultBox(hostName)

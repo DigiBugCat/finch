@@ -112,6 +112,9 @@ func TestServiceInstallLaunchd(t *testing.T) {
 		"<key>RunAtLoad</key>\n\t<true/>",
 		"<key>KeepAlive</key>\n\t<true/>",
 		"<string>" + filepath.Join(home, ".finch", "finch.log") + "</string>",
+		// Not Background: the serve sits on the path of every relayed call.
+		"<key>ProcessType</key>\n\t<string>Standard</string>",
+		"<key>FINCH_LOG_FILE</key>\n\t\t<string>" + filepath.Join(home, ".finch", "finch.log") + "</string>",
 	} {
 		if !strings.Contains(plist, want) {
 			t.Fatalf("plist lacks %q:\n%s", want, plist)
@@ -279,6 +282,56 @@ func TestServiceInstallFailures(t *testing.T) {
 			t.Fatalf("exit=%d stderr=%q", code, stderr)
 		}
 	})
+}
+
+func TestRotateServiceLog(t *testing.T) {
+	dir := t.TempDir()
+	log := filepath.Join(dir, "finch.log")
+	write := func(p, s string) {
+		t.Helper()
+		if err := os.WriteFile(p, []byte(s), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Under the cap, unset, or relative: nothing happens.
+	write(log, "small\n")
+	for _, p := range []string{log, "", "finch.log"} {
+		if f := rotateServiceLog(p, 100); f != nil {
+			t.Fatalf("rotated %q under the cap", p)
+		}
+	}
+	if mustRead(t, log) != "small\n" || fileExists(log+".1") {
+		t.Fatal("an under-cap log was touched")
+	}
+
+	// Over the cap: the log becomes .1 (replacing an older .1) and a fresh,
+	// appendable log is returned.
+	write(log+".1", "older\n")
+	write(log, strings.Repeat("x", 101))
+	f := rotateServiceLog(log, 100)
+	if f == nil {
+		t.Fatal("an over-cap log was not rotated")
+	}
+	defer f.Close()
+	if _, err := f.WriteString("fresh\n"); err != nil {
+		t.Fatal(err)
+	}
+	if mustRead(t, log+".1") != strings.Repeat("x", 101) || mustRead(t, log) != "fresh\n" {
+		t.Fatalf("after rotation: log=%q .1=%q", mustRead(t, log), mustRead(t, log+".1"))
+	}
+	if got := fileMode(t, log); got != 0o600 {
+		t.Fatalf("fresh log mode=%04o", got)
+	}
+
+	// A symlinked log is left alone rather than renamed out from under the link.
+	link := filepath.Join(dir, "linked.log")
+	if err := os.Symlink(log+".1", link); err != nil {
+		t.Fatal(err)
+	}
+	if f := rotateServiceLog(link, 100); f != nil {
+		t.Fatal("rotated a symlink")
+	}
 }
 
 func TestResolveUpdateRestartModeUsesManagedService(t *testing.T) {

@@ -15,6 +15,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"os/user"
@@ -89,6 +90,49 @@ func systemdUnitPath() string {
 }
 
 func serviceLogPath() string { return filepath.Join(finchHome(), "finch.log") }
+
+// serviceLogEnv names the log file launchd appends `finch run`'s output to.
+// The LaunchAgent sets it so the serve can keep that file bounded.
+const serviceLogEnv = "FINCH_LOG_FILE"
+
+// maxServiceLogBytes caps finch.log: launchd never rotates StandardOutPath, and
+// a crash-looping service (KeepAlive, every ThrottleInterval) appends forever.
+const maxServiceLogBytes = 10 << 20
+
+// rotateServiceLog runs as `finch run` starts under the LaunchAgent. When the
+// log has grown past max it becomes <log>.1 (replacing the previous one) and a
+// fresh log is opened for this process's output, so the file stays bounded at
+// about twice max across restarts. It returns the fresh log, or nil when
+// nothing was rotated or the fresh log could not be opened.
+func rotateServiceLog(path string, max int64) *os.File {
+	if path == "" || !filepath.IsAbs(path) {
+		return nil
+	}
+	st, err := os.Lstat(path)
+	if err != nil || !st.Mode().IsRegular() || st.Size() <= max {
+		return nil
+	}
+	if err := os.Rename(path, path+".1"); err != nil {
+		return nil
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+	if err != nil {
+		return nil
+	}
+	return f
+}
+
+// rotateServiceLogAtStart moves this process's Go-level output (os.Stdout,
+// os.Stderr, the log package) to a freshly rotated service log. launchd's own
+// file descriptors keep pointing at <log>.1 until the next start.
+func rotateServiceLogAtStart() {
+	path := os.Getenv(serviceLogEnv)
+	if f := rotateServiceLog(path, maxServiceLogBytes); f != nil {
+		os.Stdout, os.Stderr = f, f
+		log.SetOutput(f)
+		log.Printf("finch: rotated %s (over %d MiB) to %s.1", path, maxServiceLogBytes>>20, path)
+	}
+}
 
 func fileExists(p string) bool {
 	_, err := os.Stat(p)
@@ -431,7 +475,12 @@ func launchdPlist(bin, manifest, workDir, logPath string) []byte {
 	<key>ThrottleInterval</key>
 	<integer>10</integer>
 	<key>ProcessType</key>
-	<string>Background</string>
+	<string>Standard</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>` + serviceLogEnv + `</key>
+		<string>` + xmlText(logPath) + `</string>
+	</dict>
 	<key>StandardOutPath</key>
 	<string>` + xmlText(logPath) + `</string>
 	<key>StandardErrorPath</key>
