@@ -79,7 +79,14 @@ npm run dev          # http://localhost:3000  (run the hub in worker/ first)
 | `npm run lint` | eslint |
 | `npm test` | vitest (BFF auth, the signAssertion↔hub contract, the hub transport, …) |
 | `npm run build` | `next build` |
-| `npm run deploy` | OpenNext build + deploy to Cloudflare |
+| `npm run deploy` | preflight, then OpenNext build + deploy to Cloudflare |
+
+`scripts/deploy-preflight.mjs` runs first on every staging/production deploy.
+Besides the secret and Clerk-key checks, it refuses to deploy until every
+static file the landing points at exists in `public/` (`agents.md`,
+`llms.txt`; the list is `scripts/landing-files.mjs`). The copied agent prompt
+starts with "Read https://finchmcp.com/agents.md", so shipping the landing
+without that file would hand every agent a 404 on its first step.
 
 ## Layout
 
