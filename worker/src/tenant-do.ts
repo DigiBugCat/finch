@@ -440,6 +440,9 @@ export class TenantDO extends DurableObject<Env> {
         service: a.id,
         serviceLabel: a.label,
         outdated: m.version !== LATEST_AGENT,
+        // The unified liveness rule, stated here so readers (the web's /fleet
+        // page) never re-derive it from connected + state.
+        online: boxOnline(m),
         // Derive the relative-time display strings on read from stored epoch-ms.
         lastSeen: timeAgo(m.lastSeenAt, now),
         handshake: timeAgo(m.handshakeAt, now),

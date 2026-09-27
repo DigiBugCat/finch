@@ -581,9 +581,12 @@ async function handleApiInner(
   // GET /api/state — the tenant's full state. (A `viewer` query parameter used
   // to narrow it for a shared member; there are no members to narrow for, and
   // a scoped read no longer echoes viewerScoped, so an old web fails closed.)
+  // serviceBase is the origin callers reach this tenant's services on, the
+  // same value /api/cli/state hands `finch fleet`, so the web's /fleet page
+  // prints exactly the public URLs the CLI does (<serviceBase>/<id>/mcp).
   if (method === "GET" && seg.length === 1 && seg[0] === "state") {
     const state = await tenantOp<TenantState>(env, tenant, "getState");
-    return json(200, state);
+    return json(200, { ...state, serviceBase: hostBase(env, host, state?.host).http });
   }
 
   // GET /api/slug-available?slug=foo — claim-free availability check for the
