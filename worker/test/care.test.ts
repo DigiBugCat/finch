@@ -4,7 +4,8 @@ import {
   createExecutionContext,
   waitOnExecutionContext,
 } from "cloudflare:test";
-import worker, { LOCAL_SERVICE_DOWN } from "../src/index";
+import worker, { LEGACY_URL_ERROR_RE, LOCAL_SERVICE_DOWN } from "../src/index";
+import { RELAY_ERROR_HEADER } from "../src/box-do";
 import { signAssertion } from "../src/auth";
 import { LATEST_AGENT } from "../src/types";
 
@@ -138,7 +139,71 @@ describe("a local service that is down", () => {
     });
   }
 
-  it("passes the local service's own 502 through untouched", async () => {
+  // A 1.7 agent reports any failed upstream request as Go's *url.Error text,
+  // `<Method> "<url>": <cause>`, for whatever method the caller used, and the
+  // cause need not mention a dial (TLS, EOF). None of it may reach a caller.
+  for (const message of [
+    'Propfind "https://internal-host.lan:8443/dav/": tls: failed to verify certificate: x509: certificate signed by unknown authority',
+    'Frobnicate "http://10.0.0.5:9000/x": EOF',
+    'M-search "http://192.168.1.4:1900/*": read: connection reset by peer',
+    'Get "http://127.0.0.1:8000/a\\"b": net/http: timeout awaiting response headers',
+  ]) {
+    it(`redacts a 1.7 agent's URL error for any method (${message.split(" ")[0]})`, async () => {
+      const { host, base, service, agent, key } = await standUp();
+      const frame = nextFrame(agent);
+      const pending = call(mcp(base, host, service, key));
+      const req = await frame;
+      agent.send(JSON.stringify({ id: req.id, type: "err", status: 502, message }));
+      const res = await pending;
+      expect(res.status).toBe(502);
+      const text = await res.text();
+      expect(JSON.parse(text)).toEqual({ error: LOCAL_SERVICE_DOWN, service });
+      for (const leak of ["internal-host", "10.0.0.5", "192.168.1.4", "127.0.0.1"]) expect(text).not.toContain(leak);
+      expect(res.headers.get(RELAY_ERROR_HEADER)).toBeNull();
+      agent.close(1000, "done");
+    });
+  }
+
+  it("matches Go's URL error by structure, not by a list of methods", () => {
+    for (const op of ["Get", "Post", "Propfind", "Mkcol", "Report", "Frobnicate", "M-search", "X_custom!"]) {
+      expect(LEGACY_URL_ERROR_RE.test(`${op} "https://internal/x": boom`)).toBe(true);
+    }
+    for (const text of [
+      "upstream exploded",
+      "dial tcp 127.0.0.1:8000: connect: connection refused",
+      'bad gateway "https://x/": boom', // a space is not part of a method token
+      'Get "not-a-url": boom',
+    ]) {
+      expect(LEGACY_URL_ERROR_RE.test(text)).toBe(false);
+    }
+  });
+
+  // The local service's own response (a head frame) passes through untouched,
+  // whatever its status, content type and body: even a bare text/plain 502
+  // that reads exactly like a connection failure is the service's answer.
+  for (const body of [
+    "upstream exploded",
+    "502 Bad Gateway: dial tcp 127.0.0.1:9001: connect: connection refused",
+    'Post "http://backend:8080/api": dial tcp: lookup backend: no such host',
+    LOCAL_SERVICE_DOWN,
+  ]) {
+    it(`passes the local service's own text/plain 502 through untouched (${body.slice(0, 24)}…)`, async () => {
+      const { host, base, service, agent, key } = await standUp();
+      const frame = nextFrame(agent);
+      const pending = call(mcp(base, host, service, key));
+      const req = await frame;
+      agent.send(JSON.stringify({ id: req.id, type: "head", status: 502, headers: [["content-type", "text/plain"]] }));
+      agent.send(JSON.stringify({ id: req.id, type: "chunk", data: btoa(body) }));
+      agent.send(JSON.stringify({ id: req.id, type: "end" }));
+      const res = await pending;
+      expect(res.status).toBe(502);
+      expect(res.headers.get("content-type")).toBe("text/plain");
+      expect(await res.text()).toBe(body);
+      agent.close(1000, "done");
+    });
+  }
+
+  it("passes the local service's own 502 through untouched, other headers included", async () => {
     const { host, base, service, agent, key } = await standUp();
     const frame = nextFrame(agent);
     const pending = call(mcp(base, host, service, key));
@@ -150,6 +215,38 @@ describe("a local service that is down", () => {
     expect(res.status).toBe(502);
     expect(res.headers.get("x-app")).toBe("1");
     expect(await res.text()).toBe("upstream exploded");
+    agent.close(1000, "done");
+  });
+
+  it("does not let a local service forge the agent-error provenance header", async () => {
+    const { host, base, service, agent, key } = await standUp();
+    const frame = nextFrame(agent);
+    const pending = call(mcp(base, host, service, key));
+    const req = await frame;
+    agent.send(JSON.stringify({
+      id: req.id, type: "head", status: 502,
+      headers: [["content-type", "text/plain"], [RELAY_ERROR_HEADER, "agent"]],
+    }));
+    agent.send(JSON.stringify({ id: req.id, type: "chunk", data: btoa(LOCAL_SERVICE_DOWN) }));
+    agent.send(JSON.stringify({ id: req.id, type: "end" }));
+    const res = await pending;
+    expect(res.status).toBe(502);
+    expect(res.headers.get("content-type")).toBe("text/plain");
+    expect(res.headers.get(RELAY_ERROR_HEADER)).toBeNull();
+    expect(await res.text()).toBe(LOCAL_SERVICE_DOWN);
+    agent.close(1000, "done");
+  });
+
+  it("passes other agent errors through as text, without the provenance header", async () => {
+    const { host, base, service, agent, key } = await standUp();
+    const frame = nextFrame(agent);
+    const pending = call(mcp(base, host, service, key));
+    const req = await frame;
+    agent.send(JSON.stringify({ id: req.id, type: "err", status: 429, message: "too many in-flight relay requests" }));
+    const res = await pending;
+    expect(res.status).toBe(429);
+    expect(res.headers.get(RELAY_ERROR_HEADER)).toBeNull();
+    expect(await res.text()).toBe("too many in-flight relay requests");
     agent.close(1000, "done");
   });
 

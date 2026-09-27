@@ -16,7 +16,7 @@
 //     BoxDO by THAT tenant id. Unknown slug FAILS CLOSED (404). The
 //     DEFAULT_TENANT fallback exists ONLY for local dev (env.DEV === "1").
 
-import { BoxDO, readBoundedBody } from "./box-do";
+import { BoxDO, RELAY_ERROR_HEADER, readBoundedBody } from "./box-do";
 import { TenantDO } from "./tenant-do";
 import { RouterDO, routerLookup } from "./router-do";
 import { handleApi, isApiPath, isLoopbackHost } from "./api";
@@ -395,33 +395,42 @@ export function rateLimited(message = "rate limited"): Response {
 // names the machine's loopback URL. Both become this JSON.
 export const LOCAL_SERVICE_DOWN =
   "finch reached the machine, but the local service isn't answering";
-const GO_URL_ERROR_RE =
-  /^(?:Get|Post|Put|Patch|Delete|Head|Options|Connect|Trace) "[a-z]+:\/\//;
 
-/** Turn the relay DO's bare-text err-frame answer (the agent failed before
- *  the local service produced a response) into a JSON error that never
- *  names the machine's local URL. A response the local service itself sent
- *  (a head frame) carries its own headers, so it never matches, and is
- *  returned untouched. */
-async function classifyRelayError(res: Response, service: string): Promise<Response> {
-  if (res.status !== 502 && res.status !== 403) return res;
-  const ct = res.headers.get("content-type") || "";
-  const bare = [...res.headers.keys()].every((k) => k === "content-type" || k === "content-length");
-  if (!bare || !ct.startsWith("text/plain")) return res;
+/** A pre-1.8 agent's err frame for a failed upstream request: Go's
+ *  *url.Error text, `<Method> "<url>": <cause>`. net/http writes the method
+ *  with only its first letter upper-case (`Propfind`, `M-search`), and any
+ *  RFC 9110 token is a valid method, so the verb is matched as a token, not
+ *  from a list. Every such failure (dial, TLS, reset) names the upstream URL. */
+export const LEGACY_URL_ERROR_RE =
+  /^[!#$%&'*+.^_`|~0-9A-Za-z-]+ "[A-Za-z][A-Za-z0-9+.-]*:\/\/(?:[^"\\]|\\.)*": /;
+
+/** Turn an agent's err-frame answer (the agent failed before the local
+ *  service produced a response) into a JSON error that never names the
+ *  machine's local URL. Only the BoxDO's RELAY_ERROR_HEADER says an answer
+ *  came from an err frame, and only "agent" means the agent itself reported
+ *  it; a response the local service sent (a head frame) never carries the
+ *  header and is returned untouched, whatever its status, type or body. */
+export async function classifyRelayError(res: Response, service: string): Promise<Response> {
+  const origin = res.headers.get(RELAY_ERROR_HEADER);
+  if (origin === null) return res;
   const text = await res.text();
-  if (res.status === 502 && (text === LOCAL_SERVICE_DOWN || GO_URL_ERROR_RE.test(text) || /\bdial tcp\b|connection refused/.test(text))) {
-    return json(502, { error: LOCAL_SERVICE_DOWN, service });
+  if (origin === "agent") {
+    if (res.status === 502 && (text === LOCAL_SERVICE_DOWN || LEGACY_URL_ERROR_RE.test(text))) {
+      return json(502, { error: LOCAL_SERVICE_DOWN, service });
+    }
+    if (res.status === 502 && text === "the local service redirected outside what finch forwards") {
+      return json(502, { error: text, service });
+    }
+    if (res.status === 403 && text.startsWith("rejected path")) {
+      return json(403, {
+        error: "finch does not forward this path for this service (only its MCP endpoint, unless the service was added with --forward-all)",
+        service,
+      });
+    }
   }
-  if (res.status === 502 && text === "the local service redirected outside what finch forwards") {
-    return json(502, { error: text, service });
-  }
-  if (res.status === 403 && text.startsWith("rejected path")) {
-    return json(403, {
-      error: "finch does not forward this path for this service (only its MCP endpoint, unless the service was added with --forward-all)",
-      service,
-    });
-  }
-  return new Response(text, { status: res.status, headers: res.headers });
+  const headers = new Headers(res.headers);
+  headers.delete(RELAY_ERROR_HEADER);
+  return new Response(text, { status: res.status, headers });
 }
 
 /** The 503 for a service with no connected machine. X-Finch-Offline stays on
