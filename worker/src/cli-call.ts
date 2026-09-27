@@ -13,12 +13,19 @@
 // single response.
 //
 // The exchange:
-//   1. POST initialize (protocolVersion 2025-11-25). Reply is JSON or SSE; we
-//      keep Mcp-Session-Id and the negotiated protocolVersion.
+//   1. POST initialize (protocolVersion 2025-11-25 in the body, and no
+//      MCP-Protocol-Version header: the spec only asks for it after
+//      initialization, the official clients leave it off, and servers that
+//      check it on every POST — the Go SDK up to v1.1.0 knows nothing past
+//      2025-06-18 — would refuse the handshake with a plain-text 400). Reply
+//      is JSON or SSE; we keep Mcp-Session-Id and the negotiated
+//      protocolVersion.
 //   2. POST notifications/initialized.
 //   3. POST the real request with the session id + MCP-Protocol-Version (and
 //      Mcp-Method / Mcp-Name when the negotiated version is 2026-07-28+).
 //   4. Best-effort DELETE of the session (405 and every other outcome ignored).
+//      Once a session exists, steps 2-3 stop a little before the deadline so
+//      the DELETE still fits inside it, even when the call itself times out.
 // If initialize is refused the way a 2026-07-28-only server refuses it (405,
 // or a modern JSON-RPC error such as -32022 UnsupportedProtocolVersion), the
 // request is retried statelessly: `_meta` carries protocolVersion /
@@ -42,7 +49,9 @@ export const CLI_CALL_DEADLINE_MS = 25_000;
 /** Cap on the bytes read from any single upstream response (JSON or SSE).
  *  Same ceiling as the relay's request-body cap (MAX_RELAY_BODY_BYTES). */
 export const CLI_CALL_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
-/** How long the best-effort session DELETE may take at most. */
+/** How long the best-effort session DELETE may take at most. Once a session
+ *  exists, this much (or a tenth of a shorter deadline) is held back from the
+ *  exchange so a timed-out call still closes its session. */
 const DELETE_BUDGET_MS = 2_000;
 
 /** One HTTP exchange with the service's MCP endpoint through the relay. The
@@ -83,8 +92,12 @@ export async function cliMcpCall(
   params: Json,
   opts: CliCallOptions = {},
 ): Promise<Response> {
+  const budget = opts.deadlineMs ?? CLI_CALL_DEADLINE_MS;
+  const end = Date.now() + budget;
   const client = new Client(send, {
-    deadline: Date.now() + (opts.deadlineMs ?? CLI_CALL_DEADLINE_MS),
+    deadline: end,
+    hardDeadline: end,
+    deleteReserve: Math.min(DELETE_BUDGET_MS, Math.floor(budget / 10)),
     maxBytes: opts.maxResponseBytes ?? CLI_CALL_MAX_RESPONSE_BYTES,
   });
   const label = opts.service || "the service";
@@ -110,10 +123,20 @@ class Client {
   private nextId = 1;
   constructor(
     private send: McpSend,
-    private limits: { deadline: number; maxBytes: number },
+    private limits: {
+      /** When the current step gives up (CallTimeout). */
+      deadline: number;
+      /** The overall end of the exchange, the session DELETE included. */
+      hardDeadline: number;
+      /** Held back from the exchange for the DELETE once a session exists. */
+      deleteReserve: number;
+      maxBytes: number;
+    },
   ) {}
 
   async run(rpcMethod: string, params: Json): Promise<Response> {
+    // No MCP-Protocol-Version header here: the version is negotiated in the
+    // body, and the header only follows once it is known (see the top).
     const init = await this.request(
       "initialize",
       {
@@ -121,7 +144,7 @@ class Client {
         capabilities: {},
         clientInfo: CLIENT_INFO,
       },
-      { "MCP-Protocol-Version": LEGACY_PROTOCOL_VERSION },
+      {},
     );
 
     if (isOk(init.status) && init.rpc && isObject(init.rpc.result)) {
@@ -150,6 +173,10 @@ class Client {
     const session: Record<string, string> = { "MCP-Protocol-Version": negotiated };
     if (init.sessionId) session["Mcp-Session-Id"] = init.sessionId;
     const modern = negotiated >= MODERN_PROTOCOL_VERSION;
+    // There is a session to close now: keep time for its DELETE.
+    if (init.sessionId) {
+      this.limits.deadline = this.limits.hardDeadline - this.limits.deleteReserve;
+    }
 
     try {
       await this.notify(
@@ -251,7 +278,7 @@ class Client {
   }
 
   private async closeSession(session: Record<string, string>): Promise<void> {
-    const remaining = this.limits.deadline - Date.now();
+    const remaining = this.limits.hardDeadline - Date.now();
     if (remaining <= 0) return;
     const ctl = new AbortController();
     try {
@@ -322,7 +349,14 @@ class Client {
   ): Promise<Json | undefined> {
     const reader = body.getReader();
     const decoder = new TextDecoder();
-    let buf = "";
+    // The current, still unterminated line, kept as the decoded pieces it
+    // arrived in. Each chunk is searched for terminators once and the pieces
+    // are joined once per line, so a long line in small chunks stays linear
+    // (growing one string and scanning it again per chunk is quadratic).
+    let pending: string[] = [];
+    // The last chunk ended in "\r", already taken as a line end: a "\n"
+    // opening the next chunk is the rest of that "\r\n", not a blank line.
+    let skipLF = false;
     let data: string[] = [];
     let total = 0;
     let found: Json | undefined;
@@ -353,28 +387,39 @@ class Client {
       // event / id / retry are irrelevant here: every event's data is JSON-RPC
     };
 
+    const feed = async (text: string): Promise<void> => {
+      if (text === "") return;
+      let i = 0;
+      if (skipLF) {
+        skipLF = false;
+        if (text.startsWith("\n")) i = 1;
+      }
+      const re = /\r\n|\n|\r/g;
+      re.lastIndex = i;
+      let m: RegExpExecArray | null;
+      while (!found && (m = re.exec(text))) {
+        const piece = text.slice(i, m.index);
+        const line = pending.length ? pending.join("") + piece : piece;
+        pending = [];
+        i = m.index + m[0].length;
+        if (m[0] === "\r" && i === text.length) skipLF = true;
+        await onLine(line);
+      }
+      if (!found && i < text.length) pending.push(text.slice(i));
+    };
+
     try {
       while (!found) {
         const { done, value } = await this.read(reader);
         if (done) {
-          buf += decoder.decode();
-          for (const line of buf.split(/\r\n|\n|\r/)) await onLine(line);
-          await dispatch();
+          await feed(decoder.decode());
+          if (!found && pending.length) await onLine(pending.join(""));
+          if (!found) await dispatch();
           break;
         }
         total += value.byteLength;
         if (total > this.limits.maxBytes) throw new TooLarge();
-        buf += decoder.decode(value, { stream: true });
-        // Only split on terminators we have fully seen; a trailing "\r" may
-        // be the first half of "\r\n", so keep it in the buffer.
-        let m: RegExpExecArray | null;
-        const re = /\r\n|\n|\r(?!$)/g;
-        let last = 0;
-        while (!found && (m = re.exec(buf))) {
-          await onLine(buf.slice(last, m.index));
-          last = m.index + m[0].length;
-        }
-        buf = buf.slice(last);
+        await feed(decoder.decode(value, { stream: true }));
       }
     } catch (e) {
       await reader.cancel().catch(() => {});

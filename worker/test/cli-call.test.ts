@@ -9,6 +9,10 @@
 //     out a session id and answers DELETE with 405.
 //   - modernServer: a 2026-07-28-only stateless server: no initialize, no
 //     sessions, `_meta` + mirrored Mcp-* headers required, -32020 / -32022.
+//   - goSdkServer: the Go SDK (v0.x - v1.1.0) streamable handler, which checks
+//     MCP-Protocol-Version on EVERY POST, initialize included, against
+//     2025-06-18 / 2025-03-26 / 2024-11-05 and refuses anything else with a
+//     text/plain 400.
 // Most tests drive cliMcpCall directly; the last block goes through the real
 // worker route with a CLI token and a fake SELF binding.
 import { describe, it, expect } from "vitest";
@@ -285,6 +289,67 @@ function modernServer(opts: { initialize405?: boolean } = {}) {
   return { handle, seen };
 }
 
+/** Mirrors go-sdk v0.8.0 mcp/streamable.go ServeHTTP: a missing header counts
+ *  as 2025-03-26; an unknown one is http.Error(400) before the body is read. */
+function goSdkServer() {
+  const seen: Seen[] = [];
+  const supported = ["2025-06-18", "2025-03-26", "2024-11-05"];
+  const handle = async (req: Request): Promise<Response> => {
+    const headers = headersOf(req);
+    if (req.method === "DELETE") {
+      seen.push({ method: "DELETE", headers });
+      return new Response(null, { status: 204 });
+    }
+    const body = await bodyOf(req);
+    seen.push({ method: "POST", headers, body });
+    const pv = headers["mcp-protocol-version"] || "2025-03-26";
+    if (!supported.includes(pv)) {
+      return new Response(
+        `Bad Request: Unsupported protocol version (supported versions: ${supported.join(",")})\n`,
+        { status: 400, headers: { "content-type": "text/plain; charset=utf-8" } },
+      );
+    }
+    if (body?.method === "initialize") {
+      const res = {
+        jsonrpc: "2.0",
+        id: body.id,
+        result: { protocolVersion: "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "go", version: "0.8.0" } },
+      };
+      return new Response(sseEvent(res, "\n"), {
+        headers: { "content-type": "text/event-stream", "mcp-session-id": "go-session" },
+      });
+    }
+    if (headers["mcp-session-id"] !== "go-session") return new Response("session not found", { status: 404 });
+    if (!("id" in body!)) return new Response(null, { status: 202 });
+    const res =
+      body!.method === "tools/list"
+        ? { jsonrpc: "2.0", id: body!.id, result: { tools: TOOLS } }
+        : callTool(body!);
+    return new Response(sseEvent(res, "\n"), { headers: { "content-type": "text/event-stream" } });
+  };
+  return { handle, seen };
+}
+
+/** A text/event-stream answer that reaches the reader in exactly
+ *  `size`-byte chunks. A plain object rather than a Response: wrapping the
+ *  stream in a workerd Response would coalesce the chunks. */
+function chunkedSse(text: string, size: number): Response {
+  const bytes = new TextEncoder().encode(text);
+  let off = 0;
+  const body = new ReadableStream<Uint8Array>({
+    pull(ctl) {
+      if (off >= bytes.length) return ctl.close();
+      ctl.enqueue(bytes.slice(off, off + size));
+      off += size;
+    },
+  });
+  return {
+    status: 200,
+    headers: new Headers({ "content-type": "text/event-stream" }),
+    body,
+  } as unknown as Response;
+}
+
 /** Adapt a Request handler into the McpSend cli-call uses. */
 function sender(handle: (r: Request) => Promise<Response>): McpSend {
   return (init) =>
@@ -346,7 +411,9 @@ describe("cli call: Python-SDK-like stateful server", () => {
     ]);
     const init = p[0];
     expect(init.headers["accept"]).toBe("application/json, text/event-stream");
-    expect(init.headers["mcp-protocol-version"]).toBe("2025-11-25");
+    // The version is offered in the body; the header only follows once it
+    // is negotiated.
+    expect(init.headers["mcp-protocol-version"]).toBeUndefined();
     expect(init.body!.params).toEqual({
       protocolVersion: "2025-11-25",
       capabilities: {},
@@ -382,6 +449,39 @@ describe("cli call: Python-SDK-like stateful server", () => {
     expect(status).toBe(200);
     expect(body.error).toEqual({ code: -32602, message: "Unknown tool: nope" });
     expect(body.result).toBeUndefined();
+  });
+});
+
+describe("cli call: Go-SDK-like server (checks MCP-Protocol-Version on initialize too)", () => {
+  it("handshakes without the header, then carries the negotiated 2025-06-18", async () => {
+    const go = goSdkServer();
+    const { status, body } = await run(go.handle, "tools/call", { name: "echo", arguments: { q: 1 } });
+    expect(status).toBe(200);
+    expect(body.result.content[0].text).toBe('echo:{"q":1}');
+    const methods = go.seen.map((s) => (s.method === "DELETE" ? "DELETE" : s.body!.method));
+    expect(methods).toEqual(["initialize", "notifications/initialized", "tools/call", "DELETE"]);
+    expect(go.seen[0].headers["mcp-protocol-version"]).toBeUndefined();
+    for (const s of go.seen.slice(1)) {
+      expect(s.headers["mcp-protocol-version"]).toBe("2025-06-18");
+      expect(s.headers["mcp-session-id"]).toBe("go-session");
+    }
+  });
+
+  it("the fake refuses a 2025-11-25 header on initialize, as go-sdk v0.8.0 does", async () => {
+    const go = goSdkServer();
+    const res = await go.handle(
+      new Request("https://hub.test/svc/mcp", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          accept: "application/json, text/event-stream",
+          "mcp-protocol-version": "2025-11-25",
+        },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }),
+      }),
+    );
+    expect(res.status).toBe(400);
+    expect(await res.text()).toContain("Unsupported protocol version");
   });
 });
 
@@ -533,7 +633,46 @@ describe("cli call: failures keep the status the CLI classifies on", () => {
     expect(status).toBe(504);
     expect(body.error).toMatch(/did not answer tools\/list/);
     expect(Date.now() - started).toBeLessThan(5_000);
-    expect(deletes).toBe(0); // the budget is spent; the server expires the session
+    // Time was held back from the call, so the session is still closed.
+    expect(deletes).toBe(1);
+  });
+
+  it("an SSE line split between \\r and \\n across chunks is still one terminator", async () => {
+    const handle = async (req: Request) => {
+      const b = (await bodyOf(req))!;
+      if (b.method === "initialize") {
+        return jsonRes(200, { jsonrpc: "2.0", id: b.id, result: { protocolVersion: "2025-11-25", capabilities: {} } });
+      }
+      if (!("id" in b)) return new Response(null, { status: 202 });
+      // 1-byte chunks: every "\r" arrives alone, its "\n" in the next chunk.
+      return chunkedSse(
+        `: hi\r\n\r\n${sseEvent({ jsonrpc: "2.0", method: "notifications/message", params: {} })}` +
+          sseEvent({ jsonrpc: "2.0", id: b.id, result: { tools: [{ name: "a\rb" }] } }),
+        1,
+      );
+    };
+    const { status, body } = await run(handle, "tools/list");
+    expect(status).toBe(200);
+    expect(body.result.tools[0].name).toBe("a\rb");
+  });
+
+  it("a long unterminated SSE line in small chunks is scanned once, not per chunk", async () => {
+    const handle = async (req: Request) => {
+      const b = (await bodyOf(req))!;
+      if (b.method === "initialize") {
+        return jsonRes(200, { jsonrpc: "2.0", id: b.id, result: { protocolVersion: "2025-11-25", capabilities: {} } });
+      }
+      if (!("id" in b)) return new Response(null, { status: 202 });
+      return chunkedSse("x".repeat(4 * 1024 * 1024 + 64), 64);
+    };
+    // 4 MiB (the cap) in 64-byte chunks. Growing one buffer string and
+    // regex-scanning it per chunk flattens and rescans it every time: ~12 s
+    // of CPU here under workerd, against ~0.3 s for the linear splitter.
+    const started = Date.now();
+    const { status, body } = await run(handle, "tools/list", {}, { maxResponseBytes: 4 * 1024 * 1024 });
+    expect(status).toBe(502);
+    expect(body.error).toMatch(/exceeds 4194304 bytes/);
+    expect(Date.now() - started).toBeLessThan(3_000);
   });
 
   it("a response over the byte cap is refused (502)", async () => {
