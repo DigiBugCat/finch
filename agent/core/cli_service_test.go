@@ -21,6 +21,10 @@ type fakeServiceManager struct {
 	running bool
 	linger  string
 	failOn  string
+	// statusFails makes the status query itself (launchctl print /
+	// systemctl is-active) fail the way it does while the user manager or
+	// D-Bus is unreachable: an error and no state.
+	statusFails bool
 	// bootstrapFailures makes the next N launchctl bootstraps fail the way
 	// launchd does while a booted-out job is still being torn down.
 	bootstrapFailures int
@@ -60,6 +64,9 @@ func (m *fakeServiceManager) install(t *testing.T, goos string) {
 			return "Failed to connect to bus", fmt.Errorf("exit status 1")
 		}
 		uid := strconv.Itoa(os.Getuid())
+		if m.statusFails && (cmd == "launchctl print gui/"+uid+"/"+launchdLabel || cmd == "systemctl --user is-active finch.service") {
+			return "Failed to connect to bus: No such file or directory", fmt.Errorf("exit status 1")
+		}
 		switch cmd {
 		case "launchctl print gui/" + uid + "/" + launchdLabel:
 			if m.running {
@@ -366,15 +373,28 @@ func TestServiceUninstallKeepsTheUnitWhenStopFails(t *testing.T) {
 			m.failOn = tc.stop // fails and leaves the serve running
 			stdout, stderr, code := finch(t, "service", "uninstall", "--json")
 			env := decodeJSONError(t, stderr)
-			if code != 1 || stdout != "" || env.Error.Code != "INTERNAL" || !strings.Contains(env.Error.Message, "still running") {
+			if code != 1 || stdout != "" || env.Error.Code != "INTERNAL" || !strings.Contains(env.Error.Message, "may still be running") {
 				t.Fatalf("exit=%d stdout=%q env=%+v", code, stdout, env)
 			}
 			if !fileExists(unit) {
 				t.Fatal("the unit was removed while finch was still running")
 			}
 
-			// Not loaded at all: the stop error is the harmless kind.
+			// The stop fails AND the status query fails too (user manager or
+			// D-Bus unreachable): no state is not proof the serve stopped.
 			m.running = false
+			m.statusFails = true
+			stdout, stderr, code = finch(t, "service", "uninstall", "--json")
+			env = decodeJSONError(t, stderr)
+			if code != 1 || stdout != "" || env.Error.Code != "INTERNAL" || !strings.Contains(env.Error.Message, "Failed to connect to bus") {
+				t.Fatalf("status failure: exit=%d stdout=%q env=%+v", code, stdout, env)
+			}
+			if !fileExists(unit) {
+				t.Fatal("the unit was removed although the manager never confirmed the stop")
+			}
+			m.statusFails = false
+
+			// Not loaded at all: the stop error is the harmless kind.
 			stdout, stderr, code = finch(t, "service", "uninstall", "--json")
 			if got := decodeJSONOut(t, stdout); code != 0 || got["removed"] != true {
 				t.Fatalf("exit=%d stdout=%q stderr=%q", code, stdout, stderr)

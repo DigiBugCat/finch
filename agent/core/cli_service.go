@@ -162,22 +162,37 @@ func currentServiceStatus() serviceStatus {
 	}
 }
 
-// serviceStillUp reports whether the service manager still has the finch unit
-// loaded or running, after a stop that reported an error. On macOS a loaded job
-// counts even between KeepAlive restarts, since launchd would start it again.
-func serviceStillUp() bool {
+// serviceStopConfirmed asks the service manager, after a stop that reported an
+// error, whether the finch unit is gone. Only an explicit answer counts as
+// stopped: launchd's "Could not find service" (not loaded — a loaded job
+// counts as up even between KeepAlive restarts, since launchd would start it
+// again), or systemd's "inactive" / "failed" (not running; an unknown unit
+// also reads "inactive"). Anything else — the job still loaded or active, or
+// the status command itself failing, as when the user manager or D-Bus is
+// unreachable — is not proof, and returns false with what the manager said.
+func serviceStopConfirmed() (bool, string) {
 	switch serviceGOOS {
 	case "darwin":
-		_, err := runServiceCommand("launchctl", "print", launchdTarget())
-		return err == nil
-	case "linux":
-		out, _ := runServiceCommand("systemctl", "--user", "is-active", systemdUnitName)
-		switch strings.TrimSpace(out) {
-		case "active", "activating", "reloading", "deactivating":
-			return true
+		out, err := runServiceCommand("launchctl", "print", launchdTarget())
+		if err == nil {
+			return false, "launchd still has it loaded"
 		}
+		if strings.Contains(out, "Could not find service") {
+			return true, ""
+		}
+		return false, fmt.Sprintf("launchctl print failed (%v: %s)", err, strings.TrimSpace(out))
+	case "linux":
+		out, err := runServiceCommand("systemctl", "--user", "is-active", systemdUnitName)
+		state := strings.TrimSpace(out)
+		switch state {
+		case "inactive", "failed":
+			return true, ""
+		case "active", "activating", "reloading", "deactivating":
+			return false, "systemd reports it " + state
+		}
+		return false, fmt.Sprintf("systemctl --user is-active failed (%v: %s)", err, state)
 	}
-	return false
+	return false, "unsupported platform"
 }
 
 // managedServeRunning reports whether a service manager runs the serve — the
@@ -517,10 +532,14 @@ func serviceUninstall(c *cli) error {
 		out, err = runServiceCommand("systemctl", "--user", "disable", "--now", systemdUnitName)
 	}
 	// Stopping fails harmlessly when nothing is loaded. Any other failure
-	// leaves the serve up, and the unit is what stops it, so keep the unit and
-	// fail unless the manager confirms the serve is gone.
-	if err != nil && serviceStillUp() {
-		return newCLIError(codeInternal, "finch service uninstall", "%s failed (%v: %s); finch is still running, so %s was kept", stop, err, strings.TrimSpace(out), unitPath)
+	// may leave the serve up, and the unit is what stops it, so keep the unit
+	// and fail unless the manager explicitly confirms the serve is gone.
+	if err != nil {
+		if stopped, why := serviceStopConfirmed(); !stopped {
+			return newCLIError(codeInternal, "finch service uninstall",
+				"%s failed (%v: %s) and finch may still be running (%s), so %s was kept",
+				stop, err, strings.TrimSpace(out), why, unitPath)
+		}
 	}
 	removed := false
 	if err := os.Remove(unitPath); err == nil {
