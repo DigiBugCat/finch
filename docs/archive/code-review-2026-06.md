@@ -1,4 +1,6 @@
-# Finch — Engineering Code Review
+# Engineering code review (June 2026, historical)
+
+> **Historical.** A pre-launch correctness review of the hub, the agent and the web dashboard, written in June 2026. The findings were fixed before launch or made moot when the dashboard, teams and access-control rules were removed; file names and line numbers refer to code that has since moved. It is not a list of open issues.
 
 A prioritized correctness/reliability review of the Finch control plane (Cloudflare Worker
 + Durable Objects), the Go relay agent, and the Next.js dashboard. **Security is reviewed

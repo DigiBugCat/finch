@@ -1,143 +1,67 @@
-# finch 🐦
+# finch
 
-**Opinionated, batteries-included hosting for MCP services.**
+finch gives the MCP server on your Mac or Linux machine a stable `https://`
+address, with keys or OAuth sign-in at the door. Your machine dials out to
+finch, so no port is opened and nothing on it listens to the internet. It also
+works for local web apps and HTTP APIs, as long as request bodies are text
+(JSON, forms): binary uploads are refused for now. The hosted version at
+[finchmcp.com](https://finchmcp.com) is free, and everything here is MIT
+licensed so you can [run your own](docs/self-host.md).
 
-User-facing terms map to the protocol names this repo still uses on the wire:
-**service** = `appliance`, and **box** = `machine`.
-
-There are many finches. This one is yours.
-
-Finch turns any always-on box — a Mac mini, a Raspberry Pi, an old laptop —
-into a publicly reachable, authenticated, **streaming** MCP server, without
-opening a single port. The box dials *out*; finch handles **auth, routing, and
-hosting**. It feels like ngrok: you get a stable `https://<slug>.finchmcp.com`
-URL with no DNS to configure — finch owns the wildcard, and a subdomain is just
-a row in a database, not a DNS record.
-
-```
-   MCP client                 finch hub (Cloudflare)                 your box
-  ┌──────────┐   HTTPS   ┌─────────────────────────┐   outbound   ┌──────────────┐
-  │ Claude / │ ────────▶ │  Worker: auth + routing │   WebSocket  │ finch agent  │
-  │ Cursor / │  Bearer   │         │               │ ◀─────────── │ (dialed out) │
-  │  …        │ finch_…  │         ▼               │   (no open   │      │        │
-  └──────────┘           │  Durable Objects        │    ports)    │      ▼        │
-        ▲                │  (per tenant + box)     │              │  local MCP    │
-        └────────────────┤  streaming relay        ├──────────────┤  server :8000 │
-          streamed SSE / │                         │  head→chunk… │ (FastMCP, …)  │
-          long-running   └─────────────────────────┘              └──────────────┘
+```text
+  MCP client                      finch hub (Cloudflare)                     your machine
+ ┌───────────┐  HTTPS    ┌───────────────────────────────┐   WSS, dialed   ┌──────────────────┐
+ │ Claude,   │ ────────▶ │ checks the key or OAuth token │ ◀────────────── │ finch            │
+ │ Cursor,   │  finch_   │ strips it, picks the machine  │  out from your  │   │              │
+ │ Codex, …  │  key or   │ streams the answer back       │  machine; no    │   ▼              │
+ └───────────┘  OAuth    └───────────────────────────────┘  open ports     │ your MCP server  │
+                                                                           │ 127.0.0.1:8000   │
+                                                                           └──────────────────┘
 ```
 
-## Why
+## Quickstart
 
-Every layer of "host an MCP server behind auth" is a commodity (ngrok,
-cloudflared, Cloudflare Workers). What's missing is an **opinionated,
-batteries-included** way to ship one: write the tool, run it, and it's authed,
-public, identity-aware, and supervised — for free. Rails/Vercel for MCP
-services, aimed squarely at the things you **can't** just deploy to the cloud:
-on-prem data, local stdio tools, and physical/IoT hardware. See
-[`docs/design.md`](docs/design.md).
+On macOS or Linux, with an MCP server already running on
+`http://127.0.0.1:8000`:
 
-## Architecture
+```sh
+curl -fsSL https://finchmcp.com/install | sh    # no sudo; installs to ~/.local/bin if needed
+finch login                                      # opens your browser; approve and it carries on
+finch add notes --service http://127.0.0.1:8000  # prints https://<your-slug>.finchmcp.com/notes/mcp
+finch service install                            # keeps it running (launchd or systemd --user)
+finch test notes                                 # lists the server's tools through finch
+finch connect notes --client claude-code         # or cursor, codex, json
+```
 
-The hub is a thin Cloudflare Worker in front of three Durable Objects:
+`<your-slug>` is your **account address**: a name like `amber-wren-42` that
+finch gives your account the first time you use it. Every service you add lives
+under it, at `https://<your-slug>.finchmcp.com/<service>/mcp`.
 
-| Object | Role |
+`finch connect` mints a key for that one service and writes it into the
+client's configuration without printing it. From there (these commands
+require finch 1.8.0 or later; `finch version` shows yours and `finch update`
+upgrades it):
+
+| To | Run |
 |---|---|
-| **RouterDO** | global `slug → tenant` index — resolves `<slug>.finchmcp.com` |
-| **TenantDO** | per-tenant control plane: `finch_` keys, ACL, metrics, dashboard state |
-| **ApplianceDO** | per-box hibernatable **streaming relay** — the box parks its outbound WebSocket here |
+| See your services and their URLs | `finch status` or `finch fleet` |
+| See recent calls (time, route, caller, status, duration) | `finch logs notes` |
+| Point a service at a different local port | `finch add notes --service http://127.0.0.1:9000` (re-running `add` on the machine that publishes it updates it) |
+| Publish a web app or REST API, not just `/notes/mcp` | `finch add site --service http://127.0.0.1:3000 --forward-all` |
+| Open a service to anyone with the URL | add `--public` to `finch add` |
+| Remove a service, here and on the hub | `finch rm notes` |
+| Update finch | `finch update` |
+| Remove finch from this machine | `finch uninstall` (it prints how to delete the binary) |
+| Read a command's help | `finch help <command>` or `finch <command> -h` |
 
-**Auth has two layers, kept distinct:**
+Every command takes `--json` and uses fixed exit codes (0 ok, 1 error,
+2 usage, 10 waiting for approval, 11 expired, 12 not logged in), so scripts
+and agents can branch on them. A runnable example server lives in
+[`examples/hello-mcp/`](examples/hello-mcp/).
 
-- **Box ↔ hub** — the agent enrolls once with a one-shot ticket, then holds a
-  long-lived per-box **refresh token** (persisted at `--state`, `0600`) and
-  trades it for short-lived `connect-token`s. It survives restarts and reboots
-  with no new ticket ("authenticate once", like ngrok's authtoken).
-- **Client ↔ MCP server** — callers present a `finch_` bearer key; the hub hashes
-  + checks it (scope + default-deny ACL), **strips it**, and relays the request.
+### Or have your agent do it
 
-**A request, end to end (streaming):**
-
-```
-client ─POST /<app>/mcp (Bearer finch_…)─▶ Worker
-   Worker: rate-limit → checkKey (scope + ACL) → strip key → pick box
-      └─▶ ApplianceDO ──req──▶ agent ──HTTP──▶ local MCP server
-                       ◀─head──         (status+headers the instant they're known)
-                       ◀─chunk─ chunk ─ …      (body streams as base64 frames)
-                       ◀─end───                (idle-timeout, not a 30s total cap)
-   Worker streams the Response straight back to the client.
-```
-
-The relay is **MCP-unaware** — it moves raw HTTP bytes, so unmodified
-[FastMCP](https://gofastmcp.com) (or any Streamable-HTTP MCP server) just works:
-SSE, progress notifications, long-running "thinking" tools, and — on a
-single-box service — server-initiated sampling/elicitation. Pause/resume
-**WINDOW** backpressure keeps a fast box from overrunning a slow client.
-
-## Privacy boundary
-
-Production client connections use HTTPS (TLS), and the box agent's outbound
-tunnel uses WSS (WebSocket over TLS). No inbound port needs to be exposed on the
-box. The agent-to-upstream hop is the operator's choice, like cloudflared: it
-accepts a plaintext `http://` upstream to any host (loopback or another host on
-your network), so a non-loopback `http://` service is relayed in the clear over
-your LAN. Use `https://` for the upstream if that hop must be encrypted.
-
-Finch is **not end-to-end encrypted**. Cloudflare terminates the public TLS and
-WSS connections, so the Cloudflare-hosted Finch relay necessarily processes
-request and response payloads as plaintext while forwarding them. The ordinary
-MCP relay does not log or persist those bodies and does not send them to an LLM.
-It retains only operational call metadata: timestamp, tenant/service/route,
-caller label, response status, duration, and aggregate traffic/latency/error
-statistics. Account, service, box, key-hash/scope, ACL, settings, and audit
-records are retained separately as control-plane state.
-
-Dashboard **Test in chat** is a separate, explicit processing path. When used,
-Finch sends the chat history, service tool names/descriptions/input schemas,
-selected tool arguments, and tool results to Cloudflare Workers AI so the model
-can choose tools and answer. The ordinary relay's no-body-retention guarantee
-does not mean that this data is hidden from Workers AI. See
-[`docs/privacy.md`](docs/privacy.md) for the complete boundary and terminology.
-
-## Layout
-
-| Path | What |
-|---|---|
-| `worker/` | The finch hub — Cloudflare Worker + 3 Durable Objects (TS). Auth, routing, the streaming relay. |
-| `agent/` | The box-side agent (Go). Dials out, streams to your local MCP server. Cross-compiles to mac/linux × amd64/arm64. |
-| `web/` | The dashboard (Next.js + Clerk, deployed to Cloudflare via OpenNext). Add boxes, mint keys, see your fleet. |
-| `docs/` | Design + the relay protocol spec. |
-
-## Status
-
-**v1 core is real and tested.** Working today:
-
-- ✅ Outbound-dial relay, no open ports, zero per-box DNS (ngrok model)
-- ✅ Two-layer auth (`finch_` keys + ticket/refresh/connect tokens), SSRF-guarded agent
-- ✅ **Streaming** relay — SSE / progress / long-running tools, with backpressure
-- ✅ Reconnect forever, including across reboots (persisted refresh credential)
-- ✅ **CLI: `finch login` (browser approval) → `finch add` → `finch run`** — enroll
-  and serve from the box, no dashboard ticket copying
-- ✅ **`finch.yml` manifest** — one process fronts many local services, each its own
-  service (cloudflared-style ingress); found in the cwd or `~/.finch/finch.yml`
-- ✅ **Remote update** — an outdated box shows an ⬆ badge; click **update now** in the
-  dashboard (or run `finch update` on the box) and the agent swaps its binary
-  atomically and restarts in place — no SSH, no second process. Binaries are
-  served from R2 at `$HUB/releases/<asset>`
-- ✅ Dashboard: fleet, keys (default-deny ACL), settings (hub-domain slug picker +
-  CLI access tokens), and a **"test in chat"** panel that drives a service's MCP
-  tools through an LLM (Cloudflare Workers AI)
-- ✅ One-tag release pipeline (GoReleaser) + a `curl | sh` installer
-- ✅ Full-stack e2e + CI gates on all three packages (`go test -race`, vitest, typecheck/lint)
-
-**Roadmap (v1.1+):** a stdio↔Streamable-HTTP bridge (host non-HTTP servers) and
-multi-box session affinity. Authenticated caller identity already travels as a
-signed `X-Finch-Assertion` for assertion-aware services; see
-[`worker/CALLER_ASSERTIONS.md`](worker/CALLER_ASSERTIONS.md).
-
-## Use it
-
-**With an AI agent** (Claude Code, Cursor, Codex, …), paste one line:
+Paste this into Claude Code, Cursor, Codex or another coding agent:
 
 > Read https://finchmcp.com/agents.md and use finch to publish my MCP server on
 > http://127.0.0.1:8000 as notes. Show me the sign-in link when you get it. Run
@@ -147,63 +71,83 @@ signed `X-Finch-Assertion` for assertion-aware services; see
 The agent installs finch, shows you a sign-in link to approve, and does the
 rest. [`web/public/agents.md`](web/public/agents.md) is the guide it follows.
 
-**By hand**, on macOS or Linux (see [`agent/README.md`](agent/README.md) for
-the full reference):
+## How it works
 
-```bash
-curl -fsSL https://finchmcp.com/install | sh          # no sudo; ~/.local/bin if /usr/local/bin is not writable
+The hub is a Cloudflare Worker with three Durable Objects: a global index from
+account address to account, one object per account (services, machines, key
+hashes, call records), and one per service per machine that holds the
+machine's WebSocket.
 
-finch login                                           # prints a link + code; approve on any device
-finch add notes --service http://127.0.0.1:8000       # prints https://<your-slug>.finchmcp.com/notes/mcp
-finch service install                                 # runs finch run as a launchd / systemd --user service
-finch test notes                                      # lists its MCP tools; non-zero exit if it fails
-finch connect notes --client claude-code              # or cursor | codex | json
+```text
+client ─ POST /notes/mcp (Bearer finch_…) ─▶ Worker
+   find the account → rate limit → check the key or OAuth token → strip it → pick a machine
+      └─▶ Durable Object ── req ──▶ finch on your machine ── HTTP ──▶ local server
+                         ◀─ head ──  (status and headers, as soon as they exist)
+                         ◀─ chunk ─  chunk … (the body streams)
+                         ◀─ end ───
+   the Worker streams the response straight back to the client
 ```
 
-`finch add` writes a [`finch.yml`](agent/finch.example.yml) manifest; `finch
-run` (or the service) serves every rule in it, so add more services with more
-`finch add` calls and re-run `finch service install`. `finch connect` mints a
-`finch_` key for one client and writes it into that client's config without
-printing it; `--public` on `finch add` skips keys entirely. Every command takes
-`--json` and uses fixed exit codes (0 ok, 1 error, 2 usage, 10 waiting for
-approval, 11 expired, 12 not logged in), so scripts and agents can branch on them.
+- **Your machine to finch.** `finch login` is a device-code sign-in you approve
+  in the browser. `finch add` enrolls a service and saves a long-lived
+  credential for it; `finch run` trades that for a two-minute connect token each
+  time it dials. Nothing is exposed on your machine.
+- **Callers to your service.** A service needs a `finch_` key (hashed at rest,
+  scoped to services) or a Clerk OAuth sign-in by you, unless you made it
+  public. finch removes the credential before relaying, so your server never
+  sees it. On a key-gated service it adds a signed `X-Finch-Assertion` naming
+  the caller, which your server can verify; public services get one only for
+  OAuth and `finch test` calls ([`worker/CALLER_ASSERTIONS.md`](worker/CALLER_ASSERTIONS.md)).
+- **The relay does not parse MCP.** It moves HTTP bytes, so unmodified
+  Streamable-HTTP servers (FastMCP, the MCP SDKs) work, including SSE, progress
+  notifications and long-running tools. By default only `/<service>/mcp` is
+  forwarded; `--forward-all` forwards the whole service when its `--service`
+  URL has no path. A URL with a path (`http://127.0.0.1:8000/api`) is always
+  confined to that path. Request bodies must be valid UTF-8 (4 MiB at most);
+  responses can be any bytes.
 
-A runnable end-to-end example lives in
-[`examples/hello-mcp/`](examples/hello-mcp/).
+The wire format is in [`docs/relay-protocol.md`](docs/relay-protocol.md), and
+the full security model in
+[`docs/security-and-deploy.md`](docs/security-and-deploy.md).
 
-## Local dev
+## Security and privacy
 
-Run three things: the **hub** (worker), the **dashboard** (web), and the
-**agent** on the box.
+Traffic is encrypted in transit: HTTPS from the client to finch, WSS from finch
+to your machine. finch is **not** end-to-end encrypted. Cloudflare terminates
+TLS, and the relay handles request and response bodies in plaintext while it
+forwards them. It does not log or store those bodies, and it sends nothing to an
+AI model. It keeps call metadata (time, route, caller label, status, duration)
+and your account's configuration. The hop from finch to your local server is
+yours: loopback stays on your machine, and anything else should use `https://`.
+The complete boundary is in [`docs/privacy.md`](docs/privacy.md).
 
-```bash
-# 0. shared secrets — copy the examples and set a matching FINCH_SERVICE_SECRET
-#    and TICKET_SECRET in BOTH files (the dashboard signs what the hub verifies).
-cp worker/.dev.vars.example worker/.dev.vars
-cp web/.dev.vars.example    web/.dev.vars   # also needs Clerk pk_test_/sk_test_
+To report a vulnerability, see [`SECURITY.md`](SECURITY.md).
 
-# 1. run the hub
-cd worker && npm install && npm run dev          # wrangler dev on :8787
+## Run your own
 
-# 2. run the dashboard (Node 22 — see web/.nvmrc; needs a Clerk dev instance)
-cd web && npm install && npm run dev             # next dev on :3000
+The hub, website and CLI in this repository are what runs finchmcp.com.
+[`docs/self-host.md`](docs/self-host.md) walks through deploying them on your
+own Cloudflare account with your own Clerk sign-in, and pointing the CLI at them
+with `finch login --hub https://your-hub`. Today a self-hosted hub serves one
+account under one hostname; per-account subdomains on your own domain need the
+code changes listed in [`docs/self-host-coupling.md`](docs/self-host-coupling.md).
 
-# 3. run a local MCP server on :8000 (any streamable-http MCP server, e.g.
-#    a FastMCP server, or examples/hello-mcp/server.py)
+## Repository layout
 
-# 4. enroll + serve, then call it
-cd agent && go build -o finch . && \
-  ./finch login --hub http://localhost:8787 && \
-  ./finch add hello --service http://127.0.0.1:8000 && ./finch run
-```
+| Path | What |
+|---|---|
+| [`agent/`](agent/) | The `finch` CLI and relay agent (Go). macOS and Linux, amd64 and arm64, plus 32-bit ARM Linux. |
+| [`worker/`](worker/) | The hub: Cloudflare Worker and Durable Objects (TypeScript). |
+| [`web/`](web/) | The website: landing page, docs, sign-in and the `finch login` approval page (Next.js on Cloudflare via OpenNext). |
+| [`docs/`](docs/) | Specs, the self-hosting guide, and archived design history ([index](docs/README.md)). |
+| [`examples/`](examples/) | A dependency-free MCP server to test with, and a Docker Compose setup. |
+| [`scripts/`](scripts/) | Repository checks: version sync, the installer, and assertion test vectors. |
 
-## Tests
+## Contributing
 
-```bash
-cd worker && npm test          # vitest-pool-workers: relay, auth, full-stack e2e
-cd agent  && go test -race ./...
-cd web    && npm run typecheck && npm test
-```
+Issues and pull requests are welcome. [`CONTRIBUTING.md`](CONTRIBUTING.md)
+covers the development setup for each part, the tests to run, and how releases
+are cut. Changes are listed in [`CHANGELOG.md`](CHANGELOG.md).
 
 ## License
 

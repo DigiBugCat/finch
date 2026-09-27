@@ -17,6 +17,7 @@ const GROUPS: { h: string; items: [string, string][] }[] = [
       ['/docs/auth', 'Keys & auth'],
       ['/docs/acls', 'Access control'],
       ['/docs/domains', 'Domains'],
+      ['/docs/self-host', 'Run your own finch'],
     ],
   },
   {
