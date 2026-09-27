@@ -80,3 +80,7 @@
   .docs-main h2{font-size:25px; line-height:31px}
   .docs-cards{grid-template-columns:1fr}
 }
+
+/* a small status tag beside a heading ("Not live yet") */
+.docs-badge{display:inline-block; vertical-align:middle; margin-left:10px; padding:3px 8px; border-radius:var(--radius-sm);
+  background:var(--blush); color:var(--ink); font:700 11px/16px var(--sans); letter-spacing:.08em; text-transform:uppercase}

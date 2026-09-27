@@ -1,4 +1,5 @@
-// Plate VII: pricing. One finch for free, a flock for enterprise.
+// Plate VII: pricing. One finch for free, a flock for enterprise, and the
+// source for anyone who would rather run it themselves.
 import Link from 'next/link';
 import { Bird } from './Bird';
 import PlateHead from './PlateHead';
@@ -30,6 +31,9 @@ function Flock() {
   );
 }
 
+export const GITHUB_URL = 'https://github.com/DigiBugCat/finch';
+export const SELF_HOST_PATH = '/docs/self-host';
+
 export default function PricingPlate() {
   return (
     <section id="pricing" className="iw-wrap fg-plate" aria-labelledby="fg-pricing-title">
@@ -45,7 +49,8 @@ export default function PricingPlate() {
           </div>
           <p>
             Everything finch does, for anyone who signs up: services, machines and keys, OAuth connectors,
-            streaming, the CLI and the agent guide.
+            streaming, the CLI and the agent guide. Signing up takes you to your fleet page, where your
+            machines and services show up once finch is installed.
           </p>
           <Link href="/sign-up" className="iw-btn iw-btn-primary fg-tier-cta">Create a free account</Link>
         </article>
@@ -64,6 +69,19 @@ export default function PricingPlate() {
           <a href="mailto:hello@aviary.run" className="iw-btn iw-btn-quiet fg-tier-cta">Email us</a>
         </article>
       </div>
+      <aside className="fg-oss" aria-labelledby="fg-oss-title">
+        <div className="fg-oss-text">
+          <span className="iw-label iw-label-indigo" id="fg-oss-title">Open source · MIT</span>
+          <p>
+            <b>Free and open source.</b> The CLI, the relay and this site are MIT licensed. Fork it, or run
+            your own finch on your own Cloudflare account.
+          </p>
+        </div>
+        <div className="fg-oss-links">
+          <a href={GITHUB_URL} className="iw-btn iw-btn-quiet">Source on GitHub</a>
+          <Link href={SELF_HOST_PATH} className="fg-strong-link">Host it yourself</Link>
+        </div>
+      </aside>
     </section>
   );
 }

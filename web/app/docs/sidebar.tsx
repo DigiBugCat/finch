@@ -8,8 +8,7 @@ const GROUPS: { h: string; items: [string, string][] }[] = [
     h: 'Get started',
     items: [
       ['/docs', 'Quickstart'],
-      ['/docs/aviarymcp', 'AviaryMCP'],
-      ['/docs/services', 'Services & boxes'],
+      ['/docs/services', 'Services & machines'],
     ],
   },
   {
@@ -25,6 +24,12 @@ const GROUPS: { h: string; items: [string, string][] }[] = [
     items: [
       ['/docs/cli', 'CLI'],
       ['/docs/privacy', 'Privacy & data handling'],
+    ],
+  },
+  {
+    h: 'Related',
+    items: [
+      ['/docs/aviarymcp', 'AviaryMCP (Python SDK)'],
     ],
   },
 ];

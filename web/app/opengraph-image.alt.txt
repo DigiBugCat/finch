@@ -1,0 +1,1 @@
+finch: Localhost, with a front door. A stable https address for the MCP server on your machine, shown as sunny-wren-42.finchmcp.com/notes/mcp on a bird band.

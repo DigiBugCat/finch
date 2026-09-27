@@ -4,9 +4,11 @@ import SiteFooter from '@/components/fieldguide/SiteFooter';
 import DocsSidebar from './sidebar';
 import './docs.css';
 
+// Each docs page sets its own title ("Keys & auth"); the template makes it
+// "Keys & auth · finch docs" in the tab and in search results.
 export const metadata: Metadata = {
-  title: 'finch docs',
-  description: 'How to put your MCP services online with finch: install, add a service, manage keys and access.',
+  title: { default: 'finch docs', template: '%s · finch docs' },
+  description: 'How to put your MCP servers online with finch: install, add a service, manage keys and access.',
 };
 
 export default function DocsLayout({ children }: { children: React.ReactNode }) {

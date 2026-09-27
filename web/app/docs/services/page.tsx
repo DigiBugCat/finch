@@ -1,56 +1,88 @@
+import type { Metadata } from 'next';
+import { docsMetadata } from '../meta';
 import Link from 'next/link';
+import Code from '../code';
 
-function Code({ children }: { children: string }) {
-  return <pre className="docs-code"><code dangerouslySetInnerHTML={{ __html: children }} /></pre>;
-}
+export const metadata: Metadata = docsMetadata('Services & machines', 'How finch services and machines fit together: finch.yml, web apps, running in the background, updating, and adding machines.');
 
-export default function ServicesAndBoxes() {
+export default function ServicesAndMachines() {
   return (
     <>
-      <h1>Services &amp; boxes</h1>
+      <h1>Services &amp; machines</h1>
       <p className="docs-lede">
-        A service is a local HTTP app you expose through Finch. A box is a machine
-        running the Finch agent. This page explains how the two fit together, what
-        lives in <code>finch.yml</code>, and how to add more boxes.
+        A service is a local app you publish with finch. A machine is a computer
+        running finch that serves it. This page covers how the two fit together,
+        what lives in <code>finch.yml</code>, and how to change, remove and update
+        things later.
       </p>
 
       <h2>The model</h2>
       <p>
-        A <b>service</b> is any local HTTP app: an MCP server, a web app, any HTTP or
-        WebSocket app. Finch publishes it at{' '}
-        <code>https://&lt;slug&gt;.finchmcp.com/&lt;app_path&gt;/</code>. The service URL
-        must be http(s).
+        A <b>service</b> is a local HTTP app: usually an MCP server, but a web app or
+        a REST API works too. finch publishes it at{' '}
+        <code>https://&lt;account address&gt;.finchmcp.com/&lt;name&gt;/</code>. Your{' '}
+        <b>account address</b> (the slug, such as <code>sunny-wren-42</code>) is
+        picked by finch for your account; the <b>name</b> is what you pass to{' '}
+        <code>finch add</code>.
       </p>
       <p>
-        A <b>box</b> is a machine running the Finch agent. It dials out to the hub, so
-        nothing listens on the box and no ports open. One <code>finch run</code> process
-        serves every rule in <code>finch.yml</code>.
+        A <b>machine</b> is any Mac or Linux computer running finch. It dials out to
+        finch, so nothing on it listens and no ports open. One finch process on a
+        machine serves every service in its <code>finch.yml</code>.
       </p>
 
       <h2>Adding a service</h2>
-      <p>Your service must already be running locally, then:</p>
+      <p>Start your app locally first, then:</p>
       <Code>{`finch add printer --service http://127.0.0.1:8000
 <span class="o">finch: added "printer" → http://127.0.0.1:8000</span>
-<span class="o">       public URL: https://your-slug.finchmcp.com/printer/mcp</span>
+<span class="o">       public URL: https://sunny-wren-42.finchmcp.com/printer/mcp</span>
 finch service install
 finch test printer`}</Code>
       <p>
-        <code>finch add</code> writes or extends <code>finch.yml</code> and prints the
-        public URL (the <code>url</code> field with <code>--json</code>). The file holds
-        no secrets, so it is safe to commit. Credentials live on disk elsewhere, never
-        in <code>finch.yml</code>.
+        <code>finch add</code> records the service in <code>finch.yml</code> and
+        prints its public URL (the <code>url</code> field with <code>--json</code>).
+        The name becomes part of the URL: letters and digits, with <code>-</code>,{' '}
+        <code>_</code> or <code>.</code> between them, up to 63 characters. Case
+        matters in the URL, so lowercase names are easiest to share. <code>finch.yml</code> holds no secrets; each service&apos;s
+        credential is saved separately under <code>~/.finch/</code>.
       </p>
       <p>
         By default callers need a <code>finch_</code> key or an OAuth sign-in. Add{' '}
-        <code>--public</code> to open the endpoint to anyone with the URL, for a public
-        website or a demo; <code>finch auth printer key</code> closes it again.
+        <code>--public</code> to let anyone with the URL in;{' '}
+        <code>finch auth printer key</code> closes it again.
+      </p>
+
+      <h3>Changing a service&apos;s port</h3>
+      <p>
+        Run <code>finch add</code> again with the same name and the new URL. finch
+        updates that service&apos;s entry in <code>finch.yml</code>; the public URL
+        stays the same. Then restart the background service so it picks up the
+        change:
+      </p>
+      <Code>{`finch add printer --service http://127.0.0.1:9000
+finch service install`}</Code>
+
+      <h2 id="web-apps">Web apps and REST APIs</h2>
+      <p>
+        By default finch forwards only the MCP endpoint:{' '}
+        <code>/printer/mcp</code> reaches <code>/mcp</code> on your app, and every
+        other path is refused. That keeps the rest of your local app private. For a
+        web app, a REST API or a public page, add <code>--forward-all</code> so
+        every path under the service is forwarded:
+      </p>
+      <Code>{`finch add demo --service http://127.0.0.1:3000 --public --forward-all
+<span class="c"># https://sunny-wren-42.finchmcp.com/demo/about → http://127.0.0.1:3000/about</span>`}</Code>
+      <p>
+        The app is served under <code>/demo/</code>, so links and assets in it should
+        use relative paths (or know their base path). Streamed responses pass
+        through as they are written.
       </p>
 
       <h2>Running in the background</h2>
       <p>
         <code>finch run</code> serves in the foreground and stops when the terminal
-        closes. To keep a service up across logouts and reboots, install finch as a
-        login service:
+        closes. To keep your services up across logouts and reboots, install finch
+        as a background service:
       </p>
       <Code>{`finch service install      <span class="c"># launchd on macOS, systemd --user on Linux</span>
 finch service status       <span class="c"># installed? running?</span>
@@ -62,49 +94,76 @@ finch service uninstall    <span class="c"># stop and remove it</span>`}</Code>
         10 MiB). On Linux it writes a systemd user unit,{' '}
         <code>finch.service</code>; read its log with{' '}
         <code>journalctl --user -u finch.service</code>. Either way it needs no root,
-        starts at login, restarts <code>finch run</code> if it exits, and serves the{' '}
-        <code>finch.yml</code> that <code>finch add</code> wrote. Running{' '}
-        <code>install</code> again is safe, for example after moving the binary. Stop any{' '}
-        <code>finch run</code> you started in a terminal first, since only one serve per
-        machine can hold the relay; <code>install</code> exits with an error when{' '}
-        <code>finch run</code> does not come up or a service&apos;s relay has not connected
-        within about 20 seconds, and says why when it knows.
+        starts at login, restarts finch if it exits, and serves the{' '}
+        <code>finch.yml</code> that <code>finch add</code> wrote.
+      </p>
+      <p>
+        Running <code>install</code> again is safe, and it is how you apply a change
+        to <code>finch.yml</code>: it restarts the service. Stop any{' '}
+        <code>finch run</code> you started in a terminal first, since only one finch
+        per machine can serve. <code>install</code> waits about 20 seconds for every
+        service to connect, and if one doesn&apos;t, it exits with an error that says
+        why when it knows.
       </p>
       <div className="docs-note">
-        <b>Headless Linux box?</b> A systemd user service stops when you log out unless
-        lingering is on. Enable it once with{' '}
+        <b>Headless Linux machine?</b> A systemd user service stops when you log out
+        unless lingering is on. Turn it on once with{' '}
         <code>sudo loginctl enable-linger $USER</code> so finch starts at boot and keeps
         running with nobody logged in. <code>finch service install</code> tells you when
         it is off.
       </div>
 
       <h2>finch.yml</h2>
-      <Code>{`hub: https://finchmcp.com
-box: this-box
-ingress:
-  - app_path: printer                <span class="c"># becomes &lt;slug&gt;.finchmcp.com/printer/</span>
-    service: http://127.0.0.1:8000`}</Code>
       <p>
-        <code>hub</code> is where the box connects. <code>box</code> names this machine.
-        Each <code>ingress</code> entry maps a public path (<code>app_path</code>) to a
-        local URL (<code>service</code>).
+        <code>finch add</code> writes this file for you, at{' '}
+        <code>~/.finch/finch.yml</code> unless the current directory already has a{' '}
+        <code>finch.yml</code>.
+      </p>
+      <Code>{`hub: https://finchmcp.com
+box: studio                          <span class="c"># this machine's name</span>
+ingress:
+  - app_path: printer                <span class="c"># the service name: sunny-wren-42.finchmcp.com/printer/</span>
+    service: http://127.0.0.1:8000   <span class="c"># where the app runs on this machine</span>
+  - app_path: demo
+    service: http://127.0.0.1:3000
+    forward_all: true                <span class="c"># forward every path, not just /mcp</span>`}</Code>
+      <p>
+        <code>hub</code> is where the machine connects. <code>box</code> names this
+        machine (it defaults to the hostname). Each <code>ingress</code> entry is one
+        service: its name (<code>app_path</code>), the local URL it forwards to
+        (<code>service</code>), and optionally <code>forward_all</code>.
       </p>
 
-      <h2>Multiple services</h2>
+      <h2>Several services on one machine</h2>
       <p>
-        Run <code>finch add</code> once per service. Each call appends an ingress rule,
-        and one <code>finch run</code> process fronts them all. It auto-approves new
-        services while you are logged in. A running serve reads <code>finch.yml</code>{' '}
-        when it starts, so after adding a service run <code>finch service install</code>{' '}
-        again (it restarts the service) or restart your <code>finch run</code>.
+        Run <code>finch add</code> once per service, then{' '}
+        <code>finch service install</code> once to serve them all:
       </p>
       <Code>{`finch add printer --service http://127.0.0.1:8000
 finch add scraper --service http://127.0.0.1:8001
 finch service install`}</Code>
-      <p>To remove a service:</p>
+
+      <h2 id="remove">Removing a service</h2>
       <Code>{`finch rm printer`}</Code>
+      <p>
+        This removes the service from your account, deletes its entry from{' '}
+        <code>finch.yml</code> and deletes its credential on this machine. Its public
+        URL stops answering. If finch runs in the background,{' '}
+        <code>finch service install</code> restarts it without the removed service.
+        Keys scoped to that service stay on your account until you revoke them, and
+        would work again if you re-add the same name; list and revoke them with{' '}
+        <code>finch keys list</code> and <code>finch keys revoke</code>.
+      </p>
+      <p>
+        To take finch off a machine altogether, run <code>finch uninstall</code>. See{' '}
+        <Link href="/docs/cli#remove">Remove finch</Link> for exactly what it cleans up.
+      </p>
 
       <h2>States</h2>
+      <p>
+        <code>finch fleet</code> lists every service on your account with its state
+        and public URL:
+      </p>
       <div className="docs-table-wrap">
         <table>
           <thead>
@@ -113,65 +172,74 @@ finch service install`}</Code>
           <tbody>
             <tr>
               <td><code>online</code></td>
-              <td>The box holds a live connection to the hub and the service is approved. Requests flow.</td>
+              <td>A machine serving it is connected. Requests flow.</td>
             </tr>
             <tr>
               <td><code>offline</code></td>
-              <td>No box for this service is currently connected. The endpoint stays registered.</td>
+              <td>No machine serving it is connected right now. The address stays yours, and it comes back when a machine reconnects.</td>
             </tr>
             <tr>
               <td><code>pending</code></td>
-              <td>A box joined but the service is not approved yet. Clear it with <code>finch approve &lt;app_path&gt;</code>, or just be logged in: <code>finch run</code> approves automatically.</td>
+              <td>A machine joined without your login (with a one-time ticket) and the service is waiting for approval. <code>finch approve &lt;name&gt;</code> approves it. A logged-in machine never needs this.</td>
             </tr>
             <tr>
               <td><code>invited</code></td>
-              <td>The service was enrolled but no box has joined yet. It flips out of <code>invited</code> on the first real join.</td>
+              <td>The service exists but no machine has served it yet.</td>
             </tr>
           </tbody>
         </table>
       </div>
 
-      <h2>When a box goes offline</h2>
+      <h2>When something is down</h2>
       <p>
-        If a box loses its connection, its endpoint is marked <code>offline</code>.
-        Nothing is deleted and nothing needs re-installing: the agent reconnects on its
-        own, and the service goes back to <code>online</code> when it does.
+        If a machine loses its connection, its services show as <code>offline</code>.
+        Nothing is deleted and nothing needs reinstalling: finch reconnects on its own.
+        While a service is offline, callers get a <code>503</code>, but a client that
+        hasn&apos;t signed in yet still gets the sign-in challenge, so a claude.ai or
+        ChatGPT connector can finish setting up and work once the machine is back.
+      </p>
+      <p>
+        If the machine is connected but your app isn&apos;t running, callers get a{' '}
+        <code>502</code> that names the service and never shows the local address:
+      </p>
+      <Code>{`{"error":"finch reached the machine, but the local service isn't answering","service":"printer"}`}</Code>
+      <p>
+        Start the app, then check it with <code>finch test printer</code>.{' '}
+        <code>finch logs printer</code> shows the recent calls and their status.
       </p>
 
-      <h2>Keeping boxes up to date</h2>
+      <h2>Keeping finch up to date</h2>
+      <Code>{`finch update
+<span class="o">finch 1.8.0 is already the latest</span>`}</Code>
       <p>
-        Run this on the box:
-      </p>
-      <Code>{`finch update`}</Code>
-      <p>
-        The agent downloads the new binary from the hub and swaps it in place. When{' '}
-        <code>finch service install</code> manages the serve, launchd or systemd
-        restarts it cleanly on the new version; otherwise restart your{' '}
-        <code>finch run</code>. Either way the update is atomic: a failed download never
-        touches the running binary.
+        When a newer version exists, <code>finch update</code> downloads it, swaps the
+        binary in place and restarts the background service on it. When you already
+        have the latest, it says so and changes nothing; <code>--force</code>{' '}
+        reinstalls anyway. A failed download never touches the binary you are running.
       </p>
 
-      <h2>Enrolling another box</h2>
+      <h2>Adding another machine</h2>
       <p>
-        You do not need the browser step on every machine. From a box that is already
-        logged in, you can set up another one with no human step at all.{' '}
-        <code>finch token</code> mints a fresh, revocable CLI token; the browser
-        approval is only ever needed for your first box.
+        Only your first machine needs the browser step. From a machine that is
+        already logged in, <code>finch token</code> makes a fresh login you can pipe
+        to another one:
       </p>
+      <Code>{`finch token | ssh you@pi "finch login --token -"
+ssh you@pi "finch add sensors --service http://127.0.0.1:9000 && finch service install"`}</Code>
       <div className="docs-note">
-        <b>Keep the CLI token off argv.</b> It is a tenant-admin credential, and a
-        token passed as a flag lands in shell history and process lists. Pipe it into{' '}
-        <code>--token -</code>, or set <code>FINCH_CLI_TOKEN</code>.
+        <b>Keep the token out of command lines.</b> It can manage your whole account
+        for about 30 days, and a token passed as an argument lands in shell history
+        and process lists. Pipe it into <code>--token -</code>, or set{' '}
+        <code>FINCH_CLI_TOKEN</code>.
       </div>
-      <Code>{`finch token | ssh user@newbox "finch login --token -"
-ssh user@newbox "finch add api --service http://127.0.0.1:9000 && finch service install"`}</Code>
 
-      <h2>Inspecting state</h2>
-      <Code>{`finch status --json     <span class="c"># am I logged in? what does finch.yml serve?</span>
-finch fleet --json      <span class="c"># every service + its state (online/offline/pending)</span>`}</Code>
+      <h2>Checking on things</h2>
+      <Code>{`finch status --json     <span class="c"># this machine: logged in? what does finch.yml serve? URLs</span>
+finch fleet --json      <span class="c"># every service on the account, its state and URL</span>
+finch logs printer      <span class="c"># recent calls to one service</span>`}</Code>
       <p>
-        Both print JSON you can parse in a script. See the{' '}
-        <Link href="/docs/cli">CLI reference</Link> for every command.
+        See the <Link href="/docs/cli">CLI reference</Link> for every command and its
+        JSON output.
       </p>
 
       <div className="docs-foot">

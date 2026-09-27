@@ -24,7 +24,7 @@ describe('customer-facing privacy copy', () => {
   it('documents the complete transport and retention boundary', () => {
     render(<PrivacyAndDataHandling />);
 
-    expect(screen.getByText(/Finch is not end-to-end encrypted/i)).toBeInTheDocument();
+    expect(screen.getByText(/finch is not end-to-end encrypted/i)).toBeInTheDocument();
     expect(screen.getByText(/does not log or persist those bodies/i)).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: /Operational metadata we retain/i })).toBeInTheDocument();
     // Test Chat (the one path that sent payloads to a hosted model) is gone;
@@ -33,24 +33,29 @@ describe('customer-facing privacy copy', () => {
     expect(screen.queryAllByText(/Workers AI/i)).toHaveLength(0);
   });
 
-  it('says legacy sharing records are deleted on migration, not kept', () => {
+  it('says why the call record exists, and it is something the owner can actually see', () => {
     render(<PrivacyAndDataHandling />);
+    // The record is justified by `finch logs`, which shows it; the old
+    // "service health" rationale pointed at a dashboard that no longer exists.
+    const why = screen.getByText(/keeps a short record of each call/i);
+    expect(why).toHaveTextContent(/finch logs <name>/);
+    expect(screen.queryByText(/service health/i)).toBeNull();
+  });
 
-    // The hub's single-user migration purges pre-cut member, ACL and
-    // access-request rows (with their emails) and revokes other people's keys.
-    const note = screen.getByText(/earlier sharing features/i);
-    expect(note).toHaveTextContent(/deleted on migration/i);
-    expect(note).toHaveTextContent(/team members and invitations/i);
-    expect(note).toHaveTextContent(/access-control rules/i);
-    expect(note).toHaveTextContent(/access requests/i);
-    expect(note).toHaveTextContent(/email addresses/i);
-    // Nothing records who minted a key or enrolled a box, so the page must not
-    // promise that only other people's keys go when others could sign in.
-    expect(note).toHaveTextContent(
-      /if anyone besides the account owner could sign\s+in to the account, every access key, connected box and CLI login is\s+revoked/i,
-    );
-    expect(note).toHaveTextContent(/only access keys labelled for\s+someone else are revoked/i);
-    expect(note).not.toHaveTextContent(/keys minted by anyone other than/i);
+  it('keeps the legacy-migration note short, last, and out of the way', () => {
+    const { container } = render(<PrivacyAndDataHandling />);
+    // The team-features purge is a footnote for old accounts, not the page's
+    // longest paragraph: it sits under its own dated heading at the end.
+    const heading = screen.getByRole('heading', { name: 'Accounts from before September 2026' });
+    const note = heading.nextElementSibling!;
+    expect(note).toHaveTextContent(/team features/);
+    expect(note).toHaveTextContent(/deleted the first time finch handles a request/);
+    expect(note.textContent!.split(/\s+/).length).toBeLessThan(70);
+    const paragraphs = [...container.querySelectorAll('p')];
+    const longest = paragraphs.reduce((a, b) => (b.textContent!.length > a.textContent!.length ? b : a));
+    expect(longest).not.toBe(note);
+    // Nothing between the heading and the end but this note and the page nav.
+    expect(note.nextElementSibling).toHaveClass('docs-foot');
     // The retired wording that the records are still stored must be gone.
     expect(screen.queryAllByText(/still stored/i)).toHaveLength(0);
     expect(screen.queryAllByText(/ask for them to be deleted/i)).toHaveLength(0);
