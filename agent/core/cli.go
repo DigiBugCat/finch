@@ -1,201 +1,155 @@
 package core
 
-// finch CLI setup commands — `finch login` and `finch add`. Together they let a
-// box enroll services and build its finch.yml with no web round-trips after
-// one browser approval (cloudflared's `tunnel login` + `tunnel create`):
+// finch CLI setup and control commands. The agent-first flow, which an AI agent
+// can run end to end with one human approval in the middle:
 //
-//	finch login                                  # one browser approval, FIRST box only
-//	finch add printer --service http://:8000     # enroll + append an ingress rule
-//	finch run                                    # serve everything in finch.yml
+//	finch login --start --json                     # show the human the link + code
+//	finch login --poll --json                      # repeat every interval until exit 0
+//	finch add notes --service http://127.0.0.1:8000 --json
+//	finch service install --json                   # keep `finch run` running
+//	finch test notes --json
+//	finch connect notes --client claude-code
 //
-// On a FRESH box `finch login` is the only bootstrap: `finch token` cannot be,
-// because cmdToken opens with loadCliCred(), which exits "not logged in" when
-// no credential exists yet — `finch token | finch login --token -` is circular
-// on box #1. Every LATER box skips the browser by
-// piping a token from a box that is already logged in:
+// Every LATER box can skip the browser by piping a token from a box that is
+// already logged in (`finch token` needs a login itself, so it cannot bootstrap
+// box #1):
 //
 //	finch token | ssh newbox "finch login --token -"   # token never hits argv
 //
 // The CLI token is a long-lived tenant assertion the hub issues; the box
-// presents it as `Authorization: Bearer <token>` to /api/cli/*.
+// presents it as `Authorization: Bearer <token>` to /api/cli/*. Exit codes and
+// the --json envelope are defined in cli_contract.go.
 
 import (
+	"bufio"
 	"bytes"
-	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
-	"sync/atomic"
-	"time"
-
-	"gopkg.in/yaml.v3"
 )
 
-// printGuide is `finch guide` — a complete, self-contained operating manual an
-// AI agent can read once and then drive finch end to end. Point an agent at it:
-// "run 'finch guide' and use finch to host this MCP server."
-// (No backticks below — this is a Go raw string, which backticks would close.)
-func printGuide() {
-	fmt.Print(`# Using finch (agent guide)
+// guideText is `finch guide`: a complete, self-contained operating manual an AI
+// agent can read once and then drive finch end to end. It mirrors
+// https://finchmcp.com/agents.md. (No backticks: this is a Go raw string.)
+const guideText = `# Using finch (agent guide)
 
-finch publishes a LOCAL service on the public internet — authenticated, with NO
-open ports. The box dials OUT to the finch hub; clients reach it at a stable
-https://<your-slug>.finchmcp.com/<app_path>/ URL. finch is a protocol-agnostic
-tunnel: the service can be an MCP server, a website, or any HTTP/WebSocket app.
-You (an agent) drive everything from this CLI on macOS or Linux. Every command
-is non-interactive and supports --json.
+finch publishes a LOCAL HTTP service (an MCP server, a website, any HTTP or
+WebSocket app) at a public https URL with NO open ports: this machine dials OUT
+to the finch hub. You drive it from this CLI on macOS or Linux. Every command
+below takes --json; decide what to do from exit codes and JSON, not prose.
+The same manual is hosted at https://finchmcp.com/agents.md.
 
-## The only human step
-'finch login' needs a human ONCE (it prints a link + code to approve on any
-device). After that you operate freely. Already logged in? Check:
+## Before you start
   finch status --json
+  "loggedIn": true   -> skip step 1
+  "service"          -> whether the background service is installed / running
+  "ingress"          -> what this machine already publishes
 
-## Host a service (the core loop)
-1. Make sure your service is running locally over HTTP, e.g. http://127.0.0.1:8000
-   (an MCP server, a web app, any HTTP/WS app. Service MUST be an http(s) URL.)
-2. Expose it:        finch add printer --service http://127.0.0.1:8000 --json
-3. Serve it:         finch run
-   -> prints the public URL, e.g. https://<slug>.finchmcp.com/printer/
-      (an MCP server answers at https://<slug>.finchmcp.com/printer/mcp)
-'finch add' writes/extends finch.yml; 'finch run' serves EVERY rule in it (add
-more services with more 'finch add' calls — one process fronts them all, and it
-auto-approves while you are logged in).
+## 1. Log in (the only human step)
+  finch login --start --json
+  -> {"schema_version":1,"user_code":"ABCD-EFGH","verification_uri_complete":"https://...","expires_in":600,"interval":3}
+  Show the human the link and the code. Then, every <interval> seconds:
+  finch login --poll --json
+  -> exit 10 {"status":"pending"}    keep polling
+     exit 11 {"status":"expired"}    run 'finch login --start' again
+     exit 0  {"status":"approved"}   done: the credential is saved
+  Never print, log, or paste tokens or keys.
 
-## Test an endpoint
-  finch test printer                          # list the service's MCP tools
-  finch call printer echo --args '{"text":"hi"}'   # invoke one tool
+## 2. Publish the service
+  finch add notes --service http://127.0.0.1:8000 --json
+  -> {"url":"https://<slug>.finchmcp.com/notes/mcp", ...}
+  Add --public only if the human asked for an open endpoint (no key needed).
 
-## Grant + REVOKE client access
-A caller (another agent/app) reaches your server with a finch_ bearer key:
-  finch keys mint web-client --service printer   # prints a finch_ key ONCE
-  finch keys list
-  finch keys revoke <id>                            # access stops immediately
-The client then calls:
-  POST https://<slug>.finchmcp.com/printer/mcp   with header  Authorization: Bearer finch_...
-OAuth-capable MCP clients (e.g. claude.ai custom connectors) can use the same URL
-with no key: they sign in to finch with your account. To serve with NO auth:
-  finch auth printer public                       # 'finch auth printer key' to undo
+## 3. Keep it running
+  finch service install --json    launchd on macOS, systemd --user on Linux
+  finch service status --json     -> {"installed":true,"running":true,...}
+  Run install again after every later 'finch add': the service reads finch.yml
+  only when it starts, and install restarts it. On Linux, "linger": false means
+  the human should run 'sudo loginctl enable-linger <user>' (never run sudo
+  yourself). ('finch run' serves in the foreground instead.)
 
-## Provision ANOTHER box, no human in the loop
-From a box that is already logged in:
-  finch token | ssh user@newbox "finch login --token -"
-  ssh user@newbox "finch add api --service http://127.0.0.1:9000 && finch run"
-'finch token' mints a fresh, revocable CLI token. The browser step is only ever
-needed for your FIRST box.
-Pipe the token ('--token -', or set FINCH_CLI_TOKEN) rather than passing it as
-an argument: the CLI token is a ~30-day tenant-admin credential, and argv is
-world-readable on the remote box and kept in shell/SSH history.
+## 4. Check it
+  finch test notes --json         exit 0 = the MCP server answered tools/list
 
-## Inspect state
-  finch version --json    # local binary version + OS/architecture
-  finch status --json     # am I logged in (which tenant)? what does finch.yml serve?
-  finch fleet --json      # every service + its state (online/offline/pending)
-  finch domain ls         # custom hostnames mapped to this account
+## 5. Connect it to an MCP client
+  finch connect notes --client claude-code     (or cursor | codex)
+  Mints a finch_ key for that client and writes it into the client's config
+  without printing it. --client json prints an mcpServers snippet instead (the
+  only mode that shows the key).
 
-## finch.yml (what 'finch add' writes — holds NO secrets)
-  hub: https://finchmcp.com
-  box: this-box
-  ingress:
-    - app_path: printer                # becomes <slug>.finchmcp.com/printer/
-      service: http://127.0.0.1:8000
+## Exit codes
+  0 ok | 1 error | 2 usage | 10 waiting for approval | 11 expired | 12 not logged in
+With --json, errors go to stderr as
+  {"schema_version":1,"error":{"code":"NOT_LOGGED_IN","message":"...","next":"finch login --start"}}
+Codes: NOT_LOGGED_IN, APPROVAL_PENDING, EXPIRED, NOT_FOUND, UPSTREAM, USAGE,
+INTERNAL. When "next" is present, run it.
 
-## Good to know
-- --json works on add / token / status / fleet / keys / test / call for parsing.
-- The CLI token is a tenant-admin credential (~30 days). Revoke every CLI login
-  at once with:  finch revoke-tokens
-- 'finch rm <service>' removes a service; 'finch approve <app_path>' is only
-  needed if you are not logged in (otherwise 'finch run' approves automatically).
-- See 'finch help' for the flag-level reference.
-`)
-}
+## More
+  finch fleet --json                          every service + its state
+  finch call notes <tool> --args '{"k":"v"}'  invoke one tool
+  finch keys list | keys mint <label> --service notes | keys revoke <id>
+  finch auth notes public|key                 open a service, or require a key again
+  finch rm notes                              remove a service
+  finch service uninstall                     stop the background service
+  finch help                                  flag-level reference
+`
 
-// printUsage is the top-level `finch help` — an overview of the subcommands.
-// (Go's flag package only prints per-flag usage; this ties it together.)
-func printUsage() {
-	fmt.Print(`finch — publish local services (MCP servers, web apps, any HTTP/WS) through the
-finch hub from macOS or Linux. Your box dials OUT, so nothing listens and no
-ports are opened.
+// usageText is `finch help`.
+const usageText = `finch — publish a local MCP server (or any HTTP app) at a public https URL from
+macOS or Linux. This machine dials OUT to the finch hub: nothing listens and no
+ports open.
 
-Usage:
-  finch version [--json]              Show this binary's version and platform
-  finch login [--hub URL]              Log in (prints a link + code to approve on any device)
-  finch login --token -                Log in with a token piped on stdin (or FINCH_CLI_TOKEN);
-                                          keeps the tenant-admin token off argv/history
-  finch login --headless               Log in on a screenless box over SSH: prints the link
-                                          + code (approve on your phone), no local browser
-  finch add <app_path> --service <url> Enroll a service and append it to finch.yml
-                                          <app_path> becomes the URL: <slug>.finchmcp.com/<app_path>/
-  finch run [--config finch.yml]       Serve every ingress rule (auto-approves when logged in)
-  finch enroll <app_path> --ticket -   Save a box credential from a one-shot join ticket on stdin
-                                          (one time; a logged-in box uses 'finch add' instead)
-  finch approve <app_path>             Approve a service (clear the pending gate)
-  finch auth <app_path> public|key     Make a service open to anyone, or require a finch_ key
-  finch token [--json|--login]         Mint a fresh CLI token (provision a new box, no browser)
-  finch status [--json]                Show login + what finch.yml serves
-  finch fleet [--json]   (alias: ls)   List this account's services + state
-  finch test <service>               List a service's MCP tools (does-it-work check)
-  finch call <service> <tool> [--args '{...}']   Invoke one tool through the hub
-  finch keys [list|mint <label> --service <id>|revoke <id>]   Manage client finch_ keys
-  finch domain [ls|add <hostname>|rm <hostname>]   Manage custom hostnames
-  finch rm <service>                 Remove a service
-  finch update [--force]               Self-update this binary + restart the serve cleanly
-  finch revoke-tokens                  De-authorize every CLI login (incl. this box)
-  finch guide                          Full agent operating manual (point an AI agent at this)
-  finch help                           Show this help
+Agent flow (every step takes --json; 'finch guide' explains it):
+  finch status --json                                  what is set up already?
+  finch login --start --json                           show the human the link + code
+  finch login --poll --json                            repeat every <interval>s until exit 0
+  finch add <name> --service <url> [--public] --json   publish it; prints the public URL
+  finch service install --json                         keep 'finch run' running
+  finch test <name> --json                             does it answer? (non-zero if not)
+  finch connect <name> --client claude-code|cursor|codex|json
 
-Driving finch with an AI agent? Run 'finch guide' for a complete manual it can
-follow, or just tell it: "use finch — run 'finch guide' first."
+Commands:
+  login [--hub URL]                  Log in and wait for approval (link + code, any device)
+  login --start | --poll             Two-step login: exit 10 pending, 11 expired, 0 approved
+  login --token -                    Log in with a token on stdin (or FINCH_CLI_TOKEN)
+  add <name> --service <url>         Enroll a service and add it to finch.yml [--public]
+  run [--config finch.yml]           Serve every finch.yml rule in the foreground
+  service install|uninstall|status   Run 'finch run' as a login service (launchd / systemd --user)
+  connect <name> --client <client>   Wire a service into claude-code, cursor, codex, or print json
+  test <name>                        List the service's MCP tools through the hub
+  call <name> <tool> [--args '{}']   Invoke one tool through the hub
+  status                             Login, finch.yml and background service at a glance
+  fleet  (alias: ls)                 Every service in the account + its state
+  keys [list | mint <label> --service <name> | revoke <id>]   Client finch_ keys
+  auth <name> public|key             Open a service to anyone, or require a finch_ key
+  rm <name>                          Remove a service
+  approve <name>                     Clear a pending gate (only needed when not logged in)
+  domain [ls | add <host> | rm <host>]   Custom hostnames
+  token [--login]                    Mint a CLI token for another box (pipe it; never argv)
+  enroll <name> --ticket -           Save a box credential from a one-shot join ticket
+  update [--force]                   Self-update and restart the running serve cleanly
+  revoke-tokens                      De-authorize every CLI login
+  version                            Show version and platform
+  guide                              Step-by-step manual for AI agents
+  help                               Show this help
 
-Typical first-time setup:
-  finch login --hub https://finchmcp.com   # approve a code, once
-  finch add printer --service http://127.0.0.1:8000
-  finch run
-
-Automation / driving finch from an agent (after the one-time 'finch login'):
-  Everything below is non-interactive and supports --json. No browser needed.
-  The CLI token is a tenant-admin credential, so an agent can do the whole
-  loop: introspect, serve, test, and grant/revoke access.
-
-  Introspect:
-    finch status --json            # am I logged in? what does finch.yml serve?
-    finch fleet --json             # every service + its state
-
-  Serve a local service:
-    finch add scraper --service http://127.0.0.1:8001 --json
-    finch run                      # serves all finch.yml rules, auto-approves
-
-  Test an endpoint:
-    finch test scraper             # list its MCP tools
-    finch call scraper search --args '{"q":"finch"}'   # invoke one tool
-
-  Grant + REVOKE client access (the finch_ keys callers present):
-    finch keys mint web-client --service scraper     # prints a finch_ key once
-    finch keys list
-    finch keys revoke <id>         # access stops immediately
-    finch domain add mcp.example.com
-    finch revoke-tokens            # de-authorize every CLI login at once
-
-  Provision a NEW box from this already-authed one, zero human in the loop:
-    finch token | ssh user@newbox 'finch login --token -'   # token never hits argv
-    ssh user@newbox 'finch add api --service http://127.0.0.1:9000 && finch run'
+Exit codes: 0 ok, 1 error, 2 usage, 10 waiting for approval, 11 expired,
+12 not logged in. With --json, success payloads carry "schema_version":1 and
+errors go to stderr as {"schema_version":1,"error":{"code","message","next"}}.
 
 Boxes enrolled with the original one-liner keep working: 'finch join --upstream
-<url>' (optionally '--ticket') serves a single service from ~/.finch/agent.json.
+<url>' serves a single service from ~/.finch/agent.json.
 
-Run 'finch <command> -h' for a command's own flags.
-`)
-}
+Run 'finch <command> -h' for a command's flags.
+`
 
-const cliVersionSchema = 1
+const cliVersionSchema = cliSchemaVersion
 
 // cliVersionInfo is the stable machine-readable identity of this binary. Keep
 // existing JSON field names and meanings backward-compatible; add fields only
@@ -235,26 +189,22 @@ func writeCLIVersion(out io.Writer, args []string, info cliVersionInfo) error {
 	return err
 }
 
-func cmdVersion(args []string) {
-	if err := writeCLIVersion(os.Stdout, args, currentCLIVersionInfo()); err != nil {
-		fmt.Fprintf(os.Stderr, "finch version: %v\n", err)
-		os.Exit(2)
-	}
-}
-
 // cliCred is the saved CLI login: which hub, and the tenant token for it.
 type cliCred struct {
-	Hub   string `json:"hub"`
-	Token string `json:"token"`
-	Email string `json:"email,omitempty"` // the signed-in user's email (for display)
+	Hub    string `json:"hub"`
+	Token  string `json:"token"`
+	Email  string `json:"email,omitempty"`  // the signed-in user's email (for display)
+	Tenant string `json:"tenant,omitempty"` // the tenant the token acts as (for display)
 }
 
-func cliCredPath() string {
+func finchHome() string {
 	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		return filepath.Join(home, ".finch", "cli.json")
+		return filepath.Join(home, ".finch")
 	}
-	return ".finch-cli.json"
+	return ".finch"
 }
+
+func cliCredPath() string { return filepath.Join(finchHome(), "cli.json") }
 
 // cli.json holds the ~30-day TENANT-ADMIN token (finch keys mint, finch token,
 // finch domain, finch rm). It is strictly more privileged than the per-box
@@ -262,23 +212,29 @@ func cliCredPath() string {
 // path — lstat/symlink/mode checks on read, atomic 0600 write in a 0700
 // directory that is refused if group/world-writable.
 //
-// Previously this used os.ReadFile / os.WriteFile, which follow an existing
-// symlink and apply the mode only on creation: a pre-planted ~/.finch/cli.json
-// symlink would have been written through, and a loose-mode file read without
-// complaint — while the LESS privileged agent.json rejected both.
-func loadCliCred() (*cliCred, error) {
+// readCliCred returns (nil, nil) when no login is saved.
+func readCliCred() (*cliCred, error) {
 	b, err := readCredentialFile(cliCredPath(), credentialStateLimit)
-	if err != nil {
+	if err != nil || b == nil {
 		return nil, err
-	}
-	if b == nil {
-		return nil, fmt.Errorf("not logged in — run `finch login` first (no browser here? `finch login --headless` prints a link to approve on any device, or pipe a token from a logged-in box: finch token | ssh thisbox 'finch login --token -')")
 	}
 	var c cliCred
 	if err := json.Unmarshal(b, &c); err != nil {
 		return nil, err
 	}
 	return &c, nil
+}
+
+// loadCliCred is readCliCred that treats "no login" as an error.
+func loadCliCred() (*cliCred, error) {
+	c, err := readCliCred()
+	if err != nil {
+		return nil, err
+	}
+	if c == nil {
+		return nil, fmt.Errorf("not logged in — run `finch login --start`")
+	}
+	return c, nil
 }
 
 func saveCliCred(c *cliCred) error {
@@ -292,7 +248,8 @@ func saveCliCred(c *cliCred) error {
 	return writeCredentialFile(cliCredPath(), b)
 }
 
-// cliGET/cliPOST hit /api/cli/* with the bearer token.
+// cliRequest calls /api/cli/* with the bearer token. A non-200 answer or a
+// transport failure comes back as *hubError.
 func cliRequest(method, hub, path, token string, body any) (map[string]any, error) {
 	validatedHub, err := validateHubTransportURL(hub)
 	if err != nil {
@@ -314,17 +271,17 @@ func cliRequest(method, hub, path, token string, body any) (map[string]any, erro
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	req.Header.Set("Accept", "application/json, text/event-stream")
 	res, err := controlPlaneHTTPClient.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, &hubError{Msg: err.Error()}
 	}
 	defer res.Body.Close()
 	raw, err := readBoundedControlResponse(res.Body)
 	if err != nil {
-		return nil, err
+		return nil, &hubError{Msg: err.Error()}
 	}
-	var out map[string]any
-	_ = json.Unmarshal(raw, &out)
+	out := decodeHubBody(raw)
 	if res.StatusCode != 200 {
 		msg := strings.TrimSpace(string(raw))
 		if out != nil {
@@ -332,19 +289,36 @@ func cliRequest(method, hub, path, token string, body any) (map[string]any, erro
 				msg = e
 			}
 		}
-		return nil, fmt.Errorf("hub %d: %s", res.StatusCode, msg)
+		if msg == "" {
+			msg = http.StatusText(res.StatusCode)
+		}
+		return nil, &hubError{Status: res.StatusCode, Msg: msg}
 	}
 	return out, nil
 }
 
-// loadCliCredQuiet returns the saved CLI credential, or nil if not logged in
-// (no error) — for best-effort auto-approve in `finch run`.
-func loadCliCredQuiet() *cliCred {
-	c, err := loadCliCred()
-	if err != nil {
-		return nil
+// decodeHubBody parses a JSON object body, or — when an MCP server answered
+// /api/cli/call with a Streamable-HTTP event stream — the last JSON object in
+// its `data:` lines. Returns nil when neither parses.
+func decodeHubBody(raw []byte) map[string]any {
+	var out map[string]any
+	if json.Unmarshal(raw, &out) == nil {
+		return out
 	}
-	return c
+	var last map[string]any
+	sc := bufio.NewScanner(bytes.NewReader(raw))
+	sc.Buffer(make([]byte, 64<<10), len(raw)+1)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		var m map[string]any
+		if json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(line, "data:"))), &m) == nil {
+			last = m
+		}
+	}
+	return last
 }
 
 // cliApprove clears the pending gate for service `id` via the CLI token.
@@ -353,24 +327,42 @@ func cliApprove(cred *cliCred, id string) error {
 	return err
 }
 
-// cmdApprove: finch approve <path> [<path>...]
-func cmdApprove(args []string) {
-	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: finch approve <path> [<path>...]")
-		os.Exit(2)
-	}
-	cred, err := loadCliCred()
+// runApprove: finch approve <name> [<name>...] — exits 1 if any approval fails.
+func runApprove(c *cli, args []string) error {
+	fs := newFlagSet("approve")
+	fs.Bool("json", false, "JSON output")
+	ids, err := c.parseArgs(fs, args)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
-		os.Exit(1)
+		return err
 	}
-	for _, id := range args {
+	if len(ids) == 0 {
+		return usageError("usage: finch approve <name> [<name>...]")
+	}
+	cred, err := requireCred()
+	if err != nil {
+		return err
+	}
+	approved := []string{}
+	var firstErr error
+	for _, id := range ids {
 		if err := cliApprove(cred, id); err != nil {
-			fmt.Fprintf(os.Stderr, "finch: approve %q failed: %v\n", id, err)
+			if firstErr == nil {
+				firstErr = hubFailure(err, fmt.Sprintf("approve %q", id), "finch fleet")
+			}
 			continue
 		}
-		fmt.Printf("finch: approved %q\n", id)
+		approved = append(approved, id)
+		if !c.json {
+			c.printf("finch: approved %q\n", id)
+		}
 	}
+	if firstErr != nil {
+		return firstErr
+	}
+	if c.json {
+		return c.emit(map[string]any{"approved": approved})
+	}
+	return nil
 }
 
 // cliSetAuth flips a service's public-relay access mode ("key" | "public").
@@ -379,516 +371,447 @@ func cliSetAuth(cred *cliCred, appPath, mode string) error {
 	return err
 }
 
-// cmdAuth: finch auth <app_path> public|key — set whether the service's public
-// endpoint requires a finch_ bearer key. "public" makes it an open webpage.
-func cmdAuth(args []string) {
-	if len(args) != 2 || (args[1] != "public" && args[1] != "key") {
-		fmt.Fprintln(os.Stderr, "usage: finch auth <app_path> public|key")
-		os.Exit(2)
-	}
-	cred, err := loadCliCred()
+// runAuth: finch auth <name> public|key — set whether the service's public
+// endpoint requires a finch_ bearer key. "public" makes it open to anyone.
+func runAuth(c *cli, args []string) error {
+	fs := newFlagSet("auth")
+	fs.Bool("json", false, "JSON output")
+	pos, err := c.parseArgs(fs, args)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
-		os.Exit(1)
+		return err
 	}
-	if err := cliSetAuth(cred, args[0], args[1]); err != nil {
-		fmt.Fprintf(os.Stderr, "finch: set auth %q failed: %v\n", args[0], err)
-		os.Exit(1)
+	if len(pos) != 2 || (pos[1] != "public" && pos[1] != "key") {
+		return usageError("usage: finch auth <name> public|key")
 	}
-	fmt.Printf("finch: %q is now %s\n", args[0], args[1])
+	cred, err := requireCred()
+	if err != nil {
+		return err
+	}
+	if err := cliSetAuth(cred, pos[0], pos[1]); err != nil {
+		return hubFailure(err, fmt.Sprintf("set auth for %q", pos[0]), "finch fleet")
+	}
+	if c.json {
+		return c.emit(map[string]any{"service": pos[0], "auth": pos[1]})
+	}
+	c.printf("finch: %q is now %s\n", pos[0], pos[1])
+	return nil
 }
 
 // resolveCliToken applies argv-free intake for the CLI token, mirroring
-// resolveTicket: "-" reads the token from stdin and FINCH_CLI_TOKEN
-// is the env fallback. It matters strictly MORE here than for a ticket — the CLI
-// token is a ~30-day TENANT-ADMIN assertion (see saveCliCred), while a
-// ticket is one-shot and scoped to a single service — yet until now it could only
-// arrive on argv, where it is readable by any local user via /proc/<pid>/cmdline
-// and is persisted verbatim into shell/SSH history.
+// resolveTicket: "-" reads the token from stdin and FINCH_CLI_TOKEN is the env
+// fallback. The CLI token is a ~30-day TENANT-ADMIN assertion, so on argv it
+// would be readable via /proc/<pid>/cmdline and persisted into shell history.
 //
 // Returns the resolved token plus whether it came from argv, so the caller can
-// warn about that (still-supported) path. stdin is a parameter so the intake is
-// unit-testable; callers pass os.Stdin.
-func resolveCliToken(token string, stdin io.Reader) (string, bool) {
+// warn about that (still-supported) path.
+func resolveCliToken(token string, stdin io.Reader) (string, bool, error) {
 	if token == "-" {
 		b, err := io.ReadAll(io.LimitReader(stdin, 4096))
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "finch: could not read token from stdin: %v\n", err)
-			os.Exit(1)
+			return "", false, fmt.Errorf("could not read token from stdin: %w", err)
 		}
 		tok := strings.TrimSpace(string(b))
 		if tok == "" {
-			fmt.Fprintln(os.Stderr, "finch: --token - given but stdin was empty")
-			os.Exit(1)
+			return "", false, fmt.Errorf("--token - given but stdin was empty")
 		}
-		return tok, false
+		return tok, false, nil
 	}
 	if token != "" {
-		return token, true
+		return token, true, nil
 	}
-	// Empty here also covers "no token at all" — cmdLogin then falls through to
-	// the interactive device flow, which is the most argv-free path of all.
-	return strings.TrimSpace(os.Getenv("FINCH_CLI_TOKEN")), false
+	// Empty also covers "no token at all" — runLogin then falls through to the
+	// device flow, which is the most argv-free path of all.
+	return strings.TrimSpace(os.Getenv("FINCH_CLI_TOKEN")), false, nil
 }
 
-// cmdLogin: finch login [--hub URL] [--token -|<token>]
-func cmdLogin(args []string) {
-	fs := flag.NewFlagSet("login", flag.ExitOnError)
-	hub := fs.String("hub", "https://finchmcp.com", "finch hub base URL")
-	tokenFlag := fs.String("token", "", "CLI token; '-' reads it from stdin, or set FINCH_CLI_TOKEN (a literal value on argv is accepted but leaks into the process table and shell history)")
-	headless := fs.Bool("headless", false, "no local browser: print the link + code (open it on any device, e.g. your phone) and poll — for a screenless box reached over SSH")
-	_ = fs.Parse(args)
-	validatedHub, err := validateHubTransportURL(*hub)
+// mcpCall relays one JSON-RPC method to the tenant's service through the hub
+// and returns its result, turning every failure — hub status, a JSON-RPC
+// error, an unparseable body — into a contract error.
+func mcpCall(cred *cliCred, service, method string, params any) (map[string]any, error) {
+	body := map[string]any{"service": service, "method": method}
+	if params != nil {
+		body["params"] = params
+	}
+	out, err := cliRequest("POST", cred.Hub, "/api/cli/call", cred.Token, body)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "finch: login failed: %v\n", err)
-		os.Exit(1)
-	}
-	*hub = validatedHub
-
-	token := *tokenFlag
-	if token == "" && fs.NArg() > 0 {
-		token = fs.Arg(0)
-	}
-	token, fromArgv := resolveCliToken(token, os.Stdin)
-	if fromArgv {
-		// Warn but proceed: the token is already on this box's argv by the time
-		// we run, so refusing it would only break existing scripts without
-		// un-leaking anything. The warning is what moves callers to the piped
-		// form for the NEXT box they provision.
-		fmt.Fprintln(os.Stderr, "finch: warning: the CLI token was passed on the command line, so it lands in the process table (/proc/<pid>/cmdline) and shell/SSH history")
-		fmt.Fprintln(os.Stderr, "finch:          prefer:  finch token | ssh newbox 'finch login --token -'   (or set FINCH_CLI_TOKEN)")
-	}
-	// No token → run the interactive device flow (open browser, approve a code).
-	// The device flow also hands back the approver's email (for the account label);
-	// the --token path has none.
-	email := ""
-	if token == "" {
-		token, email = deviceLogin(*hub, *headless)
-	}
-
-	// Validate against the hub and learn which tenant the token acts as.
-	who, err := cliRequest("GET", *hub, "/api/cli/whoami", token, nil)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "finch: login failed: %v\n", err)
-		os.Exit(1)
-	}
-	if err := saveCliCred(&cliCred{Hub: *hub, Token: token, Email: email}); err != nil {
-		fmt.Fprintf(os.Stderr, "finch: could not save credential: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Printf("finch: logged in to tenant %v at %s (saved to %s)\n", who["tenant"], *hub, cliCredPath())
-}
-
-// deviceLogin runs the browser device-authorization flow (`finch login` with no
-// token): start a code, point the user at the hub's /cli page to approve it, poll until
-// approved, and return the issued token plus the approver's email (for the account
-// label; may be ""). Exits on error/expiry/timeout.
-//
-// headless=true is for a screenless box reached over SSH: it skips the (useless)
-// local browser spawn and force-flushes stdout so the link+code reach the far end
-// of the pipe immediately instead of sitting buffered while the poll loop blocks.
-// The flow is otherwise identical — you approve the code on any device (your phone
-// is fine), and it polls the same ~10-minute window before giving up.
-func deviceLogin(hub string, headless bool) (string, string) {
-	start, err := cliRequest("POST", hub, "/api/cli/device/start", "", struct{}{})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "finch: could not start login: %v\n", err)
-		os.Exit(1)
-	}
-	deviceCode, _ := start["device_code"].(string)
-	userCode, _ := start["user_code"].(string)
-	uri, _ := start["verification_uri_complete"].(string)
-	if uri == "" {
-		uri, _ = start["verification_uri"].(string)
-	}
-	interval := 3.0
-	if v, ok := start["interval"].(float64); ok && v > 0 {
-		interval = v
-	}
-	expires := 600.0
-	if v, ok := start["expires_in"].(float64); ok && v > 0 {
-		expires = v
-	}
-
-	fmt.Printf("\n  To finish login, open this page on any device (your phone or laptop\n  is fine — you do NOT need a browser on this machine):\n\n      %s\n\n  and confirm this code:  %s\n\n", uri, userCode)
-	if !headless {
-		openBrowser(uri)
-	}
-	fmt.Print("  Waiting for approval")
-	// Over SSH / a pipe, os.Stdout is fully buffered: flush now so the link and
-	// code land immediately instead of being trapped behind the blocking poll
-	// loop below (the exact symptom on a headless box).
-	_ = os.Stdout.Sync()
-
-	deadline := time.Now().Add(time.Duration(expires) * time.Second)
-	for time.Now().Before(deadline) {
-		time.Sleep(time.Duration(interval) * time.Second)
-		poll, err := cliRequest("POST", hub, "/api/cli/device/poll", "", map[string]string{"device_code": deviceCode})
-		if err != nil {
-			fmt.Print(".")
-			continue
+		var he *hubError
+		if asHubError(err, &he) && he.Status >= 500 {
+			return nil, newCLIError(codeUpstream, "finch service status", "%s did not answer through the hub: %v (is 'finch run' serving it?)", service, he)
 		}
-		switch poll["status"] {
-		case "approved":
-			fmt.Println("  ✓")
-			if tok, _ := poll["token"].(string); tok != "" {
-				email, _ := poll["email"].(string)
-				return tok, email
-			}
-			fmt.Fprintln(os.Stderr, "\nfinch: approval returned no token")
-			os.Exit(1)
-		case "expired", "not_found":
-			fmt.Fprintln(os.Stderr, "\nfinch: login code expired — run `finch login` again")
-			os.Exit(1)
-		default: // pending
-			fmt.Print(".")
-		}
+		return nil, hubFailure(err, service, "finch fleet")
 	}
-	fmt.Fprintln(os.Stderr, "\nfinch: timed out waiting for approval")
-	os.Exit(1)
-	return "", ""
-}
-
-// openBrowser best-effort opens a URL in the user's browser.
-func openBrowser(u string) {
-	var name string
-	var args []string
-	switch runtime.GOOS {
-	case "darwin":
-		name, args = "open", []string{u}
-	default:
-		name, args = "xdg-open", []string{u}
+	if out == nil {
+		return nil, newCLIError(codeUpstream, "", "%s returned a response that is not JSON-RPC", service)
 	}
-	_ = exec.Command(name, args...).Start()
-}
-
-// cmdTest: finch test <service> — list the service's MCP tools (a quick
-// "does my endpoint work" check, relayed through the hub via the CLI token).
-func cmdTest(args []string) {
-	fs := flag.NewFlagSet("test", flag.ExitOnError)
-	asJSON := fs.Bool("json", false, "JSON output")
-	app := ""
-	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-		app, args = args[0], args[1:]
-	}
-	_ = fs.Parse(args)
-	if app == "" {
-		fmt.Fprintln(os.Stderr, "usage: finch test <service>")
-		os.Exit(2)
-	}
-	cred := mustCliCred()
-	out, err := cliRequest("POST", cred.Hub, "/api/cli/call", cred.Token, map[string]any{"service": app, "method": "tools/list"})
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
-		os.Exit(1)
-	}
-	if *asJSON {
-		b, _ := json.Marshal(out)
-		fmt.Println(string(b))
-		return
-	}
-	res, _ := out["result"].(map[string]any)
-	tools, _ := res["tools"].([]any)
 	if e, ok := out["error"]; ok && e != nil {
-		fmt.Fprintf(os.Stderr, "finch: %v\n", e)
-		os.Exit(1)
+		msg := fmt.Sprint(e)
+		if m, ok := e.(map[string]any); ok {
+			if s, ok := m["message"].(string); ok && s != "" {
+				msg = s
+			}
+		}
+		return nil, newCLIError(codeUpstream, "", "%s answered %s with an MCP error: %s", service, method, msg)
 	}
-	fmt.Printf("%s — %d tool(s):\n", app, len(tools))
-	for _, t := range tools {
+	res, ok := out["result"].(map[string]any)
+	if !ok {
+		return nil, newCLIError(codeUpstream, "", "%s answered %s without a result", service, method)
+	}
+	return res, nil
+}
+
+// runTest: finch test <name> — list the service's MCP tools through the hub (a
+// quick "does my endpoint work" check). Exits non-zero whenever the call fails.
+func runTest(c *cli, args []string) error {
+	fs := newFlagSet("test")
+	fs.Bool("json", false, "JSON output")
+	pos, err := c.parseArgs(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 {
+		return usageError("usage: finch test <name>")
+	}
+	app := pos[0]
+	cred, err := requireCred()
+	if err != nil {
+		return err
+	}
+	res, err := mcpCall(cred, app, "tools/list", nil)
+	if err != nil {
+		return err
+	}
+	raw, ok := res["tools"].([]any)
+	if !ok {
+		return newCLIError(codeUpstream, "", "%s answered tools/list without a tools array", app)
+	}
+	tools := make([]map[string]any, 0, len(raw))
+	for _, t := range raw {
 		m, _ := t.(map[string]any)
-		fmt.Printf("  • %-16v %v\n", m["name"], m["description"])
+		name, _ := m["name"].(string)
+		desc, _ := m["description"].(string)
+		tools = append(tools, map[string]any{"name": name, "description": desc})
 	}
+	if c.json {
+		return c.emit(map[string]any{"service": app, "ok": true, "tools": tools})
+	}
+	c.printf("%s — %d tool(s):\n", app, len(tools))
+	for _, t := range tools {
+		c.printf("  • %-16v %v\n", t["name"], t["description"])
+	}
+	return nil
 }
 
-// cmdCall: finch call <service> <tool> [--args '{...}'] — invoke one tool.
-func cmdCall(args []string) {
-	fs := flag.NewFlagSet("call", flag.ExitOnError)
+// runCall: finch call <name> <tool> [--args '{...}'] — invoke one tool. A tool
+// that reports isError exits 1 like any other failure.
+func runCall(c *cli, args []string) error {
+	fs := newFlagSet("call")
 	argsJSON := fs.String("args", "{}", "tool arguments as a JSON object")
-	asJSON := fs.Bool("json", false, "print the raw JSON-RPC result")
-	pos := []string{}
-	for len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-		pos = append(pos, args[0])
-		args = args[1:]
-	}
-	_ = fs.Parse(args)
-	if len(pos) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: finch call <service> <tool> [--args '{\"k\":\"v\"}']")
-		os.Exit(2)
-	}
-	var toolArgs any
-	if err := json.Unmarshal([]byte(*argsJSON), &toolArgs); err != nil {
-		fmt.Fprintf(os.Stderr, "finch: --args is not valid JSON: %v\n", err)
-		os.Exit(2)
-	}
-	cred := mustCliCred()
-	out, err := cliRequest("POST", cred.Hub, "/api/cli/call", cred.Token, map[string]any{
-		"service": pos[0],
-		"method":  "tools/call",
-		"params":  map[string]any{"name": pos[1], "arguments": toolArgs},
-	})
+	fs.Bool("json", false, "print the tool result as JSON")
+	pos, err := c.parseArgs(fs, args)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
-		os.Exit(1)
+		return err
 	}
-	if *asJSON {
-		b, _ := json.Marshal(out)
-		fmt.Println(string(b))
-		return
+	if len(pos) != 2 {
+		return usageError(`usage: finch call <name> <tool> [--args '{"k":"v"}']`)
 	}
-	if e, ok := out["error"]; ok && e != nil {
-		fmt.Fprintf(os.Stderr, "finch: %v\n", e)
-		os.Exit(1)
+	var toolArgs map[string]any
+	if err := json.Unmarshal([]byte(*argsJSON), &toolArgs); err != nil || toolArgs == nil {
+		return usageError("--args must be a JSON object")
 	}
-	// Pretty-print the text content if present, else the raw result.
-	if res, ok := out["result"].(map[string]any); ok {
-		if content, ok := res["content"].([]any); ok {
-			for _, c := range content {
-				if m, ok := c.(map[string]any); ok && m["type"] == "text" {
-					fmt.Println(m["text"])
-				}
+	cred, err := requireCred()
+	if err != nil {
+		return err
+	}
+	res, err := mcpCall(cred, pos[0], "tools/call", map[string]any{"name": pos[1], "arguments": toolArgs})
+	if err != nil {
+		return err
+	}
+	texts := []string{}
+	if content, ok := res["content"].([]any); ok {
+		for _, item := range content {
+			if m, ok := item.(map[string]any); ok && m["type"] == "text" {
+				texts = append(texts, fmt.Sprint(m["text"]))
 			}
-			return
 		}
-		b, _ := json.Marshal(res)
-		fmt.Println(string(b))
-		return
 	}
-	b, _ := json.Marshal(out)
-	fmt.Println(string(b))
+	if isErr, _ := res["isError"].(bool); isErr {
+		return newCLIError(codeUpstream, "", "tool %s on %s failed: %s", pos[1], pos[0], strings.Join(texts, " "))
+	}
+	if c.json {
+		return c.emit(map[string]any{"service": pos[0], "tool": pos[1], "result": res})
+	}
+	if len(texts) > 0 {
+		for _, t := range texts {
+			c.printf("%s\n", t)
+		}
+		return nil
+	}
+	b, _ := json.Marshal(res)
+	c.printf("%s\n", b)
+	return nil
 }
 
-// mustCliCred loads the CLI credential or exits with the login hint.
-func mustCliCred() *cliCred {
-	cred, err := loadCliCred()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
-		os.Exit(1)
-	}
-	return cred
-}
-
-// cmdDomain: finch domain [ls|add|rm] — manage custom hostnames mapped to this
+// runDomain: finch domain [ls|add|rm] — manage custom hostnames mapped to this
 // tenant. The hub enforces ownership and, for BYO domains, returns the DNS CNAME
 // instruction the operator must configure before traffic becomes live.
-func cmdDomain(args []string) {
-	sub := "ls"
-	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-		sub, args = args[0], args[1:]
-	}
-	cred, err := loadCliCred()
+func runDomain(c *cli, args []string) error {
+	fs := newFlagSet("domain")
+	fs.Bool("json", false, "JSON output")
+	pos, err := c.parseArgs(fs, args)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
-		os.Exit(1)
+		return err
+	}
+	sub := "ls"
+	if len(pos) > 0 {
+		sub, pos = pos[0], pos[1:]
+	}
+	switch sub {
+	case "ls", "list", "add", "rm", "remove", "delete":
+	default:
+		return usageError("usage: finch domain [ls | add <hostname> | rm <hostname>]")
+	}
+	if sub != "ls" && sub != "list" && len(pos) != 1 {
+		return usageError("usage: finch domain %s <hostname>", sub)
+	}
+	cred, err := requireCred()
+	if err != nil {
+		return err
 	}
 	switch sub {
 	case "ls", "list":
-		fs := flag.NewFlagSet("domain ls", flag.ExitOnError)
-		asJSON := fs.Bool("json", false, "JSON output")
-		_ = fs.Parse(args)
 		out, err := cliRequest("GET", cred.Hub, "/api/cli/hostnames", cred.Token, nil)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "finch: %v\n", err)
-			os.Exit(1)
+			return hubFailure(err, "list hostnames", "")
 		}
 		hostnames, _ := out["hostnames"].([]any)
-		if *asJSON {
-			b, _ := json.Marshal(hostnames)
-			fmt.Println(string(b))
-			return
+		if hostnames == nil {
+			hostnames = []any{}
+		}
+		if c.json {
+			return c.emit(map[string]any{"hostnames": hostnames})
 		}
 		if len(hostnames) == 0 {
-			fmt.Println("no custom hostnames — `finch domain add <hostname>`")
-			return
+			c.printf("no custom hostnames — `finch domain add <hostname>`\n")
+			return nil
 		}
 		for _, h := range hostnames {
-			fmt.Printf("  %v\n", h)
+			c.printf("  %v\n", h)
 		}
 	case "add":
-		if len(args) < 1 {
-			fmt.Fprintln(os.Stderr, "usage: finch domain add <hostname>")
-			os.Exit(2)
-		}
-		out, err := cliRequest("POST", cred.Hub, "/api/cli/hostnames", cred.Token, map[string]string{"hostname": args[0]})
+		out, err := cliRequest("POST", cred.Hub, "/api/cli/hostnames", cred.Token, map[string]string{"hostname": pos[0]})
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "finch: %v\n", err)
-			os.Exit(1)
+			return hubFailure(err, "add hostname "+pos[0], "")
 		}
-		fmt.Printf("finch: added %v hostname %v\n", out["tier"], out["hostname"])
+		if c.json {
+			return c.emit(out)
+		}
+		c.printf("finch: added %v hostname %v\n", out["tier"], out["hostname"])
 		if instr, _ := out["instructions"].(string); instr != "" {
-			fmt.Println(instr)
+			c.printf("%s\n", instr)
 		}
 		if ssl, ok := out["ssl"]; ok && ssl != nil {
-			fmt.Printf("ssl: %v\n", ssl)
+			c.printf("ssl: %v\n", ssl)
 		}
-	case "rm", "remove", "delete":
-		if len(args) < 1 {
-			fmt.Fprintln(os.Stderr, "usage: finch domain rm <hostname>")
-			os.Exit(2)
+	default: // rm
+		if _, err := cliRequest("DELETE", cred.Hub, "/api/cli/hostnames", cred.Token, map[string]string{"hostname": pos[0]}); err != nil {
+			return hubFailure(err, "remove hostname "+pos[0], "finch domain ls")
 		}
-		if _, err := cliRequest("DELETE", cred.Hub, "/api/cli/hostnames", cred.Token, map[string]string{"hostname": args[0]}); err != nil {
-			fmt.Fprintf(os.Stderr, "finch: %v\n", err)
-			os.Exit(1)
+		if c.json {
+			return c.emit(map[string]any{"removed": pos[0]})
 		}
-		fmt.Printf("finch: removed hostname %s\n", args[0])
-	default:
-		fmt.Fprintln(os.Stderr, "usage: finch domain [ls | add <hostname> | rm <hostname>]")
-		os.Exit(2)
+		c.printf("finch: removed hostname %s\n", pos[0])
 	}
+	return nil
 }
 
-// cmdKeys: finch keys [list|mint|revoke] — manage the client finch_ keys that
-// callers present to reach your services. The control plane an agent uses to
-// grant + REVOKE access.
-func cmdKeys(args []string) {
-	sub := "list"
-	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-		sub, args = args[0], args[1:]
-	}
-	cred, err := loadCliCred()
+// mintClientKey mints a finch_ key scoped to one service (or every service).
+func mintClientKey(cred *cliCred, label string, scope any) (map[string]any, error) {
+	out, err := cliRequest("POST", cred.Hub, "/api/cli/keys", cred.Token, map[string]any{"label": label, "scope": scope})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
-		os.Exit(1)
+		return nil, hubFailure(err, "mint key", "finch fleet")
 	}
+	if key, _ := out["key"].(string); !strings.HasPrefix(key, "finch_") {
+		return nil, newCLIError(codeUpstream, "", "mint key: the hub did not return a finch_ key")
+	}
+	return out, nil
+}
+
+// runKeys: finch keys [list|mint|revoke] — manage the client finch_ keys that
+// callers present to reach your services.
+func runKeys(c *cli, args []string) error {
+	fs := newFlagSet("keys")
+	all := fs.Bool("all", false, "mint: key reaches EVERY service (default: none — scope it)")
+	service := fs.String("service", "", "mint: scope the key to one service")
+	fs.Bool("json", false, "JSON output")
+	pos, err := c.parseArgs(fs, args)
+	if err != nil {
+		return err
+	}
+	sub := "list"
+	if len(pos) > 0 {
+		sub, pos = pos[0], pos[1:]
+	}
+	var scope any
 	switch sub {
 	case "list":
-		fs := flag.NewFlagSet("keys", flag.ExitOnError)
-		asJSON := fs.Bool("json", false, "JSON output")
-		_ = fs.Parse(args)
-		st, err := cliRequest("GET", cred.Hub, "/api/cli/state", cred.Token, nil)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "finch: %v\n", err)
-			os.Exit(1)
-		}
-		keys, _ := st["keys"].([]any)
-		if *asJSON {
-			b, _ := json.Marshal(keys)
-			fmt.Println(string(b))
-			return
-		}
-		if len(keys) == 0 {
-			fmt.Println("no keys — `finch keys mint <label> --service <id>`")
-			return
-		}
-		for _, k := range keys {
-			m, _ := k.(map[string]any)
-			fmt.Printf("  %-12v %v\n", m["id"], m["label"])
+		if len(pos) != 0 {
+			return usageError("usage: finch keys list")
 		}
 	case "mint":
-		fs := flag.NewFlagSet("keys mint", flag.ExitOnError)
-		all := fs.Bool("all", false, "key reaches EVERY service (default: none — scope it)")
-		service := fs.String("service", "", "scope the key to one service id")
-		asJSON := fs.Bool("json", false, "JSON output")
-		label := ""
-		if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-			label, args = args[0], args[1:]
+		if len(pos) != 1 {
+			return usageError("usage: finch keys mint <label> (--service <name> | --all)")
 		}
-		_ = fs.Parse(args)
-		if label == "" {
-			fmt.Fprintln(os.Stderr, "usage: finch keys mint <label> (--service <id> | --all)")
-			os.Exit(2)
-		}
-		var scope any
 		switch {
+		case *all && *service != "":
+			return usageError("keys mint: pass --service or --all, not both")
 		case *all:
 			scope = map[string]bool{"all": true}
 		case *service != "":
 			scope = map[string][]string{"services": {*service}}
 		default:
-			fmt.Fprintln(os.Stderr, "finch: scope the key with --service <id> (or --all)")
-			os.Exit(2)
+			return usageError("keys mint: scope the key with --service <name> (or --all)")
 		}
-		out, err := cliRequest("POST", cred.Hub, "/api/cli/keys", cred.Token, map[string]any{"label": label, "scope": scope})
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "finch: %v\n", err)
-			os.Exit(1)
-		}
-		if *asJSON {
-			b, _ := json.Marshal(out)
-			fmt.Println(string(b))
-			return
-		}
-		fmt.Println(out["key"]) // the finch_ key — shown once
 	case "revoke":
-		if len(args) < 1 {
-			fmt.Fprintln(os.Stderr, "usage: finch keys revoke <id>")
-			os.Exit(2)
+		if len(pos) != 1 {
+			return usageError("usage: finch keys revoke <id>")
 		}
-		if _, err := cliRequest("POST", cred.Hub, "/api/cli/keys/revoke", cred.Token, map[string]string{"id": args[0]}); err != nil {
-			fmt.Fprintf(os.Stderr, "finch: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Printf("finch: revoked key %s\n", args[0])
 	default:
-		fmt.Fprintln(os.Stderr, "usage: finch keys [list | mint <label> --service <id> | revoke <id>]")
-		os.Exit(2)
+		return usageError("usage: finch keys [list | mint <label> --service <name> | revoke <id>]")
 	}
+	cred, err := requireCred()
+	if err != nil {
+		return err
+	}
+	switch sub {
+	case "list":
+		st, err := cliRequest("GET", cred.Hub, "/api/cli/state", cred.Token, nil)
+		if err != nil {
+			return hubFailure(err, "list keys", "")
+		}
+		keys, _ := st["keys"].([]any)
+		if keys == nil {
+			keys = []any{}
+		}
+		if c.json {
+			return c.emit(map[string]any{"keys": keys})
+		}
+		if len(keys) == 0 {
+			c.printf("no keys — `finch keys mint <label> --service <name>`\n")
+			return nil
+		}
+		for _, k := range keys {
+			m, _ := k.(map[string]any)
+			c.printf("  %-12v %v\n", m["id"], m["label"])
+		}
+	case "mint":
+		out, err := mintClientKey(cred, pos[0], scope)
+		if err != nil {
+			return err
+		}
+		if c.json {
+			return c.emit(out)
+		}
+		c.printf("%v\n", out["key"]) // the finch_ key — shown once
+	case "revoke":
+		if _, err := cliRequest("POST", cred.Hub, "/api/cli/keys/revoke", cred.Token, map[string]string{"id": pos[0]}); err != nil {
+			return hubFailure(err, "revoke key "+pos[0], "finch keys list")
+		}
+		if c.json {
+			return c.emit(map[string]any{"revoked": pos[0]})
+		}
+		c.printf("finch: revoked key %s\n", pos[0])
+	}
+	return nil
 }
 
-// cmdFleet: finch fleet [--json] — list this tenant's services + state.
-func cmdFleet(args []string) {
-	fs := flag.NewFlagSet("fleet", flag.ExitOnError)
-	asJSON := fs.Bool("json", false, "JSON output")
-	_ = fs.Parse(args)
-	cred, err := loadCliCred()
+// runFleet: finch fleet [--json] — list this tenant's services + state.
+func runFleet(c *cli, args []string) error {
+	fs := newFlagSet("fleet")
+	fs.Bool("json", false, "JSON output")
+	pos, err := c.parseArgs(fs, args)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
-		os.Exit(1)
+		return err
+	}
+	if len(pos) != 0 {
+		return usageError("usage: finch fleet [--json]")
+	}
+	cred, err := requireCred()
+	if err != nil {
+		return err
 	}
 	st, err := cliRequest("GET", cred.Hub, "/api/cli/state", cred.Token, nil)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
-		os.Exit(1)
+		return hubFailure(err, "fleet", "")
 	}
 	apps, _ := st["services"].([]any)
-	if *asJSON {
-		b, _ := json.Marshal(apps)
-		fmt.Println(string(b))
-		return
+	if apps == nil {
+		apps = []any{}
+	}
+	if c.json {
+		return c.emit(map[string]any{"services": apps})
 	}
 	if len(apps) == 0 {
-		fmt.Println("no services — `finch add <path> --service <url>`")
-		return
+		c.printf("no services — `finch add <name> --service <url>`\n")
+		return nil
 	}
 	for _, a := range apps {
 		m, _ := a.(map[string]any)
-		fmt.Printf("  %-16v %v\n", m["id"], m["state"])
+		c.printf("  %-16v %v\n", m["id"], m["state"])
 	}
+	return nil
 }
 
-// cmdRm: finch rm <service> — remove a service from the tenant.
-func cmdRm(args []string) {
-	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, "usage: finch rm <service>")
-		os.Exit(2)
-	}
-	if err := validateServiceID(args[0]); err != nil {
-		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
-		os.Exit(2)
-	}
-	cred, err := loadCliCred()
+// runRm: finch rm <name> — remove a service from the tenant.
+func runRm(c *cli, args []string) error {
+	fs := newFlagSet("rm")
+	fs.Bool("json", false, "JSON output")
+	pos, err := c.parseArgs(fs, args)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
-		os.Exit(1)
+		return err
 	}
-	if _, err := cliRequest("POST", cred.Hub, "/api/cli/services/release", cred.Token, map[string]string{"id": args[0]}); err != nil {
-		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
-		os.Exit(1)
+	if len(pos) != 1 {
+		return usageError("usage: finch rm <name>")
 	}
-	fmt.Printf("finch: removed %s\n", args[0])
+	if err := validateServiceID(pos[0]); err != nil {
+		return usageError("%v", err)
+	}
+	cred, err := requireCred()
+	if err != nil {
+		return err
+	}
+	if _, err := cliRequest("POST", cred.Hub, "/api/cli/services/release", cred.Token, map[string]string{"id": pos[0]}); err != nil {
+		return hubFailure(err, "remove "+pos[0], "finch fleet")
+	}
+	if c.json {
+		return c.emit(map[string]any{"removed": pos[0]})
+	}
+	c.printf("finch: removed %s\n", pos[0])
+	return nil
 }
 
-// cmdRevokeTokens: finch revoke-tokens — de-authorize every CLI login (incl. this).
-func cmdRevokeTokens(args []string) {
-	cred, err := loadCliCred()
+// runRevokeTokens: finch revoke-tokens — de-authorize every CLI login (incl. this).
+func runRevokeTokens(c *cli, args []string) error {
+	fs := newFlagSet("revoke-tokens")
+	fs.Bool("json", false, "JSON output")
+	pos, err := c.parseArgs(fs, args)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
-		os.Exit(1)
+		return err
+	}
+	if len(pos) != 0 {
+		return usageError("usage: finch revoke-tokens")
+	}
+	cred, err := requireCred()
+	if err != nil {
+		return err
 	}
 	if _, err := cliRequest("POST", cred.Hub, "/api/cli/revoke-tokens", cred.Token, struct{}{}); err != nil {
-		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
-		os.Exit(1)
+		return hubFailure(err, "revoke tokens", "")
 	}
-	fmt.Println("finch: revoked all CLI tokens — every logged-in box (including this one) must `finch login` again")
+	if c.json {
+		return c.emit(map[string]any{"revoked": true})
+	}
+	c.printf("finch: revoked all CLI tokens — every logged-in box (including this one) must `finch login` again\n")
+	return nil
 }
 
 // loginHeredocDelimiter terminates the token heredoc in loginCommand. It is
@@ -901,197 +824,210 @@ func cmdRevokeTokens(args []string) {
 const loginHeredocDelimiter = "FINCH_CLI_TOKEN"
 
 // loginCommand renders a copy-pasteable `finch login` that keeps the ~30-day
-// tenant-admin token OFF argv, for `finch token --login` (below), which hands a
-// user a whole command instead of a bare token.
-//
-// The obvious form — `finch login --hub <hub> <token>` — leaks: argv is
-// world-readable via /proc/<pid>/cmdline for the life of the process, and the
-// pasted line is persisted verbatim into ~/.bash_history / ~/.zsh_history. It
-// leaked worst exactly where it was most used, since callers pipe a printed
-// command straight into a shell. A heredoc instead delivers the token on the
-// login process's STDIN (resolveCliToken reads "-" from stdin), so
-// nothing but the hub is ever visible in the process table.
-//
-// The heredoc body is written by the shell itself, so this stays a single
-// paste with no temp file to clean up and no helper process (`echo`/`printf`)
-// whose own argv would re-leak the token.
+// tenant-admin token OFF argv, for `finch token --login`. A heredoc delivers
+// the token on the login process's STDIN (resolveCliToken reads "-" from
+// stdin), so nothing but the hub is ever visible in the process table.
 func loginCommand(hub, token string) string {
 	return fmt.Sprintf("finch login --hub %s --token - <<'%s'\n%s\n%s",
 		hub, loginHeredocDelimiter, token, loginHeredocDelimiter)
 }
 
-// cmdToken: finch token [--json] [--login] — an authed box mints a FRESH CLI
+// runToken: finch token [--json] [--login] — an authed box mints a FRESH CLI
 // token, for non-interactive provisioning of a new box:
 //
 //	finch token | ssh newbox "finch login --token -"
-//
-// Piping is the intended shape: the bare-token output goes down the SSH channel
-// into the remote login's stdin, so the tenant-admin token never appears in the
-// remote argv (/proc/<pid>/cmdline) or in either shell's history.
-//
-// --login prints the same thing pre-assembled, via loginCommand below.
-func cmdToken(args []string) {
-	fs := flag.NewFlagSet("token", flag.ExitOnError)
-	asJSON := fs.Bool("json", false, "print the raw {token,hub,expiresAt} JSON")
+func runToken(c *cli, args []string) error {
+	fs := newFlagSet("token")
+	fs.Bool("json", false, "print {token,hub,expiresAt} as JSON")
 	asLogin := fs.Bool("login", false, "print a ready-to-run `finch login` block instead of just the token (heredoc: the token is fed on stdin, never on argv)")
-	_ = fs.Parse(args)
-
-	cred, err := loadCliCred()
+	pos, err := c.parseArgs(fs, args)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
-		os.Exit(1)
+		return err
+	}
+	if len(pos) != 0 {
+		return usageError("usage: finch token [--json | --login]")
+	}
+	cred, err := requireCred()
+	if err != nil {
+		return err
 	}
 	out, err := cliRequest("POST", cred.Hub, "/api/cli/token", cred.Token, struct{}{})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "finch: could not mint token: %v\n", err)
-		os.Exit(1)
+		return hubFailure(err, "mint token", "")
 	}
 	token, _ := out["token"].(string)
 	hub, _ := out["hub"].(string)
 	if token == "" {
-		fmt.Fprintf(os.Stderr, "finch: unexpected response: %v\n", out)
-		os.Exit(1)
+		return newCLIError(codeUpstream, "", "mint token: the hub returned no token")
 	}
 	switch {
-	case *asJSON:
-		b, _ := json.Marshal(out)
-		fmt.Println(string(b))
+	case c.json:
+		return c.emit(out)
 	case *asLogin:
-		fmt.Println(loginCommand(hub, token))
+		c.printf("%s\n", loginCommand(hub, token))
 	default:
-		fmt.Println(token) // bare token, for `finch token | ssh host "finch login --token -"`
+		c.printf("%s\n", token) // bare token, for `finch token | ssh host "finch login --token -"`
 	}
+	return nil
 }
 
-// cmdStatus: finch status [--json] — introspect login + finch.yml (for agents).
-func cmdStatus(args []string) {
-	fs := flag.NewFlagSet("status", flag.ExitOnError)
-	asJSON := fs.Bool("json", false, "JSON output")
+type ingressStatus struct {
+	AppPath string `json:"app_path"`
+	Service string `json:"service"`
+}
+
+// runStatus: finch status [--json] — login, finch.yml, and the background
+// service at a glance. It reports rather than fails: not being logged in is a
+// normal answer ("loggedIn": false, exit 0), so an agent can read one payload
+// and decide which step to start from.
+func runStatus(c *cli, args []string) error {
+	fs := newFlagSet("status")
+	fs.Bool("json", false, "JSON output")
 	configPath := fs.String("config", defaultManifestPath(), "finch.yml to summarize")
-	_ = fs.Parse(args)
-
-	type ingressStatus struct {
-		AppPath string `json:"app_path"`
-		Service string `json:"service"`
+	pos, err := c.parseArgs(fs, args)
+	if err != nil {
+		return err
 	}
-	st := struct {
-		LoggedIn bool            `json:"loggedIn"`
-		Hub      string          `json:"hub,omitempty"`
-		Tenant   string          `json:"tenant,omitempty"`
-		Config   string          `json:"config,omitempty"`
-		Ingress  []ingressStatus `json:"ingress"`
-	}{Ingress: []ingressStatus{}}
+	if len(pos) != 0 {
+		return usageError("usage: finch status [--json]")
+	}
 
-	if cred := loadCliCredQuiet(); cred != nil {
-		st.Hub = cred.Hub
-		if who, err := cliRequest("GET", cred.Hub, "/api/cli/whoami", cred.Token, nil); err == nil {
-			st.LoggedIn = true
-			st.Tenant, _ = who["tenant"].(string)
+	loggedIn, hubReachable := false, true
+	hub, tenant, account := "", "", ""
+	cred, credErr := readCliCred()
+	if credErr != nil {
+		return newCLIError(codeInternal, "", "reading %s: %v", cliCredPath(), credErr)
+	}
+	if cred != nil && cred.Token != "" {
+		hub, tenant, account = cred.Hub, cred.Tenant, cred.Email
+		who, err := cliRequest("GET", cred.Hub, "/api/cli/whoami", cred.Token, nil)
+		var he *hubError
+		switch {
+		case err == nil:
+			loggedIn = true
+			if t, _ := who["tenant"].(string); t != "" {
+				tenant = t
+			}
+		case asHubError(err, &he) && he.Status == 401:
+			loggedIn = false // expired or revoked
+		default:
+			// The hub is unreachable: the saved login is unverified, not invalid.
+			loggedIn, hubReachable = true, false
 		}
 	}
+	pending, _ := readPendingLogin()
+	loginPending := !loggedIn && pending != nil && !pending.expired()
+
+	ingress := []ingressStatus{}
+	cfgPath := ""
 	hostName, _ := os.Hostname()
 	if cfg, err := loadConfig(*configPath, hostName); err == nil {
-		st.Config = *configPath
-		if st.Hub == "" {
-			st.Hub = cfg.Hub
+		cfgPath = *configPath
+		if hub == "" {
+			hub = cfg.Hub
 		}
 		for _, ing := range cfg.Ingress {
-			st.Ingress = append(st.Ingress, ingressStatus{AppPath: ing.AppPath, Service: ing.Service})
+			ingress = append(ingress, ingressStatus{AppPath: ing.AppPath, Service: ing.Service})
 		}
 	}
+	svc := currentServiceStatus()
 
-	if *asJSON {
-		b, _ := json.MarshalIndent(st, "", "  ")
-		fmt.Println(string(b))
-		return
-	}
-	if st.LoggedIn {
-		fmt.Printf("logged in: %s  (tenant %s)\n", st.Hub, st.Tenant)
-	} else {
-		fmt.Printf("not logged in%s — run `finch login`\n", func() string {
-			if st.Hub != "" {
-				return " to " + st.Hub
+	if c.json {
+		payload := map[string]any{
+			"loggedIn":      loggedIn,
+			"login_pending": loginPending,
+			"ingress":       ingress,
+			"service":       svc.payload(),
+			"version":       agentVersion,
+		}
+		if cred != nil && cred.Token != "" {
+			// Only meaningful when there was a saved login to verify.
+			payload["hub_reachable"] = hubReachable
+		}
+		for k, v := range map[string]string{"hub": hub, "tenant": tenant, "account": account, "config": cfgPath} {
+			if v != "" {
+				payload[k] = v
 			}
-			return ""
-		}())
+		}
+		return c.emit(payload)
 	}
-	if st.Config != "" {
-		fmt.Printf("%s serves %d rule(s):\n", st.Config, len(st.Ingress))
-		for _, ing := range st.Ingress {
-			fmt.Printf("  • %-16s → %s\n", ing.AppPath, ing.Service)
+	switch {
+	case loggedIn && !hubReachable:
+		c.printf("logged in to %s (could not reach the hub to verify)\n", hub)
+	case loggedIn:
+		who := tenant
+		if account != "" {
+			who = account
+		}
+		c.printf("logged in: %s  (%s)\n", hub, who)
+	case loginPending:
+		c.printf("login waiting for approval — open %s and confirm code %s, then run `finch login --poll`\n", pending.VerificationURIComplete, pending.UserCode)
+	default:
+		c.printf("not logged in — run `finch login --start`\n")
+	}
+	if cfgPath != "" {
+		c.printf("%s serves %d rule(s):\n", cfgPath, len(ingress))
+		for _, ing := range ingress {
+			c.printf("  • %-16s → %s\n", ing.AppPath, ing.Service)
 		}
 	} else {
-		fmt.Println("no finch.yml here — `finch add <app_path> --service <url>` to create one")
+		c.printf("no finch.yml yet — `finch add <name> --service <url>` creates one\n")
 	}
+	c.printf("background service (%s): %s\n", svc.Manager, svc.describe())
+	return nil
 }
 
-// cmdAdd: finch add <app_path> --service <url> [--config finch.yml]
+// runAdd: finch add <name> --service <url> [--public] [--config finch.yml] [--json]
 //
 // One-shot convenience for a logged-in box: it enrolls the service via the CLI
 // token, saves the box-side refresh credential (so `finch run` resumes without a
-// ticket), and appends a ticketless ingress rule to finch.yml.
-func cmdAdd(args []string) {
-	fs := flag.NewFlagSet("add", flag.ExitOnError)
+// ticket), appends a ticketless ingress rule to finch.yml, and — with --public —
+// opens the endpoint to callers without a key.
+func runAdd(c *cli, args []string) error {
+	fs := newFlagSet("add")
 	service := fs.String("service", "", "local server URL to expose (required), e.g. http://127.0.0.1:8000")
 	configPath := fs.String("config", defaultManifestPath(), "finch.yml to append the ingress rule to")
-	asJSON := fs.Bool("json", false, "print the result as JSON (for scripts/agents)")
-
-	// Go's flag parser stops at the first positional, so pull a leading <app_path>
-	// (the natural `finch add printer --service …` order) before parsing flags.
-	wantPath := ""
-	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-		wantPath = args[0]
-		args = args[1:]
+	public := fs.Bool("public", false, "make the endpoint open to anyone (no finch_ key needed)")
+	fs.Bool("json", false, "print the result as JSON")
+	pos, err := c.parseArgs(fs, args)
+	if err != nil {
+		return err
 	}
-	_ = fs.Parse(args)
-	if wantPath == "" && fs.NArg() > 0 {
-		wantPath = fs.Arg(0)
+	if len(pos) != 1 || *service == "" {
+		return usageError("usage: finch add <name> --service <url> [--public]  (<name> becomes https://<your-slug>.finchmcp.com/<name>/)")
 	}
-
-	if wantPath == "" || *service == "" {
-		fmt.Fprintln(os.Stderr, "usage: finch add <app_path> --service <url>")
-		fmt.Fprintln(os.Stderr, "  <app_path> becomes the public URL segment: https://<your-slug>.finchmcp.com/<app_path>/")
-		os.Exit(2)
-	}
+	wantPath := pos[0]
 	if err := validateServiceID(wantPath); err != nil {
-		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
-		os.Exit(2)
+		return usageError("%v", err)
 	}
 	if _, err := parseUpstreamTransportURL(*service); err != nil {
-		fmt.Fprintf(os.Stderr, "finch: --service %q has invalid transport: %v\n", *service, err)
-		os.Exit(2)
+		return usageError("--service %q has invalid transport: %v", *service, err)
 	}
 	if err := validateManifestMutationTarget(*configPath); err != nil {
-		fmt.Fprintf(os.Stderr, "finch: cannot safely update manifest: %v\n", err)
-		os.Exit(1)
+		return newCLIError(codeInternal, "", "cannot safely update %s: %v", *configPath, err)
 	}
-
-	cred, err := loadCliCred()
+	cred, err := requireCred()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
-		os.Exit(1)
+		return err
 	}
 
 	// Enroll the service via the CLI token. The hub slugifies the name into the
 	// real service id; use THAT as the app_path so the URL matches.
 	out, err := cliRequest("POST", cred.Hub, "/api/cli/enroll", cred.Token, map[string]string{"name": wantPath})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "finch: enroll failed: %v\n", err)
-		os.Exit(1)
+		return hubFailure(err, "enroll "+wantPath, "")
 	}
 	id, _ := out["id"].(string)
 	ticket, _ := out["ticket"].(string)
 	pubURL, _ := out["url"].(string)
 	if id == "" || ticket == "" {
-		fmt.Fprintf(os.Stderr, "finch: unexpected enroll response: %v\n", out)
-		os.Exit(1)
+		return newCLIError(codeUpstream, "", "enroll %s: the hub returned no service id or ticket", wantPath)
 	}
 	if err := validateServiceID(id); err != nil {
-		fmt.Fprintf(os.Stderr, "finch: unsafe service id returned by hub: %v\n", err)
-		os.Exit(1)
+		return newCLIError(codeUpstream, "", "enroll %s: unsafe service id returned by hub: %v", wantPath, err)
 	}
 	if id != wantPath {
-		fmt.Printf("finch: note: %q was registered as %q (host-safe slug)\n", wantPath, id)
+		c.printf("finch: note: %q was registered as %q (host-safe slug)\n", wantPath, id)
 	}
 
 	// Honor the finch.yml at --config (best-effort): the box should register under
@@ -1103,76 +1039,83 @@ func cmdAdd(args []string) {
 	// Trade the ticket for a saved box-side credential now (so the ticket never
 	// lands in the manifest), then append a ticketless ingress rule.
 	statePath := filepath.Join(credDir, id+".json")
-	if _, _, eerr := enrollToState(cred.Hub, box, ticket, statePath); eerr != nil {
-		fmt.Fprintf(os.Stderr, "finch: enroll failed: %v\n", eerr)
-		os.Exit(1)
+	if _, _, err := enrollToState(cred.Hub, box, ticket, statePath); err != nil {
+		return newCLIError(codeUpstream, "", "enroll %s: %v", id, err)
 	}
 	if err := appendIngress(*configPath, cred.Hub, id, *service, box); err != nil {
-		fmt.Fprintf(os.Stderr, "finch: could not write %s: %v\n", *configPath, err)
-		os.Exit(1)
+		return newCLIError(codeInternal, "", "could not write %s: %v", *configPath, err)
 	}
-	if *asJSON {
-		b, _ := json.Marshal(map[string]string{"app_path": id, "service": *service, "url": pubURL, "config": *configPath})
-		fmt.Println(string(b))
-		return
+	auth := "key"
+	if *public {
+		if err := cliSetAuth(cred, id, "public"); err != nil {
+			e := hubFailure(err, "make "+id+" public", "")
+			if ce, ok := e.(*cliError); ok && ce.Next == "" {
+				ce.Next = "finch auth " + id + " public"
+			}
+			return e
+		}
+		auth = "public"
 	}
-	fmt.Printf("finch: added %q → %s\n", id, *service)
+	if c.json {
+		return c.emit(map[string]any{"app_path": id, "service": *service, "url": pubURL, "config": *configPath, "auth": auth})
+	}
+	c.printf("finch: added %q → %s\n", id, *service)
 	if pubURL != "" {
-		fmt.Printf("       public endpoint: %s\n", pubURL)
+		c.printf("       public URL: %s\n", pubURL)
 	}
-	fmt.Printf("       wrote rule to %s — run `finch run` to serve it\n", *configPath)
+	if auth == "public" {
+		c.printf("       access: public — anyone with the URL can call it\n")
+	} else {
+		c.printf("       access: callers need a finch_ key — `finch connect %s --client claude-code|cursor|codex|json`\n", id)
+	}
+	c.printf("       wrote rule to %s — next: `finch service install` (or `finch run` in the foreground)\n", *configPath)
+	return nil
 }
 
-// cmdEnroll: finch enroll <app_path> --ticket <t> [--hub …] [--box …] [--credentials-dir …]
+// runEnroll: finch enroll <name> --ticket - [--hub …] [--box …] [--credentials-dir …]
 //
 // The one-time, imperative enrollment step for a box that has a ticket but no
-// CLI login: it trades a one-shot join ticket (the `ticket` field of
-// POST /api/cli/enroll) for the long-lived box-side refresh credential and
-// writes it to <credentials-dir>/<service>.json, where `finch run` resumes it
-// ticketless. Tickets are a credential, so they live here / on disk, never in
-// finch.yml. A logged-in box uses `finch add`, which does this in one step.
-func cmdEnroll(args []string) {
-	fs := flag.NewFlagSet("enroll", flag.ExitOnError)
+// CLI login: it trades a one-shot join ticket for the long-lived box-side
+// refresh credential and writes it to <credentials-dir>/<service>.json, where
+// `finch run` resumes it ticketless. A logged-in box uses `finch add` instead.
+func runEnroll(c *cli, args []string) error {
+	fs := newFlagSet("enroll")
 	ticket := fs.String("ticket", "", "one-shot enrollment ticket (required; '-' reads it from stdin, or set FINCH_TICKET)")
 	hub := fs.String("hub", "https://finchmcp.com", "finch hub base URL")
-	// Default --box and --credentials-dir to finch.yml's, so the box registers
-	// under the manifest's name and the credential lands where `finch run` looks.
 	host, _ := os.Hostname()
 	defBox, defCredDir := addPaths("finch.yml", host)
 	box := fs.String("box", defBox, "this box's name")
 	credDir := fs.String("credentials-dir", defCredDir, "directory the saved credential is written to")
-
-	appPath := ""
-	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-		appPath = args[0]
-		args = args[1:]
+	fs.Bool("json", false, "JSON output")
+	pos, err := c.parseArgs(fs, args)
+	if err != nil {
+		return err
 	}
-	_ = fs.Parse(args)
-	if appPath == "" && fs.NArg() > 0 {
-		appPath = fs.Arg(0)
+	ticketVal, err := resolveTicketFrom(*ticket, c.stdin)
+	if err != nil {
+		return usageError("%v", err)
 	}
-	ticketVal := resolveTicket(*ticket)
-	if appPath == "" || ticketVal == "" {
-		fmt.Fprintln(os.Stderr, "usage: finch enroll <app_path> --ticket <t>")
-		fmt.Fprintln(os.Stderr, "  <app_path> is the service/URL segment; a logged-in box can use 'finch add' instead")
-		fmt.Fprintln(os.Stderr, "  keep the ticket off argv/history: 'echo <t> | finch enroll <app_path> --ticket -' or set FINCH_TICKET")
-		os.Exit(2)
+	if len(pos) != 1 || ticketVal == "" {
+		return usageError("usage: finch enroll <name> --ticket -   (reads the ticket from stdin, or set FINCH_TICKET)")
 	}
+	appPath := pos[0]
 	if err := validateServiceID(appPath); err != nil {
-		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
-		os.Exit(2)
+		return usageError("%v", err)
 	}
 	id, statePath, err := enrollWithTicket(*hub, *box, ticketVal, expandHome(*credDir))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "finch: enroll failed: %v\n", err)
-		os.Exit(1)
+		return newCLIError(codeUpstream, "", "enroll failed: %v", err)
+	}
+	if c.json {
+		return c.emit(map[string]any{"app_path": id, "credential": statePath})
 	}
 	if id != appPath {
-		fmt.Printf("finch: note: %q was registered as %q (host-safe slug)\n", appPath, id)
+		c.printf("finch: note: %q was registered as %q (host-safe slug)\n", appPath, id)
 	}
-	fmt.Printf("finch: enrolled %q — credential saved to %s\n", id, statePath)
-	fmt.Printf("       add it to finch.yml and run `finch run`:\n")
-	fmt.Printf("         ingress:\n           - app_path: %s\n             service: http://127.0.0.1:8000\n", id)
+	c.printf("finch: enrolled %q — credential saved to %s\n", id, statePath)
+	c.printf("       add it to finch.yml and run `finch run`:\n")
+	c.printf("         ingress:\n           - app_path: %s\n             service: http://127.0.0.1:8000\n", id)
+	return nil
 }
 
 // enrollWithTicket joins FIRST so the credential is named by the hub's
@@ -1195,544 +1138,34 @@ func enrollWithTicket(hub, box, ticket, credDir string) (id, statePath string, e
 	return jr.Service, statePath, nil
 }
 
-// resolveTicket applies argv-free intake for a `finch enroll` or single-service
-// `finch join` enrollment ticket: "-" reads it from stdin and FINCH_TICKET from the env — so
-// a one-shot ticket (which mints the long-lived refresh token) need not land on
-// the remote process table / shell history. A literal value passes through
-// unchanged.
-func resolveTicket(ticket string) string {
+// resolveTicketFrom applies argv-free intake for an enrollment ticket: "-"
+// reads it from stdin and FINCH_TICKET from the env — so a one-shot ticket
+// (which mints the long-lived refresh token) need not land on the process
+// table / shell history. A literal value passes through unchanged.
+func resolveTicketFrom(ticket string, stdin io.Reader) (string, error) {
 	if ticket == "-" {
-		b, err := io.ReadAll(io.LimitReader(os.Stdin, 4096))
+		b, err := io.ReadAll(io.LimitReader(stdin, 4096))
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "finch: could not read ticket from stdin: %v\n", err)
-			os.Exit(1)
+			return "", fmt.Errorf("could not read ticket from stdin: %w", err)
 		}
 		ticket = strings.TrimSpace(string(b))
 		if ticket == "" {
-			fmt.Fprintln(os.Stderr, "finch: --ticket - given but stdin was empty")
-			os.Exit(1)
+			return "", fmt.Errorf("--ticket - given but stdin was empty")
 		}
 	}
 	if ticket == "" {
 		ticket = strings.TrimSpace(os.Getenv("FINCH_TICKET"))
 	}
-	return ticket
+	return ticket, nil
 }
 
-// defaultCredentialsDir mirrors loadConfig's default: ~/.finch (cwd-relative
-// .finch if there's no home dir), so `finch add`/`finch enroll` write the
-// credential where `finch run` will look for it.
-func defaultCredentialsDir() string {
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		return filepath.Join(home, ".finch")
-	}
-	return ".finch"
-}
-
-// addPaths resolves the box name + credentials dir `finch add` should use,
-// honoring an existing finch.yml at configPath (best-effort): the credential must
-// land in the manifest's credentials-dir so `finch run` finds it, and the box
-// should register under the manifest's box name. Falls back to the hostname +
-// the default ~/.finch when the manifest is absent. loadConfig already expands ~
-// and applies the credentials-dir default, so its values are used as-is.
-func addPaths(configPath, host string) (box, credDir string) {
-	box, credDir = host, defaultCredentialsDir()
-	if c, err := loadConfig(configPath, host); err == nil {
-		if c.Box != "" {
-			box = c.Box
-		}
-		if c.CredentialsDir != "" {
-			credDir = c.CredentialsDir
-		}
-	}
-	return box, credDir
-}
-
-var manifestMutationMu sync.Mutex
-
-func validateManifestMutationTarget(configPath string) error {
-	b, err := os.ReadFile(configPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	var doc yaml.Node
-	if err := yaml.Unmarshal(b, &doc); err != nil {
-		return fmt.Errorf("parsing %s: %w", configPath, err)
-	}
-	if doc.Kind == 0 || (doc.Kind == yaml.DocumentNode && len(doc.Content) == 0) {
-		return nil
-	}
-	if doc.Kind != yaml.DocumentNode || len(doc.Content) == 0 || doc.Content[0].Kind != yaml.MappingNode {
-		return fmt.Errorf("%s: top-level YAML is not a mapping", configPath)
-	}
-	if seq := yamlMapValue(doc.Content[0], "ingress"); seq != nil && seq.Kind != yaml.SequenceNode {
-		return fmt.Errorf("%s: ingress must be a sequence", configPath)
-	}
-	return nil
-}
-
-// appendIngress adds (or updates) one ingress rule in finch.yml WITHOUT clobbering
-// user comments or keys finch doesn't model: it edits an existing file through a
-// yaml.Node (yaml.v3 preserves comments + unknown content across a Node round-trip)
-// rather than unmarshaling into the fixed `config` struct and re-marshaling. An
-// existing rule with the same app_path is updated in place; hub/box are filled
-// only when absent. A missing file is created from the managed header + a minimal
-// struct marshal. No ticket is written — the credential is saved separately by enrollToState.
-func appendIngress(configPath, hub, appPath, service, box string) error {
-	manifestMutationMu.Lock()
-	defer manifestMutationMu.Unlock()
-	return appendIngressLocked(configPath, hub, appPath, service, box)
-}
-
-func appendIngressLocked(configPath, hub, appPath, service, box string) error {
-	if err := validateManifestMutationTarget(configPath); err != nil {
-		return err
-	}
-	b, err := os.ReadFile(configPath)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			return err
-		}
-		// New file: a minimal struct marshal under the managed header is fine.
-		if box == "" {
-			box, _ = os.Hostname()
-		}
-		c := config{Hub: hub, Box: box, Ingress: []ingress{{AppPath: appPath, Service: service}}}
-		out, merr := yaml.Marshal(&c)
-		if merr != nil {
-			return merr
-		}
-		return atomicManifestWrite(configPath, append([]byte("# finch.yml — managed by `finch add`\n"), out...))
-	}
-
-	// Existing file: edit through a yaml.Node so comments + unmodeled keys survive.
-	var doc yaml.Node
-	if uerr := yaml.Unmarshal(b, &doc); uerr != nil {
-		return fmt.Errorf("parsing %s: %w", configPath, uerr)
-	}
-	var root *yaml.Node
-	if doc.Kind == yaml.DocumentNode && len(doc.Content) > 0 {
-		root = doc.Content[0]
-	} else { // empty/whitespace file — start a fresh mapping document
-		root = &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
-		doc = yaml.Node{Kind: yaml.DocumentNode, Content: []*yaml.Node{root}}
-	}
-	if root.Kind != yaml.MappingNode {
-		return fmt.Errorf("%s: top-level YAML is not a mapping", configPath)
-	}
-
-	// Fill hub/box only when absent (don't overwrite a user's values).
-	if yamlMapValue(root, "hub") == nil && hub != "" {
-		yamlMapSet(root, "hub", yamlScalar(hub))
-	}
-	if yamlMapValue(root, "box") == nil {
-		if box == "" {
-			box, _ = os.Hostname()
-		}
-		if box != "" {
-			yamlMapSet(root, "box", yamlScalar(box))
-		}
-	}
-
-	// Locate (or create) the ingress sequence.
-	seq := yamlMapValue(root, "ingress")
-	if seq == nil {
-		seq = &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
-		yamlMapSet(root, "ingress", seq)
-	}
-	// Update an existing rule with the same app_path in place; else append one.
-	for _, item := range seq.Content {
-		if item.Kind != yaml.MappingNode {
-			continue
-		}
-		if ap := yamlMapValue(item, "app_path"); ap != nil && ap.Value == appPath {
-			yamlMapSet(item, "service", yamlScalar(service))
-			return yamlWriteFile(configPath, &doc)
-		}
-	}
-	seq.Content = append(seq.Content, &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map", Content: []*yaml.Node{
-		yamlScalar("app_path"), yamlScalar(appPath),
-		yamlScalar("service"), yamlScalar(service),
-	}})
-	return yamlWriteFile(configPath, &doc)
-}
-
-// --- minimal yaml.Node helpers (comment-preserving finch.yml edits) ---
-
-// yamlScalar builds a plain string scalar node.
-func yamlScalar(v string) *yaml.Node {
-	return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: v}
-}
-
-// yamlMapValue returns the value node for key in a mapping node, or nil.
-func yamlMapValue(m *yaml.Node, key string) *yaml.Node {
-	if m == nil || m.Kind != yaml.MappingNode {
-		return nil
-	}
-	for i := 0; i+1 < len(m.Content); i += 2 {
-		if m.Content[i].Value == key {
-			return m.Content[i+1]
-		}
-	}
-	return nil
-}
-
-// yamlMapSet sets key to val in a mapping node, replacing the value if the key
-// already exists (preserving the key node + its comments) or appending otherwise.
-func yamlMapSet(m *yaml.Node, key string, val *yaml.Node) {
-	for i := 0; i+1 < len(m.Content); i += 2 {
-		if m.Content[i].Value == key {
-			m.Content[i+1] = val
-			return
-		}
-	}
-	m.Content = append(m.Content, yamlScalar(key), val)
-}
-
-// yamlWriteFile marshals a yaml document node (0600). yaml.v3 preserves comments
-// and unmodeled keys through the Node, so a hand-edited finch.yml survives edits.
-func yamlWriteFile(configPath string, doc *yaml.Node) error {
-	out, err := yaml.Marshal(doc)
-	if err != nil {
-		return err
-	}
-	return atomicManifestWrite(configPath, out)
-}
-
-func atomicManifestWrite(configPath string, out []byte) error {
-	if dir := filepath.Dir(configPath); dir != "." {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return err
-		}
-	}
-	dir := filepath.Dir(configPath)
-	tmp, err := os.CreateTemp(dir, ".finch-yaml-*")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	cleanup := func() {
-		_ = tmp.Close()
-		_ = os.Remove(tmpPath)
-	}
-	if err := tmp.Chmod(0o600); err != nil {
-		cleanup()
-		return err
-	}
-	if _, err := tmp.Write(out); err != nil {
-		cleanup()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		cleanup()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmpPath)
-		return err
-	}
-	if err := os.Rename(tmpPath, configPath); err != nil {
-		_ = os.Remove(tmpPath)
-		return err
-	}
-	return nil
-}
-
-// cmdUpdate: finch update [--hub URL] [--force] [--restart=auto|service|self|none]
-//
-// Self-update the box: fetch the latest release binary from $HUB/releases/
-// finch-<os>-<arch>, atomically swap it over this executable, then bring the
-// RUNNING serve onto the new version without leaving two `finch run` processes
-// fighting over the relay socket (the "superseded" flap). Restart strategy:
-//
-//	service — if a `finch-tunnel` systemd --user service manages the serve,
-//	          `systemctl --user restart` it: the old process is stopped BEFORE
-//	          the new one starts, so the hub never sees two live sockets.
-//	self    — exec the freshly-installed binary over THIS process (portable, no
-//	          service manager). A running `finch run` becomes the new version in
-//	          place (~1s relay blip); a bare `finch update` just re-execs and
-//	          exits after reporting the version.
-//	auto    — service when a finch-tunnel service is detected, else self.
-//	none    — swap the binary only; leave the running process alone (you restart
-//	          it). Useful in scripts.
-func cmdUpdate(args []string) {
-	fs := flag.NewFlagSet("update", flag.ExitOnError)
-	hubFlag := fs.String("hub", "", "finch hub base URL (defaults to the logged-in hub)")
-	force := fs.Bool("force", false, "reinstall even if already on the latest version")
-	restart := fs.String("restart", "auto", "how to restart the running serve: auto|service|self|none")
-	_ = fs.Parse(args)
-	mode, err := resolveUpdateRestartMode(*restart, finchTunnelActive(), runningAsServe())
+// resolveTicket is resolveTicketFrom on os.Stdin for the relay agent's
+// `finch join --ticket -`, where a bad ticket is fatal.
+func resolveTicket(ticket string) string {
+	t, err := resolveTicketFrom(ticket, os.Stdin)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "finch: %v\n", err)
-		os.Exit(2)
+		os.Exit(exitUsage)
 	}
-
-	// Hub: explicit flag, else the logged-in cli.json hub, else the prod default.
-	hub := *hubFlag
-	if hub == "" {
-		if c := loadCliCredQuiet(); c != nil && c.Hub != "" {
-			hub = c.Hub
-		} else {
-			hub = "https://finchmcp.com"
-		}
-	}
-	hub = strings.TrimRight(hub, "/")
-
-	self, updated, err := performUpdate(hub, *force)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "finch: update failed: %v\n", err)
-		os.Exit(1)
-	}
-	if !updated {
-		fmt.Printf("finch: already on the latest version (%s)\n", agentVersion)
-		return
-	}
-	fmt.Printf("finch: installed new binary at %s\n", self)
-
-	// Bring the running serve onto the new binary.
-	switch mode {
-	case "none":
-		fmt.Println("finch: binary swapped — restart your serve to apply.")
-	case "service":
-		fmt.Println("finch: restarting finch-tunnel.service (clean handoff, no supersede)…")
-		out, rerr := exec.Command("systemctl", "--user", "restart", "finch-tunnel.service").CombinedOutput()
-		if rerr != nil {
-			fmt.Fprintf(os.Stderr, "finch: service restart failed: %v\n%s\n", rerr, out)
-			fmt.Fprintln(os.Stderr, "finch: binary IS updated — restart the serve manually.")
-			os.Exit(1)
-		}
-		fmt.Println("finch: finch-tunnel restarted on the new version.")
-	case "self":
-		// Re-exec this process over the new binary. syscall.Exec REPLACES the
-		// process image, so a running `finch run` continues as the new version
-		// (its relay reconnects) and a bare `finch update` simply re-runs on the
-		// new binary. Args after "update" are dropped so we don't re-update.
-		reexec := []string{self}
-		if runningAsServe() {
-			reexec = append(reexec, "run")
-		}
-		fmt.Println("finch: re-exec onto the new binary…")
-		if eerr := syscallExec(self, reexec); eerr != nil {
-			fmt.Fprintf(os.Stderr, "finch: re-exec failed: %v (binary is updated; restart manually)\n", eerr)
-			os.Exit(1)
-		}
-	}
-}
-
-func resolveUpdateRestartMode(requested string, tunnelActive, currentProcessServes bool) (string, error) {
-	switch requested {
-	case "auto":
-		if tunnelActive {
-			return "service", nil
-		}
-		if currentProcessServes {
-			return "self", nil
-		}
-		return "none", nil
-	case "service", "none":
-		return requested, nil
-	case "self":
-		if !currentProcessServes {
-			return "", fmt.Errorf("--restart=self requires the current process to be serving; use service or none from a separate updater")
-		}
-		return "self", nil
-	default:
-		return "", fmt.Errorf("unknown --restart mode %q (use auto|service|self|none)", requested)
-	}
-}
-
-// performUpdate is the shared self-update core used by BOTH `finch update` (CLI)
-// and the hub-pushed remote update (relay "update" frame): version-gate against
-// the hub's /api/version (skip when already current, unless force), then fetch
-// $HUB/releases/finch-<os>-<arch> and atomically swap it over this executable.
-// Returns the resolved binary path and whether a swap actually happened. The
-// download source is ALWAYS the box's own hub — never caller-supplied — so a
-// forged trigger can at worst cause a re-download of the pinned release.
-func performUpdate(hub string, force bool) (self string, updated bool, err error) {
-	hub, err = validateHubTransportURL(hub)
-	if err != nil {
-		return "", false, err
-	}
-	if !force {
-		if latest, verr := hubLatestVersion(hub); verr == nil && latest != "" && latest == agentVersion {
-			return "", false, nil
-		}
-	}
-	// Resolve THIS executable's real path — the atomic swap target. Follow the
-	// symlink so we replace the actual file, not a symlink into it.
-	self, err = os.Executable()
-	if err != nil {
-		return "", false, fmt.Errorf("cannot locate own binary: %w", err)
-	}
-	if resolved, rerr := filepath.EvalSymlinks(self); rerr == nil {
-		self = resolved
-	}
-	asset := fmt.Sprintf("finch-%s-%s", runtime.GOOS, updateArch())
-	if err := downloadAndSwap(hub+"/releases/"+asset, self); err != nil {
-		return self, false, err
-	}
-	return self, true, nil
-}
-
-// updateInFlight makes hub-pushed updates singleflight: repeated "update" frames
-// (retries, double-clicks) are dropped while one attempt is running.
-var updateInFlight atomic.Bool
-
-// selfUpdateFromHub handles a hub-pushed relay "update" frame: swap the binary
-// via performUpdate, then re-exec THIS process in place (same PID — safe under
-// systemd and bare alike; the relay drops for ~1s and reconnects as the new
-// version, so there are never two serves fighting over the socket). On any
-// failure it logs and keeps serving on the old binary — a broken update must
-// never take the box offline.
-func selfUpdateFromHub(hub string) {
-	if !updateInFlight.CompareAndSwap(false, true) {
-		return
-	}
-	defer updateInFlight.Store(false)
-	self, updated, err := performUpdate(hub, false)
-	if err != nil {
-		log.Printf("finch: hub-pushed update failed: %v (still serving on %s)", err, agentVersion)
-		return
-	}
-	if !updated {
-		log.Printf("finch: hub-pushed update: already on the latest version (%s)", agentVersion)
-		return
-	}
-	log.Printf("finch: hub-pushed update installed — re-exec onto the new binary")
-	if err := syscallExec(self, os.Args); err != nil {
-		log.Printf("finch: re-exec failed: %v (binary is updated; restart to apply)", err)
-	}
-}
-
-// updateArch maps Go's GOARCH to the goreleaser asset arch suffix (arm → armv6/
-// armv7 by GOARM). Matches the naming in .goreleaser.yaml and installScript().
-func updateArch() string {
-	switch runtime.GOARCH {
-	case "arm":
-		if os.Getenv("GOARM") == "7" {
-			return "armv7"
-		}
-		return "armv6"
-	default:
-		return runtime.GOARCH // amd64, arm64
-	}
-}
-
-// hubLatestVersion asks the hub for the current LATEST_AGENT so `finch update`
-// can no-op when already current. Best-effort: any error → "" (caller updates
-// anyway). The hub exposes it at /api/version (public, unauthenticated).
-func hubLatestVersion(hub string) (string, error) {
-	validatedHub, err := validateHubTransportURL(hub)
-	if err != nil {
-		return "", err
-	}
-	hub = validatedHub
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, hub+"/api/version", nil)
-	if err != nil {
-		return "", err
-	}
-	res, err := secureRedirectHTTPClient.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer res.Body.Close()
-	if res.StatusCode != 200 {
-		return "", fmt.Errorf("hub %d", res.StatusCode)
-	}
-	payload, err := io.ReadAll(io.LimitReader(res.Body, maxVersionResponseBytes+1))
-	if err != nil {
-		return "", err
-	}
-	if int64(len(payload)) > maxVersionResponseBytes {
-		return "", fmt.Errorf("version response exceeded %d bytes", maxVersionResponseBytes)
-	}
-	var body struct {
-		Latest string `json:"latest"`
-	}
-	if err := json.Unmarshal(payload, &body); err != nil {
-		return "", err
-	}
-	return body.Latest, nil
-}
-
-const (
-	maxVersionResponseBytes int64 = 64 << 10
-	maxAgentDownloadBytes   int64 = 256 << 20
-	agentDownloadTimeout          = 10 * time.Minute
-)
-
-// downloadAndSwap fetches url to a temp file NEXT TO dst (same dir → atomic
-// rename), makes it executable, then renames it over dst. Downloading to a temp
-// first means a failed/partial download never bricks the running binary; the
-// rename is atomic on POSIX so there's no torn-write window.
-func downloadAndSwap(url, dst string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), agentDownloadTimeout)
-	defer cancel()
-	return downloadAndSwapWithLimit(ctx, url, dst, maxAgentDownloadBytes)
-}
-
-func downloadAndSwapWithLimit(ctx context.Context, url, dst string, limit int64) error {
-	if limit <= 0 {
-		return fmt.Errorf("invalid Finch update size limit")
-	}
-	if err := validateHTTPTransportURL(url); err != nil {
-		return err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return err
-	}
-	res, err := secureRedirectHTTPClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer res.Body.Close()
-	if res.StatusCode != 200 {
-		return fmt.Errorf("download %s: hub %d", url, res.StatusCode)
-	}
-	if res.ContentLength > limit {
-		return fmt.Errorf("download %s exceeds %d bytes", url, limit)
-	}
-	dir := filepath.Dir(dst)
-	tmp, err := os.CreateTemp(dir, ".finch-update-*")
-	if err != nil {
-		return fmt.Errorf("temp file in %s: %w (need write access to install dir)", dir, err)
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName) // no-op after a successful rename
-	written, err := io.Copy(tmp, io.LimitReader(res.Body, limit+1))
-	if err != nil {
-		tmp.Close()
-		return err
-	}
-	if written == 0 {
-		tmp.Close()
-		return fmt.Errorf("download %s was empty", url)
-	}
-	if written > limit {
-		tmp.Close()
-		return fmt.Errorf("download %s exceeds %d bytes", url, limit)
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Chmod(tmpName, 0o755); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpName, dst); err != nil {
-		return fmt.Errorf("installing over %s: %w", dst, err)
-	}
-	return nil
-}
-
-// finchTunnelActive reports whether a running finch-tunnel systemd --user
-// service is managing the serve (the clean-restart target).
-func finchTunnelActive() bool {
-	out, _ := exec.Command("systemctl", "--user", "is-active", "finch-tunnel.service").Output()
-	return strings.TrimSpace(string(out)) == "active"
+	return t
 }

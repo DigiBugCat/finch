@@ -1,0 +1,415 @@
+package core
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+	"time"
+)
+
+// Every failure maps to one exit code and, with --json, one strictly shaped
+// envelope on stderr with nothing on stdout. The "next" command is part of the
+// contract: an agent runs it verbatim.
+func TestCLIErrorContract(t *testing.T) {
+	type setup func(t *testing.T, h *fakeHub)
+	loggedIn := func(t *testing.T, h *fakeHub) { loginTo(t, h) }
+	withNotes := func(t *testing.T, h *fakeHub) {
+		loginTo(t, h)
+		h.set(func(h *fakeHub) { h.services["notes"] = "key" })
+	}
+	for _, tc := range []struct {
+		name     string
+		setup    setup
+		args     []string
+		wantExit int
+		wantCode string
+		wantNext string
+	}{
+		{name: "unknown command", args: []string{"frobnicate", "--json"}, wantExit: 2, wantCode: "USAGE", wantNext: "finch help"},
+		{name: "unknown flag", args: []string{"status", "--bogus", "--json"}, wantExit: 2, wantCode: "USAGE", wantNext: "finch help"},
+		{name: "add without --service", args: []string{"add", "notes", "--json"}, wantExit: 2, wantCode: "USAGE", wantNext: "finch help"},
+		{name: "add with a non-http service", args: []string{"add", "notes", "--service", "ftp://x", "--json"}, wantExit: 2, wantCode: "USAGE", wantNext: "finch help"},
+		{name: "login --start and --poll together", args: []string{"login", "--start", "--poll", "--json"}, wantExit: 2, wantCode: "USAGE", wantNext: "finch help"},
+		{name: "connect to an unknown client", args: []string{"connect", "notes", "--client", "emacs", "--json"}, wantExit: 2, wantCode: "USAGE", wantNext: "finch help"},
+		{name: "service without an action", args: []string{"service", "--json"}, wantExit: 2, wantCode: "USAGE", wantNext: "finch help"},
+		{name: "add while not logged in", args: []string{"add", "notes", "--service", "http://127.0.0.1:8000", "--json"}, wantExit: 12, wantCode: "NOT_LOGGED_IN", wantNext: "finch login --start"},
+		{name: "test while not logged in", args: []string{"test", "notes", "--json"}, wantExit: 12, wantCode: "NOT_LOGGED_IN", wantNext: "finch login --start"},
+		{
+			name: "add while a login awaits approval",
+			setup: func(t *testing.T, h *fakeHub) {
+				if err := savePendingLogin(&pendingLogin{Hub: h.url(), DeviceCode: "d", UserCode: "AB-CD", VerificationURIComplete: "https://x/cli", Interval: 3, ExpiresAt: time.Now().Add(time.Minute).Unix()}); err != nil {
+					t.Fatal(err)
+				}
+			},
+			args: []string{"add", "notes", "--service", "http://127.0.0.1:8000", "--json"}, wantExit: 10, wantCode: "APPROVAL_PENDING", wantNext: "finch login --poll",
+		},
+		{name: "poll with no login in progress", args: []string{"login", "--poll", "--json"}, wantExit: 1, wantCode: "NOT_FOUND", wantNext: "finch login --start"},
+		{
+			name: "revoked CLI token",
+			setup: func(t *testing.T, h *fakeHub) {
+				if err := saveCliCred(&cliCred{Hub: h.url(), Token: "revoked"}); err != nil {
+					t.Fatal(err)
+				}
+			},
+			args: []string{"fleet", "--json"}, wantExit: 12, wantCode: "NOT_LOGGED_IN", wantNext: "finch login --start",
+		},
+		{name: "test an unknown service", setup: loggedIn, args: []string{"test", "ghost", "--json"}, wantExit: 1, wantCode: "NOT_FOUND", wantNext: "finch fleet"},
+		{name: "connect an unknown service", setup: loggedIn, args: []string{"connect", "ghost", "--client", "json", "--json"}, wantExit: 1, wantCode: "NOT_FOUND", wantNext: "finch add ghost --service <url>"},
+		{
+			name:  "hub down",
+			setup: func(t *testing.T, h *fakeHub) { withNotes(t, h); h.set(func(h *fakeHub) { h.down = true }) },
+			args:  []string{"fleet", "--json"}, wantExit: 1, wantCode: "UPSTREAM",
+		},
+		{
+			name: "MCP error from the service",
+			setup: func(t *testing.T, h *fakeHub) {
+				withNotes(t, h)
+				h.set(func(h *fakeHub) {
+					h.call = func(string) (int, string, string) {
+						return 200, "application/json", `{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"Method not found"}}`
+					}
+				})
+			},
+			args: []string{"test", "notes", "--json"}, wantExit: 1, wantCode: "UPSTREAM",
+		},
+		{
+			name: "box offline",
+			setup: func(t *testing.T, h *fakeHub) {
+				withNotes(t, h)
+				h.set(func(h *fakeHub) {
+					h.call = func(string) (int, string, string) {
+						return 503, "application/json", `{"error":"service offline"}`
+					}
+				})
+			},
+			args: []string{"test", "notes", "--json"}, wantExit: 1, wantCode: "UPSTREAM", wantNext: "finch service status",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolate(t)
+			h := newFakeHub(t)
+			if tc.setup != nil {
+				tc.setup(t, h)
+			}
+			stdout, stderr, code := finch(t, tc.args...)
+			if code != tc.wantExit {
+				t.Fatalf("exit=%d, want %d (stderr %q)", code, tc.wantExit, stderr)
+			}
+			if stdout != "" {
+				t.Fatalf("an error must leave stdout empty, got %q", stdout)
+			}
+			env := decodeJSONError(t, stderr)
+			if env.Error.Code != tc.wantCode || env.Error.Next != tc.wantNext {
+				t.Fatalf("error=%+v, want code %s next %q", env.Error, tc.wantCode, tc.wantNext)
+			}
+
+			// The same failure without --json: plain text, same exit code.
+			var plain []string
+			for _, a := range tc.args {
+				if a != "--json" {
+					plain = append(plain, a)
+				}
+			}
+			_, perr, pcode := finch(t, plain...)
+			if pcode != tc.wantExit || !strings.HasPrefix(perr, "finch: ") || strings.Contains(perr, `"schema_version"`) {
+				t.Fatalf("plain mode: exit=%d stderr=%q", pcode, perr)
+			}
+			if tc.wantNext != "" && !strings.Contains(perr, "next: "+tc.wantNext) {
+				t.Fatalf("plain mode does not name the next command: %q", perr)
+			}
+		})
+	}
+}
+
+func TestWantsJSON(t *testing.T) {
+	for args, want := range map[string]bool{
+		"--json":         true,
+		"-json":          true,
+		"notes --json":   true,
+		"--json=true":    true,
+		"notes":          false,
+		"-- --json":      false,
+		"--jsonish":      false,
+		"--json=false":   false,
+		"--client json":  false,
+		"--args {\"a\":": false,
+	} {
+		if got := wantsJSON(strings.Fields(args)); got != want {
+			t.Errorf("wantsJSON(%q)=%v, want %v", args, got, want)
+		}
+	}
+}
+
+func TestLoginStartPollApproved(t *testing.T) {
+	home := isolate(t)
+	h := newFakeHub(t)
+	t.Setenv("FINCH_HUB", h.url())
+
+	stdout, stderr, code := finch(t, "login", "--start", "--json")
+	if code != 0 {
+		t.Fatalf("login --start exit=%d stderr=%q", code, stderr)
+	}
+	// Exactly the contract's fields.
+	var start map[string]any
+	if err := json.Unmarshal([]byte(stdout), &start); err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]any{
+		"schema_version":            float64(1),
+		"user_code":                 "WXYZ-2345",
+		"verification_uri_complete": h.url() + "/cli?code=WXYZ-2345",
+		"expires_in":                float64(600),
+		"interval":                  float64(3),
+	}
+	if !reflect.DeepEqual(start, want) {
+		t.Fatalf("login --start payload=%v, want %v", start, want)
+	}
+	if h.polls != 0 {
+		t.Fatalf("login --start must not poll, polled %d times", h.polls)
+	}
+	pendingPath := filepath.Join(home, ".finch", "login-pending.json")
+	if got := fileMode(t, pendingPath); got != 0o600 {
+		t.Fatalf("pending login mode=%04o, want 0600", got)
+	}
+	if !strings.Contains(mustRead(t, pendingPath), h.deviceCode) {
+		t.Fatal("pending login does not hold the device code")
+	}
+
+	stdout, _, code = finch(t, "login", "--poll", "--json")
+	if code != 10 || strings.TrimSpace(stdout) != `{"schema_version":1,"status":"pending"}` {
+		t.Fatalf("pending poll: exit=%d stdout=%q", code, stdout)
+	}
+	if _, err := os.Stat(pendingPath); err != nil {
+		t.Fatal("a pending poll must keep the pending login")
+	}
+
+	h.set(func(h *fakeHub) { h.deviceState = "approved" })
+	stdout, stderr, code = finch(t, "login", "--poll", "--json")
+	if code != 0 {
+		t.Fatalf("approved poll exit=%d stderr=%q", code, stderr)
+	}
+	if got := decodeJSONOut(t, stdout); got["status"] != "approved" || got["account"] != "owner@example.com" || len(got) != 3 {
+		t.Fatalf("approved payload=%v", got)
+	}
+	if _, err := os.Stat(pendingPath); !os.IsNotExist(err) {
+		t.Fatal("the pending login must be removed once approved")
+	}
+	cred, err := loadCliCred()
+	if err != nil || cred.Token != fakeCLIToken || cred.Hub != h.url() || cred.Tenant != "user_1" {
+		t.Fatalf("saved credential=%+v err=%v", cred, err)
+	}
+	if strings.Contains(stdout+stderr, fakeCLIToken) {
+		t.Fatal("login printed the CLI token")
+	}
+
+	// Nothing left to poll.
+	_, stderr, code = finch(t, "login", "--poll", "--json")
+	if code != 1 || decodeJSONError(t, stderr).Error.Code != "NOT_FOUND" {
+		t.Fatalf("poll after approval: exit=%d stderr=%q", code, stderr)
+	}
+}
+
+func TestLoginPollExpired(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		hubState  string
+		clockSkew time.Duration
+		wantPolls int
+	}{
+		{name: "hub says expired", hubState: "expired", wantPolls: 1},
+		{name: "local deadline passed", hubState: "pending", clockSkew: 11 * time.Minute, wantPolls: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := isolate(t)
+			h := newFakeHub(t)
+			t.Setenv("FINCH_HUB", h.url())
+			if _, _, code := finch(t, "login", "--start", "--json"); code != 0 {
+				t.Fatal("login --start failed")
+			}
+			h.set(func(h *fakeHub) { h.deviceState = tc.hubState })
+			loginNow = func() time.Time { return time.Now().Add(tc.clockSkew) }
+			stdout, _, code := finch(t, "login", "--poll", "--json")
+			if code != 11 || strings.TrimSpace(stdout) != `{"schema_version":1,"status":"expired"}` {
+				t.Fatalf("exit=%d stdout=%q", code, stdout)
+			}
+			if h.polls != tc.wantPolls {
+				t.Fatalf("hub polled %d times, want %d", h.polls, tc.wantPolls)
+			}
+			if _, err := os.Stat(filepath.Join(home, ".finch", "login-pending.json")); !os.IsNotExist(err) {
+				t.Fatal("an expired pending login must be removed")
+			}
+		})
+	}
+}
+
+func TestLoginPollRejectsDifferentHub(t *testing.T) {
+	isolate(t)
+	h := newFakeHub(t)
+	if _, _, code := finch(t, "login", "--start", "--hub", h.url()); code != 0 {
+		t.Fatal("login --start failed")
+	}
+	_, stderr, code := finch(t, "login", "--poll", "--hub", "https://other.example", "--json")
+	if code != 2 || decodeJSONError(t, stderr).Error.Code != "USAGE" {
+		t.Fatalf("exit=%d stderr=%q", code, stderr)
+	}
+}
+
+func TestBlockingLoginStillWaits(t *testing.T) {
+	isolate(t)
+	h := newFakeHub(t)
+	sleeps := 0
+	loginSleep = func(time.Duration) {
+		sleeps++
+		if sleeps == 2 {
+			h.set(func(h *fakeHub) { h.deviceState = "approved" })
+		}
+	}
+	stdout, stderr, code := finch(t, "login", "--hub", h.url(), "--headless", "--json")
+	if code != 0 {
+		t.Fatalf("exit=%d stderr=%q", code, stderr)
+	}
+	if got := decodeJSONOut(t, stdout); got["status"] != "approved" {
+		t.Fatalf("payload=%v", got)
+	}
+	if !strings.Contains(stderr, "WXYZ-2345") || h.polls != 2 {
+		t.Fatalf("blocking login should show the code and poll until approved: polls=%d stderr=%q", h.polls, stderr)
+	}
+
+	// Expiry while blocking is exit 11 / EXPIRED.
+	isolate(t)
+	h = newFakeHub(t)
+	h.set(func(h *fakeHub) { h.deviceState = "expired" })
+	loginSleep = func(time.Duration) {}
+	_, stderr, code = finch(t, "login", "--hub", h.url(), "--headless", "--json")
+	// Blocking login shows the human the link on stderr; the envelope is the
+	// last line.
+	lines := strings.Split(strings.TrimRight(stderr, "\n"), "\n")
+	if code != 11 || decodeJSONError(t, lines[len(lines)-1]).Error.Code != "EXPIRED" {
+		t.Fatalf("expired blocking login: exit=%d stderr=%q", code, stderr)
+	}
+}
+
+func TestAddPublicPrintsURL(t *testing.T) {
+	home := isolate(t)
+	h := newFakeHub(t)
+	loginTo(t, h)
+	cfg := filepath.Join(home, "finch.yml")
+
+	stdout, stderr, code := finch(t, "add", "notes", "--service", "http://127.0.0.1:8000", "--public", "--config", cfg, "--json")
+	if code != 0 {
+		t.Fatalf("exit=%d stderr=%q", code, stderr)
+	}
+	got := decodeJSONOut(t, stdout)
+	if got["url"] != h.url()+"/notes/mcp" || got["auth"] != "public" || got["app_path"] != "notes" {
+		t.Fatalf("payload=%v", got)
+	}
+	if !reflect.DeepEqual(h.authCalls, []string{"notes=public"}) {
+		t.Fatalf("auth calls=%v, want [notes=public]", h.authCalls)
+	}
+	if !strings.Contains(mustRead(t, cfg), "app_path: notes") {
+		t.Fatal("finch.yml was not written")
+	}
+	if got := fileMode(t, filepath.Join(home, ".finch", "notes.json")); got != 0o600 {
+		t.Fatalf("box credential mode=%04o", got)
+	}
+
+	// Without --public the access mode is left alone.
+	stdout, _, code = finch(t, "add", "api", "--service", "http://127.0.0.1:9000", "--config", cfg, "--json")
+	if code != 0 || decodeJSONOut(t, stdout)["auth"] != "key" || len(h.authCalls) != 1 {
+		t.Fatalf("add without --public: exit=%d stdout=%q auth calls=%v", code, stdout, h.authCalls)
+	}
+}
+
+func TestTestCommandJSON(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		status   int
+		ctype    string
+		body     string
+		wantExit int
+	}{
+		{name: "json result", status: 200, ctype: "application/json", body: `{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"echo","description":"Echo it"}]}}`},
+		{name: "event-stream result", status: 200, ctype: "text/event-stream", body: "event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"tools\":[{\"name\":\"echo\",\"description\":\"Echo it\"}]}}\n\n"},
+		{name: "json-rpc error", status: 200, ctype: "application/json", body: `{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"boom"}}`, wantExit: 1},
+		{name: "no tools array", status: 200, ctype: "application/json", body: `{"jsonrpc":"2.0","id":1,"result":{}}`, wantExit: 1},
+		{name: "not json", status: 200, ctype: "text/html", body: `<html>hi</html>`, wantExit: 1},
+		{name: "upstream 502", status: 502, ctype: "application/json", body: `{"error":"bad gateway"}`, wantExit: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			isolate(t)
+			h := newFakeHub(t)
+			loginTo(t, h)
+			h.set(func(h *fakeHub) {
+				h.services["notes"] = "key"
+				h.call = func(method string) (int, string, string) { return tc.status, tc.ctype, tc.body }
+			})
+			stdout, stderr, code := finch(t, "test", "notes", "--json")
+			if code != tc.wantExit {
+				t.Fatalf("exit=%d, want %d (stdout %q stderr %q)", code, tc.wantExit, stdout, stderr)
+			}
+			if tc.wantExit != 0 {
+				if decodeJSONError(t, stderr).Error.Code != "UPSTREAM" || stdout != "" {
+					t.Fatalf("stdout=%q stderr=%q", stdout, stderr)
+				}
+				return
+			}
+			got := decodeJSONOut(t, stdout)
+			tools, _ := got["tools"].([]any)
+			if got["ok"] != true || got["service"] != "notes" || len(tools) != 1 {
+				t.Fatalf("payload=%v", got)
+			}
+		})
+	}
+}
+
+func TestCallToolErrorExitsNonZero(t *testing.T) {
+	isolate(t)
+	h := newFakeHub(t)
+	loginTo(t, h)
+	h.set(func(h *fakeHub) {
+		h.services["notes"] = "key"
+		h.call = func(string) (int, string, string) {
+			return 200, "application/json", `{"jsonrpc":"2.0","id":1,"result":{"isError":true,"content":[{"type":"text","text":"no such note"}]}}`
+		}
+	})
+	_, stderr, code := finch(t, "call", "notes", "read", "--args", `{"id":"x"}`, "--json")
+	if code != 1 || !strings.Contains(decodeJSONError(t, stderr).Error.Message, "no such note") {
+		t.Fatalf("exit=%d stderr=%q", code, stderr)
+	}
+	_, stderr, code = finch(t, "call", "notes", "read", "--args", `[1]`, "--json")
+	if code != 2 || decodeJSONError(t, stderr).Error.Code != "USAGE" {
+		t.Fatalf("non-object --args: exit=%d stderr=%q", code, stderr)
+	}
+}
+
+func TestStatusJSONWhenLoggedOut(t *testing.T) {
+	isolate(t)
+	stdout, stderr, code := finch(t, "status", "--json")
+	if code != 0 {
+		t.Fatalf("status must report, not fail: exit=%d stderr=%q", code, stderr)
+	}
+	got := decodeJSONOut(t, stdout)
+	svc, _ := got["service"].(map[string]any)
+	if got["loggedIn"] != false || got["login_pending"] != false || svc["installed"] != false {
+		t.Fatalf("payload=%v", got)
+	}
+}
+
+func TestListCommandsWrapArraysWithSchemaVersion(t *testing.T) {
+	isolate(t)
+	h := newFakeHub(t)
+	loginTo(t, h)
+	h.set(func(h *fakeHub) { h.services["notes"] = "key" })
+	for cmd, field := range map[string]string{"fleet": "services", "keys": "keys"} {
+		stdout, stderr, code := finch(t, cmd, "--json")
+		if code != 0 {
+			t.Fatalf("%s: exit=%d stderr=%q", cmd, code, stderr)
+		}
+		if _, ok := decodeJSONOut(t, stdout)[field].([]any); !ok {
+			t.Fatalf("%s --json lacks a %q array: %q", cmd, field, stdout)
+		}
+	}
+}

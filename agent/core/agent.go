@@ -257,70 +257,10 @@ type joinResp struct {
 }
 
 func Main() {
-	// Setup subcommands (cloudflared-style): `finch login` saves a CLI token,
-	// `finch add` enrolls a service + appends an ingress rule. These run
-	// and exit; `run`/`join`/bare fall through to the relay agent below.
-	if len(os.Args) > 1 {
-		switch os.Args[1] {
-		case "login":
-			cmdLogin(os.Args[2:])
-			return
-		case "add":
-			cmdAdd(os.Args[2:])
-			return
-		case "enroll":
-			cmdEnroll(os.Args[2:])
-			return
-		case "approve":
-			cmdApprove(os.Args[2:])
-			return
-		case "auth":
-			cmdAuth(os.Args[2:])
-			return
-		case "token":
-			cmdToken(os.Args[2:])
-			return
-		case "status":
-			cmdStatus(os.Args[2:])
-			return
-		case "keys":
-			cmdKeys(os.Args[2:])
-			return
-		case "domain":
-			cmdDomain(os.Args[2:])
-			return
-		case "fleet", "ls":
-			cmdFleet(os.Args[2:])
-			return
-		case "rm":
-			cmdRm(os.Args[2:])
-			return
-		case "revoke-tokens":
-			cmdRevokeTokens(os.Args[2:])
-			return
-		case "test":
-			cmdTest(os.Args[2:])
-			return
-		case "call":
-			cmdCall(os.Args[2:])
-			return
-		case "update":
-			cmdUpdate(os.Args[2:])
-			return
-		case "version", "--version", "-v":
-			cmdVersion(os.Args[2:])
-			return
-		case "guide":
-			printGuide()
-			return
-		case "help", "-h", "--help":
-			printUsage()
-			return
-		}
-		if err := validateRelayCommandArg(os.Args[1]); err != nil {
-			log.Fatalf("finch: %v", err)
-		}
-	}
+	// Setup and control subcommands (login, add, service, connect, …) run and
+	// exit through the agent-facing CLI contract (cli_contract.go); only
+	// `run`/`join`/bare flags fall through to the relay agent below.
+	cliMain(os.Args[1:])
 
 	hostName, _ := os.Hostname()
 	defaultHub := agentDefaultHub()

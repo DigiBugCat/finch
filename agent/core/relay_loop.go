@@ -145,7 +145,7 @@ func serveConfig(ctx context.Context, cfg *config) error {
 // after `finch run` started still counts, and the request runs in the
 // background so one slow hub call never blocks a sibling or a relay.
 func autoApproveAsync(hub, appPath string) {
-	cred := loadCliCredQuiet()
+	cred, _ := readCliCred()
 	if cred == nil || strings.TrimRight(cred.Hub, "/") != hub {
 		return
 	}

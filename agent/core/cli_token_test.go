@@ -31,7 +31,10 @@ func TestResolveCliToken(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("FINCH_CLI_TOKEN", tc.env)
-			got, fromArgv := resolveCliToken(tc.arg, strings.NewReader(tc.stdin))
+			got, fromArgv, err := resolveCliToken(tc.arg, strings.NewReader(tc.stdin))
+			if err != nil {
+				t.Fatalf("resolveCliToken(%q): %v", tc.arg, err)
+			}
 			if got != tc.want || fromArgv != tc.wantFromArgv {
 				t.Fatalf("resolveCliToken(%q) = (%q, %v), want (%q, %v)", tc.arg, got, fromArgv, tc.want, tc.wantFromArgv)
 			}
@@ -65,9 +68,9 @@ func TestLoginCommandKeepsTokenOffArgv(t *testing.T) {
 	}
 	// What the shell hands the login process on stdin is exactly the body line;
 	// resolveCliToken must recover the token verbatim, metacharacters intact.
-	got, fromArgv := resolveCliToken("-", strings.NewReader(lines[1]+"\n"))
-	if got != token || fromArgv {
-		t.Fatalf("round-trip = (%q, %v), want (%q, false)", got, fromArgv, token)
+	got, fromArgv, err := resolveCliToken("-", strings.NewReader(lines[1]+"\n"))
+	if err != nil || got != token || fromArgv {
+		t.Fatalf("round-trip = (%q, %v, %v), want (%q, false, nil)", got, fromArgv, err, token)
 	}
 }
 

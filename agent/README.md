@@ -8,33 +8,60 @@ server, a website, or any HTTP/WebSocket app. Nothing listens on the box; no
 ports are opened.
 
 A single Go binary with a few subcommands. It is built to be driven end to end
-by an AI agent: every command is non-interactive and supports `--json`, and
-`finch guide` prints a complete operating manual an agent can follow.
+by an AI agent: every command takes `--json`, uses fixed exit codes, and never
+prompts. `finch guide` prints the agent manual (the same flow as
+[finchmcp.com/agents.md](../web/public/agents.md)).
 
 | Command | What it does |
 |---|---|
-| `finch version [--json]` | Print this binary's version and platform; JSON is a stable SDK/automation contract. |
-| `finch login` | Log in to your tenant: prints a link + code to approve on any device (like `gh auth login`). |
-| `finch add <app_path> --service <url>` | Enroll a service and append an `ingress` rule to `finch.yml`. |
-| `finch run` | Serve every rule in `finch.yml` — dials out, auto-approves, holds the relay open. |
-| `finch enroll <app_path> --ticket -` | One time, on a box with no CLI login: trade a one-shot join ticket (stdin, or `FINCH_TICKET`) for a saved credential. A logged-in box uses `finch add`. |
-| `finch status` | Am I logged in (which tenant)? What does `finch.yml` serve? |
+| `finch login --start` | Start a login and return at once: prints the sign-in link + code and saves the pending login to `~/.finch/login-pending.json` (0600). |
+| `finch login --poll` | Poll that login once: exit 0 approved (credential saved), 10 pending, 11 expired. |
+| `finch login` | The same login in one blocking step (like `gh auth login`); `--headless` skips opening a browser. |
+| `finch add <name> --service <url> [--public]` | Enroll a service, append an `ingress` rule to `finch.yml`, print its public URL. `--public` makes it open (no key). |
+| `finch service install\|uninstall\|status` | Run `finch run` as a login service: launchd LaunchAgent `~/Library/LaunchAgents/com.finchmcp.finch.plist` (macOS) or systemd user unit `finch.service` (Linux). Idempotent. |
+| `finch connect <name> --client claude-code\|cursor\|codex\|json` | Mint a `finch_` key for one client and write it into that client's config without printing it (`json` prints an `mcpServers` snippet — the only mode that shows the key). |
+| `finch test <name>` | List a service's MCP tools through the hub; non-zero exit when the call fails. |
+| `finch call <name> <tool> [--args '{…}']` | Invoke one tool through the hub; a tool error exits 1. |
+| `finch run` | Serve every rule in `finch.yml` in the foreground — dials out, auto-approves, holds the relay open. |
+| `finch status` | Logged in? Login pending? What does `finch.yml` serve? Is the service installed and running? Always exits 0. |
 | `finch fleet` (alias `ls`) | List this account's services + state. |
-| `finch test <service>` | List a service's MCP tools (does-it-work check). |
-| `finch call <service> <tool> [--args '{…}']` | Invoke one tool through the hub. |
-| `finch keys [list \| mint <label> --service <id> \| revoke <id>]` | Manage the client `finch_` keys callers present (grant + revoke access). |
-| `finch auth <app_path> public\|key` | Serve a service with no auth, or require a `finch_` key (the default). |
+| `finch keys [list \| mint <label> --service <name> \| revoke <id>]` | Manage the client `finch_` keys callers present (grant + revoke access). |
+| `finch auth <name> public\|key` | Serve a service with no auth, or require a `finch_` key (the default). |
+| `finch rm <name>` | Remove a service. |
 | `finch domain [ls \| add <hostname> \| rm <hostname>]` | Manage custom hostnames. |
-| `finch token` | Mint a fresh CLI token — provision a new box with no browser. |
-| `finch approve <path>` | Approve a service (clear the pending gate). Usually automatic. |
-| `finch rm <service>` | Remove a service. |
-| `finch update` | Self-update this binary and restart the serve cleanly. |
+| `finch token` | Mint a fresh CLI token — set up another machine with no browser. |
+| `finch enroll <name> --ticket -` | One time, on a box with no CLI login: trade a one-shot join ticket (stdin, or `FINCH_TICKET`) for a saved credential. |
+| `finch approve <name>` | Approve a service (clear the pending gate). Usually automatic. |
+| `finch update` | Self-update this binary and restart the serve cleanly (through launchd/systemd when `finch service` manages it). |
 | `finch revoke-tokens` | De-authorize every CLI login (including this box). |
-| `finch guide` | The full agent operating manual. |
-| `finch help` | Command overview, first-time setup, and worked automation examples. |
+| `finch version [--json]` | Print this binary's version and platform. |
+| `finch guide` / `finch help` | The agent manual / the command overview. |
 
-Because the CLI token is a tenant-admin credential, an agent can run the whole
-loop — introspect, serve, test, and grant/revoke access — from the command line.
+## The JSON and exit-code contract
+
+Agents branch on these, so they are stable (add fields; never repurpose them):
+
+| Exit | Meaning | `--json` error code |
+|---|---|---|
+| 0 | ok | |
+| 1 | error | `NOT_FOUND`, `UPSTREAM`, `INTERNAL` |
+| 2 | usage | `USAGE` |
+| 10 | waiting for login approval | `APPROVAL_PENDING` |
+| 11 | login code expired | `EXPIRED` |
+| 12 | not logged in (or the login was revoked) | `NOT_LOGGED_IN` |
+
+With `--json`, every success payload on stdout carries `"schema_version":1`
+(lists are wrapped: `{"schema_version":1,"services":[…]}`), and every error goes
+to stderr as one line:
+
+```json
+{"schema_version":1,"error":{"code":"NOT_LOGGED_IN","message":"not logged in","next":"finch login --start"}}
+```
+
+`next`, when present, is the command to run next. `finch login --poll` reports
+its outcome on stdout instead (`{"schema_version":1,"status":"pending"}` with
+exit 10, `"expired"` with exit 11). The contract lives in
+[`core/cli_contract.go`](core/cli_contract.go).
 
 `finch version --json` is the stable local-binary identity contract used by
 SDKs and deployment checks:
@@ -50,21 +77,49 @@ change meaning.
 ## Quick start
 
 ```bash
-# 1. install (or `go build -o finch .` from this directory)
+# 1. install (or `go build -o finch .` from this directory). Never uses sudo:
+#    /usr/local/bin when writable, else ~/.local/bin; FINCH_INSTALL_DIR overrides.
 curl -fsSL https://finchmcp.com/install | sh
 
-# 2. log in — prints https://<hub>/cli?code=WXYZ-1234 ; approve it on any device
-finch login --hub https://finchmcp.com
+# 2. log in — two steps for an agent (a human can run plain `finch login`)
+finch login --start          # prints https://finchmcp.com/cli?code=WXYZ-2345 ; approve it on any device
+finch login --poll           # repeat every few seconds until it exits 0
 
-# 3. expose a local service (running on :8000) as the service "printer"
-finch add printer --service http://127.0.0.1:8000
+# 3. publish a local service (running on :8000) as "notes"; prints the public URL
+finch add notes --service http://127.0.0.1:8000
 
-# 4. serve it — prints the public URL, e.g. https://<slug>.finchmcp.com/printer/
-finch run
+# 4. keep it running as a login service (or `finch run` in the foreground)
+finch service install
+
+# 5. check it, then wire it into an MCP client
+finch test notes
+finch connect notes --client claude-code
 ```
 
-`finch add` writes/extends `finch.yml`; `finch run` serves it. Add more
-services with more `finch add` calls — one process fronts them all.
+`finch add` writes/extends `finch.yml`; `finch run` (and the service) serves
+it. Add more services with more `finch add` calls — one process fronts them
+all — then re-run `finch service install` so the service restarts onto the new
+manifest.
+
+## Background service
+
+`finch service install` pins `finch run --config <absolute finch.yml>` in a
+per-user unit, with the manifest's directory as the working directory:
+
+- **macOS** — `~/Library/LaunchAgents/com.finchmcp.finch.plist`, loaded with
+  `launchctl bootstrap gui/<uid>`; `RunAtLoad` + `KeepAlive`; logs to
+  `~/.finch/finch.log`.
+- **Linux** — `~/.config/systemd/user/finch.service` (honours
+  `$XDG_CONFIG_HOME`), `Restart=always`, enabled and restarted via
+  `systemctl --user`; logs in `journalctl --user -u finch.service`. On a
+  headless box, `sudo loginctl enable-linger $USER` keeps it running without a
+  login session; `install` reports `"linger": false` and a note when it is off.
+
+Re-running `install` rewrites and reloads the unit, so it is safe after moving
+the binary or adding a service. `uninstall` stops and removes it; `status`
+reports `installed` and `running`. Only one serve per box can hold the relay, so
+stop a foreground `finch run` before installing (install warns when one holds
+the lock).
 
 ## Provision a new box from an already-authed one (no human)
 
@@ -73,7 +128,7 @@ services with more `finch add` calls — one process fronts them all.
 # `--token -` reads stdin, so this tenant-admin token never reaches the remote
 # argv (/proc/<pid>/cmdline, world-readable) or either shell's history:
 finch token | ssh user@newbox "finch login --token -"
-ssh user@newbox "finch add api --service http://127.0.0.1:9000 && finch run"
+ssh user@newbox "finch add api --service http://127.0.0.1:9000 && finch service install"
 ```
 
 `finch token` mints a fresh, epoch-bound CLI token (revocable via `finch
@@ -137,7 +192,7 @@ upgrade by rebuilding/pulling the image, not `finch update`.
 
 ## Auth & credentials
 
-- **`finch login`** saves a long-lived **CLI token** (a tenant-admin credential,
+- **`finch login`** (or `--start` + `--poll`) saves a long-lived **CLI token** (a tenant-admin credential,
   ~30 days) to `~/.finch/cli.json` (`0600`). On a box without a browser, use
   `finch login --headless` and approve on your phone, or pipe a token from a
   logged-in box (`finch token | ssh box 'finch login --token -'`).
