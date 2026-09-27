@@ -179,6 +179,53 @@ func TestConnectRevokesTheKeyItReplaces(t *testing.T) {
 	}
 }
 
+// A dotfile manager's symlinked mcp.json must stay a symlink, with the new
+// entry written into its target.
+func TestConnectCursorWritesThroughSymlink(t *testing.T) {
+	home, _ := connectFixture(t)
+	dir := filepath.Join(home, ".cursor")
+	dotfiles := filepath.Join(home, "dotfiles")
+	for _, d := range []string{dir, dotfiles} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dotTarget := filepath.Join(dotfiles, "mcp.json")
+	if err := os.WriteFile(dotTarget, []byte(`{"theme":"dark"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "mcp.json")
+	if err := os.Symlink(dotTarget, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, stderr, code := finch(t, "connect", "notes", "--client", "cursor", "--json"); code != 0 {
+		t.Fatalf("exit=%d stderr=%q", code, stderr)
+	}
+	if st, err := os.Lstat(link); err != nil || st.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("%s is no longer a symlink (err %v)", link, err)
+	}
+	got := mustRead(t, dotTarget)
+	if !strings.Contains(got, `"notes"`) || !strings.Contains(got, `"theme": "dark"`) {
+		t.Fatalf("the symlink target was not updated:\n%s", got)
+	}
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 1 {
+		t.Fatalf("stray files next to the link: %v", entries)
+	}
+
+	// A dangling link is refused (and the minted key revoked), not replaced.
+	if err := os.Remove(dotTarget); err != nil {
+		t.Fatal(err)
+	}
+	_, stderr, code := finch(t, "connect", "notes", "--client", "cursor", "--json")
+	if code != 1 || !strings.Contains(decodeJSONError(t, stderr).Error.Message, "symlink") {
+		t.Fatalf("dangling link: exit=%d stderr=%q", code, stderr)
+	}
+	if st, err := os.Lstat(link); err != nil || st.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("dangling link was replaced (err %v)", err)
+	}
+}
+
 // claude-code entries are per project and json snippets go who knows where,
 // so neither revokes anything.
 func TestConnectJSONRevokesNothing(t *testing.T) {

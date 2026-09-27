@@ -472,7 +472,17 @@ WantedBy=default.target
 
 // atomicWriteFile writes via a temp file + rename so a reader (launchd,
 // systemd, an editor) never sees a torn file.
+//
+// A symlinked path (a dotfile manager's ~/.cursor/mcp.json → ~/dotfiles/…) is
+// written through: the rename lands on the link's target, so the link survives.
 func atomicWriteFile(path string, b []byte, mode os.FileMode) error {
+	if st, err := os.Lstat(path); err == nil && st.Mode()&os.ModeSymlink != 0 {
+		target, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			return fmt.Errorf("%s is a symlink whose target cannot be resolved: %w", path, err)
+		}
+		path = target
+	}
 	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return err
