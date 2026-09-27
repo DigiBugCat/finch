@@ -89,7 +89,8 @@ function Panorama() {
         <path className="fg-draw" style={draw(300, 1100)} d="M980 196 C 1080 196, 1180 250, 1262 267" />
         <path className="fg-draw" style={draw(400, 1200)} d="M980 196 C 1100 210, 1240 330, 1330 347" />
       </g>
-      <g className="fg-svg-sans" style={f('ink')}>
+      {/* Too small to read on a phone; there the legend names the places. */}
+      <g className="fg-hero-label fg-svg-sans" style={f('ink')}>
         <text x="848" y="202" style={{ fontSize: 14 }}>finchmcp.com</text>
         <text x="1174" y="322">Claude</text>
         <text x="1287" y="272">Cursor</text>
@@ -169,6 +170,10 @@ function Legend() {
           <span>The answer, streamed back as it is written</span>
         </li>
       </ul>
+      {/* Shown only where the plate's own labels are too small to read. */}
+      <p className="fg-hero-places">
+        Left to right: your machine, the finchmcp.com relay, then Claude, Cursor and ChatGPT.
+      </p>
     </div>
   );
 }

@@ -49,6 +49,7 @@
   font-size:14px; line-height:21px}
 .fg-hero-legend li{display:grid; grid-template-columns:22px 1fr; gap:12px; align-items:center}
 .fg-hero-legend svg{justify-self:center}
+.fg-hero-places{display:none; font-size:14px; line-height:21px}
 
 /* ---------- Plate II: the band ---------- */
 .fg-band-fig{margin:0; display:flex; flex-direction:column; gap:14px}
@@ -104,13 +105,18 @@
 .fg-dial-key{left:1.6%; top:21.8%}
 .fg-dial-oauth{left:50%; top:5.5%; transform:translateX(-50%)}
 .fg-dial-public{right:1.6%; top:21.8%}
-.fg-gate-body{display:grid; grid-template-columns:minmax(0,1fr) 330px; gap:36px; align-items:center}
+/* The art gives up 50px at desktop width so the detail column (and its
+   command) has room: 284px instead of 230px. */
+.fg-gate-body{display:grid; grid-template-columns:minmax(0,1fr) 280px; gap:32px; align-items:center}
 .fg-gate-detail{display:flex; flex-direction:column; gap:12px}
 .fg-gate-detail .iw-label{letter-spacing:.08em}
 .fg-gate-detail h3{font-family:var(--serif); font-size:28px; line-height:34px; font-weight:500}
 .fg-gate-detail code,.fg-by-hand pre{font-family:var(--mono); font-size:13px; line-height:20px}
-.fg-gate-detail code{align-self:flex-start; max-width:100%; overflow-wrap:anywhere; background:var(--surface);
+/* Commands wrap only between tokens (each token is a .fg-nowrap span), so a
+   flag like --service never splits; a token wider than the card scrolls. */
+.fg-gate-detail code{align-self:flex-start; max-width:100%; overflow-x:auto; background:var(--surface);
   border-radius:var(--radius-sm); padding:8px 10px}
+.fg-nowrap{white-space:nowrap}
 .fg-gate-art{width:min(330px, 100%); margin-inline:auto}
 @media (prefers-reduced-motion:reduce){ .fg-knob{transition:none} }
 
@@ -132,10 +138,12 @@
   font-family:var(--mono); font-size:13px; line-height:23px; overflow:hidden}
 .fg-term-bar{flex:none; padding-bottom:12px; margin-bottom:8px; border-bottom:1px solid var(--line);
   font:700 12px/16px var(--sans); letter-spacing:.04em; color:var(--ink-muted)}
-/* Anchored to the bottom once it overflows, like a terminal scrolling. */
-.fg-term-scroll{flex:1; min-height:0; overflow:hidden; display:flex; flex-direction:column; justify-content:flex-end}
-.fg-term-lines{flex:none; min-height:100%; display:flex; flex-direction:column}
+/* Every line is laid out from the start (untyped ones are hidden), so the
+   box never grows while the session types itself out. */
+.fg-term-scroll{flex:1; min-height:0; overflow:hidden}
+.fg-term-lines{display:flex; flex-direction:column}
 .fg-term-lines > span{overflow-wrap:anywhere}
+.fg-term-pending{visibility:hidden}
 .fg-term-cmd{color:var(--ink)}
 .fg-term-out{color:var(--ink-muted)}
 .fg-term-ok{color:var(--leaf)}
@@ -172,6 +180,10 @@
 .fg-log td.fg-denied{color:var(--vermilion)}
 .fg-log td.fg-not-kept{color:var(--ink-muted); text-decoration:line-through}
 .fg-log-note{font-family:var(--hand); font-size:17px; color:var(--indigo); padding-top:6px}
+.fg-log-swipe{display:none; align-self:flex-end; font-family:var(--hand); font-size:16px; line-height:20px; color:var(--indigo)}
+/* The table needs about 733px (a viewport of about 821px); below that it
+   scrolls sideways, so say so. */
+@media (max-width:820px){ .fg-log-swipe{display:block} }
 
 /* ---------- Plate VII: pricing ---------- */
 .fg-tiers{display:grid; grid-template-columns:repeat(2, minmax(0,1fr)); gap:24px}
@@ -219,8 +231,10 @@
   .fg-hero-sheet h1{font-size:40px; line-height:44px; letter-spacing:-.015em}
   .fg-hero-sheet p{font-size:16px; line-height:26px}
   .fg-hero-actions .iw-btn{width:100%; white-space:normal}
-  /* The in-plate handwriting is too small to read here; the legend carries it. */
-  .fg-hero-anno{display:none}
+  /* The in-plate handwriting and labels are too small to read here (the
+     panorama is drawn at about a quarter scale); the legend carries them. */
+  .fg-hero-anno,.fg-hero-label{display:none}
+  .fg-hero-places{display:block}
   .fg-head h2{font-size:29px; line-height:35px}
   .fg-migration-stops{grid-template-columns:minmax(0,1fr); gap:14px}
   .fg-scale-text{font-size:40px !important}
@@ -233,7 +247,10 @@
   .fg-prompt{font-size:18px; line-height:28px}
   .fg-prompt-card .iw-btn{align-self:stretch; justify-content:center; text-align:center}
   .fg-session{height:auto; display:flex; flex-direction:column; align-items:center; gap:20px}
-  .fg-term{position:relative; width:100%; height:440px; padding:16px; font-size:12px; line-height:20px}
+  /* Sized by the whole transcript (see .fg-term-pending), so the finished
+     frame shows the install step and nothing moves while it types. */
+  .fg-term{position:relative; width:100%; height:auto; padding:16px; font-size:12px; line-height:20px}
+  .fg-term-scroll{flex:none}
   .fg-term-hand{font-size:15px}
   /* Stacked under the terminal the phone stays in view (no empty slot, no
      shift); only its Approve button follows the session. */

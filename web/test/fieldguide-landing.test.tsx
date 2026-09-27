@@ -4,6 +4,7 @@ import { act, fireEvent, render, screen, within } from '@testing-library/react';
 import Home from '@/app/page';
 import AgentSession, { SESSION } from '@/components/fieldguide/AgentSession';
 import { logRows } from '@/components/fieldguide/SightingLog';
+import { breakableParts } from '@/components/fieldguide/GateDial';
 
 // The one paste for humans, verbatim from the shared CLI contract. Pinned here
 // as a literal (not imported) so a drift in the component fails this test.
@@ -102,26 +103,90 @@ describe('field-guide landing', () => {
   });
 
   it('turns the gate dial with real toggle buttons', () => {
-    render(<Home />);
+    const { container } = render(<Home />);
     const group = screen.getByRole('group', { name: 'Who gets in' });
     const key = within(group).getByRole('button', { name: 'Key' });
     const oauth = within(group).getByRole('button', { name: 'Sign in' });
     const pub = within(group).getByRole('button', { name: 'Public' });
+    const gateCode = () => container.querySelector('#gate .fg-gate-detail code')!.textContent;
 
     expect(key).toHaveAttribute('aria-pressed', 'true');
     expect(oauth).toHaveAttribute('aria-pressed', 'false');
-    expect(screen.getByText('finch keys mint cursor --service notes')).toBeInTheDocument();
+    expect(gateCode()).toBe('finch keys mint cursor --service notes');
+    assertContractCommand(gateCode()!);
 
     fireEvent.click(pub);
     expect(pub).toHaveAttribute('aria-pressed', 'true');
     expect(key).toHaveAttribute('aria-pressed', 'false');
-    const openCmd = screen.getByText('finch add demo --service http://127.0.0.1:3000 --public');
-    assertContractCommand(openCmd.textContent!);
+    expect(gateCode()).toBe('finch add demo --service http://127.0.0.1:3000 --public');
+    assertContractCommand(gateCode()!);
     expect(screen.getByRole('img', { name: 'Garden gate: anyone can walk in' })).toBeInTheDocument();
 
     fireEvent.click(oauth);
     expect(oauth).toHaveAttribute('aria-pressed', 'true');
     expect(screen.getByRole('heading', { name: 'Sign in at the gate' })).toBeInTheDocument();
+  });
+
+  it('announces a dial change from a live region that stays mounted', () => {
+    const { container } = render(<Home />);
+    const live = container.querySelector('#gate [aria-live="polite"]')!;
+    expect(live).not.toBeNull();
+    // Exactly one live region in the plate, holding the detail.
+    expect(container.querySelectorAll('#gate [aria-live]')).toHaveLength(1);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Public' }));
+    // The same node, now carrying the new detail: a region inserted together
+    // with its content is not announced, so it must not be remounted.
+    expect(container.querySelector('#gate [aria-live="polite"]')).toBe(live);
+    expect(live).toHaveTextContent('Leave the gate open');
+    expect(live).toHaveTextContent('finch add demo --service http://127.0.0.1:3000 --public');
+  });
+
+  it('lets a gate command wrap only between words or URL path segments, never inside a flag', () => {
+    const { container } = render(<Home />);
+    const seen: string[][] = [];
+    for (const name of ['Key', 'Sign in', 'Public']) {
+      fireEvent.click(screen.getByRole('button', { name }));
+      const code = container.querySelector('#gate .fg-gate-detail code')!;
+      // All visible text sits in unbreakable spans; the only other children
+      // are <wbr> break points (and the spaces between words).
+      for (const c of code.children) {
+        if (c.tagName === 'WBR') continue;
+        expect(c.tagName).toBe('SPAN');
+        expect(c).toHaveClass('fg-nowrap');
+      }
+      const pieces = [...code.querySelectorAll('.fg-nowrap')].map((s) => s.textContent!);
+      for (const flag of code.textContent!.match(/--[a-z-]+/g) ?? []) {
+        expect(pieces.some((p) => p.includes(flag))).toBe(true);
+      }
+      seen.push(pieces);
+    }
+    expect(seen).toEqual([
+      ['finch', 'keys', 'mint', 'cursor', '--service', 'notes'],
+      ['https://maray.finchmcp.com/', 'notes/', 'mcp'],
+      ['finch', 'add', 'demo', '--service', 'http://127.0.0.1:3000', '--public'],
+    ]);
+    expect(container.querySelector('#gate code')!.textContent).toBe('finch add demo --service http://127.0.0.1:3000 --public');
+  });
+
+  it('splits only URLs at path slashes, and loses no characters doing it', () => {
+    expect(breakableParts('--service')).toEqual(['--service']);
+    expect(breakableParts('http://127.0.0.1:3000')).toEqual(['http://127.0.0.1:3000']);
+    expect(breakableParts('https://a.finchmcp.com/notes/mcp')).toEqual(['https://a.finchmcp.com/', 'notes/', 'mcp']);
+    for (const t of ['https://a.b/', 'https://a.b//x//y/', 'http://h:1/p?q=a/b']) {
+      expect(breakableParts(t).join('')).toBe(t);
+    }
+  });
+
+  it('names every panorama label in the legend line phones see instead', () => {
+    const { container } = render(<Home />);
+    // landing.css hides .fg-hero-label below 760px (it renders at ~3.5px
+    // there) and shows .fg-hero-places, so that line must carry every label.
+    const labels = [...container.querySelectorAll('.fg-hero-svg .fg-hero-label text')].map((t) => t.textContent!);
+    expect(labels).toEqual(['finchmcp.com', 'Claude', 'Cursor', 'ChatGPT']);
+    const places = container.querySelector('.fg-hero-places')!.textContent!;
+    for (const l of labels) expect(places).toContain(l);
+    expect(places).toContain('your machine');
   });
 
   it('labels the band address and its anatomy for screen readers', () => {
@@ -207,7 +272,15 @@ describe('agent session motion', () => {
     window.IntersectionObserver = realIO;
   });
 
-  const typed = (c: HTMLElement) => c.querySelectorAll('.fg-term-lines > span:not(.fg-term-cursor)').length;
+  const typed = (c: HTMLElement) =>
+    c.querySelectorAll('.fg-term-lines > span:not(.fg-term-cursor):not(.fg-term-pending)').length;
+  // The terminal's rows, in order: every session line plus exactly one cursor.
+  // Untyped lines stay in the layout (hidden), so the box is always sized by
+  // the whole transcript and the finished frame never clips its first line.
+  const rows = (c: HTMLElement) =>
+    [...c.querySelectorAll('.fg-term-lines > span')].map((s) =>
+      s.classList.contains('fg-term-cursor') ? 'CURSOR' : s.classList.contains('fg-term-pending') ? `(${s.textContent})` : s.textContent,
+    );
 
   it('holds the finished session, phone approved, for reduced motion', () => {
     reduced = true;
@@ -217,14 +290,23 @@ describe('agent session motion', () => {
     expect(typed(container)).toBe(SESSION.length);
     expect(container.querySelector('.fg-phone')).toHaveClass('is-shown');
     expect(screen.getByText('Approved ✓')).toBeInTheDocument();
+    // The still frame starts at the install step and ends on the cursor.
+    expect(rows(container)).toEqual([...SESSION.map((l) => l.text), 'CURSOR']);
   });
 
   it('types the session out line by line when motion is allowed', () => {
     reduced = false;
     const { container } = render(<AgentSession />);
     expect(typed(container)).toBe(0);
+    expect(rows(container)).toEqual(['CURSOR', ...SESSION.map((l) => `(${l.text})`)]);
     act(() => { vi.advanceTimersByTime(650 * 3); });
     expect(typed(container)).toBe(3);
+    // Typed lines first, then the cursor, then the rest held in place, hidden.
+    expect(rows(container)).toEqual([
+      ...SESSION.slice(0, 3).map((l) => l.text),
+      'CURSOR',
+      ...SESSION.slice(3).map((l) => `(${l.text})`),
+    ]);
     expect(container.querySelector('.fg-phone')).not.toHaveClass('is-shown');
     act(() => { vi.advanceTimersByTime(650 * 3); });
     expect(container.querySelector('.fg-phone')).toHaveClass('is-shown');

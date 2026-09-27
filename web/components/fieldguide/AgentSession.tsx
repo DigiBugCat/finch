@@ -45,9 +45,25 @@ export default function AgentSession() {
   }, [animate]);
 
   const at = animate ? step : SESSION.length;
-  const shown = SESSION.slice(0, Math.min(at, SESSION.length));
+  const typedCount = Math.min(at, SESSION.length);
   const phoneShown = at >= 5 && at <= 16;
   const approved = at >= 7;
+
+  // Every line is always laid out; lines not typed yet are only hidden. That
+  // way the box is sized by the whole transcript (on a phone it grows to fit
+  // it, so the finished frame never clips the first command), and typing it
+  // out never shifts the page. The cursor sits on the line after the last one
+  // typed, so the total line count never changes either.
+  const cursor = <span key="cursor" className="iw-blink fg-term-cursor">▍</span>;
+  const lines = SESSION.map((l, i) => (
+    <span
+      key={i}
+      className={`fg-term-${l.kind}${i >= typedCount ? ' fg-term-pending' : animate ? ' fg-rowin' : ''}`}
+    >
+      {l.text}
+    </span>
+  ));
+  lines.splice(typedCount, 0, cursor);
 
   return (
     <div className="fg-session" ref={ref}>
@@ -56,12 +72,7 @@ export default function AgentSession() {
         {/* The whole transcript for assistive tech; the typed copy is decoration. */}
         <pre className="sr-only">{SESSION.map((l) => l.text).join('\n')}</pre>
         <div className="fg-term-scroll" aria-hidden="true">
-          <div className="fg-term-lines">
-            {shown.map((l, i) => (
-              <span key={i} className={`fg-term-${l.kind}${animate ? ' fg-rowin' : ''}`}>{l.text}</span>
-            ))}
-            <span className="iw-blink fg-term-cursor">▍</span>
-          </div>
+          <div className="fg-term-lines">{lines}</div>
         </div>
       </div>
       {/* Decorative: the approval step is already in the transcript above. */}

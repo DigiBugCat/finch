@@ -70,6 +70,9 @@ export default function SightingLog() {
             <span className="iw-blink fg-leaf" aria-hidden="true">●</span> recording · {clock(T0 + (tick + 40) * 3 + 1)}
           </span>
         </div>
+        {/* Only on narrow screens, where the table scrolls: the columns past
+            Caller (and the struck-out body, the privacy point) are off-screen. */}
+        <span className="fg-log-swipe" aria-hidden="true">swipe sideways for every column →</span>
         <div className="fg-log-scroll" role="region" aria-label="Sighting log, scrolls sideways" tabIndex={0}>
           <table>
             <caption className="sr-only">Example per-call log for the notes service</caption>

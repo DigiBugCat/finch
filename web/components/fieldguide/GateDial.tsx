@@ -1,7 +1,7 @@
 "use client";
 // Plate IV: the gate. Three real toggle buttons (aria-pressed) turn a dial
 // between the three ways in: a key per client, OAuth sign-in, or public.
-import { useState, type CSSProperties } from 'react';
+import { Fragment, useState, type CSSProperties } from 'react';
 import PlateHead from './PlateHead';
 
 export type GateMode = 'key' | 'oauth' | 'public';
@@ -41,6 +41,16 @@ const DETAIL: Record<GateMode, { who: string; title: string; body: string; code:
     code: 'finch add demo --service http://127.0.0.1:3000 --public',
   },
 };
+
+// A command may wrap only between words, never inside a flag like --service,
+// so each piece is an unbreakable span. A URL may also wrap after a path
+// slash (https://maray.finchmcp.com/ | notes/ | mcp), since on its own it can
+// be wider than the detail column.
+export function breakableParts(token: string): string[] {
+  const url = /^(https?:\/\/[^/]+\/?)(.*)$/.exec(token);
+  if (!url) return [token];
+  return [url[1], ...(url[2].match(/[^/]+\/*|\/+/g) ?? [])];
+}
 
 // Dial ticks every 12°, with major ticks at the three settings.
 function buildTicks() {
@@ -136,11 +146,27 @@ export default function GateDial({ initialMode = 'key' }: { initialMode?: GateMo
           ))}
         </div>
         <div className="fg-gate-body">
-          <div key={mode} className="fg-gate-detail iw-soak" aria-live="polite">
-            <span className="iw-label">{d.who}</span>
-            <h3>{d.title}</h3>
-            <p>{d.body}</p>
-            <code>{d.code}</code>
+          {/* The live region stays mounted so a change is announced; only the
+              inner block is re-keyed, to replay the soak on each turn. */}
+          <div className="fg-gate-live" aria-live="polite">
+            <div key={mode} className="fg-gate-detail iw-soak">
+              <span className="iw-label">{d.who}</span>
+              <h3>{d.title}</h3>
+              <p>{d.body}</p>
+              <code>
+                {d.code.split(' ').map((token, i) => (
+                  <Fragment key={i}>
+                    {i > 0 && ' '}
+                    {breakableParts(token).map((part, j) => (
+                      <Fragment key={j}>
+                        {j > 0 && <wbr />}
+                        <span className="fg-nowrap">{part}</span>
+                      </Fragment>
+                    ))}
+                  </Fragment>
+                ))}
+              </code>
+            </div>
           </div>
           <div className="fg-gate-art">
             <Gate mode={mode} />
