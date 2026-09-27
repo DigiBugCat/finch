@@ -9,7 +9,13 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
 import { render } from '@testing-library/react';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+// The nav's account slot reads Clerk; render the landing signed out.
+vi.mock('@clerk/nextjs', () => ({
+  useAuth: () => ({ isLoaded: true, isSignedIn: false }),
+  UserButton: () => null,
+}));
 
 import Home from '@/app/page';
 import { AGENT_PROMPT } from '@/components/fieldguide/prompt';

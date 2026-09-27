@@ -97,6 +97,7 @@ img,svg{max-width:100%}
 .site-links a.site-signin{color:var(--indigo); border:1px solid var(--indigo); border-radius:var(--radius-md);
   padding:9px 16px; text-decoration:none}
 .site-links a.site-signin:hover{background:var(--surface-raised)}
+.site-account{display:flex; align-items:center; min-height:44px}
 @media (max-width:900px){
   .site-links{gap:18px}
   .site-links .site-anchor{display:none}

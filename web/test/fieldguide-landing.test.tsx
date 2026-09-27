@@ -1,7 +1,18 @@
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, fireEvent, render, screen, within } from '@testing-library/react';
 
+// Clerk is the nav's only outside input: a session that tests can flip between
+// loading, signed out and signed in. UserButton stands in as a labelled button.
+const clerk = vi.hoisted(() => ({ auth: { isLoaded: true, isSignedIn: false } }));
+vi.mock('@clerk/nextjs', () => ({
+  useAuth: () => clerk.auth,
+  UserButton: () => <button type="button">Open account menu</button>,
+}));
+
 import Home from '@/app/page';
+import SiteNav from '@/components/fieldguide/SiteNav';
 import AgentSession, { SESSION } from '@/components/fieldguide/AgentSession';
 import { logRows } from '@/components/fieldguide/SightingLog';
 import { breakableParts } from '@/components/fieldguide/GateDial';
@@ -189,6 +200,20 @@ describe('field-guide landing', () => {
     expect(places).toContain('your machine');
   });
 
+  it('shows the band address exactly as typed, never case-transformed', () => {
+    // The service path is case-sensitive (/NOTES/mcp is not /notes/mcp), so
+    // the ring must not uppercase it: nothing styling the address may transform case.
+    const css = readFileSync(resolve(import.meta.dirname, '../components/fieldguide/landing.css'), 'utf8');
+    const rules = [...css.matchAll(/([^{}]*\.fg-(?:band|seg)[^{}]*)\{([^}]*)\}/g)];
+    expect(rules.length).toBeGreaterThan(0);
+    for (const [, selector, body] of rules) {
+      expect({ selector: selector.trim(), transform: /text-transform/.test(body) }).toEqual({ selector: selector.trim(), transform: false });
+    }
+    render(<Home />);
+    const addr = screen.getByText('maray.finchmcp.com/notes/mcp', { selector: '.fg-band > span' });
+    expect(addr.textContent).toBe(addr.textContent!.toLowerCase());
+  });
+
   it('labels the band address and its anatomy for screen readers', () => {
     render(<Home />);
     expect(screen.getByText('maray.finchmcp.com/notes/mcp', { selector: '.fg-band > span' })).toBeInTheDocument();
@@ -314,17 +339,69 @@ describe('agent session motion', () => {
   });
 });
 
+describe('site nav account control', () => {
+  beforeEach(() => { clerk.auth = { isLoaded: true, isSignedIn: false }; });
+
+  it('offers Sign in to a signed-out visitor', () => {
+    render(<SiteNav />);
+    const nav = screen.getByRole('navigation', { name: 'Main' });
+    expect(within(nav).getByRole('link', { name: 'Sign in' })).toHaveAttribute('href', '/sign-in');
+    expect(within(nav).queryByRole('button', { name: 'Open account menu' })).toBeNull();
+  });
+
+  it('gives a signed-in visitor the account menu instead of Sign in', () => {
+    clerk.auth = { isLoaded: true, isSignedIn: true };
+    render(<SiteNav />);
+    const nav = screen.getByRole('navigation', { name: 'Main' });
+    expect(within(nav).getByRole('button', { name: 'Open account menu' })).toBeInTheDocument();
+    expect(within(nav).queryByRole('link', { name: 'Sign in' })).toBeNull();
+    expect(within(nav).getByRole('link', { name: 'Docs' })).toHaveAttribute('href', '/docs');
+  });
+
+  it('keeps the Sign in link while Clerk is still loading (the prerendered HTML)', () => {
+    clerk.auth = { isLoaded: false, isSignedIn: undefined as unknown as boolean };
+    render(<SiteNav />);
+    expect(screen.getByRole('link', { name: 'Sign in' })).toHaveAttribute('href', '/sign-in');
+  });
+});
+
 describe('sighting log rows', () => {
-  it('is deterministic, newest first, three seconds apart, with occasional 401s', () => {
+  it('is deterministic, newest first, three seconds apart', () => {
     const rows = logRows(0);
     expect(rows).toHaveLength(7);
     expect(rows[0].time).toBe('14:04:05');
     expect(rows[1].time).toBe('14:04:02');
     expect(logRows(0)).toEqual(rows);
-    expect(rows.every((r) => r.status === '200' && !r.denied)).toBe(true);
-    const later = logRows(4); // row 44 is a turned-away key
-    const denied = later.filter((r) => r.denied);
-    expect(denied).toHaveLength(1);
-    expect(denied[0]).toMatchObject({ status: '401', caller: 'unknown key' });
+  });
+
+  it('shows only what the relay records: no turned-away calls, and every row has its route', () => {
+    // Rejected calls (no key, a bad key) return before recordCall, so no
+    // window of the log may show one.
+    for (let tick = 0; tick < 60; tick++) {
+      for (const r of logRows(tick)) {
+        expect(r.status).toBe('200');
+        expect(r.caller).not.toMatch(/unknown|denied|rejected/);
+        // RecentCall.route is the whole request path, under the service.
+        expect(r.route.startsWith(`/${r.svc}/`)).toBe(true);
+      }
+    }
+    // Not vacuous: one service logs more than one route.
+    const scraperRoutes = new Set(Array.from({ length: 60 }, (_, t) => logRows(t)).flat()
+      .filter((r) => r.svc === 'scraper').map((r) => r.route));
+    expect(scraperRoutes.size).toBeGreaterThan(1);
+  });
+
+  it('shows every stored field as a column, the body struck out, and says what is not logged', () => {
+    render(<Home />);
+    const table = screen.getByRole('table');
+    const headers = within(table).getAllByRole('columnheader').map((h) => h.textContent);
+    expect(headers).toEqual(['Time', 'Service', 'Route', 'Caller', 'Status', 'Took', 'Body']);
+    const first = within(table).getAllByRole('row')[1];
+    const cells = within(first).getAllByRole('cell').map((c) => c.textContent);
+    const [row] = logRows(0);
+    expect(cells).toEqual([row.time, row.svc, row.route, row.caller, '200', row.took, 'not kept']);
+    expect(screen.queryByText(/401|unknown key/)).toBeNull();
+    const note = screen.getByText(/six columns, and that is all of it/);
+    expect(note).toHaveTextContent('Calls turned away at the door are not logged.');
   });
 });

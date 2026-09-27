@@ -1,4 +1,5 @@
 import Link from 'next/link';
+import AccountControl from './AccountControl';
 import { BirdMark } from './Bird';
 
 // Anchors point at the landing's plates with a leading "/" so the same nav
@@ -23,7 +24,7 @@ export default function SiteNav() {
           <a key={href} href={href} className="site-anchor">{label}</a>
         ))}
         <Link href="/docs">Docs</Link>
-        <Link href="/sign-in" className="site-signin">Sign in</Link>
+        <AccountControl />
       </nav>
     </header>
   );

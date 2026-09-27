@@ -6,8 +6,9 @@ import PlateHead from './PlateHead';
 
 const f = (token: string): CSSProperties => ({ fill: `var(--${token})` });
 
-// The address, split into the parts the anatomy labels. Rendered lowercase in
-// the DOM (so it reads as a URL) and uppercased by CSS for the ring.
+// The address, split into the parts the anatomy labels. Shown exactly as
+// written, never case-transformed: the service path is case-sensitive, so a
+// reader who copies the ring must get a URL that works.
 const SEGMENTS: { text: string; label: string; kind: 'bracket' | 'muted' }[] = [
   { text: 'maray', label: 'your account', kind: 'bracket' },
   { text: '.finchmcp.com', label: 'the relay', kind: 'muted' },
