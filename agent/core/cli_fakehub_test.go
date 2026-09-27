@@ -133,6 +133,7 @@ type fakeHub struct {
 	polls       int
 	services    map[string]string // id -> auth mode
 	host        string
+	serviceBase string            // /api/cli/state serviceBase; "" = omitted, like an older hub
 	keys        map[string]string // id -> label
 	keyScope    map[string]string // id -> the one service it is scoped to
 	keyLast4    map[string]string // id -> last four characters of the plaintext
@@ -315,7 +316,11 @@ func (h *fakeHub) serve(w http.ResponseWriter, r *http.Request) {
 				"scope": map[string]any{"services": []string{h.keyScope[id]}},
 			})
 		}
-		writeJSON(w, 200, map[string]any{"host": h.host, "services": services, "keys": keys})
+		st := map[string]any{"host": h.host, "services": services, "keys": keys}
+		if h.serviceBase != "" {
+			st["serviceBase"] = h.serviceBase
+		}
+		writeJSON(w, 200, st)
 	case "POST /api/cli/keys":
 		var b struct {
 			Label string `json:"label"`

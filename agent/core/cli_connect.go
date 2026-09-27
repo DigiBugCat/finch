@@ -235,11 +235,19 @@ func preflightClient(client, name string) (*connectTarget, error) {
 	return t, nil
 }
 
-// serviceMCPURL is the public MCP endpoint of a service: the tenant's slug host
-// in production, the hub itself for a loopback (dev) hub or a tenant with no
-// slug yet.
-func serviceMCPURL(hub, host, name string) string {
-	if u, err := url.Parse(hub); err == nil && host != "" && !isLoopbackHost(u.Hostname()) {
+// serviceMCPURL is the public MCP endpoint of a service. The hub says which
+// origin reaches the tenant's services (serviceBase in /api/cli/state): the
+// slug host in production, the hub itself in dev/staging, where the stored
+// <slug>.finchmcp.com host is not routed. A hub that predates serviceBase gets
+// the slug host only when it is a subdomain of the hub's own host (production:
+// finchmcp.com → <slug>.finchmcp.com), and otherwise the hub itself (a loopback
+// or workers.dev hub, or a tenant with no slug yet).
+func serviceMCPURL(hub, serviceBase, host, name string) string {
+	if b, err := url.Parse(serviceBase); err == nil && (b.Scheme == "https" || b.Scheme == "http") && b.Host != "" && (b.Path == "" || b.Path == "/") && b.RawQuery == "" && b.User == nil {
+		return b.Scheme + "://" + b.Host + "/" + name + "/mcp"
+	}
+	if u, err := url.Parse(hub); err == nil && host != "" && !isLoopbackHost(u.Hostname()) &&
+		strings.HasSuffix(strings.ToLower(host), "."+strings.ToLower(u.Hostname())) {
 		return "https://" + host + "/" + name + "/mcp"
 	}
 	return strings.TrimRight(hub, "/") + "/" + name + "/mcp"
@@ -291,7 +299,8 @@ func runConnect(c *cli, args []string) error {
 		return newCLIError(codeNotFound, "finch add "+name+" --service <url>", "no service named %q in this account", name)
 	}
 	host, _ := st["host"].(string)
-	endpoint := serviceMCPURL(cred.Hub, host, name)
+	serviceBase, _ := st["serviceBase"].(string)
+	endpoint := serviceMCPURL(cred.Hub, serviceBase, host, name)
 
 	// A public service needs no key; everything else gets its own, so revoking
 	// one client never cuts off another.

@@ -614,14 +614,37 @@ func TestConnectPublicServiceNeedsNoKey(t *testing.T) {
 	}
 }
 
+// On a staging hub the tenant's stored slug host is not routed, so connect
+// writes the origin the hub names in serviceBase.
+func TestConnectUsesTheHubsServiceBase(t *testing.T) {
+	_, h := connectFixture(t)
+	h.set(func(h *fakeHub) {
+		h.host = "brave-finch-12.finchmcp.com"
+		h.serviceBase = "https://finch-hub-staging.example.workers.dev"
+	})
+	stdout, stderr, code := finch(t, "connect", "notes", "--client", "json", "--json")
+	if got := decodeJSONOut(t, stdout); code != 0 || got["url"] != "https://finch-hub-staging.example.workers.dev/notes/mcp" {
+		t.Fatalf("exit=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+}
+
 func TestServiceMCPURL(t *testing.T) {
-	for _, tc := range []struct{ hub, host, want string }{
-		{"https://finchmcp.com", "brave-finch-12.finchmcp.com", "https://brave-finch-12.finchmcp.com/notes/mcp"},
-		{"https://finchmcp.com", "", "https://finchmcp.com/notes/mcp"},
-		{"http://127.0.0.1:8787", "brave-finch-12.finchmcp.com", "http://127.0.0.1:8787/notes/mcp"},
+	const staging = "https://finch-hub-staging.example.workers.dev"
+	for _, tc := range []struct{ hub, base, host, want string }{
+		// The hub's serviceBase wins.
+		{"https://finchmcp.com", "https://brave-finch-12.finchmcp.com", "brave-finch-12.finchmcp.com", "https://brave-finch-12.finchmcp.com/notes/mcp"},
+		{staging, staging, "brave-finch-12.finchmcp.com", staging + "/notes/mcp"},
+		{"http://127.0.0.1:8787", "http://127.0.0.1:8787", "brave-finch-12.finchmcp.com", "http://127.0.0.1:8787/notes/mcp"},
+		// A hub without serviceBase (or with a malformed one).
+		{"https://finchmcp.com", "", "brave-finch-12.finchmcp.com", "https://brave-finch-12.finchmcp.com/notes/mcp"},
+		{"https://finchmcp.com", "", "", "https://finchmcp.com/notes/mcp"},
+		{"http://127.0.0.1:8787", "", "brave-finch-12.finchmcp.com", "http://127.0.0.1:8787/notes/mcp"},
+		{staging, "", "brave-finch-12.finchmcp.com", staging + "/notes/mcp"},
+		{staging, "ftp://x", "brave-finch-12.finchmcp.com", staging + "/notes/mcp"},
+		{staging, "https://x.example/sub", "brave-finch-12.finchmcp.com", staging + "/notes/mcp"},
 	} {
-		if got := serviceMCPURL(tc.hub, tc.host, "notes"); got != tc.want {
-			t.Errorf("serviceMCPURL(%q,%q)=%q, want %q", tc.hub, tc.host, got, tc.want)
+		if got := serviceMCPURL(tc.hub, tc.base, tc.host, "notes"); got != tc.want {
+			t.Errorf("serviceMCPURL(%q,%q,%q)=%q, want %q", tc.hub, tc.base, tc.host, got, tc.want)
 		}
 	}
 }

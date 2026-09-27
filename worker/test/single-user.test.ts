@@ -691,3 +691,31 @@ describe("retired hub surfaces", () => {
     expect((env as any).AVIARY_ENROLLMENT).toBeUndefined();
   });
 });
+
+// `finch connect` writes the service URL into client configs, so /api/cli/state
+// names the origin that actually reaches the tenant's services: the inbound hub
+// in dev/staging (DEV=1, no per-slug routing), the claimed slug host in prod.
+describe("GET /api/cli/state serviceBase", () => {
+  async function cliState(tenant: string, e: Record<string, unknown>): Promise<any> {
+    const token = await signAssertion({ tenant, exp: nowSec() + 300, kind: "cli", epoch: 0 }, SERVICE);
+    const ctx = createExecutionContext();
+    const res = await worker.fetch(
+      new Request(`https://${HOST}/api/cli/state`, { headers: { host: HOST, Authorization: `Bearer ${token}` } }),
+      e as any,
+      ctx,
+    );
+    await waitOnExecutionContext(ctx);
+    expect(res.status).toBe(200);
+    return res.json();
+  }
+
+  it("is the inbound hub under DEV=1 and the slug host in prod", async () => {
+    const tenant = `user_state_base_${++seq}`;
+    const dev = await cliState(tenant, env);
+    expect(dev.host).toMatch(/\.finchmcp\.com$/);
+    expect(dev.serviceBase).toBe(`https://${HOST}`);
+
+    const prod = await cliState(tenant, { ...env, DEV: undefined });
+    expect(prod.serviceBase).toBe(`https://${prod.host}`);
+  });
+});

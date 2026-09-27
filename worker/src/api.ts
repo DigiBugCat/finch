@@ -426,9 +426,13 @@ async function handleApiInner(
     //      credential, same as the dashboard) — so an agent can manage and
     //      REVOKE access without the dashboard. ----
 
-    // GET /api/cli/state — full tenant state (fleet, keys) for finch fleet/keys.
+    // GET /api/cli/state — full tenant state (fleet, keys) for finch fleet/keys,
+    // plus serviceBase: the origin clients reach this tenant's services on
+    // (the slug host in prod, the inbound hub in dev/staging and local), which
+    // `finch connect` writes into client configs.
     if (path === "/api/cli/state" && method === "GET") {
-      return json(200, await tenantOp(env, cliTenant, "getState"));
+      const state = await tenantOp<Record<string, unknown> & { host?: string }>(env, cliTenant, "getState");
+      return json(200, { ...state, serviceBase: hostBase(env, host, state?.host).http });
     }
     // POST /api/cli/keys {label,scope} — mint a client finch_ key (once). The
     // key's owner is always the tenant owner.
@@ -823,20 +827,35 @@ async function tenantHostBase(
   tenant: string,
   inboundHost: string,
 ): Promise<{ http: string; ws: string; host: string }> {
-  const local =
-    inboundHost.startsWith("localhost") || inboundHost.startsWith("127.");
-  // In dev/staging (DEV=1: a single DEFAULT_TENANT, no per-slug subdomains) the
-  // ONLY reachable host is the inbound workers.dev host we were called on. The
-  // tenant's stored <slug>.finchmcp.com resolves only in prod (wildcard DNS +
-  // slug routing), so using it here hands operators an unresolvable install/URL.
-  // Prod (DEV unset) routes by slug subdomain, so there we must use it.
-  const useInbound = local || env.DEV === "1";
-  let host = inboundHost;
-  if (!useInbound) {
+  let stateHost: string | undefined;
+  if (!usesInboundHost(env, inboundHost)) {
     const state = await tenantOp<{ host?: string }>(env, tenant, "getState");
-    if (state?.host) host = state.host;
+    stateHost = state?.host;
   }
-  const s = local ? "" : "s";
+  return hostBase(env, inboundHost, stateHost);
+}
+
+// In dev/staging (DEV=1: a single DEFAULT_TENANT, no per-slug subdomains) the
+// ONLY reachable host is the inbound workers.dev host we were called on. The
+// tenant's stored <slug>.finchmcp.com resolves only in prod (wildcard DNS +
+// slug routing), so using it there hands operators an unresolvable install/URL.
+// Prod (DEV unset) routes by slug subdomain, so there we must use it.
+function isLocalHost(inboundHost: string): boolean {
+  return inboundHost.startsWith("localhost") || inboundHost.startsWith("127.");
+}
+
+function usesInboundHost(env: Env, inboundHost: string): boolean {
+  return isLocalHost(inboundHost) || env.DEV === "1";
+}
+
+/** tenantHostBase for a caller that already holds the tenant's stored host. */
+function hostBase(
+  env: Env,
+  inboundHost: string,
+  stateHost: string | undefined,
+): { http: string; ws: string; host: string } {
+  const host = !usesInboundHost(env, inboundHost) && stateHost ? stateHost : inboundHost;
+  const s = isLocalHost(inboundHost) ? "" : "s";
   return { http: `http${s}://${host}`, ws: `ws${s}://${host}`, host };
 }
 
