@@ -29,6 +29,7 @@ import {
   paramHeaders,
   type McpSend,
 } from "../src/cli-call";
+import { routerRegister, routerUnregister } from "../src/router-do";
 
 type Json = Record<string, any>;
 interface Seen {
@@ -771,14 +772,14 @@ const SERVICE = env.FINCH_SERVICE_SECRET;
 const TENANT = env.DEFAULT_TENANT!;
 const HOST = "hub.test";
 
-async function cliToken(): Promise<string> {
-  const epochRes = await env.TENANT.get(env.TENANT.idFromName(TENANT)).fetch("https://tenant/op", {
+async function cliToken(tenant = TENANT): Promise<string> {
+  const epochRes = await env.TENANT.get(env.TENANT.idFromName(tenant)).fetch("https://tenant/op", {
     method: "POST",
     body: JSON.stringify({ op: "cliEpoch" }),
   });
   const { epoch } = (await epochRes.json()) as { epoch: number };
   return signAssertion(
-    { tenant: TENANT, exp: Math.floor(Date.now() / 1000) + 300, kind: "cli", epoch },
+    { tenant, exp: Math.floor(Date.now() / 1000) + 300, kind: "cli", epoch },
     SERVICE,
   );
 }
@@ -816,7 +817,7 @@ const unused = async () => new Response("unexpected", { status: 500 });
 
 describe("POST /api/cli/call route", () => {
   it("runs the MCP exchange over SELF, pinned to one box, with first-party auth", async () => {
-    const { service, boxes, agents } = await bridgedService(unused, 2);
+    const { service, boxes, agents, slugHost } = await bridgedService(unused, 2);
     const py = pythonSdkServer();
     const { res, urls, authed } = await viaRoute(py.handle, { service, method: "tools/list" });
     expect(res.status).toBe(200);
@@ -827,7 +828,9 @@ describe("POST /api/cli/call route", () => {
     // stateful server's session id is valid on each of them.
     expect(urls.length).toBe(5); // initialize, initialized, tools/list, ping reply, DELETE
     expect(new Set(urls).size).toBe(1);
-    expect(boxes.map((b) => `https://${HOST}/${service}/${b}/mcp`)).toContain(urls[0]);
+    // ...on the tenant's own slug host, which is what the relay resolves the
+    // tenant from; the host the CLI called (HOST) routes to no tenant.
+    expect(boxes.map((b) => `https://${slugHost}/${service}/${b}/mcp`)).toContain(urls[0]);
     expect(authed.every(Boolean)).toBe(true);
     agents.forEach((a) => a.close(1000, "done"));
   });
@@ -874,11 +877,16 @@ describe("POST /api/cli/call route", () => {
 //      fake. Proves the session id header and the SSE body survive the relay
 //      in both directions. ----
 
-async function hubApi(method: string, path: string, body?: unknown): Promise<Response> {
+async function hubApi(
+  method: string,
+  path: string,
+  body?: unknown,
+  tenant = TENANT,
+): Promise<Response> {
   const headers: Record<string, string> = {
     "X-Finch-Service": SERVICE,
     "X-Finch-Auth": await signAssertion(
-      { tenant: TENANT, exp: Math.floor(Date.now() / 1000) + 300 },
+      { tenant, exp: Math.floor(Date.now() / 1000) + 300 },
       SERVICE,
     ),
     host: HOST,
@@ -906,15 +914,20 @@ function b64(bytes: Uint8Array): string {
 
 /** Enroll a service with `n` approved, live boxes. Box i's fake agent answers
  *  every relayed request by calling `handlers[i]` (or the single handler) and
- *  streaming the Response back as head/chunk/end frames. */
+ *  streaming the Response back as head/chunk/end frames. Boxes dial in on the
+ *  tenant's own slug host, the way a production agent does. */
 async function bridgedService(
   handlers: ((r: Request) => Promise<Response>) | Array<(r: Request) => Promise<Response>>,
   n = Array.isArray(handlers) ? handlers.length : 1,
+  tenant = TENANT,
 ) {
   const handlerFor = (i: number) => (Array.isArray(handlers) ? handlers[i] : handlers);
   const enroll = (await (
-    await hubApi("POST", "/api/enroll", { name: `cli call ${Date.now()}` })
+    await hubApi("POST", "/api/enroll", { name: `cli call ${Date.now()}` }, tenant)
   ).json()) as { id: string; ticket: string };
+  const slugHost = ((await (await hubApi("GET", "/api/state", undefined, tenant)).json()) as any)
+    .host as string;
+  expect(slugHost).toMatch(/\.finchmcp\.com$/);
   const boxes: string[] = [];
   const agents: WebSocket[] = [];
   const frames: Array<{ box: string; method: string; path: string; headers: Record<string, string> }> = [];
@@ -934,7 +947,7 @@ async function bridgedService(
               ? enroll.ticket
               : await signToken(
                   {
-                    tenant: TENANT,
+                    tenant,
                     service: enroll.id,
                     exp: Math.floor(Date.now() / 1000) + 600,
                     kind: "join",
@@ -954,8 +967,8 @@ async function bridgedService(
     const join = (await joinRes.json()) as { connectToken: string };
     const connectRes = await worker.fetch(
       new Request(
-        `http://${HOST}/${enroll.id}/${box}/_connect?ct=${encodeURIComponent(join.connectToken)}`,
-        { headers: { Upgrade: "websocket", host: HOST } },
+        `https://${slugHost}/${enroll.id}/${box}/_connect?ct=${encodeURIComponent(join.connectToken)}`,
+        { headers: { Upgrade: "websocket", host: slugHost } },
       ),
       env as any,
       ctx,
@@ -992,10 +1005,10 @@ async function bridgedService(
     boxes.push(box);
     agents.push(agent);
   }
-  expect((await hubApi("POST", `/api/services/${enroll.id}/approve`)).status).toBe(200);
+  expect((await hubApi("POST", `/api/services/${enroll.id}/approve`, undefined, tenant)).status).toBe(200);
   let live = false;
   for (let i = 0; i < 50 && !live; i++) {
-    const state = (await (await hubApi("GET", "/api/state")).json()) as any;
+    const state = (await (await hubApi("GET", "/api/state", undefined, tenant)).json()) as any;
     const svc = state.services?.find((a: any) => a.id === enroll.id);
     live = boxes.every((b) => {
       const m = svc?.boxes?.find((x: any) => x.name === b);
@@ -1004,7 +1017,7 @@ async function bridgedService(
     if (!live) await new Promise((r) => setTimeout(r, 0));
   }
   expect(live).toBe(true);
-  return { service: enroll.id, boxes, agents, frames };
+  return { service: enroll.id, boxes, agents, frames, slugHost };
 }
 
 describe("POST /api/cli/call end to end through the relay", () => {
@@ -1059,6 +1072,139 @@ describe("POST /api/cli/call end to end through the relay", () => {
     // Every session opened was closed on the box that opened it.
     expect(servers.flatMap((s) => s.deleted)).toHaveLength(4);
     expect(servers.every((s) => s.sessions.size === 0)).toBe(true);
+    agents.forEach((a) => a.close(1000, "done"));
+  });
+});
+
+// ---- Production shape: no DEV, no DEFAULT_TENANT, no insecure-HTTP escape
+//      hatch, and the CLI calling the apex or hub host, which RouterDO maps to
+//      no tenant. The DEV fallback used to hide that the relay leg kept the
+//      apex host and 404'd "tenant could not be resolved from host". ----
+
+describe("POST /api/cli/call in production (DEV and DEFAULT_TENANT unset)", () => {
+  function prodWorld() {
+    const selfUrls: string[] = [];
+    const prodEnv: any = {
+      ...env,
+      DEV: undefined,
+      DEFAULT_TENANT: undefined,
+      ALLOW_INSECURE_HTTP: undefined,
+    };
+    prodEnv.SELF = {
+      fetch: (input: RequestInfo | URL, init?: RequestInit) => {
+        const req = new Request(input as any, init);
+        selfUrls.push(req.url);
+        return worker.fetch(req, prodEnv, createExecutionContext());
+      },
+    };
+    const call = async (tenant: string, host: string, body: unknown) => {
+      const ctx = createExecutionContext();
+      const res = await worker.fetch(
+        new Request(`https://${host}/api/cli/call`, {
+          method: "POST",
+          headers: {
+            host,
+            authorization: `Bearer ${await cliToken(tenant)}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify(body),
+        }),
+        prodEnv,
+        ctx,
+      );
+      await waitOnExecutionContext(ctx);
+      return res;
+    };
+    return { prodEnv, selfUrls, call };
+  }
+  const prodTenant = () => `user_prod_cli_${crypto.randomUUID().slice(0, 8)}`;
+
+  it("the apex host really does route to no tenant (the premise of the fix)", async () => {
+    const tenant = prodTenant();
+    const { service, boxes, agents } = await bridgedService(unused, 1, tenant);
+    const { prodEnv } = prodWorld();
+    const res = await worker.fetch(
+      new Request(`https://finchmcp.com/${service}/${boxes[0]}/mcp`, {
+        method: "POST",
+        headers: {
+          host: "finchmcp.com",
+          "content-type": "application/json",
+          "x-finch-service": SERVICE,
+          "x-finch-auth": await signAssertion(
+            { tenant, exp: Math.floor(Date.now() / 1000) + 300 },
+            SERVICE,
+          ),
+        },
+        body: "{}",
+      }),
+      prodEnv,
+      createExecutionContext(),
+    );
+    expect(res.status).toBe(404);
+    expect(((await res.json()) as Json).error).toBe("tenant could not be resolved from host");
+    agents.forEach((a) => a.close(1000, "done"));
+  });
+
+  for (const apex of ["finchmcp.com", "hub.finchmcp.com"]) {
+    it(`finch test and finch call reach the service when the CLI calls ${apex}`, async () => {
+      const tenant = prodTenant();
+      const py = pythonSdkServer();
+      const { service, agents, frames, slugHost } = await bridgedService(py.handle, 1, tenant);
+      const { selfUrls, call } = prodWorld();
+
+      // finch test = tools/list
+      const listed = await call(tenant, apex, { service, method: "tools/list" });
+      expect(listed.status).toBe(200);
+      expect(((await listed.json()) as Json).result.tools).toHaveLength(3);
+
+      // finch call = tools/call
+      const called = await call(tenant, apex, {
+        service,
+        method: "tools/call",
+        params: { name: "echo", arguments: { from: apex } },
+      });
+      expect(called.status).toBe(200);
+      expect(((await called.json()) as Json).result.content[0].text).toBe(
+        `echo:${JSON.stringify({ from: apex })}`,
+      );
+
+      // Every relayed leg named the tenant's slug host, never the apex/hub.
+      expect(selfUrls.length).toBeGreaterThan(0);
+      for (const u of selfUrls) expect(new URL(u).host).toBe(slugHost);
+      expect(frames.every((f) => f.path === "/mcp")).toBe(true);
+      agents.forEach((a) => a.close(1000, "done"));
+    });
+  }
+
+  it("a tenant with only a custom hostname relays through that hostname", async () => {
+    const tenant = prodTenant();
+    const py = pythonSdkServer();
+    const { service, agents, slugHost } = await bridgedService(py.handle, 1, tenant);
+    const custom = `mcp-${crypto.randomUUID().slice(0, 8)}.example.org`;
+    expect((await routerUnregister(env as any, slugHost.split(".")[0], tenant)).ok).toBe(true);
+    expect((await routerRegister(env as any, custom, tenant)).ok).toBe(true);
+    const { selfUrls, call } = prodWorld();
+    const res = await call(tenant, "finchmcp.com", { service, method: "tools/list" });
+    expect(res.status).toBe(200);
+    expect(selfUrls.length).toBeGreaterThan(0);
+    for (const u of selfUrls) expect(new URL(u).host).toBe(custom);
+    agents.forEach((a) => a.close(1000, "done"));
+  });
+
+  it("a tenant with no public hostname gets a classifiable 409 and nothing is relayed", async () => {
+    const tenant = prodTenant();
+    const { service, agents, slugHost } = await bridgedService(unused, 1, tenant);
+    expect((await routerUnregister(env as any, slugHost.split(".")[0], tenant)).ok).toBe(true);
+    const { selfUrls, call } = prodWorld();
+    const res = await call(tenant, "finchmcp.com", { service, method: "tools/list" });
+    expect(res.status).toBe(409);
+    const out = (await res.json()) as Json;
+    expect(out.error).toBe("no public hostname for this account");
+    expect(selfUrls).toHaveLength(0);
+    // An unknown service is still the plain 404 the CLI classifies as
+    // NOT_FOUND, before the hostname is looked at.
+    const missing = await call(tenant, "finchmcp.com", { service: "no-such-svc", method: "tools/list" });
+    expect(missing.status).toBe(404);
     agents.forEach((a) => a.close(1000, "done"));
   });
 });

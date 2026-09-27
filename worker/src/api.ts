@@ -16,7 +16,7 @@
 // for exactly that id. There are no shared members, invitations, workspaces,
 // ACL rules, or per-user app grants.
 
-import { rateLimitOk, clientIp, json, tenantOp, boxStub, pickHealthyPool, type Env } from "./index";
+import { rateLimitOk, clientIp, json, tenantOp, boxStub, pickHealthyPool, hostKeyFromHost, type Env } from "./index";
 import {
   serviceOk,
   signToken,
@@ -61,8 +61,7 @@ async function mintCliToken(
     { tenant, exp, kind: "cli", epoch: epoch ?? 0 },
     env.FINCH_SERVICE_SECRET,
   );
-  const scheme =
-    host.startsWith("localhost") || host.startsWith("127.") ? "http" : "https";
+  const scheme = isLoopbackHost(host) ? "http" : "https";
   return { token, expiresAt: exp, hub: `${scheme}://${host}` };
 }
 
@@ -427,9 +426,13 @@ async function handleApiInner(
     //      credential, same as the dashboard) — so an agent can manage and
     //      REVOKE access without the dashboard. ----
 
-    // GET /api/cli/state — full tenant state (fleet, keys) for finch fleet/keys.
+    // GET /api/cli/state — full tenant state (fleet, keys) for finch fleet/keys,
+    // plus serviceBase: the origin clients reach this tenant's services on
+    // (the slug host in prod, the inbound hub in dev/staging and local), which
+    // `finch connect` writes into client configs.
     if (path === "/api/cli/state" && method === "GET") {
-      return json(200, await tenantOp(env, cliTenant, "getState"));
+      const state = await tenantOp<Record<string, unknown> & { host?: string }>(env, cliTenant, "getState");
+      return json(200, { ...state, serviceBase: hostBase(env, host, state?.host).http });
     }
     // POST /api/cli/keys {label,scope} — mint a client finch_ key (once). The
     // key's owner is always the tenant owner.
@@ -481,7 +484,6 @@ async function handleApiInner(
       // deadline (CLI_CALL_DEADLINE_MS) with margin.
       const exp = Math.floor(Date.now() / 1000) + 120;
       const assertion = await signAssertion({ tenant: cliTenant, exp }, env.FINCH_SERVICE_SECRET);
-      const scheme = host.startsWith("localhost") || host.startsWith("127.") ? "http" : "https";
       // SESSION AFFINITY: the exchange is several HTTP requests and a stateful
       // server's Mcp-Session-Id only exists on the box that answered
       // initialize, but the load-balanced /<svc>/mcp route picks a box per
@@ -491,12 +493,23 @@ async function handleApiInner(
       const pool = await pickHealthyPool(env, cliTenant, service);
       if (!pool) return json(404, { error: "no such service", service });
       if (!pool.length) return json(503, { error: "service offline", service });
+      // The relay resolves its tenant from the request HOST (the assertion
+      // only confirms it), so every relayed request must name a host that
+      // routes to cliTenant. The host the CLI called — the apex or
+      // hub.finchmcp.com — routes to no tenant in production.
+      const origin = await relayOriginForTenant(env, cliTenant, host);
+      if (!origin) {
+        return json(409, {
+          error: "no public hostname for this account",
+          hint: "claim a hub subdomain in the dashboard, or map one with `finch domain add <host>`",
+        });
+      }
       let pick = 0;
       let committed = false;
       const send: McpSend = async (init) => {
         while (true) {
           const url =
-            `${scheme}://${host}/${encodeURIComponent(service)}` +
+            `${origin}/${encodeURIComponent(service)}` +
             `/${encodeURIComponent(pool[pick])}/mcp`;
           const res = await env.SELF.fetch(url, {
             method: init.method,
@@ -857,20 +870,80 @@ async function tenantHostBase(
   tenant: string,
   inboundHost: string,
 ): Promise<{ http: string; ws: string; host: string }> {
-  const local =
-    inboundHost.startsWith("localhost") || inboundHost.startsWith("127.");
-  // In dev/staging (DEV=1: a single DEFAULT_TENANT, no per-slug subdomains) the
-  // ONLY reachable host is the inbound workers.dev host we were called on. The
-  // tenant's stored <slug>.finchmcp.com resolves only in prod (wildcard DNS +
-  // slug routing), so using it here hands operators an unresolvable install/URL.
-  // Prod (DEV unset) routes by slug subdomain, so there we must use it.
-  const useInbound = local || env.DEV === "1";
-  let host = inboundHost;
-  if (!useInbound) {
+  let stateHost: string | undefined;
+  if (!usesInboundHost(env, inboundHost)) {
     const state = await tenantOp<{ host?: string }>(env, tenant, "getState");
-    if (state?.host) host = state.host;
+    stateHost = state?.host;
   }
-  const s = local ? "" : "s";
+  return hostBase(env, inboundHost, stateHost);
+}
+
+// In dev/staging (DEV=1: a single DEFAULT_TENANT, no per-slug subdomains) the
+// ONLY reachable host is the inbound workers.dev host we were called on. The
+// tenant's stored <slug>.finchmcp.com resolves only in prod (wildcard DNS +
+// slug routing), so using it there hands operators an unresolvable install/URL.
+// Prod (DEV unset) routes by slug subdomain, so there we must use it.
+/** Whether a Host header (with or without a port) names this machine: the
+ *  parsed hostname is exactly `localhost`, an IPv4 address in 127.0.0.0/8, or
+ *  the IPv6 loopback ::1 — the same set the agent's net.IP.IsLoopback accepts.
+ *  The WHATWG URL parser canonicalizes IP literals first (127.1, 0x7f.0.0.2
+ *  and [0:0:0:0:0:0:0:1] all come out dotted-quad / [::1]), so the checks run
+ *  on the parsed address, never on a prefix of the raw text:
+ *  localhost.example.com or 127.0.0.1.nip.io is a routed public host, and
+ *  plain http there would carry client credentials in the clear. */
+export function isLoopbackHost(hostHeader: string): boolean {
+  let hostname: string;
+  try {
+    hostname = new URL(`http://${hostHeader}`).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  if (hostname === "localhost" || hostname === "[::1]") return true;
+  const v4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(hostname);
+  return !!v4 && v4.slice(1).every((o) => Number(o) <= 255) && v4[1] === "127";
+}
+
+/** The origin POST /api/cli/call relays through, chosen so the relay's
+ *  host-based tenant resolution (index.ts resolveTenant) lands on `tenant`.
+ *  A pure read: it lists the host keys RouterDO already maps to the tenant and
+ *  never claims one (no getState / ensureDefaultSlug writes). Prefers a
+ *  <slug>.finchmcp.com key, then a custom hostname; each candidate must
+ *  round-trip through hostKeyFromHost to its own key, so the relay looks up
+ *  exactly the row that names this tenant. With none, only dev/loopback falls
+ *  back to the inbound host (resolved by the dev-only DEFAULT_TENANT);
+ *  production gets null and the caller answers 409. SELF hands the request
+ *  straight to this Worker, so the chosen host needs no DNS. */
+async function relayOriginForTenant(
+  env: Env,
+  tenant: string,
+  inboundHost: string,
+): Promise<string | null> {
+  const keys = await routerListForTenant(env, tenant);
+  const candidates: Array<[string, string]> = [
+    ...keys.filter((k) => !k.includes(".")).map((k): [string, string] => [k, `${k}.finchmcp.com`]),
+    ...keys.filter((k) => k.includes(".")).map((k): [string, string] => [k, k]),
+  ];
+  for (const [key, host] of candidates) {
+    if (hostKeyFromHost(host) === key) return `https://${host}`;
+  }
+  if (usesInboundHost(env, inboundHost)) {
+    return `${isLoopbackHost(inboundHost) ? "http" : "https"}://${inboundHost}`;
+  }
+  return null;
+}
+
+function usesInboundHost(env: Env, inboundHost: string): boolean {
+  return isLoopbackHost(inboundHost) || env.DEV === "1";
+}
+
+/** tenantHostBase for a caller that already holds the tenant's stored host. */
+function hostBase(
+  env: Env,
+  inboundHost: string,
+  stateHost: string | undefined,
+): { http: string; ws: string; host: string } {
+  const host = !usesInboundHost(env, inboundHost) && stateHost ? stateHost : inboundHost;
+  const s = isLoopbackHost(inboundHost) ? "" : "s";
   return { http: `http${s}://${host}`, ws: `ws${s}://${host}`, host };
 }
 

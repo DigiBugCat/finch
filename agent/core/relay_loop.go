@@ -33,6 +33,15 @@ type relayOptions struct {
 	ForwardAll     bool   // forward the whole host (default: confine to /mcp)
 	AutoApprove    bool   // config mode: self-approve AppPath again whenever a new credential is picked up
 	WatchManifest  bool   // single-service mode: hand off to finch.yml once `finch add` writes it
+	// Report, when set, receives the relay's state transitions (see
+	// run_status.go): connected, reconnecting, credential_error.
+	Report func(state, detail string)
+}
+
+func (o relayOptions) report(state, detail string) {
+	if o.Report != nil {
+		o.Report(state, detail)
+	}
 }
 
 func (o relayOptions) hub() string {
@@ -117,13 +126,15 @@ func serveConfig(ctx context.Context, cfg *config) error {
 		return fmt.Errorf("another finch run already serves %s — refusing to start a second relay", cfg.CredentialsDir)
 	}
 	defer release()
+	status := newRunStatusWriter(cfg)
+	defer status.remove()
 
 	var wg sync.WaitGroup
 	for _, ing := range cfg.Ingress {
 		o := relayOptions{
 			Hub: cfg.Hub, Box: cfg.Box, AppPath: ing.AppPath, Upstream: ing.Service,
 			CredentialPath: cfg.statePathFor(ing.AppPath), ForwardAll: ing.ForwardAll,
-			AutoApprove: true,
+			AutoApprove: true, Report: status.reporter(ing.AppPath),
 		}
 		autoApproveAsync(o.hub(), o.AppPath)
 		wg.Add(1)
@@ -145,7 +156,7 @@ func serveConfig(ctx context.Context, cfg *config) error {
 // after `finch run` started still counts, and the request runs in the
 // background so one slow hub call never blocks a sibling or a relay.
 func autoApproveAsync(hub, appPath string) {
-	cred := loadCliCredQuiet()
+	cred, _ := readCliCred()
 	if cred == nil || strings.TrimRight(cred.Hub, "/") != hub {
 		return
 	}
@@ -184,6 +195,7 @@ func superviseRelay(ctx context.Context, o relayOptions) error {
 		}
 		var cerr *credentialError
 		if errors.As(err, &cerr) {
+			o.report(relayCredentialError, err.Error())
 			if o.WatchManifest {
 				log.Printf("%s: %v — run `finch login`, then `finch add <app_path> --service %s`; this process switches to serving finch.yml once it is written",
 					lp, err, o.Upstream)
@@ -210,6 +222,7 @@ func superviseRelay(ctx context.Context, o relayOptions) error {
 		if time.Since(started) > time.Minute {
 			backoff = 5 * time.Second
 		}
+		o.report(relayReconnecting, err.Error())
 		log.Printf("%s: %v — restarting in %s", lp, err, backoff)
 		select {
 		case <-ctx.Done():
@@ -373,6 +386,7 @@ func runRelay(ctx context.Context, o relayOptions) error {
 				if isHubAuthRejection(rerr) {
 					return rejected(fmt.Errorf("saved credential rejected: %w", rerr))
 				}
+				o.report(relayReconnecting, "connect-token refresh failed: "+rerr.Error())
 				log.Printf("%s: connect-token refresh failed: %v (retrying in %s)", lp, rerr, backoff)
 				if !sleep() {
 					return nil
@@ -397,7 +411,7 @@ func runRelay(ctx context.Context, o relayOptions) error {
 			continue
 		}
 		start := time.Now()
-		serr := serve(ctx, wsURL, up, o.ForwardAll, hub)
+		serr := serveLink(ctx, wsURL, up, o.ForwardAll, hub, func() { o.report(relayConnected, "") })
 		if ctx.Err() != nil {
 			return nil // shutdown cancelled the link — clean exit
 		}
@@ -406,6 +420,7 @@ func runRelay(ctx context.Context, o relayOptions) error {
 			backoff = time.Second
 		}
 		if serr != nil {
+			o.report(relayReconnecting, serr.Error())
 			log.Printf("%s: link down: %v (reconnecting in %s)", lp, serr, backoff)
 			if !sleep() {
 				return nil
