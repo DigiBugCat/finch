@@ -17,6 +17,7 @@ export const SITEMAP_PATHS = [
   '/docs/domains',
   '/docs/cli',
   '/docs/privacy',
+  '/docs/self-host',
   '/docs/aviarymcp',
   '/agents.md',
   '/llms.txt',
