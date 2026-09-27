@@ -8,10 +8,10 @@ const appDir = resolve(import.meta.dirname, "../app");
 describe("pages removed with the CLI cut", () => {
   // Released agents' tray still opens /dashboard[?service=<id>], and people
   // have it bookmarked.
-  it("sends the old dashboard (tray links, bookmarks) to the docs", () => {
+  it("sends the old dashboard (tray links, bookmarks) to the fleet page", () => {
     const response = dashboard();
     expect(response.status).toBe(302);
-    expect(response.headers.get("location")).toBe("/docs");
+    expect(response.headers.get("location")).toBe("/fleet");
     expect(response.headers.get("cache-control")).toBe("no-store");
   });
 
