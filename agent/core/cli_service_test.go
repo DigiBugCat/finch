@@ -614,7 +614,7 @@ func TestServiceInstallWaitsForTheRelays(t *testing.T) {
 		_, stderr, code := finch(t, "service", "install", "--json")
 		env := decodeJSONError(t, stderr)
 		if code != 1 || env.Error.Code != "INTERNAL" || env.Error.Next != "finch service status" ||
-			!strings.Contains(env.Error.Message, "not connected after 20s: notes (reconnecting: Finch relay dial failed (HTTP 502))") {
+			!strings.Contains(env.Error.Message, "not connected after 20s: notes (reconnecting: finch relay dial failed (HTTP 502))") {
 			t.Fatalf("exit=%d env=%+v", code, env)
 		}
 		if !fileExists(launchdPlistPath()) {

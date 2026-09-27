@@ -62,9 +62,9 @@ func (s serviceStatus) describe() string {
 	case s.Running:
 		return "installed, running"
 	case s.Installed:
-		return "installed, NOT running — check the log, then `finch service install` again"
+		return "installed, NOT running — check the log, then run 'finch service install' again"
 	default:
-		return "not installed — `finch service install`"
+		return "not installed — 'finch service install' starts it"
 	}
 }
 
@@ -234,7 +234,7 @@ func restartManagedService() error {
 // runService: finch service install|uninstall|status [--config finch.yml] [--json]
 func runService(c *cli, args []string) error {
 	fs := newFlagSet("service")
-	configPath := fs.String("config", "", "finch.yml the service serves (default: the one `finch add` wrote)")
+	configPath := fs.String("config", "", "the `finch.yml` the service serves (default: the one 'finch add' wrote)")
 	fs.Bool("json", false, "JSON output")
 	pos, err := c.parseArgs(fs, args)
 	if err != nil {
@@ -298,7 +298,7 @@ func serviceManifest(configPath string) (string, error) {
 		return "", newCLIError(codeUsage, "", "%v", err)
 	}
 	if len(cfg.Ingress) == 0 {
-		return "", newCLIError(codeNotFound, "finch add <name> --service <url>", "%s has no ingress rules to serve", abs)
+		return "", newCLIError(codeNotFound, "finch add <name> --service <url>", "%s lists no services to serve", abs)
 	}
 	return abs, nil
 }
@@ -343,7 +343,7 @@ func serviceInstall(c *cli, configPath string) error {
 			if release, ok := lockState(filepath.Join(cfg.CredentialsDir, "finch-run")); ok {
 				release()
 			} else {
-				notes = append(notes, "another 'finch run' is serving this box in the foreground; stop it (Ctrl-C) and the service takes over")
+				notes = append(notes, "another 'finch run' is serving this machine in the foreground; stop it (Ctrl-C) and the service takes over")
 			}
 		}
 	}
@@ -402,7 +402,7 @@ func serviceInstall(c *cli, configPath string) error {
 		}
 		linger = lingerEnabled()
 		if !linger {
-			notes = append(notes, "on a headless box, run 'sudo loginctl enable-linger "+currentUsername()+"' so finch keeps running after you log out and starts at boot")
+			notes = append(notes, "on a headless machine, run 'sudo loginctl enable-linger "+currentUsername()+"' so finch keeps running after you log out and starts at boot")
 		}
 	}
 
@@ -520,7 +520,28 @@ func waitForRelays(manifest string, since time.Time) (map[string]relayStatus, *c
 }
 
 func serviceUninstall(c *cli) error {
-	var unitPath, stop string
+	unitPath, removed, err := stopAndRemoveService()
+	if err != nil {
+		return err
+	}
+	s := currentServiceStatus()
+	if c.json {
+		p := s.payload()
+		p["removed"] = removed
+		return c.emit(p)
+	}
+	if removed {
+		c.printf("finch: removed %s — the service is stopped\n", unitPath)
+	} else {
+		c.printf("finch: no finch service was installed\n")
+	}
+	return nil
+}
+
+// stopAndRemoveService stops the background service and deletes its unit.
+// removed reports whether a unit was there to delete.
+func stopAndRemoveService() (unitPath string, removed bool, cerr *cliError) {
+	var stop string
 	var out string
 	var err error
 	switch serviceGOOS {
@@ -536,32 +557,20 @@ func serviceUninstall(c *cli) error {
 	// and fail unless the manager explicitly confirms the serve is gone.
 	if err != nil {
 		if stopped, why := serviceStopConfirmed(); !stopped {
-			return newCLIError(codeInternal, "finch service uninstall",
+			return unitPath, false, newCLIError(codeInternal, "finch service uninstall",
 				"%s failed (%v: %s) and finch may still be running (%s), so %s was kept",
 				stop, err, strings.TrimSpace(out), why, unitPath)
 		}
 	}
-	removed := false
 	if err := os.Remove(unitPath); err == nil {
 		removed = true
 	} else if !os.IsNotExist(err) {
-		return newCLIError(codeInternal, "", "removing %s: %v", unitPath, err)
+		return unitPath, false, newCLIError(codeInternal, "", "removing %s: %v", unitPath, err)
 	}
 	if serviceGOOS == "linux" && removed {
 		_, _ = runServiceCommand("systemctl", "--user", "daemon-reload")
 	}
-	s := currentServiceStatus()
-	if c.json {
-		p := s.payload()
-		p["removed"] = removed
-		return c.emit(p)
-	}
-	if removed {
-		c.printf("finch: removed %s — the service is stopped\n", unitPath)
-	} else {
-		c.printf("finch: no finch service was installed\n")
-	}
-	return nil
+	return unitPath, removed, nil
 }
 
 func currentUsername() string {

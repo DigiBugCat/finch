@@ -106,24 +106,22 @@ func (e *credentialError) Unwrap() error { return e.err }
 // runConfig serves every ingress rule from a finch.yml — one relay per service,
 // concurrently, over a single process (the cloudflared model) — until SIGINT or
 // SIGTERM, which closes each relay cleanly.
-func runConfig(cfg *config) {
+func runConfig(cfg *config) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := serveConfig(ctx, cfg); err != nil {
-		log.Fatalf("finch: %v", err)
-	}
+	return serveConfig(ctx, cfg)
 }
 
 func serveConfig(ctx context.Context, cfg *config) error {
 	if len(cfg.Ingress) == 0 {
-		return fmt.Errorf("finch.yml has no ingress rules — add one with `finch add <app_path> --service <url>`")
+		return newCLIError(codeNotFound, "finch add <name> --service <url>", "finch.yml lists no services yet; add one with 'finch add <name> --service <url>'")
 	}
 	// One box-level lock for the whole config run: a second finch run against the
 	// same credentials dir would dial the same slugs and supersede these relays,
 	// flapping both. (The systemd unit is the intended owner.)
 	release, ok := lockState(filepath.Join(cfg.CredentialsDir, "finch-run"))
 	if !ok {
-		return fmt.Errorf("another finch run already serves %s — refusing to start a second relay", cfg.CredentialsDir)
+		return newCLIError(codeInternal, "finch service status", "another 'finch run' is already serving this machine (%s); stop it first (Ctrl-C in its terminal), or check the background service", cfg.CredentialsDir)
 	}
 	defer release()
 	status := newRunStatusWriter(cfg)
@@ -143,7 +141,7 @@ func serveConfig(ctx context.Context, cfg *config) error {
 			_ = superviseRelay(ctx, o)
 		}()
 	}
-	log.Printf("finch: serving %d ingress rule(s) from finch.yml as box %q", len(cfg.Ingress), cfg.Box)
+	log.Printf("finch: publishing %d service(s) from finch.yml as machine %q", len(cfg.Ingress), cfg.Box)
 	wg.Wait()
 	return nil
 }
@@ -197,10 +195,10 @@ func superviseRelay(ctx context.Context, o relayOptions) error {
 		if errors.As(err, &cerr) {
 			o.report(relayCredentialError, err.Error())
 			if o.WatchManifest {
-				log.Printf("%s: %v — run `finch login`, then `finch add <app_path> --service %s`; this process switches to serving finch.yml once it is written",
+				log.Printf("%s: %v — run 'finch login', then 'finch add <name> --service %s'; this process switches to serving finch.yml once it is written",
 					lp, err, o.Upstream)
 			} else {
-				log.Printf("%s: %v — run `finch add %s --service %s` to enroll; waiting for a new credential at %s",
+				log.Printf("%s: %v — run 'finch add %s --service %s' to publish it again; waiting for a new credential at %s",
 					lp, err, o.AppPath, o.Upstream, o.CredentialPath)
 			}
 			if werr := waitForNewCredential(ctx, o.CredentialPath, o.hub(), cerr.attempted, manifestChanged); werr != nil {
@@ -354,7 +352,7 @@ func runRelay(ctx context.Context, o relayOptions) error {
 	if endpoint == "" { // older hub without host/url in the join response
 		endpoint = relayURL(hub, jr.Service, jr.Box)
 	}
-	log.Printf("%s: %q live at %s  →  %s  (box %q, tenant %s)", lp, name, endpoint, up, jr.Box, jr.Tenant)
+	log.Printf("%s: ✓ %s is live at %s  →  %s  (machine %q)", lp, name, endpoint, up, jr.Box)
 
 	wsBase := relayDialURL(jr, hub)
 	connectToken := jr.ConnectToken

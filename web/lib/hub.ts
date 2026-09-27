@@ -13,7 +13,8 @@
 //
 // This module centralizes (a) resolving the tenant from the Clerk session and
 // (b) calling the hub with the right headers. Route handlers stay thin. The
-// web's only hub-backed surface is the `finch login` approval page (/cli).
+// web's hub-backed surfaces are the `finch login` approval page (/cli) and the
+// read-only fleet page (/fleet), which only ever GETs /api/state.
 //
 // Tenancy is single-user: a signed-in Clerk user's tenant is exactly their
 // Clerk user id, and they are its owner. There is nothing to choose between
@@ -151,6 +152,28 @@ async function resolveTenantUncached(): Promise<ResolvedTenant> {
   return { tenant, userId, memberId: id, email };
 }
 export const resolveTenant = process.env.NODE_ENV === "test" ? resolveTenantUncached : cache(resolveTenantUncached);
+
+/**
+ * The signed-in user's whole account as the hub reports it (GET /api/state),
+ * for the read-only /fleet page. Resolves the tenant first, which also sets up
+ * a brand-new account (owner row, then the hub assigns its address on this
+ * first read). The raw JSON is returned unvalidated: the page maps it through
+ * toFleetView (components/fleet/model.ts), which keeps only the fields it
+ * shows and never passes a key hash, a key's last digits, emails or the admin
+ * log through to the HTML.
+ */
+export async function readTenantState(): Promise<unknown> {
+  const { tenant } = await resolveTenant();
+  const res = await hubFetchAs(tenant, "/api/state", { method: "GET" });
+  if (!res.ok) {
+    throw new HttpError(res.status >= 500 ? 502 : res.status, "could not read your fleet");
+  }
+  const data = await readHubJson(res);
+  if (!data || typeof data !== "object" || Array.isArray(data)) {
+    throw new HttpError(502, "invalid response from hub");
+  }
+  return data;
+}
 
 
 /** Return a canonical origin, or throw unless `hubUrl` is https: or a

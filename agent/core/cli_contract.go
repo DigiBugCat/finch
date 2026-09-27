@@ -21,8 +21,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"regexp"
-	"strings"
 )
 
 const (
@@ -161,11 +159,21 @@ func (c *cli) finish(err error) int {
 		fmt.Fprintln(c.stderr, withSchemaVersion(b))
 	} else {
 		fmt.Fprintf(c.stderr, "finch: %s\n", ce.Message)
-		if ce.Next != "" {
-			fmt.Fprintf(c.stderr, "  next: %s\n", ce.Next)
+		if next := humanNext(ce.Next); next != "" {
+			fmt.Fprintf(c.stderr, "  next: %s\n", next)
 		}
 	}
 	return ce.exitCode()
+}
+
+// humanNext is the next step shown to a person. An agent (--json) is told to
+// log in with the two-step 'finch login --start' / '--poll'; a person runs
+// plain 'finch login', which opens the browser and waits.
+func humanNext(next string) string {
+	if next == "finch login --start" || next == "finch login --start --json" {
+		return "finch login"
+	}
+	return next
 }
 
 // wantsJSON reports whether --json appears among a command's arguments. It is
@@ -199,10 +207,7 @@ func (c *cli) parseArgs(fs *flag.FlagSet, args []string) ([]string, error) {
 	for {
 		if err := fs.Parse(args); err != nil {
 			if errors.Is(err, flag.ErrHelp) {
-				fmt.Fprintf(c.stdout, "Usage of finch %s:\n", fs.Name())
-				fs.SetOutput(c.stdout)
-				fs.PrintDefaults()
-				return nil, errHelpShown
+				return nil, c.showCommandHelp(fs.Name(), fs)
 			}
 			return nil, usageError("%s: %v", fs.Name(), err)
 		}
@@ -219,10 +224,15 @@ func (c *cli) parseArgs(fs *flag.FlagSet, args []string) ([]string, error) {
 // relay agent (`finch run`, `finch join`, or bare flags), which Main serves.
 func runCLI(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int, handled bool) {
 	if len(args) == 0 {
-		return 0, false
+		// Bare `finch` is a person finding their way: show the help.
+		c := &cli{stdout: stdout, stderr: stderr, stdin: stdin}
+		return c.finish(runHelp(c, nil)), true
 	}
 	name, rest := args[0], args[1:]
 	c := &cli{stdout: stdout, stderr: stderr, stdin: stdin, json: wantsJSON(rest)}
+	if (name == "run" || name == "join") && isHelpArg(rest) {
+		return c.finish(c.showCommandHelp(name, relayFlagSet(name))), true
+	}
 	h := lookupCommand(name)
 	if h == nil {
 		if validateRelayCommandArg(name) == nil {
@@ -230,7 +240,13 @@ func runCLI(args []string, stdin io.Reader, stdout, stderr io.Writer) (code int,
 		}
 		return c.finish(usageError("unknown command %q", name)), true
 	}
-	return c.finish(h(c, rest)), true
+	err := h(c, rest)
+	// A usage mistake points at this command's own help, not the whole list.
+	var ce *cliError
+	if d := findDoc(name); d != nil && d.name != "help" && errors.As(err, &ce) && ce.Code == codeUsage && ce.Next == "finch help" {
+		ce.Next = "finch " + d.name + " -h"
+	}
+	return c.finish(err), true
 }
 
 type commandFunc func(c *cli, args []string) error
@@ -263,6 +279,10 @@ func lookupCommand(name string) commandFunc {
 		return runFleet
 	case "rm":
 		return runRm
+	case "logs":
+		return runLogs
+	case "uninstall":
+		return runUninstall
 	case "revoke-tokens":
 		return runRevokeTokens
 	case "test":
@@ -273,6 +293,9 @@ func lookupCommand(name string) commandFunc {
 		return runUpdate
 	case "version", "--version", "-v":
 		return func(c *cli, args []string) error {
+			if isHelpArg(args) {
+				return c.showCommandHelp("version", versionFlagSet())
+			}
 			if err := writeCLIVersion(c.stdout, args, currentCLIVersionInfo()); err != nil {
 				return usageError("version: %v", err)
 			}
@@ -280,6 +303,9 @@ func lookupCommand(name string) commandFunc {
 		}
 	case "guide":
 		return func(c *cli, args []string) error {
+			if isHelpArg(args) {
+				return commandHelp(c, "guide")
+			}
 			if c.json {
 				return c.emit(map[string]any{"text": guideText})
 			}
@@ -287,40 +313,9 @@ func lookupCommand(name string) commandFunc {
 			return err
 		}
 	case "help", "-h", "--help":
-		return func(c *cli, args []string) error {
-			if c.json {
-				return c.emit(map[string]any{"text": usageText, "commands": helpCommands(usageText)})
-			}
-			_, err := io.WriteString(c.stdout, usageText)
-			return err
-		}
+		return runHelp
 	}
 	return nil
-}
-
-var helpCommandLine = regexp.MustCompile(`^  (\S.*?)\s{2,}(\S.*)$`)
-
-// helpCommands is the "Commands:" table of `finch help` as structured rows,
-// for `finch help --json`: each command's usage and one-line summary.
-func helpCommands(text string) []map[string]string {
-	rows := []map[string]string{}
-	in := false
-	for _, line := range strings.Split(text, "\n") {
-		if line == "Commands:" {
-			in = true
-			continue
-		}
-		if !in {
-			continue
-		}
-		if strings.TrimSpace(line) == "" {
-			break
-		}
-		if m := helpCommandLine.FindStringSubmatch(line); m != nil {
-			rows = append(rows, map[string]string{"usage": m[1], "summary": m[2]})
-		}
-	}
-	return rows
 }
 
 // hubError is a non-200 answer (or a transport failure, Status 0) from the hub.
