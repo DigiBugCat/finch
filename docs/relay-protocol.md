@@ -151,6 +151,12 @@ sight, write `sessionId → machine` to a per-session sharded `SessionDO`
 Single-machine appliances (the common IoT case) need none of this — they pin
 trivially. (Do **not** use cookie affinity — MCP clients drop `Set-Cookie`.)
 
+The hub's own MCP client — `POST /api/cli/call`, behind `finch test` and
+`finch call` (`worker/src/cli-call.ts`) — does not wait for this: it runs the
+whole initialize → call → `DELETE` exchange against one box's pinned
+`/<service>/<box>/mcp` path, failing over to the next healthy box only while
+the pick is answering the DO's `X-Finch-Offline` 503.
+
 ## What changes in the existing code
 
 - `appliance-do.ts`: delete the 501 SSE reject, `req.text()` buffering, the
