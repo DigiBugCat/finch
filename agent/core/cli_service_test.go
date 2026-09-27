@@ -411,6 +411,44 @@ func TestRotateServiceLog(t *testing.T) {
 	}
 }
 
+// `finch update` restarts the installed finch.service even when it is stopped
+// at that moment (--restart=service, or it stopped mid-update); the legacy
+// finch-tunnel.service only when finch.service is not installed.
+func TestRestartManagedServicePicksTheInstalledUnit(t *testing.T) {
+	home := isolate(t)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg"))
+	var calls []string
+	serviceGOOS = "linux"
+	runServiceCommand = func(name string, args ...string) (string, error) {
+		cmd := name + " " + strings.Join(args, " ")
+		calls = append(calls, cmd)
+		if strings.Contains(cmd, "is-active") {
+			return "inactive\n", fmt.Errorf("exit status 3")
+		}
+		return "", nil
+	}
+	if err := restartManagedService(); err != nil {
+		t.Fatal(err)
+	}
+	if got := calls[len(calls)-1]; got != "systemctl --user restart finch-tunnel.service" {
+		t.Fatalf("no finch.service installed: restarted %q, want the legacy unit", got)
+	}
+
+	if err := os.MkdirAll(filepath.Dir(systemdUnitPath()), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(systemdUnitPath(), systemdUnit("/opt/finch/bin/finch", "/x/finch.yml", "/x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	calls = nil
+	if err := restartManagedService(); err != nil {
+		t.Fatal(err)
+	}
+	if got := calls[len(calls)-1]; got != "systemctl --user restart finch.service" {
+		t.Fatalf("finch.service installed but inactive: restarted %q, want finch.service", got)
+	}
+}
+
 func TestResolveUpdateRestartModeUsesManagedService(t *testing.T) {
 	isolate(t)
 	m := &fakeServiceManager{t: t, running: true}

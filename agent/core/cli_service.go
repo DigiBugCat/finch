@@ -195,14 +195,17 @@ func legacyTunnelActive() bool {
 }
 
 // restartManagedService restarts the managed serve through its manager: the
-// old process stops before the new one starts, so the hub never sees two.
+// old process stops before the new one starts, so the hub never sees two. On
+// Linux the installed finch.service is the one restarted (which also starts it
+// when it is stopped); the legacy finch-tunnel.service only when finch.service
+// is not installed.
 func restartManagedService() error {
 	var out string
 	var err error
 	switch {
 	case serviceGOOS == "darwin":
 		out, err = runServiceCommand("launchctl", "kickstart", "-k", launchdTarget())
-	case currentServiceStatus().Running:
+	case fileExists(systemdUnitPath()):
 		out, err = runServiceCommand("systemctl", "--user", "restart", systemdUnitName)
 	default:
 		out, err = runServiceCommand("systemctl", "--user", "restart", legacySystemdUnit)
