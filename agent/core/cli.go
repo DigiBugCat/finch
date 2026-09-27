@@ -291,7 +291,11 @@ func cliRequest(method, hub, path, token string, body any) (map[string]any, erro
 		req.Header.Set("Content-Type", "application/json")
 	}
 	req.Header.Set("Accept", "application/json, text/event-stream")
-	res, err := controlPlaneHTTPClient.Do(req)
+	client := controlPlaneHTTPClient
+	if path == "/api/cli/call" {
+		client = relayCallHTTPClient
+	}
+	res, err := client.Do(req)
 	if err != nil {
 		return nil, &hubError{Msg: err.Error()}
 	}

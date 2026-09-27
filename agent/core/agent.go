@@ -81,6 +81,23 @@ var controlPlaneHTTPClient = &http.Client{
 	},
 }
 
+// relayCallHTTPClient is for /api/cli/call (finch test / finch call). The hub
+// answers only after it has run a whole MCP exchange with the service, which it
+// bounds at 25s, so the header timeout must outlast that budget or a slow but
+// successful call is reported as a transport failure.
+var relayCallHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 40 * time.Second,
+		ExpectContinueTimeout: time.Second,
+	},
+	Timeout: 45 * time.Second,
+	CheckRedirect: func(*http.Request, []*http.Request) error {
+		return http.ErrUseLastResponse
+	},
+}
+
 type hubHTTPStatusError struct {
 	Status int
 }
